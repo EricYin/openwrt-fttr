@@ -1,0 +1,215 @@
+//! Verified HL202 service configuration; verify each accepted write by GET.
+use crate::pon_engine::omci_transport::{is_unknown_instance, OmciSession, StockOmccLease};
+use crate::controller::business::{verify, create_verified, assign_tcont, create_gem};
+use crate::{bosa, pon_engine::ploam::PloamFrame};
+use std::io;
+
+// Do not enable the FPGA ONU/OMCC mapping while discovery/ranging owns it.
+// Query the live daemon, never the CLI's cached status-file fallback.
+fn wait_for_operation(id: u8) {
+    use crate::{ipc, model::FttrSystemStatus};
+    let mut attempts = 0u64;
+    loop {
+        let ready = ipc::send_ipc_command("STATUS").ok()
+            .and_then(|reply| serde_json::from_str::<FttrSystemStatus>(&reply).ok())
+            .is_some_and(|status| status.sub_gateways.iter()
+                .any(|onu| onu.onu_id == id && onu.vendor == "H3CT" && onu.state == "O5Operation"));
+        if ready {
+            println!("ONU_OPERATION_CONFIRMED id={id}; starting OMCI service");
+            return;
+        }
+        if attempts % 10 == 0 { println!("WAITING_FOR_O5 id={id}; OMCC mapping untouched"); }
+        attempts += 1;
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+struct ChannelLease { id: u8, previous: u16 }
+impl Drop for ChannelLease {
+    fn drop(&mut self) {
+        if let Err(e) = bosa::exchange_omci_channel(self.id, self.previous) {
+            eprintln!("OMCI channel restore failed: {e}");
+        }
+    }
+}
+
+fn retire_previous_ani(session: &mut OmciSession, current: u16) -> io::Result<()> {
+    // ONU-ID can change across daemon/main restarts while the child retains
+    // its MIB. Two ANI bridge entries with the same port number leave the
+    // old GEM selected. Retire ONLY entities matching our verified profile.
+    for old in 0x101u16..=0x10f {
+        if old == current { continue; }
+        let entry = match session.get(47, old, 0xf000) {
+            Ok(entry) => entry,
+            Err(error) if is_unknown_instance(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let expected = [0,1,6,5,(old >> 8) as u8,old as u8];
+        if entry.payload[3..9] != expected {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("foreign ANI bridge profile {old:04x}; migration blocked")));
+        }
+        let mut entities = vec![(47, old)];
+        for (class, mask, expected) in [
+            (266, 0xf200, vec![(old >> 8) as u8, old as u8,1,0,1,0,0,0,1]),
+            (268, 0xe000, vec![(old >> 8) as u8, old as u8,0x80,0,3]),
+            (84, 0xc000, vec![0;25]),
+        ] {
+            match session.get(class, old, mask) {
+                Ok(entry) if entry.payload[3..3+expected.len()] == expected => entities.push((class, old)),
+                Err(error) if is_unknown_instance(&error) => {},
+                Err(error) => return Err(error),
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("foreign entity class={class} instance={old:04x}; migration blocked"))),
+            }
+        }
+        for (class, instance) in entities {
+            session.delete(class, instance)?;
+            match session.get(class, instance, if class == 84 { 0xc000 } else { 0x8000 }) {
+                Err(error) if is_unknown_instance(&error) => {},
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "retired ANI entity still present or GET failed")),
+            }
+            println!("PREVIOUS_ANI_RETIRED class={class} instance={instance:04x} new={current:04x}");
+        }
+    }
+    Ok(())
+}
+pub fn configure(id: u8, seconds: Option<u64>, transparent: bool, supervised: bool, restore_initial: bool,
+    cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> io::Result<()> {
+    if id == 0 || id > 15 || seconds.is_some_and(|s| s > 600) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "ONU_ID must be 1..15 and hold seconds <=600")); }
+    if supervised && cancellation.is_none() { wait_for_operation(id); }
+    if cancellation.as_ref().is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err(io::Error::new(io::ErrorKind::NotConnected, "registration cancelled before configuration"));
+    }
+    // Declared before all hardware leases: released only after their Drop.
+    let _operation_lock = crate::pon_engine::omci_transport::lock_onu(id)?;
+    if supervised && !crate::pon_engine::omci_transport::operation_confirmed(id) {
+        return Err(io::Error::new(io::ErrorKind::NotConnected, "ONU went offline before OMCC setup"));
+    }
+    let mut session = OmciSession::open(id)?;
+    if supervised { session.require_operation(); }
+    if let Some(token) = cancellation { session.cancel_when(token); }
+    let _lease = StockOmccLease::open(id)?;
+    let port = 0x100u16 + id as u16;
+    let previous = bosa::exchange_omci_channel(id, 0)?;
+    let _channel = ChannelLease { id, previous };
+    if restore_initial {
+        // Assign ONU-ID, not the data T-CONT Alloc-ID.
+        // Explicit recovery of earlier diagnostics; require a real GET below.
+        for _ in 0..3 {
+            bosa::send_ploam_msg(&PloamFrame::assign_alloc_id(id).to_bytes())?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let mut channel = 0;
+    // Alloc-ID is retained by the ONU when a diagnostic lease exits, while
+    // the host mapping is restored. Recover the existing channel before SET.
+    match session.get(256, 0, 0x8000) {
+        Ok(frame) if &frame.payload[3..7] == b"H3CT" => {}
+        Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected ONU vendor")),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+            bosa::exchange_omci_channel(id, port)?;
+            channel = port;
+            verify(&mut session, 256, 0, 0x8000, b"H3CT")?;
+            println!("EXISTING_ALLOC_CHANNEL_RECOVERED channel={port:04x}");
+        }
+        Err(e) => return Err(e),
+    }
+    let equipment = session.get(257, 0, 0x8000)?;
+    let equipment = &equipment.payload[3..23];
+    let end = equipment.iter().position(|byte| *byte == 0 || *byte == 0xff).unwrap_or(equipment.len());
+    if std::str::from_utf8(&equipment[..end]).map(str::trim) != Ok("HL202-DU-C") {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "HL202 profile requires verified HL202-DU-C equipment identity"));
+    }
+    // Verify the existing FTTR credentials before setting status=1.
+    // Do not overwrite the ONU's credentials.
+    let loid = session.get(65530, 0, 0x4000)?;
+    let password = session.get(65530, 0, 0x2000)?;
+    if &loid.payload[3..13] != b"subGateway" || &password.payload[3..13] != b"0000000000" {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "ONU credentials differ from verified stock FTTR profile"));
+    }
+    session.set(65530, 0, 0x1000, &[1])?;
+    verify(&mut session, 65530, 0, 0x1000, &[1])?;
+    println!("STOCK_FTTR_AUTH_STATUS_READBACK_OK; existing credentials matched");
+    // Assign Alloc-ID 0x100+ONU-ID to T-CONT 0x8000.
+    // Create GAL profile 1 and bridge profile 1 first.
+    create_verified(&mut session, 272, 1, &[0,48], 0x8000, &[0,48])?;
+    let bridge = [0,1,0,0x80,0,0x14,0,2,0,0x0f,0,0];
+    create_verified(&mut session, 45, 1, &bridge, 0xe000, &[0,1,0])?;
+    assign_tcont(&mut session, 0x8000, port)?;
+    // Use GEM-ID=0x100+ONU-ID, bidirectional, with queue pointers 0.
+    // Bind MAC-bridged GEM interworking option 1 to bridge 1/GAL 1.
+    create_gem(&mut session, port, port, 0x8000, 1, 1)?;
+    retire_previous_ani(&mut session, port)?;
+    // First Ethernet UNI from the actual MIB is 0x0101, not ONU-ID.
+    let uni = [0,1,1,1,1,1,0,0,0,1,0,0,0];
+    create_verified(&mut session, 47, 1, &uni, 0xf000, &uni[..6])?;
+    if session.get(47, port, 0x4000).is_ok() {
+        session.set(47, port, 0x4000, &[6])?;
+    }
+    let mut network = vec![0,1,6,5]; network.extend(port.to_be_bytes()); network.extend([0,0,0,1,0,0,0]);
+    create_verified(&mut session, 47, port, &network, 0xf000, &network[..6])?;
+    for index in 2..=4u16 {
+        let pointer = 0x100 + index;
+        let mut uni = vec![0,1,index as u8,1]; uni.extend(pointer.to_be_bytes()); uni.extend([0,0,0,1,0,0,0]);
+        create_verified(&mut session, 47, index, &uni, 0xf000, &uni[..6])?;
+    }
+    // Bridge the MIB-discovered VEIP using TP type 11.
+    session.set(47, port, 0x4000, &[6])?;
+    verify(&mut session, 47, port, 0x4000, &[6])?;
+    let veip = [0,1,5,11,4,1,0,0,0,1,0,0,0];
+    create_verified(&mut session, 47, 5, &veip, 0xf000, &veip[..6])?;
+    for index in 1..=5u16 {
+        let association = if index == 5 { 10 } else { 2 };
+        let pointer = if index == 5 { 0x401u16 } else { 0x100 + index };
+        let mut attrs = vec![association]; attrs.extend(pointer.to_be_bytes());
+        create_verified(&mut session, 171, index, &attrs, 0x8200, &attrs)?;
+        // Use downstream transparent forwarding; do not guess a VLAN rule.
+        session.set(171, index, 0x0800, &[1])?;
+        verify(&mut session, 171, index, 0x0800, &[1])?;
+        if transparent {
+            let before = session.get_table(171, index, 0x0400)?;
+            if before.is_empty() {
+                let mut expected = Vec::new();
+                for (outer, inner) in [(0xf8000000u32,0xf8000000u32),(0xf8000000,0xe8000000),(0xe8000000,0xe8000000)] {
+                    let mut row = Vec::new();
+                    for word in [outer,inner,0x000f0000,0x000f0000] { row.extend(word.to_be_bytes()); }
+                    session.set(171, index, 0x0400, &row)?;
+                    expected.extend(row);
+                }
+                let actual = session.get_table(171, index, 0x0400)?;
+                if actual != expected { return Err(io::Error::new(io::ErrorKind::InvalidData, "EVTO default rows readback differs")); }
+                println!("EVTO_TRANSPARENT_DEFAULTS_READBACK_OK instance={index} bytes={}", actual.len());
+            } else {
+                println!("EVTO_EXISTING_TABLE_PRESERVED instance={index} bytes={}", before.len());
+            }
+        }
+    }
+    // Complete the ANI bridge with class 84, instance 0x100+ONU-ID:
+    // zero VLAN entries and forward operation 0.
+    // Preserve any existing profile that differs rather than replacing it.
+    // This HL202 rejects GET of the entry-count attribute (mask 0x2000,
+    // result 9 with unsupported-mask 0x2000). Validate the supported list
+    // and forward-operation attributes; do not treat the rejected GET as success.
+    create_verified(&mut session, 84, port, &[0;26], 0xc000, &[0;25])?;
+    println!("STOCK_ANI_VLAN_FILTER_READBACK_OK instance={port:04x}; entry-count GET unsupported");
+    println!("RESULT OMCI_service_entities_readback=true data_plane_verified=false");
+    for (class, instance, mask) in [(329,0x401,0xc000),(11,0x101,0x0c00),(11,0x102,0x0c00),(171,5,0x0400),(65530,0,0x8000)] {
+        match session.get(class,instance,mask) {
+            Ok(frame) => println!("SERVICE_STATE class={class} instance={instance:04x} mask={mask:04x} data={:02X?}", &frame.payload[3..]),
+            Err(e) => eprintln!("SERVICE_STATE class={class} instance={instance:04x}: {e}"),
+        }
+    }
+    if let Some(seconds) = seconds {
+        // T-CONT 0x8000 has already been verified above. Do not reassign the
+        // initial/OMCC Alloc-ID to the business Alloc-ID just to hold the lease.
+        verify(&mut session, 256, 0, 0x8000, b"H3CT")?;
+        println!("SERVICE_OMCI_READBACK_OK channel={channel:04x}");
+        println!("STOCK_DATA_ALLOC_ID {port:04x}; holding verified OMCC setup for {seconds}s");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        while std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_secs(5).min(until.saturating_duration_since(std::time::Instant::now())));
+            verify(&mut session, 256, 0, 0x8000, b"H3CT")?;
+            println!("OMCC_HEARTBEAT_OK channel={channel:04x}; data plane still requires packet evidence");
+        }
+    }
+    Ok(())
+}

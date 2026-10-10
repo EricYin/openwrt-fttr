@@ -1,0 +1,65 @@
+#!/bin/sh /etc/rc.common
+START=80
+STOP=20
+
+USE_PROCD=1
+PROG=/usr/sbin/fttrd
+
+start_service() {
+	config_load fttr
+	config_get_bool acs_enabled acs enabled 0
+	config_get acs_listen acs listen ""
+	config_get acs_port acs port 7547
+	config_get acs_path acs path /cwmp
+	config_get acs_state acs state_file /var/lib/fttr/acs-state.json
+	config_get acs_username acs username ""
+	config_get acs_password acs password ""
+	config_get_bool acs_provision_k155 acs provision_k155 0
+	config_get acs_k155_vlan acs k155_vlan 0
+	[ -n "$acs_listen" ] || acs_listen=$(uci -q get network.lan.ipaddr)
+	acs_listen=${acs_listen%%/*}
+	[ -n "$acs_listen" ] || acs_listen=127.0.0.1
+	# Only start on H3C HM2004-DU
+	board=$(cat /tmp/sysinfo/board_name 2>/dev/null)
+	if [ "$board" != "h3c,hm2004-du" ]; then
+		return 0
+	fi
+
+	echo "[*] Initializing H3C FTTR Micro-OLT Subsystem..."
+	# Migrate legacy split service: fttrd now owns all ONU business workers.
+	if [ -x /etc/init.d/fttr-online ]; then
+		/etc/init.d/fttr-online stop
+		/etc/init.d/fttr-online disable
+	fi
+
+	# 1. Program FPGA Bitstream if needed (fallback if not auto-loaded by driver)
+	if [ -f /lib/firmware/FTTR_TOP.sbit ] && [ ! -e /sys/devices/platform/fmcs/reload_fpga ]; then
+		/usr/sbin/fttrctl load-fpga /lib/firmware/FTTR_TOP.sbit 2>/dev/null || true
+	fi
+
+	# 2. Setup downstream DSA switch ports (fttr1 ~ fttr16)
+	for i in $(seq 1 16); do
+		dev="fttr${i}"
+		if [ -d "/sys/class/net/${dev}" ]; then
+			ip link set "$dev" up 2>/dev/null
+			ip link set "$dev" master br-lan 2>/dev/null || brctl addif br-lan "$dev" 2>/dev/null
+		fi
+	done
+
+	# 3. Start Controller Daemon
+	procd_open_instance
+	procd_set_param command "$PROG"
+	procd_set_param env FTTR_ACS_ENABLED="$acs_enabled" FTTR_ACS_LISTEN="$acs_listen:$acs_port" FTTR_ACS_PATH="$acs_path" FTTR_ACS_STATE="$acs_state" FTTR_ACS_USERNAME="$acs_username" FTTR_ACS_PASSWORD="$acs_password" FTTR_ACS_PROVISION_K155="$acs_provision_k155" FTTR_ACS_K155_VLAN="$acs_k155_vlan"
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	echo "[*] Stopping H3C FTTR Subsystem..."
+}
+
+service_triggers() {
+	procd_add_reload_trigger fttr
+}

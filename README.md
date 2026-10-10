@@ -1,0 +1,55 @@
+# OpenWrt FTTR
+
+H3C HM2004-DU 下联 Micro-OLT 的 OpenWrt feed。源码仓库：
+https://github.com/LazuliKao/openwrt-fttr 。
+
+## 目录
+
+- `h3c-fmcs/`：内核驱动、FPGA 初始化、PLOAM/OMCI/GEM 通道及驱动测试。
+- `h3c-fttr-tools/`：Rust 控制器 `fttrd`、命令入口 `fttrctl`、设备适配和可裁剪 ACS。
+
+## 接入 PonWrt
+
+在 OpenWrt 的 `feeds.conf.default` 或自定义 `feeds.conf` 中加入：
+
+```text
+src-git fttr https://github.com/LazuliKao/openwrt-fttr.git
+```
+
+在 PonWrt 根目录运行：
+
+```sh
+./scripts/feeds update -a
+# 已有构建树先移除旧 feed 的两个包链接；不删除其他 PON 包。
+./scripts/feeds uninstall h3c-fmcs h3c-fttr-tools
+./scripts/feeds install -p fttr h3c-fmcs h3c-fttr-tools
+./scripts/feeds install -a
+make defconfig
+make package/feeds/fttr/h3c-fmcs/compile V=s -j2
+make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
+```
+
+## 编译选项
+
+| OpenWrt 配置 | Cargo feature | 默认 |
+| --- | --- | --- |
+| `CONFIG_FTTR_DEVICE_HL202` | `device-hl202` | 开 |
+| `CONFIG_FTTR_DEVICE_HWTC_K155` | `device-hwtc-k155` | 关 |
+| `CONFIG_FTTR_ACS` | `acs` | 关 |
+
+## Windows Rust 交叉编译
+
+在 `h3c-fttr-tools/src` 中使用已安装的 Rust target、Zig 和 cargo-zigbuild：
+
+```powershell
+$previous = $env:RUSTFLAGS
+try {
+    $env:RUSTFLAGS = '-C target-feature=+crt-static'
+    cargo zigbuild --release --target aarch64-unknown-linux-musl --no-default-features --features all-devices,acs --bin fttrd --bin fttrctl
+} finally {
+    $env:RUSTFLAGS = $previous
+}
+```
+
+产物位于 `src/target/aarch64-unknown-linux-musl/release/`。
+内核驱动与固件镜像使用 Linux OpenWrt 构建环境。
