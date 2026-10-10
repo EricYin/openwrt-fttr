@@ -8,7 +8,7 @@ fn send(request: Value) -> io::Result<Value> {
     serde_json::from_str(&reply).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 pub fn run(args: &[String]) -> io::Result<i32> {
-    let usage = "fttrctl acs status|devices|task ID\nfttrctl acs methods DEVICE [--wait SECONDS]\nfttrctl acs names DEVICE PATH [--next-level] [--wait SECONDS]\nfttrctl acs get DEVICE PATH... [--wait SECONDS]\nfttrctl acs set DEVICE PATH --type string|boolean|int|unsignedInt --value VALUE [--wait SECONDS]";
+    let usage = "fttrctl acs status|devices|task ID\nfttrctl acs methods DEVICE [--wait SECONDS]\nfttrctl acs names DEVICE PATH [--next-level] [--wait SECONDS]\nfttrctl acs get DEVICE PATH... [--wait SECONDS]\nfttrctl acs set DEVICE PATH --type string|boolean|int|unsignedInt --value VALUE [--wait SECONDS]\nfttrctl acs add|delete DEVICE OBJECT. [--wait SECONDS]";
     let mut values = Vec::new(); let mut wait = None; let mut next = false; let mut kind = "string".to_string(); let mut value = None; let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -29,6 +29,7 @@ pub fn run(args: &[String]) -> io::Result<i32> {
         "status" | "devices" if values.len()==1 => json!({"op":op}),
         "task" if values.len()==2 => json!({"op":"task","id":values[1].parse::<u64>().map_err(|_| invalid("invalid task ID"))?}),
         "methods" if values.len()==2 => json!({"op":"queue","device":values[1],"method":"GetRPCMethods","args":{}}),
+        "add" | "delete" if values.len()==3 => json!({"op":"queue","device":values[1],"method":if op == "add" {"AddObject"} else {"DeleteObject"},"args":{"object":values[2]}}),
         "names" if values.len()==3 => json!({"op":"queue","device":values[1],"method":"GetParameterNames","args":{"path":values[2],"next_level":next}}),
         "get" if values.len()>=3 => json!({"op":"queue","device":values[1],"method":"GetParameterValues","args":{"names":values[2..]}}),
         "set" if values.len()==3 => json!({"op":"queue","device":values[1],"method":"SetParameterValues","args":{"parameters":[{"name":values[2],"value":value.ok_or_else(|| invalid("--value required"))?,"kind":kind}]}}),

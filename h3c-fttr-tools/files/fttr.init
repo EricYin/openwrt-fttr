@@ -14,8 +14,6 @@ start_service() {
 	config_get acs_state acs state_file /var/lib/fttr/acs-state.json
 	config_get acs_username acs username ""
 	config_get acs_password acs password ""
-	config_get_bool acs_provision_k155 acs provision_k155 0
-	config_get acs_k155_vlan acs k155_vlan 0
 	[ -n "$acs_listen" ] || acs_listen=$(uci -q get network.lan.ipaddr)
 	acs_listen=${acs_listen%%/*}
 	[ -n "$acs_listen" ] || acs_listen=127.0.0.1
@@ -49,7 +47,7 @@ start_service() {
 	# 3. Start Controller Daemon
 	procd_open_instance
 	procd_set_param command "$PROG"
-	procd_set_param env FTTR_ACS_ENABLED="$acs_enabled" FTTR_ACS_LISTEN="$acs_listen:$acs_port" FTTR_ACS_PATH="$acs_path" FTTR_ACS_STATE="$acs_state" FTTR_ACS_USERNAME="$acs_username" FTTR_ACS_PASSWORD="$acs_password" FTTR_ACS_PROVISION_K155="$acs_provision_k155" FTTR_ACS_K155_VLAN="$acs_k155_vlan"
+	procd_set_param env FTTR_ACS_ENABLED="$acs_enabled" FTTR_ACS_LISTEN="$acs_listen:$acs_port" FTTR_ACS_PATH="$acs_path" FTTR_ACS_STATE="$acs_state" FTTR_ACS_USERNAME="$acs_username" FTTR_ACS_PASSWORD="$acs_password"
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1
@@ -62,4 +60,8 @@ stop_service() {
 
 service_triggers() {
 	procd_add_reload_trigger fttr
+}
+
+reload_service() {
+	/usr/sbin/fttrctl config reload
 }

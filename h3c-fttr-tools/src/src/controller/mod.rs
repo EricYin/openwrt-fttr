@@ -3,6 +3,7 @@ mod activation;
 pub mod business;
 pub mod health;
 pub mod inventory;
+pub mod management;
 pub mod profile;
 mod runtime;
 mod service;

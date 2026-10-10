@@ -206,7 +206,9 @@ fn run(args: Vec<String>, cancellation: Option<std::sync::Arc<AtomicBool>>, vend
     let mut last_data = None;
     let mut next_get = start + Duration::from_secs(5);
     let mut next_state = start;
+    let management_version=crate::provisioning::management_version();
     while !STOP.load(Ordering::Relaxed) && (watch || start.elapsed() < Duration::from_secs(seconds)) {
+        if watch && crate::provisioning::management_version()!=management_version {return Err(io::Error::other("OMCI management configuration changed"));}
         if cancellation.as_ref().is_some_and(|token| token.load(Ordering::Acquire)) { return Ok(()); }
         if watch && Instant::now() >= next_state {
             if !crate::pon_engine::omci_transport::operation_confirmed(id) {

@@ -11,5 +11,7 @@ pub mod model;
 pub use devices::hl202::command as subdev_command;
 pub mod controller;
 pub mod acs_cli;
+pub mod provisioning;
+pub mod provisioning_cli;
 #[cfg(feature = "acs")]
 pub mod acs;

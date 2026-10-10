@@ -54,6 +54,7 @@ impl Server {
         match request["op"].as_str().unwrap_or("") {
             "status" => json!({"compiled":true, "enabled":self.enabled, "listen":self.listen, "path":self.path, "auth":self.auth.is_some(), "devices":state.devices.len(), "tasks":state.tasks.len(), "http_requests":self.requests.load(Ordering::Relaxed), "error":self.failure.lock().unwrap().clone()}),
             "devices" => json!({"devices":state.devices}),
+            "busy" => json!({"busy":state.tasks.values().any(|t| t.device == request["device"].as_str().unwrap_or("") && matches!(t.state.as_str(), "queued" | "sent"))}),
             "task" => request["id"].as_u64().and_then(|id| state.tasks.get(&id)).map(|t| json!(t)).unwrap_or_else(|| error("unknown task")),
             "queue" => {
                 if !self.enabled { return error("ACS disabled by UCI"); }
@@ -61,6 +62,7 @@ impl Server {
                 if !state.devices.contains_key(device) { return error("unknown device: a real Inform is required before queuing RPCs; use acs devices"); }
                 let method = request["method"].as_str().unwrap_or(""); let args = request["args"].clone();
                 if let Err(err) = validate(method, &args) { return error(&err); }
+                if let Err(err) = protect_management(&state,device,method,&args) { return error(&err); }
                 if state.tasks.values().filter(|t| matches!(t.state.as_str(), "queued" | "sent")).count() >= 128 { return error("ACS queue full"); }
                 while state.tasks.len() >= 256 {
                     let expired = state.tasks.iter().find(|(_,t)| !matches!(t.state.as_str(), "queued" | "sent")).map(|(id,_)| *id);
@@ -74,10 +76,31 @@ impl Server {
         }
     }
 }
+fn protect_management(state: &State, device: &str, method: &str, args: &Value) -> Result<(),String> {
+    const ROOT:&str="InternetGatewayDevice.WANDevice.1.WANConnectionDevice.";
+    let paths:Vec<&str>=match method {
+        "SetParameterValues"=>args["parameters"].as_array().into_iter().flatten().filter_map(|p|p["name"].as_str()).collect(),
+        "AddObject"|"DeleteObject"=>vec![args["object"].as_str().unwrap_or("")],
+        _=>return Ok(()),
+    };
+    if method=="SetParameterValues" && args["parameters"].as_array().into_iter().flatten().any(|p|p["name"].as_str().is_some_and(|n|n.starts_with("InternetGatewayDevice.ManagementServer.") || ((n.ends_with("ServiceList") || n.ends_with("SERVICELIST")) && p["value"].as_str().unwrap_or("").contains("TR069")))) {return Err("TR069 management is owned by OMCI".into());}
+    for path in paths {
+        if method=="AddObject" && path==ROOT {continue;}
+        if !path.starts_with("InternetGatewayDevice.WANDevice.") {continue;}
+        let parent=path.strip_prefix(ROOT).and_then(|p|p.split('.').next()).and_then(|p|p.parse::<u32>().ok()).ok_or("protected WAN object")?;
+        if !crate::provisioning::owns_business_wan(device,parent) {return Err("WAN is not a controller-owned business object".into());}
+        if method=="AddObject" {continue;}
+        let prefix=format!("{ROOT}{parent}.WANIPConnection.");
+        let observed=state.tasks.values().rev().filter(|t|t.device==device && t.method=="GetParameterValues" && t.state=="completed" && now().saturating_sub(t.sent.unwrap_or(0))<=90).find_map(|t|t.result.as_ref()?["parameters"].as_array()?.iter().find(|p|p["name"].as_str().is_some_and(|n|n.starts_with(&prefix) && (n.ends_with("ServiceList") || n.ends_with("SERVICELIST")))).and_then(|p|p["value"].as_str()));
+        if observed.is_none_or(|v|v.contains("TR069")) {return Err("WAN write requires a fresh non-TR069 service readback".into());}
+    }
+    Ok(())
+}
 fn validate(method: &str, args: &Value) -> Result<(), String> {
     let path = |v: &Value| v.as_str().is_some_and(|s| s.len() <= 1024 && !s.chars().any(char::is_control));
     match method {
         "GetRPCMethods" => (),
+        "AddObject" | "DeleteObject" if path(&args["object"]) && args["object"].as_str().is_some_and(|s| s.starts_with("InternetGatewayDevice.") && s.ends_with('.') && s.split('.').count() >= 5) => (),
         "GetParameterNames" if path(&args["path"]) && args["next_level"].is_boolean() => (),
         "GetParameterValues" if args["names"].as_array().is_some_and(|a| !a.is_empty() && a.len() <= 64 && a.iter().all(|v| path(v) && v != "")) => (),
         "SetParameterValues" if args["parameters"].as_array().is_some_and(|a| !a.is_empty() && a.len() <= 32 && a.iter().all(|v| path(&v["name"]) && v["name"] != "" && v["value"].as_str().is_some_and(|s| s.len() <= 4096 && !s.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))))) => (),
@@ -98,6 +121,11 @@ impl State {
     }
     fn next(&mut self, device: &str, namespace: &str) -> io::Result<Option<String>> {
         if self.tasks.values().any(|t| t.device == device && t.state == "sent") { return Ok(None); }
+        if let Some(task)=self.tasks.values().find(|t|t.device==device && t.state=="queued") {
+            if let Err(reason)=protect_management(self,device,&task.method,&task.args) {
+                let id=task.id; let task=self.tasks.get_mut(&id).unwrap(); task.state="fault".into(); task.result=Some(error(&reason)); return Ok(None);
+            }
+        }
         let task = self.tasks.values_mut().find(|t| t.device == device && t.state == "queued");
         if let Some(task) = task { let xml = soap::request(namespace, task.id, &task.method, &task.args)?; task.state = "sent".into(); task.sent = Some(now()); return Ok(Some(xml)); }
         Ok(None)
@@ -107,10 +135,11 @@ impl State {
         let task = self.tasks.get_mut(&id).filter(|t| t.device == device && t.state == "sent").ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unexpected CWMP response"))?;
         if message.method == "Fault" { task.state = "fault".into(); }
         else if message.method == format!("{}Response", task.method) {
-            if task.method == "SetParameterValues" && !matches!(message.data["status"].as_str(), Some("0" | "1")) {
+            if matches!(task.method.as_str(), "SetParameterValues" | "AddObject" | "DeleteObject") && !matches!(message.data["status"].as_str(), Some("0" | "1")) {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid SetParameterValues Status"));
             }
-            task.state = if task.method == "SetParameterValues" && message.data["status"] == "1" { "accepted_pending_apply" } else { "completed" }.into();
+            if task.method == "AddObject" && !message.data["instance_number"].as_str().and_then(|s| s.parse::<u32>().ok()).is_some_and(|n| n > 0) { return Err(io::Error::new(io::ErrorKind::InvalidData,"invalid AddObject InstanceNumber")); }
+            task.state = if matches!(task.method.as_str(), "SetParameterValues" | "AddObject" | "DeleteObject") && message.data["status"] == "1" { "accepted_pending_apply" } else { "completed" }.into();
         } else { return Err(io::Error::new(io::ErrorKind::InvalidData, "RPC response method mismatch")); }
         task.result = Some(message.data.clone()); Ok(())
     }
@@ -189,6 +218,19 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn management_writes_and_unowned_wan_are_blocked_even_when_queued() {
+        let mut state=State::default();
+        for name in ["InternetGatewayDevice.ManagementServer.URL", "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.3.WANIPConnection.1.X_CU_ServiceList"] {
+            let args=json!({"parameters":[{"name":name,"value":"TR069"}]});
+            assert!(protect_management(&state,"guard-test","SetParameterValues",&args).is_err());
+            state.tasks.insert(1,Task{id:1,device:"guard-test".into(),method:"SetParameterValues".into(),args,state:"queued".into(),created:now(),sent:None,result:None});
+            assert!(state.next("guard-test","urn:dslforum-org:cwmp-1-0").unwrap().is_none());
+            assert_eq!(state.tasks[&1].state,"fault");
+        }
+        assert!(protect_management(&state,"guard-test","DeleteObject",&json!({"object":"InternetGatewayDevice.WANDevice.1.WANConnectionDevice.3."})).is_err());
+        assert!(protect_management(&state,"guard-test","AddObject",&json!({"object":"InternetGatewayDevice.WANDevice.1.WANConnectionDevice."})).is_ok());
+        assert!(protect_management(&state,"guard-test","GetParameterValues",&json!({"names":["InternetGatewayDevice.ManagementServer.URL"]})).is_ok());
+    }
     #[test] fn task_identity_fault_and_no_write_replay() {
         let mut s = State::default(); s.tasks.insert(4, Task { id:4, device:"a".into(), method:"SetParameterValues".into(), args:json!({"parameters":[{"name":"x","value":"y"}]}), state:"queued".into(), created:now(), sent:None, result:None });
         assert!(s.next("a", "urn:dslforum-org:cwmp-1-0").unwrap().unwrap().contains("fttr-4"));

@@ -92,12 +92,6 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     create_verified(&mut session, 84, entity, &[0;26], 0xc000, &[0;25])?;
     verify(&mut session, 256, 0, 0x8000, b"HWTC")?;
     println!("K155_SERVICE_READBACK_OK gem={port:04x}; data evidence still required");
-    #[cfg(feature = "acs")]
-    if std::env::var("FTTR_ACS_PROVISION_K155").as_deref() == Ok("1") && std::env::var("FTTR_ACS_ENABLED").as_deref() == Ok("1") {
-        let endpoint = format!("http://{}{}", std::env::var("FTTR_ACS_LISTEN").unwrap_or_default(), std::env::var("FTTR_ACS_PATH").unwrap_or_else(|_| "/cwmp".into()));
-        if let Err(e) = super::acs::configure(&mut session, &endpoint) {
-            eprintln!("K155_ACS_PROVISION_FAILED: {e}; bridge business remains independently supervised");
-        }
-    }
+    crate::controller::management::bootstrap(&mut session,id,0x601);
     Ok(())
 }

@@ -1,0 +1,45 @@
+config acs 'acs'
+	option enabled '1'
+	option port '7547'
+	option path '/cwmp'
+
+config provisioning 'provisioning'
+	option enabled '1'
+	option mode 'manual'
+	option freshness '180'
+	option interval '0'
+	list trigger 'config_change'
+	list trigger 'device_online'
+	list trigger 'cwmp_boot'
+
+config management 'management'
+	option vlan '46'
+	option priority '0'
+	option acs_url 'http://192.168.1.1:7547/cwmp'
+
+config template 'home'
+	option name 'Home'
+
+config group 'home_group'
+	option name 'Home'
+	option template 'home'
+
+config device 'hl202'
+	option optical_sn 'H3CT685DF998'
+	option adapter 'hl202'
+	option group 'home_group'
+
+config device 'k155'
+	option optical_sn 'HWTC3C6DE5B3'
+	option adapter 'k155'
+	option group 'home_group'
+
+config wifi 'wifi_2g'
+	option template 'home'
+	option ssid 'FTTR_2G'
+	option radio '2g'
+
+config wifi 'wifi_5g'
+	option template 'home'
+	option ssid 'FTTR_5G'
+	option radio '5g'

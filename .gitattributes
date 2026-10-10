@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Keep backend and driver text files as LF in the repository and worktree.
+h3c-fttr-tools/** text=auto eol=lf
+h3c-fmcs/** text=auto eol=lf

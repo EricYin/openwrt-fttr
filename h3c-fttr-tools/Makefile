@@ -59,6 +59,8 @@ define Package/h3c-fttr-tools/install
 	$(INSTALL_BIN) ./files/fttr.init $(1)/etc/init.d/fttr
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/fttr.config $(1)/etc/config/fttr
+	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
+	$(INSTALL_DATA) ./files/fttr.keep $(1)/lib/upgrade/keep.d/fttr
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/fttr-mqtt.defaults $(1)/etc/uci-defaults/90-fttr-mqtt
 endef

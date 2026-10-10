@@ -192,6 +192,7 @@ pub fn configure(id: u8, seconds: Option<u64>, transparent: bool, supervised: bo
     create_verified(&mut session, 84, port, &[0;26], 0xc000, &[0;25])?;
     println!("STOCK_ANI_VLAN_FILTER_READBACK_OK instance={port:04x}; entry-count GET unsupported");
     println!("RESULT OMCI_service_entities_readback=true data_plane_verified=false");
+    crate::controller::management::bootstrap(&mut session,id,0x401);
     for (class, instance, mask) in [(329,0x401,0xc000),(11,0x101,0x0c00),(11,0x102,0x0c00),(171,5,0x0400),(65530,0,0x8000)] {
         match session.get(class,instance,mask) {
             Ok(frame) => println!("SERVICE_STATE class={class} instance={instance:04x} mask={mask:04x} data={:02X?}", &frame.payload[3..]),

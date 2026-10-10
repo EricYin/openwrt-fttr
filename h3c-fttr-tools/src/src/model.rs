@@ -88,6 +88,16 @@ pub struct SubGatewayStatus {
     #[serde(default)]
     pub business_status: String,
     #[serde(default)]
+    pub management: serde_json::Value,
+    #[serde(default)]
+    pub provisioning: serde_json::Value,
+    #[serde(default)]
+    pub services: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub ssids: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub wifi_sync: String,
+    #[serde(default)]
     pub identity: Option<OnuIdentity>,
     #[serde(default)]
     pub identity_age_seconds: Option<u64>,
@@ -118,6 +128,8 @@ pub struct TelemetryGatewayInfo {
 /// Aggregated system status model returned by fttrd daemon on STATUS request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FttrSystemStatus {
+    #[serde(default)]
+    pub provisioning: serde_json::Value,
     #[serde(default = "default_fpga_status")]
     pub fpga_status: String,
     pub optical_transceiver: OpticalTransceiverStatus,

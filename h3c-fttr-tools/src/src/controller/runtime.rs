@@ -52,13 +52,16 @@ fn start_ipc_server(
             let mut line = String::new();
             if reader.read_line(&mut line).is_ok() {
                 let line = line.trim();
-                if let Some(_request) = line.strip_prefix("ACS ") {
+                if let Some(request) = line.strip_prefix("PROVISIONING ") {
+                    let _ = stream.write_all(crate::provisioning::control(request).as_bytes());
+                } else if let Some(_request) = line.strip_prefix("ACS ") {
                     #[cfg(feature = "acs")]
                     let response = crate::acs::control(_request);
                     #[cfg(not(feature = "acs"))]
                     let response = "{\"error\":\"ACS adapter not compiled (enable Cargo feature acs)\"}".to_string();
                     let _ = stream.write_all(response.as_bytes());
                 } else if line == "STATUS" {
+                    let provisioning = crate::provisioning::snapshot();
                     let devs = devices.lock().unwrap();
                     let engine = pon_engine.lock().unwrap();
                     let now = SystemTime::now()
@@ -108,6 +111,7 @@ fn start_ipc_server(
                         let service = services.lock().unwrap().get(&onu.onu_id).cloned();
                         let identity = service.as_ref().and_then(|state| state.identity.clone());
                         let sn_str = onu.full_sn_str();
+                        let desired = provisioning["devices"].as_array().and_then(|a| a.iter().find(|d| d["optical_sn"] == sn_str)).cloned().unwrap_or_default();
 
                         sub_gateways.push(SubGatewayStatus {
                             onu_id: onu.onu_id,
@@ -115,6 +119,11 @@ fn start_ipc_server(
                             model: identity.as_ref().and_then(|value| value.equipment_id.clone()).unwrap_or_else(|| onu.model.clone()),
                             serial_number: sn_str,
                             state: format!("{:?}", onu.state),
+                            management: desired["management"].clone(),
+                            provisioning: desired["provisioning"].clone(),
+                            services: desired["services"].as_array().cloned().unwrap_or_default(),
+                            ssids: desired["ssids"].as_array().cloned().unwrap_or_default(),
+                            wifi_sync: desired["wifi_sync"].as_str().unwrap_or("not_configured").into(),
                             business_status: services.lock().unwrap().get(&onu.onu_id).map(|state| {
                                 let verified = fs::read_to_string(format!("/sys/class/net/fttr{}/carrier", onu.onu_id)).is_ok_and(|value| value.trim() == "1");
                                 format!("{} (generation {}){}", if state.phase == "Verifying" && verified { "Verified" } else { &state.phase }, state.generation,
@@ -157,6 +166,7 @@ fn start_ipc_server(
 
                     let fpga_status_str = fpga::get_fpga_status().to_string();
                     let sys_status = FttrSystemStatus {
+                        provisioning,
                         fpga_status: fpga_status_str,
                         optical_transceiver: opt,
                         switch_ports,
@@ -206,6 +216,7 @@ pub fn run() {
     // 1. Data Structures & IPC Socket Server (Start immediately so fttrctl can query)
     let devices: Arc<Mutex<Vec<SubDevice>>> = Arc::new(Mutex::new(Vec::new()));
     let pon_engine = Arc::new(Mutex::new(PonEngine::new()));
+    crate::provisioning::start(pon_engine.clone());
     let mqtt_client_arc: Arc<Mutex<Option<MqttClient>>> = Arc::new(Mutex::new(None));
     let hardware_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let service_states: super::service::States = Arc::new(Mutex::new(BTreeMap::new()));

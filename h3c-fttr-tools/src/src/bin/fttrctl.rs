@@ -16,6 +16,8 @@ fn print_usage() {
     eprintln!(
         "Usage: fttrctl <command> [arguments]\n\n\
 Commands:\n  \
+  config check|reload  Validate or reload /etc/config/fttr desired state\n  \
+  sync plan|apply [DEVICE|all] [--item SECTION] [--management] [--wait SECONDS]\n  \
   load-fpga [path]     Program FPGA bitstream (default: /lib/firmware/FTTR_TOP.sbit)\n  \
   bosa-init            Initialize BOSA optical transceiver registers\n  \
   bridge-setup         Ensure downstream FTTR switch ports (fttr1~16) are bridged to br-lan\n  \
@@ -259,6 +261,10 @@ fn print_status_table(status: &FttrSystemStatus) {
         _ => "[UNKNOWN / NOT STARTED]",
     };
     println!("[*] FPGA Micro-OLT Core:    {} (Status: {})", fpga_badge, status.fpga_status);
+    if !status.provisioning.is_null() {
+        println!("[*] Provisioning: {} / {} / revision {}", status.provisioning["enabled"], status.provisioning["mode"].as_str().unwrap_or("unknown"), status.provisioning["revision"].as_str().unwrap_or("unknown"));
+        if let Some(error)=status.provisioning["error"].as_str() { println!("    Config error: {error}"); }
+    }
     println!();
 
     // 1. Optical Link
@@ -321,6 +327,12 @@ fn print_status_table(status: &FttrSystemStatus) {
             if !sg.business_status.is_empty() {
                 println!("    Business:       {}", sg.business_status);
             }
+            if !sg.provisioning.is_null() {
+                println!("    CWMP:           {} | Sync: {} | Wi-Fi: {}", sg.management["state"].as_str().unwrap_or("unknown"), sg.provisioning["state"].as_str().unwrap_or("not_started"), sg.wifi_sync);
+                for item in sg.services.iter().chain(sg.ssids.iter()) {
+                    println!("      {} [{}]: {} {}", item["id"].as_str().unwrap_or("?"), item["service_type"].as_str().filter(|s| !s.is_empty()).unwrap_or_else(|| item["kind"].as_str().unwrap_or("?")), item["state"].as_str().unwrap_or("?"), item["reason"].as_str().unwrap_or(""));
+                }
+            }
             println!("    Hardware:       {}", sg.hardware_version);
             println!("    Software:       {}", sg.firmware_version);
             if let Some(identity) = &sg.identity {
@@ -368,6 +380,12 @@ fn main() {
             match h3c_fttr_tools::acs_cli::run(&args[2..]) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => { eprintln!("ACS: {e}"); std::process::exit(1); }
+            }
+        }
+        "config" | "sync" => {
+            match h3c_fttr_tools::provisioning_cli::run(&args[1], &args[2..]) {
+                Ok(code) => exit(code),
+                Err(e) => { eprintln!("Provisioning: {e}"); exit(1); }
             }
         }
         "load-fpga" => {

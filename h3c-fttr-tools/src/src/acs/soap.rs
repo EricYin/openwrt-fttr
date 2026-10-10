@@ -30,11 +30,11 @@ pub fn parse(input: &str) -> io::Result<Message> {
     for node in rpc.descendants().filter(|n| n.is_element() && matches!(n.tag_name().name(), "ParameterValueStruct" | "ParameterInfoStruct" | "SetParameterValuesFault")) {
         let child = |name| node.children().find(|n| n.is_element() && n.tag_name().name() == name);
         let value = |name| child(name).and_then(|n| n.text()).unwrap_or("").to_owned();
-        values.push(serde_json::json!({"name": value("Name"), "value": value("Value"), "writable": value("Writable"), "type": child("Value").and_then(|n| n.attribute(("http://www.w3.org/2001/XMLSchema-instance", "type"))).unwrap_or(""), "fault_code": value("FaultCode"), "fault_string": value("FaultString")}));
+        values.push(serde_json::json!({"name": if node.tag_name().name() == "SetParameterValuesFault" {value("ParameterName")} else {value("Name")}, "value": value("Value"), "writable": value("Writable"), "type": child("Value").and_then(|n| n.attribute(("http://www.w3.org/2001/XMLSchema-instance", "type"))).unwrap_or(""), "fault_code": value("FaultCode"), "fault_string": value("FaultString")}));
     }
     Ok(Message { method: rpc.tag_name().name().into(), namespace: namespace.into(), id,
         serial: text("SerialNumber"), oui: text("OUI"), product: text("ProductClass"),
-        data: serde_json::json!({"parameters": values, "methods": rpc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "string").filter_map(|n| n.text()).collect::<Vec<_>>(), "status": text("Status"), "fault_code": text("FaultCode"), "fault_string": text("FaultString"), "events": rpc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "EventCode").filter_map(|n| n.text()).collect::<Vec<_>>()}) })
+        data: serde_json::json!({"parameters": values, "methods": rpc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "string").filter_map(|n| n.text()).collect::<Vec<_>>(), "status": text("Status"), "instance_number":text("InstanceNumber"), "fault_code": text("FaultCode"), "fault_string": text("FaultString"), "events": rpc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "EventCode").filter_map(|n| n.text()).collect::<Vec<_>>()}) })
 }
 pub fn escape(value: &str) -> String {
     value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
@@ -59,6 +59,7 @@ pub fn request(namespace: &str, id: u64, method: &str, args: &serde_json::Value)
             }
             format!("<cwmp:SetParameterValues><ParameterList soap-enc:arrayType=\"cwmp:ParameterValueStruct[{}]\">{list}</ParameterList><ParameterKey>fttr-{id}</ParameterKey></cwmp:SetParameterValues>", values.len())
         }
+        "AddObject" | "DeleteObject" => format!("<cwmp:{method}><ObjectName>{}</ObjectName><ParameterKey>fttr-{id}</ParameterKey></cwmp:{method}>",escape(args["object"].as_str().unwrap_or(""))),
         _ => return Err(bad("unsupported ACS RPC")),
     };
     Ok(envelope(namespace, &format!("fttr-{id}"), &body))
@@ -67,6 +68,14 @@ pub fn request(namespace: &str, id: u64, method: &str, args: &serde_json::Value)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn object_response_and_parameter_fault() {
+        let reply=parse(&envelope("urn:dslforum-org:cwmp-1-0","fttr-2","<cwmp:AddObjectResponse><InstanceNumber>4</InstanceNumber><Status>1</Status></cwmp:AddObjectResponse>")).unwrap();
+        assert_eq!(reply.data["instance_number"],"4"); assert_eq!(reply.data["status"],"1");
+        let fault=parse(&envelope("urn:dslforum-org:cwmp-1-0","fttr-2","<soap:Fault><detail><cwmp:Fault><FaultCode>9003</FaultCode><SetParameterValuesFault><ParameterName>InternetGatewayDevice.x</ParameterName><FaultCode>9005</FaultCode></SetParameterValuesFault></cwmp:Fault></detail></soap:Fault>")).unwrap();
+        assert_eq!(fault.data["parameters"][0]["name"],"InternetGatewayDevice.x");
+        let xml=request("urn:dslforum-org:cwmp-1-0",2,"DeleteObject",&serde_json::json!({"object":"InternetGatewayDevice.WANDevice.1.WANConnectionDevice.4."})).unwrap();
+        assert_eq!(parse(&xml).unwrap().method,"DeleteObject");
+    }
     #[test] fn namespaces_entities_and_faults() {
         let input = envelope("urn:dslforum-org:cwmp-1-2", "id<&", "<cwmp:Inform><DeviceId><OUI>AABBCC</OUI><SerialNumber>SN&amp;1</SerialNumber></DeviceId><ParameterList><ParameterValueStruct><Name>x</Name><Value xsi:type=\"xsd:string\">a&lt;b</Value></ParameterValueStruct></ParameterList></cwmp:Inform>");
         let parsed = parse(&input).unwrap();

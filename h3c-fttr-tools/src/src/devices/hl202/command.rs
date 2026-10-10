@@ -89,14 +89,14 @@ mod tests {
 
     #[test]
     fn identity_and_advisory_lock_reject_ambiguous_commands() {
-        assert_eq!(normalize_mac("1c:94:68:5d:f9:98").unwrap(), "1A2B3C4DA111");
+        assert_eq!(normalize_mac("1a:2b:3c:4d:a1:11").unwrap(), "1A2B3C4DA111");
         assert!(normalize_mac("H3CT1A2B3C4D").is_err());
         assert!(normalize_mac("../1A2B3C4DA111").is_err());
         let target = format!("TEST{}", request_id());
         let first = lock_target(&target).unwrap();
         assert_eq!(lock_target(&target).unwrap_err().kind(), io::ErrorKind::WouldBlock);
         drop(first);
-        assert!(lock_target(&target).is_ok());
+        lock_target(&target).unwrap();
         std::fs::remove_file(format!("/tmp/fttr-command-{target}.lock")).unwrap();
     }
 }
