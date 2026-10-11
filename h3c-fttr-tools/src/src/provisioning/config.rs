@@ -81,11 +81,14 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
     for (id, s) in sections.iter().filter(|(_,s)| s.kind == "device") {
         if s.get("optical_sn").len() != 12 || !s.get("optical_sn").is_ascii() || !s.get("optical_sn")[4..].bytes().all(|b| b.is_ascii_hexdigit()) { return Err(format!("{id}: invalid optical_sn")); }
         if s.get("cwmp_id").is_empty() || !sns.insert(s.get("optical_sn").to_ascii_uppercase()) || !ids.insert(s.get("cwmp_id")) { return Err(format!("{id}: missing/duplicate device identity")); }
-        let compiled = match s.get("adapter") { "hl202" => cfg!(feature="device-hl202"), "hwtc" => cfg!(feature="device-hwtc"), _ => false };
-        if !compiled { return Err(format!("{id}: adapter unknown or not compiled")); }
+        let adapter = match s.get("adapter") {
+            "hl202" if cfg!(feature="device-hl202") => "hl202",
+            "hwtc" | "k155" if cfg!(feature="device-hwtc") => "hwtc",
+            _ => return Err(format!("{id}: adapter unknown or not compiled")),
+        };
         let wifi_cleanup=match s.get("wifi_cleanup") { "" | "preserve" => "preserve", "delete" => "delete", "disable" => "disable", _ => return Err(format!("{id}: wifi_cleanup must be preserve, delete or disable")) };
         let wifi_preserve=s.options.get("wifi_preserve").into_iter().flatten().map(|v| v.parse::<u32>().ok().filter(|n| (1..=32).contains(n)).ok_or("invalid wifi_preserve instance")).collect::<Result<BTreeSet<_>,_>>()?;
-        cfg.devices.push(Device { id: id.clone(), optical_sn: s.get("optical_sn").to_ascii_uppercase(), cwmp_id: s.get("cwmp_id").into(), adapter: s.get("adapter").into(), items: Vec::new(), wifi_cleanup:wifi_cleanup.into(), wifi_preserve });
+        cfg.devices.push(Device { id: id.clone(), optical_sn: s.get("optical_sn").to_ascii_uppercase(), cwmp_id: s.get("cwmp_id").into(), adapter: adapter.into(), items: Vec::new(), wifi_cleanup:wifi_cleanup.into(), wifi_preserve });
     }
     for (id, s) in &sections {
         if !matches!(s.kind.as_str(), "device_service" | "ssid" | "port_binding") { continue; }
@@ -195,9 +198,10 @@ mod tests {
     #[test] fn quoted_export() { assert_eq!(words("option ssid 'a'\\''b c'").unwrap(), ["option", "ssid", "a'b c"]); }
     #[test] fn rejects_invalid_policy() { assert!(parse("config provisioning 'global'\n option mode 'invalid'").is_err()); }
     #[test] fn revision_excludes_acs_credentials() { assert_eq!(parse("config acs 'acs'\n option password 'one'").unwrap().revision, parse("config acs 'acs'\n option password 'two'").unwrap().revision); }
-    #[test] fn hwtc_is_the_only_supported_vendor_adapter_name() {
+    #[test] fn hwtc_and_legacy_k155_names_select_the_hwtc_adapter() {
         let config = |adapter: &str| format!("config device 'child'\n option optical_sn 'HWTC3C6DE5B3'\n option cwmp_id 'child-id'\n option adapter '{adapter}'");
         assert_eq!(parse_expanded(&config("hwtc")).is_ok(), cfg!(feature="device-hwtc"));
-        assert!(parse_expanded(&config("k155")).is_err());
+        assert_eq!(parse_expanded(&config("k155")).is_ok(), cfg!(feature="device-hwtc"));
+        if cfg!(feature="device-hwtc") { assert_eq!(parse_expanded(&config("k155")).unwrap().devices[0].adapter,"hwtc"); }
     }
 }

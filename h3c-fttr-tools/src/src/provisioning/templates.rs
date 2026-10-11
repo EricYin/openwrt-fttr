@@ -38,7 +38,7 @@ pub fn compile(text: &str) -> Result<Config,String> {
     // Validate every template, including ones not assigned to a group yet.
     for (id,s) in &all {
         let allowed:&[&str]=match s.kind.as_str() {
-            "device"=>&["name","optical_sn","adapter","group"],
+            "device"=>&["name","optical_sn","adapter","group","wifi_cleanup"],
             "group"=>&["name","template"],
             "template"=>&["name"],
             "network"=>&["name","template","type","vlan","priority","ssid","port"],
@@ -63,6 +63,9 @@ pub fn compile(text: &str) -> Result<Config,String> {
             if !matches!(s.get("radio"),"2g"|"5g") {return Err(format!("{id}: invalid radio"));}
             if !matches!(s.get("security"),""|"wpa2-psk") || (s.get("security")=="wpa2-psk" && !(8..=63).contains(&s.get("key").len())) {return Err(format!("{id}: invalid Wi-Fi security"));}
         }
+        if s.kind=="device" && !matches!(s.get("wifi_cleanup"),""|"preserve"|"disable"|"delete") {
+            return Err(format!("{id}: wifi_cleanup must be preserve, disable or delete"));
+        }
     }
     for (template,_) in all.iter().filter(|(_,s)|s.kind=="template") {
         let mut bound=BTreeSet::new();
@@ -75,7 +78,8 @@ pub fn compile(text: &str) -> Result<Config,String> {
     for (device,d) in all.iter().filter(|(_,s)|s.kind=="device") {
         let group=get(&all,d.get("group"),"group")?;
         let template_id=group.get("template"); get(&all,template_id,"template")?;
-        let mut dev=d.clone(); dev.options.insert("wifi_cleanup".into(),vec!["delete".into()]);
+        let mut dev=d.clone();
+        if dev.get("wifi_cleanup").is_empty() { dev.options.insert("wifi_cleanup".into(),vec!["disable".into()]); }
         dev.options.insert("cwmp_id".into(),vec![format!("pending:{}",d.get("optical_sn").to_ascii_uppercase())]);
         emit(&mut expanded,"device",device,&dev);
         let mut wifi_instances=BTreeMap::new(); let mut slots=[0u32;2]; let mut ids=Vec::new();
@@ -145,6 +149,15 @@ pub fn compile(text: &str) -> Result<Config,String> {
     }
     #[test] fn creation_order_changes_revision() {
         assert_ne!(compile("config template 'z'\nconfig template 'a'").unwrap().revision,compile("config template 'a'\nconfig template 'z'").unwrap().revision);
+    }
+    #[test] fn wlan_cleanup_defaults_to_disable_and_explicit_policy_is_preserved() {
+        let base="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'";
+        assert_eq!(compile(base).unwrap().devices[0].wifi_cleanup,"disable");
+        for policy in ["preserve","disable","delete"] {
+            let text=format!("{base}\n option wifi_cleanup '{policy}'");
+            assert_eq!(compile(&text).unwrap().devices[0].wifi_cleanup,policy);
+        }
+        assert!(compile(&format!("{base}\n option wifi_cleanup 'remove-everything'")).is_err());
     }
     #[test] fn group_expansion_keeps_creation_order_and_no_public_indices() {
         let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig network 'z'\n option template 't'\n option type 'internet'\n option vlan '100'\nconfig network 'a'\n option template 't'\n option type 'iptv'\n option vlan '43'\nconfig wifi 'w5'\n option template 't'\n option ssid 'five'\n option radio '5g'\nconfig wifi 'w2'\n option template 't'\n option ssid 'two'\n option radio '2g'";
