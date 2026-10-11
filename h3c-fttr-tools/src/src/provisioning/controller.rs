@@ -180,6 +180,7 @@ struct Controller {
     owned: BTreeMap<String, BTreeMap<String, wan::Owned>>,
     wifi_owned: BTreeMap<String, wifi::Registry>,
     omci_management: BTreeMap<String, Value>,
+    acs_status: Value,
 }
 static CONTROLLER: OnceLock<Mutex<Controller>> = OnceLock::new();
 fn controller() -> &'static Mutex<Controller> {
@@ -314,7 +315,7 @@ impl Controller {
             let services: Vec<_> = items.iter().filter(|i| i["kind"] != "ssid").cloned().collect();
             let wifi_sync=if operation["wifi_lifecycle"].as_object().is_some_and(|m|m.values().any(|i|matches!(i["state"].as_str(),Some("blocked"|"failed"|"unknown")))) { "attention_required" } else if operation["wifi_stage"].is_string() && operation["wifi_stage"] != "done" { "pending" } else { aggregate(&ssids) };
             let assignment=self.config.assignments.get(&d.id);
-            json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"adapter":d.adapter,"omci_management":self.omci_management.get(&d.optical_sn).cloned().unwrap_or_else(||json!({"state":"pending"})),"management":self.management.get(&d.id),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
+            json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"adapter":d.adapter,"omci_management":self.omci_management.get(&d.optical_sn).cloned().unwrap_or_else(||json!({"state":"pending"})),"management":self.management.get(&d.id),"acs_bootstrap":super::bootstrap::view(&d.id,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
         }).collect();
         json!({"enabled":self.config.enabled,"mode":if self.config.automatic {"auto"} else {"manual"},"method":"diff","revision":self.config.revision,"triggers":self.config.triggers,"interval":self.config.interval,"omci_management":{"desired":self.config.management,"state":"not_verified"},"groups":self.config.groups.iter().map(|(id,t)|json!({"id":id,"name":self.config.labels.get(id),"template":t})).collect::<Vec<_>>(),"error":self.failure,"devices":devices,"pending_devices":devices.iter().filter(|d| d["provisioning"]["state"] != "completed").map(|d| d["device"].clone()).collect::<Vec<_>>()})
     }
@@ -487,7 +488,9 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
             .map(|o| o.full_sn_str())
             .collect();
         let devices = acs(json!({"op":"devices"}));
+        let acs_status = acs(json!({"op":"status"}));
         let mut c = controller().lock().unwrap();
+        c.acs_status = acs_status;
         for d in &mut c.config.devices {
             if d.cwmp_id.starts_with("pending:") {
                 if let Some(id) = discovered_identity(&devices, &d.optical_sn, &d.adapter) {
@@ -496,6 +499,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
             }
         }
         let config = c.config.clone();
+        super::bootstrap::retain_devices(&config.devices.iter().map(|d| d.id.clone()).collect());
         let time = now();
         let periodic = config.interval > 0
             && time.saturating_sub(c.last_periodic) >= config.interval
@@ -522,6 +526,24 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                 if let Some(at) = at {
                     c.last_boot.insert(d.id.clone(), at);
                 }
+            }
+            super::bootstrap::tick(super::bootstrap::Observation {
+                device: d,
+                management: config.management.as_ref(),
+                target: config.mqtt_targets.get(&d.id).map(String::as_str),
+                last_inform: at,
+                online: online.contains(&d.optical_sn),
+                new_boot,
+                freshness: config.freshness,
+                time,
+                acs_available: c.acs_status["enabled"] == true && c.acs_status["error"].is_null(),
+            });
+            let reachable = reachable && super::bootstrap::is_ready(&d.id);
+            if let Some(m) = c.management.get_mut(&d.id) {
+                m["state"] = json!(if reachable { "online" } else if at.is_none() { "waiting_inform" } else { "offline_or_stale" });
+            }
+            if !reachable {
+                fresh.remove(&d.id);
             }
             let previous = c
                 .operations

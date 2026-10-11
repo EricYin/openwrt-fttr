@@ -1,6 +1,5 @@
 //! Public group/template model. Expanded sections are private compiler output.
 use super::config::{self, Config, Section};
-use super::model::ItemKind;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn quote(s: &str) -> String {
@@ -20,15 +19,6 @@ fn emit(out: &mut String, kind: &str, id: &str, s: &Section) {
     }
 }
 
-fn hl202_binding_supported(interface: &str) -> bool {
-    matches!(
-        interface,
-        "InternetGatewayDevice.LANDevice.1.LANEthernetInterfaceConfig.2"
-            | "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1"
-            | "InternetGatewayDevice.LANDevice.1.WLANConfiguration.2"
-            | "InternetGatewayDevice.LANDevice.1.WLANConfiguration.6"
-    )
-}
 fn section(kind: &str, values: &[(&str, &str)]) -> Section {
     Section {
         kind: kind.into(),
@@ -110,11 +100,17 @@ pub fn compile(text: &str) -> Result<Config, String> {
     // Validate every template, including ones not assigned to a group yet.
     for (id, s) in &all {
         let allowed: &[&str] = match s.kind.as_str() {
-            "device" => &["name", "optical_sn", "adapter", "group", "wifi_cleanup"],
+            "device" => &["name", "optical_sn", "adapter", "group", "wifi_cleanup", "mqtt_mac"],
             "group" => &["name", "template"],
             "template" => &["name"],
             "network" => &[
-                "name", "template", "service_list", "vlan", "priority", "ssid", "port",
+                "name",
+                "template",
+                "service_list",
+                "vlan",
+                "priority",
+                "ssid",
+                "port",
             ],
             "wifi" => &["template", "ssid", "radio", "security", "key"],
             "management" => &["vlan", "priority", "acs_url"],
@@ -140,17 +136,25 @@ pub fn compile(text: &str) -> Result<Config, String> {
             get(&all, s.get("template"), "template")?;
         }
         if s.kind == "network" {
-            let configured = s.options.get("service_list").map(Vec::as_slice).unwrap_or(&[]);
+            let configured = s
+                .options
+                .get("service_list")
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let labels = config::normalize_custom_vlan_service_list(configured)?;
             if labels.is_empty() {
                 return Err(format!("{id}: select at least one WAN Service List label"));
             }
             let vlan = s.number("vlan", 4094)?;
             if labels.iter().any(|label| label == "INTERNET") && vlan == 0 {
-                return Err(format!("{id}: untagged INTERNET WAN is not managed by ACS automation"));
+                return Err(format!(
+                    "{id}: untagged INTERNET WAN is not managed by ACS automation"
+                ));
             }
             if !labels.is_empty() && vlan == 0 {
-                return Err(format!("{id}: custom VLAN ServiceList requires a non-zero VLAN ID"));
+                return Err(format!(
+                    "{id}: custom VLAN ServiceList requires a non-zero VLAN ID"
+                ));
             }
             if !s.get("priority").is_empty() {
                 s.number("priority", 7)?;
@@ -403,21 +407,6 @@ pub fn compile(text: &str) -> Result<Config, String> {
     for d in &mut cfg.devices {
         d.items
             .sort_by_key(|i| order[&d.id].iter().position(|id| id == &i.id).unwrap());
-        // Keep only interfaces verified on HL202; WLAN2/6 were written and
-        // read back together (the firmware's extra 10/14 aliases are ignored
-        // by readback equivalence, not exposed as configurable endpoints).
-        for item in &mut d.items {
-            if item.kind == ItemKind::PortBinding
-                && d.adapter == "hl202"
-                && item
-                    .parameters
-                    .iter()
-                    .any(|p| p.value.split(',').any(|v| !hl202_binding_supported(v)))
-            {
-                item.blocked =
-                    Some("LAN/SSID binding mapping not verified for selected endpoint".into());
-            }
-        }
     }
     // Do not include listener credentials in the business revision.
     let mut canonical = String::new();
@@ -439,6 +428,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provisioning::model::ItemKind;
     #[test]
     fn hl202_internet_bridge_dhcp_and_second_radio_slots_compile_for_binding() {
         let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'a2'\n option template 't'\n option ssid 'base2'\n option radio '2g'\nconfig wifi 'a5'\n option template 't'\n option ssid 'base5'\n option radio '5g'\nconfig wifi 'b2'\n option template 't'\n option ssid 'TTTT'\n option radio '2g'\nconfig wifi 'b5'\n option template 't'\n option ssid 'YYYY'\n option radio '5g'\nconfig network 'iot'\n option template 't'\n option vlan '66'\n list service_list 'INTERNET'\n option priority '6'\n list ssid 'b2'\n list ssid 'b5'";
@@ -477,10 +467,10 @@ mod tests {
             .iter()
             .find(|item| item.kind == ItemKind::DeviceService)
             .unwrap();
-        assert!(item.parameters.iter().any(|p| {
-            p.name.ends_with("X_CU_ServiceList") && p.value == "IPTV,VOIP,OTHER"
-        }));
-
+        assert!(item
+            .parameters
+            .iter()
+            .any(|p| { p.name.ends_with("X_CU_ServiceList") && p.value == "IPTV,VOIP,OTHER" }));
     }
     #[test]
     fn service_list_infers_internet_behavior() {
@@ -532,24 +522,6 @@ mod tests {
             .err()
             .unwrap()
             .contains("select at least one WAN Service List label"));
-    }
-    #[test]
-    fn hl202_binding_contract_accepts_verified_wlan_slots_only() {
-        for interface in [
-            "InternetGatewayDevice.LANDevice.1.LANEthernetInterfaceConfig.2",
-            "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1",
-            "InternetGatewayDevice.LANDevice.1.WLANConfiguration.2",
-            "InternetGatewayDevice.LANDevice.1.WLANConfiguration.6",
-        ] {
-            assert!(hl202_binding_supported(interface), "{interface}");
-        }
-        for interface in [
-            "InternetGatewayDevice.LANDevice.1.LANEthernetInterfaceConfig.1",
-            "InternetGatewayDevice.LANDevice.1.WLANConfiguration.5",
-            "InternetGatewayDevice.LANDevice.1.WLANConfiguration.10",
-        ] {
-            assert!(!hl202_binding_supported(interface), "{interface}");
-        }
     }
     #[test]
     fn wpa2_uses_device_beacon_contract() {

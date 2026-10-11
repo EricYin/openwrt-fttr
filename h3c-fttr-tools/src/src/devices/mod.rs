@@ -28,20 +28,33 @@ pub trait MqttLifecycleAdapter {
 
 /// Dispatch a generic MQTT lifecycle event to the compiled device adapters.
 pub fn on_mqtt_connected(device_id: &str, acs_url: Option<&str>) -> Result<(), String> {
-    let event = MqttConnectedEvent {
-        device_id: device_id.to_string(),
-        acs_url: acs_url.map(str::to_string),
-    };
-
     #[cfg(feature = "device-hl202")]
     {
+        let event = MqttConnectedEvent {
+            device_id: device_id.to_string(),
+            acs_url: acs_url.map(str::to_string),
+        };
         let adapter = hl202::MqttLifecycle;
         if adapter.matches_mqtt_device(&event.device_id) {
             return adapter.on_mqtt_connected(&event);
         }
     }
+    #[cfg(not(feature = "device-hl202"))]
+    let _ = (device_id, acs_url);
 
-    Ok(())
+    Err("automatic MQTT ACS bootstrap adapter unavailable".into())
+}
+
+pub fn read_mqtt_cwmp_settings(device_id: &str, acs_url: &str) -> Result<bool, String> {
+    #[cfg(feature = "device-hl202")]
+    {
+        hl202::mqtt_lifecycle::read_settings(device_id, acs_url)
+    }
+    #[cfg(not(feature = "device-hl202"))]
+    {
+        let _ = (device_id, acs_url);
+        Err("automatic MQTT ACS bootstrap adapter unavailable".into())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,9 +154,9 @@ mod tests {
     }
 
     #[test]
-    fn mqtt_connected_dispatch_ignores_non_hl202_devices() {
+    fn mqtt_connected_dispatch_reports_unsupported_identities() {
         assert!(on_mqtt_connected("HWTC3C6DE5B3/fttr_data.tar.gz", Some("http://acs"))
-            .is_ok());
-        assert!(on_mqtt_connected("H3CT685DF998", Some("http://acs")).is_ok());
+            .is_err());
+        assert!(on_mqtt_connected("H3CT12345678", Some("http://acs")).is_err());
     }
 }
