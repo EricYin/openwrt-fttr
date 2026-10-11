@@ -7,7 +7,7 @@ PKG_URL:=https://github.com/LazuliKao/openwrt-fttr/tree/main/h3c-fttr-tools
 
 PKG_BUILD_DEPENDS:=rust/host
 PKG_BUILD_PARALLEL:=1
-PKG_CONFIG_DEPENDS:=CONFIG_FTTR_DEVICE_HL202 CONFIG_FTTR_DEVICE_HWTC_K155 CONFIG_FTTR_ACS
+PKG_CONFIG_DEPENDS:=CONFIG_FTTR_DEVICE_HL202 CONFIG_FTTR_DEVICE_HWTC CONFIG_FTTR_ACS
 
 include $(INCLUDE_DIR)/package.mk
 include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk
@@ -30,8 +30,8 @@ define Package/h3c-fttr-tools/config
     bool "Compile HL202-DU-C adapter (verified business and MQTT commands)"
     depends on PACKAGE_h3c-fttr-tools
     default y
-  config FTTR_DEVICE_HWTC_K155
-    bool "Compile HWTC K155-11 adapter (standard OMCI business)"
+  config FTTR_DEVICE_HWTC
+    bool "Compile HWTC adapters (standard OMCI and model profiles)"
     depends on PACKAGE_h3c-fttr-tools
     default n
   config FTTR_ACS
@@ -40,7 +40,7 @@ define Package/h3c-fttr-tools/config
     default n
 endef
 
-RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC_K155),device-hwtc-k155) $(if $(CONFIG_FTTR_ACS),acs)
+RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC),device-hwtc) $(if $(CONFIG_FTTR_ACS),acs)
 CARGO_PKG_ARGS+= --no-default-features
 
 define Build/Prepare

@@ -91,7 +91,7 @@ pub fn compile(text: &str) -> Result<Config,String> {
             let service=format!("{device}__service__{id}"); emit(&mut expanded,"service",&service,s);
             let name=format!("{device}__network__{id}"); network_ids.push(name.clone());
             // These service labels have been read back on the two physical models.
-            let label=if s.get("type")=="internet" {"INTERNET"} else if d.get("adapter")=="hl202" {"OTHER"} else {return Err(format!("{device}: K155 IPTV service contract not verified"));};
+            let label=if s.get("type")=="internet" {"INTERNET"} else if d.get("adapter")=="hl202" {"OTHER"} else {return Err(format!("{device}: HWTC IPTV service contract not verified"));};
             emit(&mut expanded,"device_service",&name,&section("device_service",&[("device",device),("service",&service),("service_list",label),("enabled",if s.get("enabled").is_empty(){"1"}else{s.get("enabled")})]));
             let interfaces:Vec<String>=list(s,"ssid").map(|id|format!("InternetGatewayDevice.LANDevice.1.WLANConfiguration.{}",wifi_instances[id])).chain(list(s,"port").map(|p|format!("InternetGatewayDevice.LANDevice.1.LANEthernetInterfaceConfig.{}",&p[3..]))).collect();
             if !interfaces.is_empty() {
@@ -121,7 +121,7 @@ pub fn compile(text: &str) -> Result<Config,String> {
 #[cfg(test)] mod tests {
     use super::*;
     #[test] fn wpa2_uses_device_beacon_contract() {
-        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'k155'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '2g'\n option security 'wpa2-psk'\n option key 'testpassword'";
+        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '2g'\n option security 'wpa2-psk'\n option key 'testpassword'";
         let cfg=compile(text).unwrap();
         for d in &cfg.devices {
             let beacon=d.items[0].parameters.iter().find(|p|p.name.ends_with(".BeaconType")).unwrap();
@@ -133,7 +133,7 @@ pub fn compile(text: &str) -> Result<Config,String> {
         assert!(compile("config template 't'\nconfig network 'n'\n option template 't'\n option type 'tr069'\n option vlan '46'").is_err());
     }
     #[test] fn enabled_ssid_requires_radio_but_disabled_ssid_does_not_disable_shared_radio() {
-        let text="config device 'd'\n option optical_sn 'HWTC3C6DE5B3'\n option cwmp_id 'test:k155'\n option adapter 'k155'\nconfig wifi_profile 'a'\n option ssid 'enabled'\n option enabled '1'\nconfig wifi_profile 'b'\n option ssid 'disabled'\n option enabled '0'\nconfig ssid 'a'\n option device 'd'\n option profile 'a'\n option radio '2g'\n option slot '1'\nconfig ssid 'b'\n option device 'd'\n option profile 'b'\n option radio '2g'\n option slot '2'";
+        let text="config device 'd'\n option optical_sn 'HWTC3C6DE5B3'\n option cwmp_id 'test:hwtc'\n option adapter 'hwtc'\nconfig wifi_profile 'a'\n option ssid 'enabled'\n option enabled '1'\nconfig wifi_profile 'b'\n option ssid 'disabled'\n option enabled '0'\nconfig ssid 'a'\n option device 'd'\n option profile 'a'\n option radio '2g'\n option slot '1'\nconfig ssid 'b'\n option device 'd'\n option profile 'b'\n option radio '2g'\n option slot '2'";
         let text=text.replace("config ssid 'a'", "config ssid 'ssid_a'").replace("config ssid 'b'", "config ssid 'ssid_b'");
         let cfg=config::parse_expanded(&text).unwrap(); let items=&cfg.devices[0].items;
         assert!(items[0].parameters.iter().any(|p|p.name.ends_with(".RadioEnabled") && p.value=="1"));

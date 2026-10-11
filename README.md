@@ -34,7 +34,7 @@ make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
 | OpenWrt 配置 | Cargo feature | 默认 |
 | --- | --- | --- |
 | `CONFIG_FTTR_DEVICE_HL202` | `device-hl202` | 开 |
-| `CONFIG_FTTR_DEVICE_HWTC_K155` | `device-hwtc-k155` | 关 |
+| `CONFIG_FTTR_DEVICE_HWTC` | `device-hwtc` | 关 |
 | `CONFIG_FTTR_ACS` | `acs` | 关 |
 
 ## Windows Rust 交叉编译

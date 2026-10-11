@@ -99,6 +99,22 @@ mod tests {
         lock_target(&target).unwrap();
         std::fs::remove_file(format!("/tmp/fttr-command-{target}.lock")).unwrap();
     }
+
+    #[test]
+    fn command_locks_are_isolated_per_device() {
+        let suffix = request_id();
+        let first_target = format!("TESTA{suffix}");
+        let second_target = format!("TESTB{suffix}");
+        let first = lock_target(&first_target).unwrap();
+        let second = lock_target(&second_target).unwrap();
+
+        assert!(lock_target(&first_target).is_err());
+        assert!(lock_target(&second_target).is_err());
+
+        drop((first, second));
+        std::fs::remove_file(format!("/tmp/fttr-command-{first_target}.lock")).unwrap();
+        std::fs::remove_file(format!("/tmp/fttr-command-{second_target}.lock")).unwrap();
+    }
 }
 
 // Advisory locks survive file reuse but are released automatically on process exit.

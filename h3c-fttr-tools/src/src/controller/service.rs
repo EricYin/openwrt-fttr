@@ -65,8 +65,9 @@ impl Services {
                 let result = adapter.configure(id, token.clone())
                     .and_then(|()| {
                         if token.load(Ordering::Acquire) { return Ok(()); }
-                        println!("[+] ONU {id} generation={generation}: integrated service configured; starting evidence monitor");
-                        set("Verifying", None);
+                        let phase = adapter.verification_status();
+                        println!("[+] ONU {id} generation={generation}: OMCI profile readback complete; {phase}; starting evidence monitor");
+                        set(phase, None);
                         super::health::watch(id, token.clone(), vendor.as_bytes().try_into().map_err(|_| std::io::Error::other("invalid vendor ID"))?)
                     });
                 if token.load(Ordering::Acquire) { break; }

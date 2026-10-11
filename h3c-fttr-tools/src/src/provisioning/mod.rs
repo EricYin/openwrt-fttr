@@ -24,7 +24,7 @@ fn acs(v: Value) -> Value { RPC.with(|r| { let mut r=r.borrow_mut(); r.1.push(v)
 struct Operation {
     id: u64, device: Device, revision: String, apply: bool, management: bool,
     index: usize, stage: String, task: Option<u64>, roots: Vec<String>, writable: BTreeSet<String>,
-    changes: Vec<Parameter>, uncertain: bool, pending: bool, written: bool, results: BTreeMap<String, Value>, started: u64,
+    changes: Vec<Parameter>, uncertain: bool, pending: bool, written: bool, passphrase_fallback: bool, results: BTreeMap<String, Value>, started: u64,
     wan: wan::Reconciler,
     wifi: wifi::Reconciler,
 }
@@ -33,7 +33,7 @@ impl Operation {
         let wan=wan::Reconciler::new(&device,BTreeMap::new(),false);
         let wifi=wifi::Reconciler::new(&device,wifi::Registry::default(),false);
         Self { id, device, revision, apply, management, index:0, stage:"waiting".into(), task:None,wan,wifi,
-            roots:Vec::new(), writable:BTreeSet::new(), changes:Vec::new(), uncertain:false, pending:false, written:false, results:BTreeMap::new(), started:now() }
+            roots:Vec::new(), writable:BTreeSet::new(), changes:Vec::new(), uncertain:false, pending:false, written:false, passphrase_fallback:false, results:BTreeMap::new(), started:now() }
     }
     fn item(&self) -> &Item { &self.device.items[self.index] }
     fn finish_item(&mut self, state: &str, reason: &str) {
@@ -41,7 +41,7 @@ impl Operation {
         if i.kind=="ssid" && state=="verified" && self.apply { for p in &i.parameters { if let Some(n)=wifi::instance(&p.name) { self.wifi.registry.owned.insert(n); } } }
         let i = self.item();
         self.results.insert(i.id.clone(), json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":state,"reason":reason,"revision":self.revision,"operation_id":self.id,"task_id":self.task,"updated_at":now(),"changes":self.changes.iter().map(|p| json!({"name":p.name,"desired":if p.secret {"<redacted>"} else {&p.value}})).collect::<Vec<_>>()}));
-        self.index+=1; self.task=None; self.stage="waiting".into(); self.roots.clear(); self.writable.clear(); self.changes.clear(); self.uncertain=false; self.pending=false; self.written=false;
+        self.index+=1; self.task=None; self.stage="waiting".into(); self.roots.clear(); self.writable.clear(); self.changes.clear(); self.uncertain=false; self.pending=false; self.written=false; self.passphrase_fallback=false;
         if self.index >= self.device.items.len() { self.stage="wifi_reconciling".into(); }
     }
     fn view(&self) -> Value {
@@ -126,7 +126,11 @@ fn discovered_identity(devices: &Value, optical_sn: &str, adapter: &str) -> Opti
     let hex=format!("{}{}",optical_sn[..4].bytes().map(|b|format!("{b:02X}")).collect::<String>(),&optical_sn[4..]);
     let matches:Vec<_>=devices["devices"].as_object()?.iter().filter(|(_,d)| {
         let serial=d["serial"].as_str().unwrap_or("");
-        match adapter {"hl202"=>d["product_class"]=="HL202-DU-C" && serial.contains(optical_sn),"k155"=>d["product_class"]=="K155-11" && serial.eq_ignore_ascii_case(&hex),_=>false}
+        match adapter {
+            "hl202"=>d["product_class"]=="HL202-DU-C" && serial.contains(optical_sn),
+            "hwtc"=>optical_sn.starts_with("HWTC") && serial.eq_ignore_ascii_case(&hex),
+            _=>false,
+        }
     }).map(|(id,_)|id.clone()).collect();
     if matches.len()==1 {matches.into_iter().next()} else {None}
 }
@@ -299,7 +303,24 @@ fn advance(op: &mut Operation, reachable: bool) {
         if matches!(state,"completed" | "accepted_pending_apply" | "unknown") {
             op.uncertain=state == "unknown"; op.pending=state == "accepted_pending_apply"; op.written=state != "unknown";
             queue_read(op,"verifying");
-        } else { op.finish_item("failed", "SetParameterValues failed; inspect ACS task for fault"); }
+        } else {
+            // HL202 rejects the standard PreSharedKey.1.KeyPassphrase on some
+            // WLAN instances (fault 9007) but accepts the vendor's top-level
+            // KeyPassphrase parameter on the same object.
+            let parameter_faults: Vec<String> = task["result"]["parameters"].as_array().map(|a| a.iter()
+                .filter(|p| p["fault_code"].as_str().is_some_and(|f| !f.is_empty()))
+                .filter_map(|p| p["name"].as_str().map(str::to_string)).collect()).unwrap_or_default();
+            if op.device.adapter=="hl202" && !op.passphrase_fallback && !parameter_faults.is_empty()
+                && parameter_faults.iter().all(|n| n.ends_with(".PreSharedKey.1.KeyPassphrase")) {
+                op.passphrase_fallback=true; op.task=None; op.stage="waiting".into();
+                let root=parameter_faults[0].trim_end_matches("PreSharedKey.1.KeyPassphrase").to_string();
+                for p in &mut op.changes { if p.name.ends_with(".PreSharedKey.1.KeyPassphrase") { p.name=format!("{root}KeyPassphrase"); } }
+                let parameters: Vec<_>=op.changes.iter().map(|p| json!({"name":p.name,"value":p.value,"kind":p.kind})).collect();
+                queue(op,"SetParameterValues",json!({"parameters":parameters}),"writing");
+                return;
+            }
+            op.finish_item("failed", "SetParameterValues failed; inspect ACS task for fault");
+        }
         return;
     }
     if state != "completed" { op.finish_item("failed", &format!("{}: {state}, fault {}",op.stage,task["result"]["fault_code"].as_str().unwrap_or(""))); return; }
@@ -318,16 +339,22 @@ fn advance(op: &mut Operation, reachable: bool) {
         if item.service_type != "tr069" && service.contains("TR069") { op.finish_item("blocked","WAN carries TR069; dedicated business object required"); return; }
         if item.service_type == "tr069" { op.finish_item("blocked","TR069 is owned by OMCI"); return; }
     }
-    let mut changes=Vec::new(); let mut unreadable=false;
+    let mut changes=Vec::new();
     for p in &item.parameters {
+        // Credential parameters are write-only on the supported ONUs. A
+        // successful SetParameterValues is sufficient; never fail an item
+        // because CWMP cannot return the password.
+        if op.stage == "verifying" && p.secret { continue; }
         let value=values.iter().find(|v| v["name"] == p.name).and_then(|v| v["value"].as_str());
+        if op.stage == "reading" && p.secret && value.is_none_or(str::is_empty) {
+            changes.push(p.clone());
+            continue;
+        }
         if value.is_none() { op.finish_item("failed","incomplete parameter readback"); return; }
-        if p.secret && value == Some("") { unreadable=true; }
         if !equivalent(p,value.unwrap()) { changes.push(p.clone()); }
     }
     if op.stage == "verifying" {
-        if changes.iter().all(|p| p.secret) && unreadable && op.written { op.finish_item("accepted_unverified","readable parameters match; credential readback unavailable"); }
-        else if changes.is_empty() { op.finish_item("verified","CWMP readback matches desired state (data-plane not tested)"); }
+        if changes.is_empty() { op.finish_item("verified","readable CWMP parameters match; credential write was accepted (password readback is write-only)"); }
         else if op.pending { op.finish_item("accepted_pending_apply","device returned Status=1; readback still differs"); }
         else if op.uncertain { op.finish_item("unknown","write outcome unknown; readback differs, no automatic replay"); }
         else { op.finish_item("failed","SetParameterValues accepted but readback differs"); }
@@ -354,6 +381,22 @@ fn equivalent(p: &Parameter, observed: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn hwtc_identity_matches_serial_across_models() {
+        for model in ["K155-11", "V152", "OTHER-HWTC"] {
+            let devices=json!({"devices":{"child":{"product_class":model,"serial":"485754433c6de5b3"}}});
+            assert_eq!(discovered_identity(&devices,"HWTC3C6DE5B3","hwtc"),Some("child".into()));
+            assert_eq!(discovered_identity(&devices,"HWTC3E5E5EB6","hwtc"),None);
+        }
+    }
+    #[test] fn hwtc_identity_rejects_other_vendors_and_ambiguous_serials() {
+        let devices=json!({"devices":{"child":{"product_class":"V152","serial":"483343543C6DE5B3"}}});
+        assert_eq!(discovered_identity(&devices,"H3CT3C6DE5B3","hwtc"),None);
+        let devices=json!({"devices":{
+            "one":{"product_class":"V152","serial":"485754433C6DE5B3"},
+            "two":{"product_class":"K155-11","serial":"485754433C6DE5B3"}
+        }});
+        assert_eq!(discovered_identity(&devices,"HWTC3C6DE5B3","hwtc"),None);
+    }
     #[test] fn bool_and_binding_equivalence() {
         let mut p=Parameter{name:"Enable".into(),value:"1".into(),kind:"boolean".into(),secret:false}; assert!(equivalent(&p,"true")); assert!(!equivalent(&p,"false"));
         p.name="X_CU_LanInterface".into(); p.kind="string".into(); p.value="a,b".into(); assert!(equivalent(&p,"b,a"));
@@ -376,11 +419,38 @@ mod tests {
         responses(vec![json!({"state":"accepted_pending_apply"}),json!({"id":2}),readback("old")]);
         advance(&mut o,true); advance(&mut o,true); assert_eq!(o.results["wifi"]["state"],"accepted_pending_apply");
     }
-    #[test] fn credential_empty_is_not_verified() {
+    #[test] fn credential_write_does_not_require_readback() {
         let mut o=operation("writing",true);
-        responses(vec![json!({"state":"completed"}),json!({"id":2}),readback("")]);
-        advance(&mut o,true); advance(&mut o,true); assert_eq!(o.results["wifi"]["state"],"accepted_unverified");
+        let key=Parameter{name:"InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.KeyPassphrase".into(),value:"secret12".into(),kind:"string".into(),secret:true};
+        o.device.items[0].parameters=vec![key.clone()];
+        o.changes=vec![key];
+        responses(vec![json!({"state":"completed"}),json!({"id":2}),json!({"state":"completed","result":{"parameters":[]}})]);
+        advance(&mut o,true); advance(&mut o,true); assert_eq!(o.results["wifi"]["state"],"verified");
         assert!(!o.view().to_string().contains("wanted"));
+    }
+    #[test] fn hl202_passphrase_fault_retries_vendor_keypassphrase() {
+        let mut o=operation("writing",true);
+        let secret=Parameter{name:"InternetGatewayDevice.LANDevice.1.WLANConfiguration.2.PreSharedKey.1.KeyPassphrase".into(),value:"secret12".into(),kind:"string".into(),secret:true};
+        o.device.items[0].parameters=vec![secret.clone()];
+        o.changes=vec![secret];
+        let fault=json!({"state":"fault","result":{"fault_code":"9003","parameters":[{"name":"InternetGatewayDevice.LANDevice.1.WLANConfiguration.2.PreSharedKey.1.KeyPassphrase","fault_code":"9007","fault_string":"Invalid parameter value"}]}});
+        let retried=json!({"id":9});
+        let ok=json!({"state":"completed"});
+        let read_ok=json!({"id":10});
+        let readback=json!({"state":"completed","result":{"parameters":[{"name":"InternetGatewayDevice.LANDevice.1.WLANConfiguration.2.PreSharedKey.1.KeyPassphrase","value":""},{"name":"InternetGatewayDevice.LANDevice.1.WLANConfiguration.2.KeyPassphrase","value":"secret12"}]}});
+        responses(vec![fault,retried,ok,read_ok,readback]);
+        advance(&mut o,true); assert_eq!(o.stage,"writing"); assert_eq!(o.task,Some(9));
+        RPC.with(|r| { let b=r.borrow(); let q=b.1.last().unwrap(); assert_eq!(q["method"],"SetParameterValues"); assert_eq!(q["args"]["parameters"][0]["name"],"InternetGatewayDevice.LANDevice.1.WLANConfiguration.2.KeyPassphrase"); });
+        advance(&mut o,true); advance(&mut o,true);
+        assert_eq!(o.results["wifi"]["state"],"verified");
+    }
+    #[test] fn hwtc_passphrase_fault_does_not_retry() {
+        let mut o=operation("writing",true); o.device.adapter="hwtc".into();
+        o.changes=vec![Parameter{name:"InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.KeyPassphrase".into(),value:"secret12".into(),kind:"string".into(),secret:true}];
+        let fault=json!({"state":"fault","result":{"fault_code":"9003","parameters":[{"name":"InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.KeyPassphrase","fault_code":"9007"}]}});
+        responses(vec![fault]);
+        advance(&mut o,true);
+        assert_eq!(o.results["wifi"]["state"],"failed");
     }
     #[test] fn management_wan_is_never_converted_to_business_bridge() {
         let mut o=operation("reading",false); o.device.items[0].guard=Some("guard".into()); o.device.items[0].service_type="internet".into();

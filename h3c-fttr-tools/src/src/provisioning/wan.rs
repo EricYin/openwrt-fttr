@@ -169,7 +169,7 @@ impl Reconciler {
 mod tests {
     use super::*;
     use super::super::{RPC,config::{Item,Parameter}};
-    fn device() -> Device { Device{id:"child".into(),optical_sn:"HWTC12345678".into(),cwmp_id:"id".into(),adapter:"k155".into(),items:vec![Item{id:"internet".into(),kind:"device_service".into(),service_type:"internet".into(),guard:Some(format!("{ROOT}1000.WANIPConnection.1.X_HW_SERVICELIST")),blocked:None,wan_ref:Some("internet".into()),auto_instance:Some(1000),parameters:vec![Parameter{name:format!("{ROOT}1000.WANIPConnection.1.X_HW_SERVICELIST"),value:"INTERNET".into(),kind:"string".into(),secret:false}]}],wifi_cleanup:"preserve".into(),wifi_preserve:BTreeSet::new()} }
+    fn device() -> Device { Device{id:"child".into(),optical_sn:"HWTC12345678".into(),cwmp_id:"id".into(),adapter:"hwtc".into(),items:vec![Item{id:"internet".into(),kind:"device_service".into(),service_type:"internet".into(),guard:Some(format!("{ROOT}1000.WANIPConnection.1.X_HW_SERVICELIST")),blocked:None,wan_ref:Some("internet".into()),auto_instance:Some(1000),parameters:vec![Parameter{name:format!("{ROOT}1000.WANIPConnection.1.X_HW_SERVICELIST"),value:"INTERNET".into(),kind:"string".into(),secret:false}]}],wifi_cleanup:"preserve".into(),wifi_preserve:BTreeSet::new()} }
     fn responses(v: Vec<Value>) { RPC.with(|r| *r.borrow_mut()=(v.into(),Vec::new())); }
     fn ok(parameters: Value) -> Value { json!({"state":"completed","result":{"parameters":parameters}}) }
     #[test] fn auto_creation_uses_returned_parent_and_child_instances() {

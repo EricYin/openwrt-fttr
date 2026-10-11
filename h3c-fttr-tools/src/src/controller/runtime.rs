@@ -21,7 +21,6 @@ use super::activation::{RangingSession, clear_offline_hardware};
 use crate::pon_engine::ploam::PloamFrame;
 use std::collections::{BTreeMap, BTreeSet};
 
-
 fn setup_bridge() {
     println!("[*] Initializing downstream FTTR DSA switch ports (fttr1 ~ fttr16)...");
     let _ = Command::new("ip").args(["link", "set", "molt_ploam", "up"]).status();
@@ -608,8 +607,10 @@ pub fn run() {
                             .as_secs();
 
                         let mut found = false;
+                        let mut newly_connected = false;
                         for dev in devs.iter_mut() {
                             if dev.id == dev_id {
+                                newly_connected = now.saturating_sub(dev.last_seen) > 60;
                                 dev.last_seen = now;
                                 dev.payload_bytes = payload.len();
                                 found = true;
@@ -619,6 +620,7 @@ pub fn run() {
 
                         if !found {
                             println!("[+] New sub-gateway joined network: {}", dev_id);
+                            newly_connected = true;
                             devs.push(SubDevice {
                                 id: dev_id.to_string(),
                                 last_seen: now,
@@ -627,6 +629,24 @@ pub fn run() {
                         }
 
                         let _ = ipc::update_status_file(&devs);
+                        drop(devs);
+
+                        if newly_connected {
+                            let acs_url = crate::provisioning::management_desired()
+                                .map(|(management, _)| management.acs_url);
+                            let device_id = dev_id.to_string();
+                            // Keep device-specific MQTT commands off the telemetry loop. Each
+                            // device event owns its worker, so a slow ONU cannot stall others.
+                            thread::spawn(move || {
+                                match crate::devices::on_mqtt_connected(
+                                    &device_id,
+                                    acs_url.as_deref(),
+                                ) {
+                                    Ok(()) => println!("[+] MQTT connected setup completed for {device_id}"),
+                                    Err(error) => eprintln!("[-] MQTT connected device handler failed: {error}"),
+                                }
+                            });
+                        }
                     }
                 }
                 Ok(None) => {}

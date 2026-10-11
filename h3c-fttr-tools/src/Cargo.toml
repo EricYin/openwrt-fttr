@@ -8,8 +8,8 @@ repository = "https://github.com/LazuliKao/openwrt-fttr"
 [features]
 default = ["device-hl202"]
 device-hl202 = []
-device-hwtc-k155 = []
-all-devices = ["device-hl202", "device-hwtc-k155"]
+device-hwtc = []
+all-devices = ["device-hl202", "device-hwtc"]
 acs = ["dep:roxmltree"]
 
 [dependencies]

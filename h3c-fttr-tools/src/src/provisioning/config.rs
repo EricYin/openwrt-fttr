@@ -81,7 +81,7 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
     for (id, s) in sections.iter().filter(|(_,s)| s.kind == "device") {
         if s.get("optical_sn").len() != 12 || !s.get("optical_sn").is_ascii() || !s.get("optical_sn")[4..].bytes().all(|b| b.is_ascii_hexdigit()) { return Err(format!("{id}: invalid optical_sn")); }
         if s.get("cwmp_id").is_empty() || !sns.insert(s.get("optical_sn").to_ascii_uppercase()) || !ids.insert(s.get("cwmp_id")) { return Err(format!("{id}: missing/duplicate device identity")); }
-        let compiled = match s.get("adapter") { "hl202" => cfg!(feature="device-hl202"), "k155" => cfg!(feature="device-hwtc-k155"), _ => false };
+        let compiled = match s.get("adapter") { "hl202" => cfg!(feature="device-hl202"), "hwtc" => cfg!(feature="device-hwtc"), _ => false };
         if !compiled { return Err(format!("{id}: adapter unknown or not compiled")); }
         let wifi_cleanup=match s.get("wifi_cleanup") { "" | "preserve" => "preserve", "delete" => "delete", "disable" => "disable", _ => return Err(format!("{id}: wifi_cleanup must be preserve, delete or disable")) };
         let wifi_preserve=s.options.get("wifi_preserve").into_iter().flatten().map(|v| v.parse::<u32>().ok().filter(|n| (1..=32).contains(n)).ok_or("invalid wifi_preserve instance")).collect::<Result<BTreeSet<_>,_>>()?;
@@ -140,7 +140,7 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
             item.service_type = match service.get("type") { "internet" => "internet", "iptv" => "iptv", _ => return Err("business type must be internet or iptv".into()) }.into();
             if s.kind == "port_binding" {
                 if item.service_type == "tr069" { return Err("TR069 management WAN cannot have business port bindings".into()); }
-                if d.adapter != "hl202" { item.blocked = Some("K155 LAN/SSID binding contract not verified".into()); }
+                if d.adapter != "hl202" { item.blocked = Some("HWTC LAN/SSID binding contract not verified".into()); }
                 let interfaces = s.options.get("interface").ok_or("port_binding requires interface object paths")?;
                 if interfaces.iter().any(|v| !v.starts_with("InternetGatewayDevice.LANDevice.1.") || v.ends_with('.') || v.contains(',')) { return Err("invalid binding interface path".into()); }
                 add(&mut item, &path, "X_CU_LanInterface", &interfaces.join(","), "string", false);
@@ -195,4 +195,9 @@ mod tests {
     #[test] fn quoted_export() { assert_eq!(words("option ssid 'a'\\''b c'").unwrap(), ["option", "ssid", "a'b c"]); }
     #[test] fn rejects_invalid_policy() { assert!(parse("config provisioning 'global'\n option mode 'invalid'").is_err()); }
     #[test] fn revision_excludes_acs_credentials() { assert_eq!(parse("config acs 'acs'\n option password 'one'").unwrap().revision, parse("config acs 'acs'\n option password 'two'").unwrap().revision); }
+    #[test] fn hwtc_is_the_only_supported_vendor_adapter_name() {
+        let config = |adapter: &str| format!("config device 'child'\n option optical_sn 'HWTC3C6DE5B3'\n option cwmp_id 'child-id'\n option adapter '{adapter}'");
+        assert_eq!(parse_expanded(&config("hwtc")).is_ok(), cfg!(feature="device-hwtc"));
+        assert!(parse_expanded(&config("k155")).is_err());
+    }
 }

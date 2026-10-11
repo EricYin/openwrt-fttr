@@ -31,7 +31,7 @@ config device 'hl202'
 
 config device 'k155'
 	option optical_sn 'HWTC3C6DE5B3'
-	option adapter 'k155'
+	option adapter 'hwtc'
 	option group 'home_group'
 
 config wifi 'wifi_2g'
