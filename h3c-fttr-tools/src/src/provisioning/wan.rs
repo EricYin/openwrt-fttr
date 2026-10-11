@@ -1,199 +1,1273 @@
-//! Reconcile only WAN objects allocated by this controller. Never adopt or prune
-//! an arbitrary vendor WAN based merely on its ordinal instance number.
+//! Discover every connection, protect fallback services, then reconcile in order.
+use super::model::{ItemKind, WanPhase};
+use super::policy::protected;
 use super::{acs, config::Device};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 const ROOT: &str = "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.";
 fn registry_path(id: &str) -> String {
-    let hash=id.bytes().fold(0xcbf29ce484222325u64,|h,b| (h ^ b as u64).wrapping_mul(0x100000001b3));
-    format!("/etc/fttr/wan-owned/{hash:016x}.json")
+    super::storage::registry_path("/etc/fttr/wan-owned", id)
 }
-pub fn load(id: &str) -> Result<Option<BTreeMap<String,Owned>>,String> {
-    let path=registry_path(id);
-    let text=match std::fs::read_to_string(path) { Ok(v)=>v,Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),Err(e)=>return Err(format!("read WAN ownership: {e}")) };
-    let v: Value=serde_json::from_str(&text).map_err(|e|format!("invalid WAN ownership: {e}"))?;
-    if v["cwmp_id"] != id { return Err("WAN ownership identity mismatch".into()); }
-    serde_json::from_value(v["owned"].clone()).map(Some).map_err(|e|format!("invalid WAN ownership records: {e}"))
+pub fn load(id: &str) -> Result<Option<BTreeMap<String, Owned>>, String> {
+    let path = registry_path(id);
+    let text = match std::fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read WAN ownership: {e}")),
+    };
+    let v: Value =
+        serde_json::from_str(&text).map_err(|e| format!("invalid WAN ownership: {e}"))?;
+    if v["cwmp_id"] != id {
+        return Err("WAN ownership identity mismatch".into());
+    }
+    serde_json::from_value(v["owned"].clone())
+        .map(Some)
+        .map_err(|e| format!("invalid WAN ownership records: {e}"))
+}
+#[cfg(feature = "acs")]
+pub fn parent_protected(id: &str, parent: u32) -> bool {
+    std::fs::read_to_string(registry_path(id))
+        .ok()
+        .and_then(|v| serde_json::from_str::<Value>(&v).ok())
+        .is_none_or(|v| {
+            v["protected_parents"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|p| p.as_u64() == Some(parent as u64)))
+        })
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Owned {
-    pub parent: u32, pub connection: u32, pub state: String, pub service_list: String,
+    pub parent: u32,
+    pub connection: u32,
+    pub state: String,
+    pub service_list: String,
+    #[serde(default = "ip_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub baseline: Option<BTreeSet<u32>>,
+}
+fn ip_kind() -> String {
+    "WANIPConnection".into()
 }
 #[derive(Clone)]
 pub struct Reconciler {
-    pub owned: BTreeMap<String, Owned>, pub results: BTreeMap<String, Value>,
-    actions: VecDeque<(String,bool)>,
-    pub stage: String, task: Option<u64>, current: Option<(String,bool)>, initialized: bool,
+    pub owned: BTreeMap<String, Owned>,
+    pub results: BTreeMap<String, Value>,
+    actions: VecDeque<(String, bool)>,
+    pub stage: WanPhase,
+    task: Option<u64>,
+    current: Option<(String, bool)>,
+    initialized: bool,
+    discovery: VecDeque<(u32, u32, String)>,
+    discovered: Vec<Owned>,
+    prune: bool,
+    replacing: BTreeSet<String>,
+    parents: BTreeSet<u32>,
+    vlans: BTreeMap<u32, (u32, bool)>,
+    priorities: BTreeMap<u32, u32>,
+    final_started: bool,
+    final_apply: bool,
 }
 impl Reconciler {
-    pub fn new(device: &Device, owned: BTreeMap<String,Owned>, prune: bool) -> Self {
-        let mut actions=VecDeque::new();
-        if prune { for id in owned.keys() { if !device.items.iter().any(|i| i.wan_ref.as_ref() == Some(id)) { actions.push_back((id.clone(),true)); } } }
-        for i in &device.items { if i.kind == "device_service" && i.auto_instance.is_some() { actions.push_back((i.id.clone(),false)); } }
-        Self{owned,results:BTreeMap::new(),actions,stage:"waiting".into(),task:None,current:None,initialized:false}
+    pub fn new(device: &Device, owned: BTreeMap<String, Owned>, prune: bool) -> Self {
+        let _ = device;
+        Self {
+            owned,
+            results: BTreeMap::new(),
+            actions: VecDeque::new(),
+            stage: WanPhase::Waiting,
+            task: None,
+            current: None,
+            initialized: false,
+            discovery: VecDeque::new(),
+            discovered: Vec::new(),
+            prune,
+            replacing: BTreeSet::new(),
+            parents: BTreeSet::new(),
+            vlans: BTreeMap::new(),
+            priorities: BTreeMap::new(),
+            final_started: false,
+            final_apply: false,
+        }
     }
-    fn queue(&mut self, device: &Device, method: &str, args: Value, stage: &str) {
-        if self.save(&device.cwmp_id).is_err() { self.fail(device,"blocked","cannot persist WAN ownership before lifecycle RPC"); return; }
-        let v=acs(json!({"op":"queue","device":device.cwmp_id,"method":method,"args":args}));
-        if let Some(id)=v["id"].as_u64() { self.task=Some(id); self.stage=stage.into(); }
-        else { self.fail(device,"failed","cannot queue WAN lifecycle RPC"); }
+    pub fn begin_final_verification(&mut self, apply: bool) -> bool {
+        if self.final_started || !self.prune {
+            return false;
+        }
+        self.final_started = true;
+        self.final_apply = apply;
+        self.initialized = false;
+        self.stage = WanPhase::Waiting;
+        self.parents.clear();
+        self.vlans.clear();
+        true
+    }
+    pub fn full_sync(&self) -> bool {
+        self.prune
+    }
+    fn queue(&mut self, device: &Device, method: &str, args: Value, stage: WanPhase) {
+        if self.save(&device.cwmp_id).is_err() {
+            self.fail(
+                device,
+                "blocked",
+                "cannot persist WAN ownership before lifecycle RPC",
+            );
+            return;
+        }
+        let v = acs(json!({"op":"queue","device":device.cwmp_id,"method":method,"args":args}));
+        if let Some(id) = v["id"].as_u64() {
+            self.task = Some(id);
+            self.stage = stage;
+        } else {
+            self.fail(device, "failed", "cannot queue WAN lifecycle RPC");
+        }
     }
     fn fail(&mut self, device: &Device, state: &str, reason: &str) {
-        let id=self.current.as_ref().map(|a| a.0.as_str()).unwrap_or("inventory");
-        self.results.insert(id.into(),json!({"state":state,"reason":reason,"task_id":self.task,"cwmp_id":device.cwmp_id}));
-        self.task=None; self.current=None; self.stage="next".into();
+        let id = self
+            .current
+            .as_ref()
+            .map(|a| a.0.as_str())
+            .unwrap_or("inventory");
+        self.results.insert(
+            id.into(),
+            json!({"state":state,"reason":reason,"task_id":self.task,"cwmp_id":device.cwmp_id}),
+        );
+        self.task = None;
+        self.current = None;
+        self.stage = WanPhase::Next;
     }
-    pub fn tick(&mut self, device: &mut Device, apply: bool, _management: bool, reachable: bool) -> bool {
-        if self.stage == "done" { return true; }
-        if self.actions.is_empty() && self.current.is_none() { self.stage="done".into(); return true; }
-        if !reachable { return false; }
-        if self.task.is_none() && acs(json!({"op":"busy","device":device.cwmp_id}))["busy"] == true { return false; }
-        if !self.initialized {
-            self.initialized=true;
-            self.queue(device,"GetParameterNames",json!({"path":ROOT,"next_level":true}),"inventory"); return false;
+    pub fn tick(
+        &mut self,
+        device: &mut Device,
+        apply: bool,
+        _management: bool,
+        reachable: bool,
+    ) -> bool {
+        if !self.prune && !device.items.iter().any(|i| i.wan_ref.is_some()) {
+            self.stage = WanPhase::Done;
+            return true;
         }
-        if let Some(task)=self.task {
-            let v=acs(json!({"op":"task","id":task})); let state=v["state"].as_str().unwrap_or("missing");
-            if matches!(state,"queued" | "sent") { return false; }
-            if !matches!(state,"completed" | "accepted_pending_apply") {
-                if matches!(state,"fault" | "expired") && self.stage == "adding_parent" {
-                    if let Some((id,_))=&self.current { self.owned.remove(id); }
-                }
-                self.fail(device,if state == "unknown" {"unknown"} else {"failed"},"WAN lifecycle RPC failed/unknown; no write replay");
-                if self.stage == "next" && self.current.is_none() && !self.results.contains_key("inventory") { return false; }
-                self.actions.clear(); self.stage="done".into(); return true;
+        if self.stage == WanPhase::Done {
+            return true;
+        }
+        if self.initialized
+            && self.actions.is_empty()
+            && self.current.is_none()
+            && self.task.is_none()
+            && self.stage == WanPhase::Next
+        {
+            if apply {
+                self.order_mapping(device);
             }
-            self.task=None;
-            match self.stage.as_str() {
-                "inventory" => {
-                    let names: BTreeSet<String>=v["result"]["parameters"].as_array().into_iter().flatten().filter_map(|p| p["name"].as_str().map(str::to_string)).collect();
-                    self.owned.retain(|_,o| o.parent == 0 || o.state != "ready" || names.contains(&format!("{ROOT}{}.",o.parent)));
-                    self.stage="next".into();
-                },
-                "adding_parent" => {
-                    let n=v["result"]["instance_number"].as_str().and_then(|n| n.parse::<u32>().ok()).filter(|n| *n>0);
-                    let Some(n)=n else { self.fail(device,"unknown","AddObject did not return an instance"); return false; };
-                    let id=self.current.as_ref().unwrap().0.clone(); let o=self.owned.get_mut(&id).unwrap(); o.parent=n; o.state="discovering_child".into();
-                    self.queue(device,"GetParameterNames",json!({"path":format!("{ROOT}{n}."),"next_level":false}),"child_names"); return false;
-                },
-                "child_names" => {
-                    let id=self.current.as_ref().unwrap().0.clone(); let o=&self.owned[&id];
-                    let prefix=format!("{ROOT}{}.WANIPConnection.",o.parent);
-                    let children: Vec<u32>=v["result"]["parameters"].as_array().into_iter().flatten().filter_map(|p| p["name"].as_str()?.strip_prefix(&prefix)?.strip_suffix('.')?.parse::<u32>().ok()).collect();
-                    if children.len() > 1 { self.fail(device,"blocked","new WAN unexpectedly has multiple IP connections"); return false; }
-                    if let Some(n)=children.first() { let o=self.owned.get_mut(&id).unwrap(); o.connection=*n; o.state="ready".into(); self.remap(device,&id); self.current=None; self.stage="next".into(); }
-                    else { self.owned.get_mut(&id).unwrap().state="adding_child".into(); self.queue(device,"AddObject",json!({"object":prefix}),"adding_child"); return false; }
-                },
-                "adding_child" => {
-                    let n=v["result"]["instance_number"].as_str().and_then(|n| n.parse::<u32>().ok()).filter(|n| *n>0);
-                    let Some(n)=n else { self.fail(device,"unknown","child AddObject did not return an instance"); return false; };
-                    let id=self.current.as_ref().unwrap().0.clone(); let o=self.owned.get_mut(&id).unwrap(); o.connection=n; o.state="ready".into();
-                    self.remap(device,&id); self.current=None; self.stage="next".into();
-                },
-                "delete_guard" => {
-                    let id=self.current.as_ref().unwrap().0.clone(); let o=&self.owned[&id];
-                    let observed=v["result"]["parameters"].as_array().and_then(|a| a.first()).and_then(|p| p["value"].as_str());
-                    let Some(observed)=observed else { self.fail(device,"blocked","missing service list before deleting owned WAN"); return false; };
-                    if observed.contains("TR069") || (!observed.is_empty() && observed != o.service_list) {
-                        self.fail(device,"blocked","owned WAN now carries protected or reassigned service; manual review required"); return false;
+            self.stage = WanPhase::Done;
+            return true;
+        }
+        if !reachable {
+            return false;
+        }
+        if self.task.is_none() && acs(json!({"op":"busy","device":device.cwmp_id}))["busy"] == true
+        {
+            return false;
+        }
+        if !self.initialized {
+            self.initialized = true;
+            self.queue(
+                device,
+                "GetParameterNames",
+                json!({"path":ROOT,"next_level":false}),
+                WanPhase::Inventory,
+            );
+            return false;
+        }
+        if let Some(task) = self.task {
+            let v = acs(json!({"op":"task","id":task}));
+            let state = v["state"].as_str().unwrap_or("missing");
+            if matches!(state, "queued" | "sent") {
+                return false;
+            }
+            if !matches!(state, "completed" | "accepted_pending_apply") {
+                if matches!(state, "fault" | "expired") && self.stage == WanPhase::AddingParent {
+                    if let Some((id, _)) = &self.current {
+                        self.owned.remove(id);
                     }
-                    if !apply { self.fail(device,"drift","owned WAN removed from desired configuration; apply will delete"); return false; }
-                    let object=format!("{ROOT}{}.",o.parent); self.owned.get_mut(&id).unwrap().state="deleting".into();
-                    self.queue(device,"DeleteObject",json!({"object":object}),"deleting"); return false;
-                },
-                "deleting" => {
-                    self.queue(device,"GetParameterNames",json!({"path":ROOT,"next_level":true}),"verify_delete"); return false;
-                },
-                "verify_delete" => {
-                    let id=self.current.as_ref().unwrap().0.clone(); let path=format!("{ROOT}{}.",self.owned[&id].parent);
-                    let exists=v["result"]["parameters"].as_array().is_some_and(|a| a.iter().any(|p| p["name"] == path));
-                    if exists { self.fail(device,"unknown","DeleteObject accepted but WAN still exists; no replay"); return false; }
-                    self.owned.remove(&id); self.results.insert(id,json!({"state":"deleted","reason":"owned WAN removed and absence verified","task_id":task})); self.current=None; self.stage="next".into();
-                },
-                _ => (),
+                }
+                self.fail(
+                    device,
+                    if state == "unknown" {
+                        "unknown"
+                    } else {
+                        "failed"
+                    },
+                    "WAN lifecycle RPC failed/unknown; no write replay",
+                );
+                if self.stage == WanPhase::Next
+                    && self.current.is_none()
+                    && !self.results.contains_key("inventory")
+                {
+                    return false;
+                }
+                self.actions.clear();
+                self.stage = WanPhase::Done;
+                return true;
+            }
+            self.task = None;
+            if matches!(
+                self.stage,
+                WanPhase::Inventory
+                    | WanPhase::Classifying
+                    | WanPhase::ChildNames
+                    | WanPhase::DeleteGuard
+                    | WanPhase::VerifyDelete
+                    | WanPhase::EmptyParent
+                    | WanPhase::VerifyParentDelete
+            ) && v["result"]["parameters"].as_array().is_none()
+            {
+                self.fail(
+                    device,
+                    "blocked",
+                    "incomplete WAN RPC inventory/readback; no mutation allowed",
+                );
+                self.actions.clear();
+                self.stage = WanPhase::Done;
+                return true;
+            }
+            match self.stage {
+                WanPhase::Inventory => {
+                    let mut connections = BTreeSet::new();
+                    for p in v["result"]["parameters"].as_array().into_iter().flatten() {
+                        if let Some(n) = p["name"].as_str().and_then(|n| n.strip_prefix(ROOT)) {
+                            let parts: Vec<_> = n.split('.').collect();
+                            if let Ok(parent) = parts[0].parse::<u32>() {
+                                if parent > 0 {
+                                    self.parents.insert(parent);
+                                }
+                            }
+                            if parts.len() >= 3
+                                && matches!(parts[1], "WANIPConnection" | "WANPPPConnection")
+                            {
+                                if let (Ok(parent), Ok(child)) =
+                                    (parts[0].parse::<u32>(), parts[2].parse::<u32>())
+                                {
+                                    if parent > 0 && child > 0 {
+                                        connections.insert((parent, child, parts[1].to_string()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.discovery = connections.into_iter().collect();
+                    self.discovered.clear();
+                    self.discover_next(device);
+                    if self.stage != WanPhase::Next {
+                        return self.stage == WanPhase::Done;
+                    }
+                }
+                WanPhase::Classifying => {
+                    let (parent, connection, kind) = self.discovery.pop_front().unwrap();
+                    let parameters = v["result"]["parameters"].as_array();
+                    let value = |suffix: &str| {
+                        parameters
+                            .and_then(|a| {
+                                a.iter().find(|p| {
+                                    p["name"].as_str().is_some_and(|n| n.ends_with(suffix))
+                                })
+                            })
+                            .and_then(|p| p["value"].as_str())
+                    };
+                    let service = value(if device.adapter == "hl202" {
+                        "X_CU_ServiceList"
+                    } else {
+                        "X_HW_SERVICELIST"
+                    });
+                    let vlan = value(if device.adapter == "hl202" {
+                        "X_CU_VLAN"
+                    } else {
+                        "X_HW_VLAN"
+                    })
+                    .and_then(|v| v.parse::<u32>().ok());
+                    let enabled = if device.adapter == "hl202" {
+                        value("X_CU_VLANEnabled").and_then(|v| match v {
+                            "1" | "true" => Some(true),
+                            "0" | "false" => Some(false),
+                            _ => None,
+                        })
+                    } else {
+                        vlan.map(|v| v != 0)
+                    };
+                    let (Some(service), Some(vlan), Some(enabled)) = (service, vlan, enabled)
+                    else {
+                        self.fail(
+                            device,
+                            "blocked",
+                            "incomplete WAN classification; no changes allowed",
+                        );
+                        self.actions.clear();
+                        self.stage = WanPhase::Done;
+                        return true;
+                    };
+                    self.vlans.insert(parent, (vlan, enabled));
+                    if device.adapter == "hl202" {
+                        let Some(priority) =
+                            value("X_CU_802_1p").and_then(|v| v.parse::<u32>().ok())
+                        else {
+                            self.fail(device, "blocked", "incomplete parent priority readback");
+                            self.stage = WanPhase::Done;
+                            return true;
+                        };
+                        self.priorities.insert(parent, priority);
+                    }
+                    self.discovered.push(Owned {
+                        parent,
+                        connection,
+                        kind,
+                        state: if protected(service, enabled) {
+                            "protected"
+                        } else {
+                            "ready"
+                        }
+                        .into(),
+                        service_list: service.into(),
+                        baseline: None,
+                    });
+                    self.discover_next(device);
+                    return false;
+                }
+                WanPhase::AddingParent => {
+                    let n = v["result"]["instance_number"]
+                        .as_str()
+                        .and_then(|n| n.parse::<u32>().ok())
+                        .filter(|n| *n > 0);
+                    let Some(n) = n else {
+                        self.fail(device, "unknown", "AddObject did not return an instance");
+                        return false;
+                    };
+                    self.parents.insert(n);
+                    let id = self.current.as_ref().unwrap().0.clone();
+                    let o = self.owned.get_mut(&id).unwrap();
+                    o.parent = n;
+                    o.state = "discovering_child".into();
+                    self.queue(
+                        device,
+                        "GetParameterNames",
+                        json!({"path":format!("{ROOT}{n}."),"next_level":false}),
+                        WanPhase::ChildNames,
+                    );
+                    return false;
+                }
+                WanPhase::ChildNames => {
+                    let id = self.current.as_ref().unwrap().0.clone();
+                    let o = &self.owned[&id];
+                    let prefix = format!("{ROOT}{}.WANIPConnection.", o.parent);
+                    let children: BTreeSet<u32> = v["result"]["parameters"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|p| {
+                            p["name"]
+                                .as_str()?
+                                .strip_prefix(&prefix)?
+                                .split('.')
+                                .next()?
+                                .parse::<u32>()
+                                .ok()
+                        })
+                        .collect();
+                    if children.len() > 1 {
+                        self.fail(
+                            device,
+                            "blocked",
+                            "new WAN unexpectedly has multiple IP connections",
+                        );
+                        return false;
+                    }
+                    if let Some(n) = children.first() {
+                        let o = self.owned.get_mut(&id).unwrap();
+                        o.connection = *n;
+                        o.state = "ready".into();
+                        self.remap(device, &id);
+                        self.current = None;
+                        self.stage = WanPhase::Next;
+                    } else {
+                        self.owned.get_mut(&id).unwrap().state = "adding_child".into();
+                        self.queue(
+                            device,
+                            "AddObject",
+                            json!({"object":prefix}),
+                            WanPhase::AddingChild,
+                        );
+                        return false;
+                    }
+                }
+                WanPhase::AddingChild => {
+                    let n = v["result"]["instance_number"]
+                        .as_str()
+                        .and_then(|n| n.parse::<u32>().ok())
+                        .filter(|n| *n > 0);
+                    let Some(n) = n else {
+                        self.fail(
+                            device,
+                            "unknown",
+                            "child AddObject did not return an instance",
+                        );
+                        return false;
+                    };
+                    let id = self.current.as_ref().unwrap().0.clone();
+                    let o = self.owned.get_mut(&id).unwrap();
+                    o.connection = n;
+                    o.state = "ready".into();
+                    self.remap(device, &id);
+                    self.current = None;
+                    self.stage = WanPhase::Next;
+                }
+                WanPhase::DeleteGuard => {
+                    let id = self.current.as_ref().unwrap().0.clone();
+                    let o = &self.owned[&id];
+                    let parameters = v["result"]["parameters"].as_array();
+                    let value = |suffix: &str| {
+                        parameters
+                            .and_then(|a| {
+                                a.iter().find(|p| {
+                                    p["name"].as_str().is_some_and(|n| n.ends_with(suffix))
+                                })
+                            })
+                            .and_then(|p| p["value"].as_str())
+                    };
+                    let observed = value(if device.adapter == "hl202" {
+                        "X_CU_ServiceList"
+                    } else {
+                        "X_HW_SERVICELIST"
+                    });
+                    let Some(observed) = observed else {
+                        self.fail(
+                            device,
+                            "blocked",
+                            "missing service list before deleting owned WAN",
+                        );
+                        return false;
+                    };
+                    if observed.contains("TR069")
+                        || (!observed.is_empty() && observed != o.service_list)
+                    {
+                        self.fail(device,"blocked","owned WAN now carries protected or reassigned service; manual review required");
+                        return false;
+                    }
+                    let enabled = if device.adapter == "hl202" {
+                        value("X_CU_VLANEnabled").and_then(|v| match v {
+                            "1" | "true" => Some(true),
+                            "0" | "false" => Some(false),
+                            _ => None,
+                        })
+                    } else {
+                        value("X_HW_VLAN")
+                            .and_then(|v| v.parse::<u32>().ok())
+                            .map(|v| v != 0)
+                    };
+                    if enabled.is_none_or(|enabled| protected(observed, enabled)) {
+                        self.fail(
+                            device,
+                            "blocked",
+                            "WAN became a protected fallback before deletion",
+                        );
+                        return false;
+                    }
+                    if !apply {
+                        self.fail(
+                            device,
+                            "drift",
+                            "owned WAN removed from desired configuration; apply will delete",
+                        );
+                        return false;
+                    }
+                    let object = format!("{ROOT}{}.{}.{}.", o.parent, o.kind, o.connection);
+                    self.owned.get_mut(&id).unwrap().state = "deleting".into();
+                    self.queue(
+                        device,
+                        "DeleteObject",
+                        json!({"object":object}),
+                        WanPhase::Deleting,
+                    );
+                    return false;
+                }
+                WanPhase::Deleting => {
+                    let id = &self.current.as_ref().unwrap().0;
+                    let o = &self.owned[id];
+                    let path = format!("{ROOT}{}.{}.", o.parent, o.kind);
+                    self.queue(
+                        device,
+                        "GetParameterNames",
+                        json!({"path":path,"next_level":true}),
+                        WanPhase::VerifyDelete,
+                    );
+                    return false;
+                }
+                WanPhase::VerifyDelete => {
+                    let id = self.current.as_ref().unwrap().0.clone();
+                    let o = &self.owned[&id];
+                    let path = format!("{ROOT}{}.{}.{}.", o.parent, o.kind, o.connection);
+                    let exists = v["result"]["parameters"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|p| p["name"] == path));
+                    if exists {
+                        self.fail(
+                            device,
+                            "unknown",
+                            "DeleteObject accepted but WAN still exists; no replay",
+                        );
+                        return false;
+                    }
+                    if self.replacing.remove(&id) {
+                        let baseline = self.parents.clone();
+                        let o = self.owned.get_mut(&id).unwrap();
+                        o.kind = ip_kind();
+                        o.connection = 0;
+                        o.state = "adding_child".into();
+                        o.baseline = Some(baseline);
+                        let prefix = format!("{ROOT}{}.WANIPConnection.", o.parent);
+                        self.queue(
+                            device,
+                            "AddObject",
+                            json!({"object":prefix}),
+                            WanPhase::AddingChild,
+                        );
+                        return false;
+                    }
+                    let path = format!("{ROOT}{}.", o.parent);
+                    self.queue(
+                        device,
+                        "GetParameterNames",
+                        json!({"path":path,"next_level":false}),
+                        WanPhase::EmptyParent,
+                    );
+                    return false;
+                }
+                WanPhase::EmptyParent => {
+                    let id = self.current.as_ref().unwrap().0.clone();
+                    let parent = self.owned[&id].parent;
+                    let prefix = format!("{ROOT}{parent}.");
+                    let children = v["result"]["parameters"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|p| {
+                            p["name"]
+                                .as_str()
+                                .and_then(|n| n.strip_prefix(&prefix))
+                                .is_some_and(|n| {
+                                    let parts: Vec<_> = n.split('.').collect();
+                                    parts.len() > 1
+                                        && matches!(
+                                            parts[0],
+                                            "WANIPConnection" | "WANPPPConnection"
+                                        )
+                                        && parts[1].parse::<u32>().is_ok()
+                                })
+                        });
+                    if children {
+                        self.owned.remove(&id);
+                        self.results.insert(id,json!({"state":"deleted","reason":"surplus connection absence verified; shared parent retained","task_id":task}));
+                        self.current = None;
+                        self.stage = WanPhase::Next;
+                        return false;
+                    }
+                    self.queue(
+                        device,
+                        "DeleteObject",
+                        json!({"object":prefix}),
+                        WanPhase::DeletingParent,
+                    );
+                    return false;
+                }
+                WanPhase::DeletingParent => {
+                    self.queue(
+                        device,
+                        "GetParameterNames",
+                        json!({"path":ROOT,"next_level":true}),
+                        WanPhase::VerifyParentDelete,
+                    );
+                    return false;
+                }
+                WanPhase::VerifyParentDelete => {
+                    let id = self.current.as_ref().unwrap().0.clone();
+                    let parent = self.owned[&id].parent;
+                    let path = format!("{ROOT}{parent}.");
+                    if v["result"]["parameters"]
+                        .as_array()
+                        .is_none_or(|a| a.iter().any(|p| p["name"] == path))
+                    {
+                        self.fail(
+                            device,
+                            "unknown",
+                            "parent deletion not confirmed; no replay",
+                        );
+                        return false;
+                    }
+                    self.parents.remove(&parent);
+                    self.owned.remove(&id);
+                    self.results.insert(id,json!({"state":"deleted","reason":"surplus connection and empty parent absence verified","task_id":task}));
+                    self.current = None;
+                    self.stage = WanPhase::Next;
+                }
+                WanPhase::Waiting | WanPhase::Next | WanPhase::Done => (),
             }
         }
         if self.current.is_none() {
-            let Some((id,delete))=self.actions.pop_front() else { self.stage="done".into(); return true; };
-            self.current=Some((id.clone(),delete));
+            let Some((id, delete)) = self.actions.pop_front() else {
+                if apply {
+                    self.order_mapping(device);
+                }
+                self.stage = WanPhase::Done;
+                return true;
+            };
+            self.current = Some((id.clone(), delete));
             if delete {
-                let Some(o)=self.owned.get(&id) else { self.current=None; return false; };
-                if o.state != "ready" { self.fail(device,"unknown","owned WAN lifecycle interrupted; automatic deletion withheld"); return false; }
-                let guard=format!("{ROOT}{}.WANIPConnection.{}.{}",o.parent,o.connection,if device.adapter == "hl202" {"X_CU_ServiceList"} else {"X_HW_SERVICELIST"});
-                self.queue(device,"GetParameterValues",json!({"names":[guard]}),"delete_guard"); return false;
+                let Some(o) = self.owned.get(&id) else {
+                    self.current = None;
+                    return false;
+                };
+                if o.state != "ready" {
+                    self.fail(
+                        device,
+                        "unknown",
+                        "owned WAN lifecycle interrupted; automatic deletion withheld",
+                    );
+                    return false;
+                }
+                let names = classification_names(device, o.parent, o.connection, &o.kind);
+                self.queue(
+                    device,
+                    "GetParameterValues",
+                    json!({"names":names}),
+                    WanPhase::DeleteGuard,
+                );
+                return false;
             }
-            if let Some(o)=self.owned.get(&id) {
-                if o.state == "ready" { self.remap(device,&id); self.current=None; return false; }
-                self.fail(device,"unknown","WAN creation interrupted; automatic AddObject replay withheld"); return false;
+            if let Some(o) = self.owned.get(&id) {
+                if o.state == "ready" {
+                    self.remap(device, &id);
+                    self.current = None;
+                    return false;
+                }
+                if o.parent > 0 && o.connection == 0 && self.parents.contains(&o.parent) {
+                    let path = format!("{ROOT}{}.", o.parent);
+                    self.queue(
+                        device,
+                        "GetParameterNames",
+                        json!({"path":path,"next_level":false}),
+                        WanPhase::ChildNames,
+                    );
+                    return false;
+                }
+                self.fail(
+                    device,
+                    "unknown",
+                    "WAN creation interrupted; automatic AddObject replay withheld",
+                );
+                return false;
             }
-            let item=device.items.iter().find(|i| i.id == id).unwrap();
-            if item.service_type == "tr069" { self.fail(device,"blocked","TR069 is owned by OMCI"); return false; }
-            if !apply { self.fail(device,"drift","WAN missing; apply will allocate parent and IP connection"); return false; }
-            let service_list=item.parameters.iter().find(|p| p.name.ends_with("ServiceList") || p.name.ends_with("SERVICELIST")).map(|p| p.value.clone()).unwrap_or_default();
-            self.owned.insert(id,Owned{parent:0,connection:0,state:"adding_parent".into(),service_list});
-            self.queue(device,"AddObject",json!({"object":ROOT}),"adding_parent");
+            let item = device.items.iter().find(|i| i.id == id).unwrap();
+            if item.service_type == "tr069" {
+                self.fail(device, "blocked", "TR069 is owned by OMCI");
+                return false;
+            }
+            if !apply {
+                self.fail(
+                    device,
+                    "drift",
+                    "WAN missing; apply will allocate parent and IP connection",
+                );
+                return false;
+            }
+            let service_list = item
+                .parameters
+                .iter()
+                .find(|p| p.name.ends_with("ServiceList") || p.name.ends_with("SERVICELIST"))
+                .map(|p| p.value.clone())
+                .unwrap_or_default();
+            self.owned.insert(
+                id,
+                Owned {
+                    parent: 0,
+                    connection: 0,
+                    state: "adding_parent".into(),
+                    service_list,
+                    kind: ip_kind(),
+                    baseline: Some(self.parents.clone()),
+                },
+            );
+            self.queue(
+                device,
+                "AddObject",
+                json!({"object":ROOT}),
+                WanPhase::AddingParent,
+            );
         }
         false
     }
+    fn discover_next(&mut self, device: &mut Device) {
+        if let Some((parent, child, kind)) = self.discovery.front() {
+            let names = classification_names(device, *parent, *child, kind);
+            self.queue(
+                device,
+                "GetParameterValues",
+                json!({"names":names}),
+                WanPhase::Classifying,
+            );
+            return;
+        }
+        let editable: Vec<_> = self
+            .discovered
+            .iter()
+            .filter(|o| o.state != "protected")
+            .cloned()
+            .collect();
+        if self.final_started {
+            let expected: Vec<_> = device
+                .items
+                .iter()
+                .filter(|i| i.kind == ItemKind::DeviceService && i.auto_instance.is_some())
+                .filter_map(|i| self.owned.get(&i.id))
+                .collect();
+            let matched = expected.len() == editable.len()
+                && expected.iter().zip(&editable).all(|(a, b)| {
+                    a.parent == b.parent && a.connection == b.connection && a.kind == b.kind
+                });
+            self.results.insert("final_inventory".into(),json!({"state":if matched {"verified"} else if self.final_apply {"blocked"} else {"drift"},"reason":if matched {"full WAN inventory matches ordered configuration"} else {"full WAN inventory differs after reconciliation"}}));
+            self.stage = WanPhase::Done;
+            return;
+        }
+        let previous = std::mem::take(&mut self.owned);
+        self.actions.clear();
+        let desired: Vec<_> = device
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::DeviceService && i.auto_instance.is_some())
+            .map(|i| i.id.clone())
+            .collect();
+        for (index, id) in desired.iter().enumerate() {
+            let item = device.items.iter().find(|i| i.id == *id).unwrap();
+            let service = item
+                .parameters
+                .iter()
+                .find(|p| p.name.ends_with("ServiceList") || p.name.ends_with("SERVICELIST"))
+                .map(|p| p.value.as_str())
+                .unwrap_or("");
+            let untagged = item.parameters.iter().any(|p| {
+                (p.name.ends_with("X_CU_VLANEnabled") || p.name.ends_with("X_HW_VLAN"))
+                    && matches!(p.value.as_str(), "0" | "false")
+            });
+            if untagged && protected(service, false) {
+                self.results.insert(id.clone(),json!({"state":"blocked","reason":"untagged INTERNET is reserved for the fallback network"}));
+                continue;
+            }
+            if let Some(old) = previous.get(id).filter(|o| o.state != "ready") {
+                let mut old = old.clone();
+                if old.parent == 0 {
+                    let candidates: Vec<_> = old
+                        .baseline
+                        .as_ref()
+                        .map(|b| self.parents.difference(b).copied().collect())
+                        .unwrap_or_default();
+                    if candidates.len() == 1
+                        && !self.discovered.iter().any(|o| o.parent == candidates[0])
+                    {
+                        old.parent = candidates[0];
+                    } else {
+                        self.owned.insert(id.clone(), old);
+                        self.results.insert(id.clone(),json!({"state":"unknown","reason":"interrupted parent creation cannot be uniquely recovered; AddObject replay withheld"}));
+                        continue;
+                    }
+                }
+                if self.parents.contains(&old.parent)
+                    && !self.discovered.iter().any(|o| o.parent == old.parent)
+                {
+                    old.connection = 0;
+                    old.kind = ip_kind();
+                    old.baseline = Some(self.parents.clone());
+                    self.owned.insert(id.clone(), old);
+                    self.actions.push_back((id.clone(), false));
+                    continue;
+                }
+            }
+            if let Some(o) = editable.get(index) {
+                if device.adapter == "hl202"
+                    && self
+                        .discovered
+                        .iter()
+                        .filter(|p| p.parent == o.parent)
+                        .count()
+                        > 1
+                {
+                    let item = device.items.iter().find(|i| i.id == *id).unwrap();
+                    let vlan = item
+                        .parameters
+                        .iter()
+                        .find(|p| p.name.ends_with("X_CU_VLAN"))
+                        .and_then(|p| p.value.parse::<u32>().ok());
+                    let enabled = item
+                        .parameters
+                        .iter()
+                        .find(|p| p.name.ends_with("X_CU_VLANEnabled"))
+                        .map(|p| matches!(p.value.as_str(), "1" | "true"));
+                    let priority = item
+                        .parameters
+                        .iter()
+                        .find(|p| p.name.ends_with("X_CU_802_1p"))
+                        .and_then(|p| p.value.parse::<u32>().ok());
+                    if vlan.is_none()
+                        || enabled.is_none()
+                        || priority.is_none()
+                        || self.vlans.get(&o.parent).copied() != vlan.zip(enabled)
+                        || self.priorities.get(&o.parent).copied() != priority
+                    {
+                        self.results.insert(id.clone(),json!({"state":"blocked","reason":"requested parent VLAN conflicts with a shared WAN parent; other connections must be preserved"}));
+                        continue;
+                    }
+                }
+                if o.kind != "WANIPConnection" {
+                    self.owned.insert(id.clone(), o.clone());
+                    if self.prune {
+                        self.replacing.insert(id.clone());
+                        self.actions.push_back((id.clone(), true));
+                    } else {
+                        self.results.insert(id.clone(),json!({"state":"blocked","reason":"PPP conversion requires full-device synchronization"}));
+                    }
+                    continue;
+                }
+                self.owned.insert(id.clone(), o.clone());
+                self.remap(device, id);
+            }
+            self.actions.push_back((id.clone(), false));
+        }
+        if self.prune {
+            for (index, o) in editable.iter().enumerate().skip(desired.len()).rev() {
+                let id = format!("surplus_{index}");
+                self.owned.insert(id.clone(), o.clone());
+                self.actions.push_back((id, true));
+            }
+        }
+        self.stage = WanPhase::Next;
+    }
     fn remap(&self, device: &mut Device, id: &str) {
-        let o=&self.owned[id];
-        for item in &mut device.items { if item.wan_ref.as_deref() == Some(id) { if let Some(old)=item.auto_instance {
-            let old=format!("{ROOT}{old}."); let new=format!("{ROOT}{}.",o.parent);
-            for p in &mut item.parameters { p.name=p.name.replace(&old,&new).replace("WANIPConnection.1.",&format!("WANIPConnection.{}.",o.connection)); }
-            if let Some(g)=&mut item.guard { *g=g.replace(&old,&new).replace("WANIPConnection.1.",&format!("WANIPConnection.{}.",o.connection)); }
-        } } }
-    }
-    pub fn block_unresolved(&self, device: &mut Device) {
-        for item in &mut device.items { if let Some(id)=&item.wan_ref { if item.auto_instance.is_some() && self.results.contains_key(id) {
-            item.blocked=Some(self.results[id]["reason"].as_str().unwrap_or("WAN reconciliation failed").into());
-        } } }
-    }
-    pub fn save(&self, id: &str) -> Result<(),String> {
-        #[cfg(test)] { let _=id; return Ok(()); }
-        #[cfg(not(test))] {
-            use std::{io::Write,os::unix::fs::OpenOptionsExt};
-            let text=json!({"cwmp_id":id,"owned":self.owned}).to_string(); let path=registry_path(id);
-            if std::fs::read_to_string(&path).ok().as_deref() == Some(&text) { return Ok(()); }
-            let result=(|| -> std::io::Result<()> {
-                std::fs::create_dir_all("/etc/fttr/wan-owned")?;
-                let tmp=format!("{path}.tmp"); let mut f=std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-                f.write_all(text.as_bytes())?; f.sync_all()?; std::fs::rename(tmp,path)?;
-                std::fs::File::open("/etc/fttr/wan-owned")?.sync_all()
-            })(); result.map_err(|e|format!("persist WAN ownership: {e}"))
+        let o = &self.owned[id];
+        for item in &mut device.items {
+            if item.wan_ref.as_deref() == Some(id) && item.auto_instance.is_some() {
+                for p in &mut item.parameters {
+                    p.name = remapped(&p.name, o);
+                }
+                if let Some(g) = &mut item.guard {
+                    *g = remapped(g, o);
+                }
+            }
         }
     }
+    fn order_mapping(&mut self, device: &mut Device) {
+        let ids: Vec<_> = device
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::DeviceService && i.auto_instance.is_some())
+            .map(|i| i.id.clone())
+            .collect();
+        let mut rows: Vec<_> = ids
+            .iter()
+            .filter_map(|id| self.owned.get(id).cloned())
+            .collect();
+        if rows.len() != ids.len()
+            || rows.iter().any(|o| o.state != "ready")
+            || ids.iter().any(|id| self.results.contains_key(id))
+        {
+            return;
+        }
+        rows.sort_by(|a, b| {
+            (a.parent, a.connection, &a.kind).cmp(&(b.parent, b.connection, &b.kind))
+        });
+        for (id, row) in ids.into_iter().zip(rows) {
+            self.owned.insert(id.clone(), row);
+            self.remap(device, &id);
+        }
+    }
+    pub fn block_unresolved(&self, device: &mut Device) {
+        let global = self
+            .results
+            .get("inventory")
+            .or_else(|| self.results.get("persistence"));
+        for item in &mut device.items {
+            if let Some(id) = &item.wan_ref {
+                if item.auto_instance.is_some() && self.results.contains_key(id) {
+                    item.blocked = Some(
+                        self.results[id]["reason"]
+                            .as_str()
+                            .unwrap_or("WAN reconciliation failed")
+                            .into(),
+                    );
+                } else if let Some(result) = global {
+                    item.blocked = Some(
+                        result["reason"]
+                            .as_str()
+                            .unwrap_or("WAN discovery failed")
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+    pub fn save(&self, id: &str) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            let _ = id;
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        {
+            let protected_parents: BTreeSet<_> = self
+                .discovered
+                .iter()
+                .filter(|o| o.state == "protected")
+                .map(|o| o.parent)
+                .collect();
+            let text =
+                json!({"cwmp_id":id,"owned":self.owned,"protected_parents":protected_parents})
+                    .to_string();
+            let path = registry_path(id);
+            if std::fs::read_to_string(&path).ok().as_deref() == Some(&text) {
+                return Ok(());
+            }
+            super::storage::write_atomic(&path, text.as_bytes(), true)
+                .map_err(|e| format!("persist WAN ownership: {e}"))
+        }
+    }
+}
+fn classification_names(device: &Device, parent: u32, child: u32, kind: &str) -> Vec<String> {
+    let root = format!("{ROOT}{parent}.");
+    let path = format!("{root}{kind}.{child}.");
+    if device.adapter == "hl202" {
+        vec![
+            format!("{path}X_CU_ServiceList"),
+            format!("{root}X_CU_VLANEnabled"),
+            format!("{root}X_CU_VLAN"),
+            format!("{root}X_CU_802_1p"),
+        ]
+    } else {
+        vec![
+            format!("{path}X_HW_SERVICELIST"),
+            format!("{path}X_HW_VLAN"),
+        ]
+    }
+}
+fn remapped(name: &str, o: &Owned) -> String {
+    let Some((_, tail)) = name.strip_prefix(ROOT).and_then(|n| n.split_once('.')) else {
+        return name.into();
+    };
+    let tail = if let Some(rest) = tail.strip_prefix("WANIPConnection.") {
+        rest.split_once('.')
+            .map(|(_, parameter)| format!("WANIPConnection.{}.{parameter}", o.connection))
+            .unwrap_or_else(|| tail.into())
+    } else {
+        tail.into()
+    };
+    format!("{ROOT}{}.{tail}", o.parent)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        config::{Item, Parameter},
+        model::ParameterKind,
+        RPC,
+    };
     use super::*;
-    use super::super::{RPC,config::{Item,Parameter}};
-    fn device() -> Device { Device{id:"child".into(),optical_sn:"HWTC12345678".into(),cwmp_id:"id".into(),adapter:"hwtc".into(),items:vec![Item{id:"internet".into(),kind:"device_service".into(),service_type:"internet".into(),guard:Some(format!("{ROOT}1000.WANIPConnection.1.X_HW_SERVICELIST")),blocked:None,wan_ref:Some("internet".into()),auto_instance:Some(1000),parameters:vec![Parameter{name:format!("{ROOT}1000.WANIPConnection.1.X_HW_SERVICELIST"),value:"INTERNET".into(),kind:"string".into(),secret:false}]}],wifi_cleanup:"preserve".into(),wifi_preserve:BTreeSet::new()} }
-    fn responses(v: Vec<Value>) { RPC.with(|r| *r.borrow_mut()=(v.into(),Vec::new())); }
-    fn ok(parameters: Value) -> Value { json!({"state":"completed","result":{"parameters":parameters}}) }
-    #[test] fn auto_creation_uses_returned_parent_and_child_instances() {
-        let mut d=device(); let mut r=Reconciler::new(&d,BTreeMap::new(),true);
-        responses(vec![json!({"busy":false}),json!({"id":1}),ok(json!([])),json!({"id":2}),json!({"state":"completed","result":{"instance_number":"7"}}),json!({"id":3}),ok(json!([])),json!({"id":4}),json!({"state":"completed","result":{"instance_number":"3"}})]);
-        for _ in 0..5 { r.tick(&mut d,true,false,true); }
-        assert_eq!(r.owned["internet"].parent,7); assert_eq!(r.owned["internet"].connection,3);
-        assert_eq!(d.items[0].parameters[0].name,format!("{ROOT}7.WANIPConnection.3.X_HW_SERVICELIST"));
+    fn device() -> Device {
+        Device {
+            id: "child".into(),
+            optical_sn: "HWTC12345678".into(),
+            cwmp_id: "id".into(),
+            adapter: "hwtc".into(),
+            items: vec![Item {
+                id: "internet".into(),
+                kind: ItemKind::DeviceService,
+                service_type: "internet".into(),
+                guard: Some(format!("{ROOT}1000.WANIPConnection.1.X_HW_SERVICELIST")),
+                blocked: None,
+                wan_ref: Some("internet".into()),
+                auto_instance: Some(1000),
+                parameters: vec![Parameter {
+                    name: format!("{ROOT}1000.WANIPConnection.1.X_HW_SERVICELIST"),
+                    value: "INTERNET".into(),
+                    kind: ParameterKind::String,
+                    secret: false,
+                }],
+            }],
+            wifi_cleanup: "preserve".into(),
+            wifi_preserve: BTreeSet::new(),
+        }
     }
-    #[test] fn plan_allocates_nothing_and_unknown_add_is_not_replayed() {
-        let mut d=device(); let mut r=Reconciler::new(&d,BTreeMap::new(),true);
-        responses(vec![json!({"busy":false}),json!({"id":1}),ok(json!([]))]);
-        r.tick(&mut d,false,false,true); r.tick(&mut d,false,false,true);
-        assert_eq!(r.results["internet"]["state"],"drift"); assert!(r.owned.is_empty());
-        let mut r=Reconciler::new(&d,BTreeMap::new(),true);
-        responses(vec![json!({"busy":false}),json!({"id":1}),ok(json!([])),json!({"id":2}),json!({"state":"unknown"})]);
-        for _ in 0..3 { r.tick(&mut d,true,false,true); }
-        assert_eq!(r.results["internet"]["state"],"unknown"); assert_eq!(r.owned["internet"].parent,0);
+    fn responses(v: Vec<Value>) {
+        RPC.with(|r| *r.borrow_mut() = (v.into(), Vec::new()));
     }
-    #[test] fn pruning_refuses_a_management_or_reassigned_wan() {
-        let mut d=device(); d.items.clear(); let mut owned=BTreeMap::new(); owned.insert("old".into(),Owned{parent:2,connection:1,state:"ready".into(),service_list:"INTERNET".into()});
-        let mut r=Reconciler::new(&d,owned,true);
-        responses(vec![json!({"busy":false}),json!({"id":1}),ok(json!([{"name":format!("{ROOT}2.")}])),json!({"id":2}),ok(json!([{"value":"TR069_INTERNET"}]))]);
-        for _ in 0..3 { r.tick(&mut d,true,false,true); }
-        assert_eq!(r.results["old"]["state"],"blocked"); assert!(r.owned.contains_key("old"));
+    fn ok(parameters: Value) -> Value {
+        json!({"state":"completed","result":{"parameters":parameters}})
+    }
+    #[test]
+    fn auto_creation_uses_returned_parent_and_child_instances() {
+        let mut d = device();
+        let mut r = Reconciler::new(&d, BTreeMap::new(), true);
+        responses(vec![
+            json!({"busy":false}),
+            json!({"id":1}),
+            ok(json!([])),
+            json!({"id":2}),
+            json!({"state":"completed","result":{"instance_number":"7"}}),
+            json!({"id":3}),
+            ok(json!([])),
+            json!({"id":4}),
+            json!({"state":"completed","result":{"instance_number":"3"}}),
+        ]);
+        for _ in 0..5 {
+            r.tick(&mut d, true, false, true);
+        }
+        assert_eq!(r.owned["internet"].parent, 7);
+        assert_eq!(r.owned["internet"].connection, 3);
+        assert_eq!(
+            d.items[0].parameters[0].name,
+            format!("{ROOT}7.WANIPConnection.3.X_HW_SERVICELIST")
+        );
+    }
+    #[test]
+    fn plan_allocates_nothing_and_unknown_add_is_not_replayed() {
+        let mut d = device();
+        let mut r = Reconciler::new(&d, BTreeMap::new(), true);
+        responses(vec![json!({"busy":false}), json!({"id":1}), ok(json!([]))]);
+        r.tick(&mut d, false, false, true);
+        r.tick(&mut d, false, false, true);
+        assert_eq!(r.results["internet"]["state"], "drift");
+        assert!(r.owned.is_empty());
+        let mut r = Reconciler::new(&d, BTreeMap::new(), true);
+        responses(vec![
+            json!({"busy":false}),
+            json!({"id":1}),
+            ok(json!([])),
+            json!({"id":2}),
+            json!({"state":"unknown"}),
+        ]);
+        for _ in 0..3 {
+            r.tick(&mut d, true, false, true);
+        }
+        assert_eq!(r.results["internet"]["state"], "unknown");
+        assert_eq!(r.owned["internet"].parent, 0);
+    }
+    #[test]
+    fn pruning_refuses_a_management_or_reassigned_wan() {
+        let mut d = device();
+        d.items.clear();
+        let mut r = Reconciler::new(&d, BTreeMap::new(), true);
+        responses(vec![
+            json!({"busy":false}),
+            json!({"id":1}),
+            ok(json!([{"name":format!("{ROOT}2.WANIPConnection.1.")}])),
+            json!({"id":2}),
+            ok(
+                json!([{"name":format!("{ROOT}2.WANIPConnection.1.X_HW_SERVICELIST"),"value":"TR069_INTERNET"},{"name":format!("{ROOT}2.WANIPConnection.1.X_HW_VLAN"),"value":"46"}]),
+            ),
+        ]);
+        for _ in 0..3 {
+            r.tick(&mut d, true, false, true);
+        }
+        assert!(r.owned.is_empty());
+        assert_eq!(r.discovered[0].state, "protected");
+        RPC.with(|r| assert!(r.borrow().1.iter().all(|v| v["method"] != "DeleteObject")));
+    }
+    #[test]
+    fn fallback_classification_is_semantic() {
+        assert!(protected("INTERNET", false));
+        assert!(!protected("INTERNET", true));
+        assert!(protected("TR069,INTERNET", true));
+        assert!(!protected("OTHER", false));
+    }
+    #[test]
+    fn discovery_replaces_stale_registry_and_preserves_order() {
+        let mut d = device();
+        let mut r = Reconciler::new(&d, BTreeMap::new(), true);
+        r.discovered = vec![
+            Owned {
+                parent: 7,
+                connection: 3,
+                state: "protected".into(),
+                service_list: "INTERNET".into(),
+                kind: ip_kind(),
+                baseline: None,
+            },
+            Owned {
+                parent: 12,
+                connection: 2,
+                state: "ready".into(),
+                service_list: "OTHER".into(),
+                kind: ip_kind(),
+                baseline: None,
+            },
+        ];
+        r.discover_next(&mut d);
+        assert_eq!(r.owned["internet"].parent, 12);
+        assert_eq!(r.owned["internet"].connection, 2);
+        assert!(d.items[0].parameters[0]
+            .name
+            .contains("12.WANIPConnection.2."));
+    }
+    #[test]
+    fn shared_protected_parent_blocks_mutation() {
+        let mut d = device();
+        d.adapter = "hl202".into();
+        let mut r = Reconciler::new(&d, BTreeMap::new(), true);
+        r.discovered = vec![
+            Owned {
+                parent: 4,
+                connection: 1,
+                state: "protected".into(),
+                service_list: "TR069".into(),
+                kind: ip_kind(),
+                baseline: None,
+            },
+            Owned {
+                parent: 4,
+                connection: 2,
+                state: "ready".into(),
+                service_list: "OTHER".into(),
+                kind: ip_kind(),
+                baseline: None,
+            },
+        ];
+        r.discover_next(&mut d);
+        r.block_unresolved(&mut d);
+        assert!(d.items[0].blocked.is_some());
+        assert!(r.actions.is_empty());
+    }
+    #[test]
+    fn interrupted_add_recovers_only_a_unique_empty_parent() {
+        let mut d = device();
+        let old = Owned {
+            parent: 0,
+            connection: 0,
+            state: "adding_parent".into(),
+            service_list: "INTERNET".into(),
+            kind: ip_kind(),
+            baseline: Some([1, 2, 3].into()),
+        };
+        let mut r = Reconciler::new(&d, [("internet".into(), old.clone())].into(), true);
+        r.parents = [1, 2, 3, 4].into();
+        r.discover_next(&mut d);
+        assert_eq!(r.owned["internet"].parent, 4);
+        assert_eq!(r.actions.len(), 1);
+        let mut r = Reconciler::new(&d, [("internet".into(), old)].into(), true);
+        r.parents = [1, 2, 3, 4, 5].into();
+        r.discover_next(&mut d);
+        assert!(r.actions.is_empty());
+        assert_eq!(r.results["internet"]["state"], "unknown");
+    }
+    #[test]
+    fn surplus_deletes_child_then_only_an_empty_parent() {
+        let mut d = device();
+        d.items.clear();
+        let mut r = Reconciler::new(&d, BTreeMap::new(), true);
+        r.discovered = vec![Owned {
+            parent: 4,
+            connection: 2,
+            state: "ready".into(),
+            service_list: "OTHER".into(),
+            kind: ip_kind(),
+            baseline: None,
+        }];
+        r.parents.insert(4);
+        r.initialized = true;
+        r.discover_next(&mut d);
+        responses(vec![
+            json!({"busy":false}),
+            json!({"id":1}),
+            ok(
+                json!([{"name":format!("{ROOT}4.WANIPConnection.2.X_HW_SERVICELIST"),"value":"OTHER"},{"name":format!("{ROOT}4.WANIPConnection.2.X_HW_VLAN"),"value":"43"}]),
+            ),
+            json!({"id":2}),
+            ok(json!([])),
+            json!({"id":3}),
+            ok(json!([])),
+            json!({"id":4}),
+            ok(json!([])),
+            json!({"id":5}),
+            ok(json!([])),
+            json!({"id":6}),
+            ok(json!([])),
+        ]);
+        for _ in 0..7 {
+            r.tick(&mut d, true, false, true);
+        }
+        assert_eq!(r.results["surplus_0"]["state"], "deleted");
+        assert!(r.owned.is_empty());
+        RPC.with(|r| {
+            let b = r.borrow();
+            let deletes: Vec<_> =
+                b.1.iter()
+                    .filter(|v| v["method"] == "DeleteObject")
+                    .map(|v| v["args"]["object"].as_str().unwrap())
+                    .collect();
+            assert_eq!(
+                deletes,
+                vec![format!("{ROOT}4.WANIPConnection.2."), format!("{ROOT}4.")]
+            );
+        });
+    }
+    #[test]
+    fn final_inventory_detects_an_extra_connection() {
+        let mut d = device();
+        let mut r = Reconciler::new(&d, BTreeMap::new(), true);
+        let o = Owned {
+            parent: 4,
+            connection: 2,
+            state: "ready".into(),
+            service_list: "OTHER".into(),
+            kind: ip_kind(),
+            baseline: None,
+        };
+        r.discovered = vec![o.clone()];
+        r.discover_next(&mut d);
+        r.begin_final_verification(true);
+        r.discovered.push(Owned { parent: 5, ..o });
+        r.discover_next(&mut d);
+        assert_eq!(r.results["final_inventory"]["state"], "blocked");
+        assert_eq!(r.owned["internet"].parent, 4);
+    }
+    #[test]
+    fn reused_instance_holes_are_remapped_in_numeric_order() {
+        let mut d = device();
+        let mut second = d.items[0].clone();
+        second.id = "second".into();
+        second.wan_ref = Some("second".into());
+        second.auto_instance = Some(1001);
+        second.parameters[0].name = second.parameters[0].name.replace("1000", "1001");
+        d.items.push(second);
+        let mut r = Reconciler::new(&d, BTreeMap::new(), true);
+        let row = Owned {
+            parent: 7,
+            connection: 3,
+            state: "ready".into(),
+            service_list: "OTHER".into(),
+            kind: ip_kind(),
+            baseline: None,
+        };
+        r.owned.insert("internet".into(), row.clone());
+        r.remap(&mut d, "internet");
+        r.owned.insert(
+            "second".into(),
+            Owned {
+                parent: 4,
+                connection: 2,
+                ..row
+            },
+        );
+        r.remap(&mut d, "second");
+        r.order_mapping(&mut d);
+        assert!(d.items[0].parameters[0]
+            .name
+            .contains("4.WANIPConnection.2."));
+        assert!(d.items[1].parameters[0]
+            .name
+            .contains("7.WANIPConnection.3."));
     }
 }

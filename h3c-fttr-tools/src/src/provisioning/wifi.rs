@@ -1,230 +1,604 @@
 //! WLAN lifecycle is separate from parameter diffs. Inventory, actual returned
 //! instances and readback are authoritative; an acknowledged Delete is not proof.
-use super::{acs,config::Device};
-use serde::{Deserialize,Serialize};
-use serde_json::{json,Value};
-use std::collections::{BTreeMap,BTreeSet};
-pub const ROOT: &str="InternetGatewayDevice.LANDevice.1.WLANConfiguration.";
-#[derive(Clone,Default,Serialize,Deserialize)]
-pub struct Registry { pub owned:BTreeSet<u32>, pub pending:Option<String>, pub pending_instance:Option<u32> }
-fn path(id:&str)->String {
-    let hash=id.bytes().fold(0xcbf29ce484222325u64,|h,b|(h ^ b as u64).wrapping_mul(0x100000001b3));
-    format!("/etc/fttr/wifi-owned/{hash:016x}.json")
+use super::model::{ItemKind, WifiPhase};
+use super::{acs, config::Device};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+pub const ROOT: &str = "InternetGatewayDevice.LANDevice.1.WLANConfiguration.";
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Registry {
+    pub owned: BTreeSet<u32>,
+    pub pending: Option<String>,
+    pub pending_instance: Option<u32>,
+}
+fn path(id: &str) -> String {
+    super::storage::registry_path("/etc/fttr/wifi-owned", id)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        config::{Item, Parameter},
+        model::ParameterKind,
+        RPC,
+    };
     use super::*;
-    use super::super::{RPC,config::{Item,Parameter}};
-    fn device()->Device {
-        Device{id:"child".into(),optical_sn:"H3CT12345678".into(),cwmp_id:"id".into(),adapter:"hl202".into(),wifi_cleanup:"delete".into(),wifi_preserve:BTreeSet::new(),items:vec![Item{id:"wifi".into(),kind:"ssid".into(),service_type:String::new(),parameters:vec![Parameter{name:format!("{ROOT}1.SSID"),value:"wanted".into(),kind:"string".into(),secret:false}],guard:None,blocked:None,wan_ref:None,auto_instance:None}]}
+    fn device() -> Device {
+        Device {
+            id: "child".into(),
+            optical_sn: "H3CT12345678".into(),
+            cwmp_id: "id".into(),
+            adapter: "hl202".into(),
+            wifi_cleanup: "delete".into(),
+            wifi_preserve: BTreeSet::new(),
+            items: vec![Item {
+                id: "wifi".into(),
+                kind: ItemKind::Ssid,
+                service_type: String::new(),
+                parameters: vec![Parameter {
+                    name: format!("{ROOT}1.SSID"),
+                    value: "wanted".into(),
+                    kind: ParameterKind::String,
+                    secret: false,
+                }],
+                guard: None,
+                blocked: None,
+                wan_ref: None,
+                auto_instance: None,
+            }],
+        }
     }
-    fn reply(instances:&[u32])->Value { json!({"state":"completed","result":{"parameters":instances.iter().map(|n|json!({"name":format!("{ROOT}{n}.")})).collect::<Vec<_>>()}}) }
-    fn responses(v:Vec<Value>) { RPC.with(|r|*r.borrow_mut()=(v.into(),Vec::new())); }
-    fn initialized(d:&Device)->Reconciler { let mut r=Reconciler::new(d,Registry::default(),true); r.stage="inventory".into(); r.task=Some(1); r }
-    #[test] fn deletes_only_extras_and_verifies_absence() {
-        let d=device(); let mut r=initialized(&d);
-        responses(vec![reply(&[1,2]),json!({"id":2}),json!({"state":"completed"}),json!({"id":3}),reply(&[1])]);
-        assert!(!r.tick(&d,true,true,true,true)); assert!(!r.tick(&d,true,true,true,true)); assert!(r.tick(&d,true,true,true,true));
-        assert_eq!(r.results["2"]["state"],"deleted"); assert!(r.existing.contains(&1));
-        RPC.with(|r|assert_eq!(r.borrow().1[1]["args"]["object"],format!("{ROOT}2.")));
+    fn reply(instances: &[u32]) -> Value {
+        json!({"state":"completed","result":{"parameters":instances.iter().map(|n|json!({"name":format!("{ROOT}{n}.")})).collect::<Vec<_>>()}})
     }
-    #[test] fn plan_never_writes_and_failure_prevents_cleanup() {
-        let d=device(); let mut r=initialized(&d);
-        responses(vec![reply(&[1,2]),json!({"busy":false})]);
-        assert!(!r.tick(&d,false,true,true,false)); assert!(r.tick(&d,false,true,true,false));
-        assert_eq!(r.results["2"]["state"],"drift"); RPC.with(|r|assert!(r.borrow().1.iter().all(|v|v["op"]!="queue")));
-        let mut r=initialized(&d); responses(vec![reply(&[1,2])]); assert!(r.tick(&d,true,true,true,false));
-        assert_eq!(r.results["inventory"]["state"],"blocked");
+    fn responses(v: Vec<Value>) {
+        RPC.with(|r| *r.borrow_mut() = (v.into(), Vec::new()));
     }
-    #[test] fn acknowledged_delete_is_not_success_without_absence() {
-        let d=device(); let mut r=initialized(&d);
-        responses(vec![reply(&[1,2]),json!({"id":2}),json!({"state":"completed"}),json!({"id":3}),reply(&[1,2])]);
-        for _ in 0..3 { r.tick(&d,true,true,true,true); }
-        assert_eq!(r.results["2"]["state"],"unknown"); assert_eq!(r.registry.pending.as_deref(),Some("deleting"));
+    fn initialized(d: &Device) -> Reconciler {
+        let mut r = Reconciler::new(d, Registry::default(), true);
+        r.stage = WifiPhase::Inventory;
+        r.task = Some(1);
+        r
     }
-    #[test] fn returned_slot_is_verified_before_further_allocation_and_unknown_is_not_replayed() {
-        let mut d=device(); d.items[0].parameters[0].name=format!("{ROOT}6.SSID"); let mut r=initialized(&d);
-        responses(vec![reply(&[1,5]),json!({"id":2}),json!({"state":"completed","result":{"instance_number":"2"}}),json!({"id":3}),reply(&[1,2,5]),json!({"id":4}),json!({"state":"unknown"})]);
-        for _ in 0..4 { r.tick(&d,true,true,false,false); }
-        assert!(r.registry.owned.contains(&2)); assert!(!r.existing.contains(&6)); assert_eq!(r.results["6"]["state"],"unknown");
-        let calls=RPC.with(|r|r.borrow().1.len()); assert!(r.tick(&d,true,true,false,false)); RPC.with(|r|assert_eq!(r.borrow().1.len(),calls));
+    #[test]
+    fn deletes_only_extras_and_verifies_absence() {
+        let d = device();
+        let mut r = initialized(&d);
+        responses(vec![
+            reply(&[1, 2]),
+            json!({"id":2}),
+            json!({"state":"completed"}),
+            json!({"id":3}),
+            reply(&[1]),
+        ]);
+        assert!(!r.tick(&d, true, true, true, true));
+        assert!(!r.tick(&d, true, true, true, true));
+        assert!(r.tick(&d, true, true, true, true));
+        assert_eq!(r.results["2"]["state"], "deleted");
+        assert!(r.existing.contains(&1));
+        RPC.with(|r| assert_eq!(r.borrow().1[1]["args"]["object"], format!("{ROOT}2.")));
     }
-    #[test] fn preserve_policy_removes_owned_only_and_keep_list_wins() {
-        let mut d=device(); d.wifi_cleanup="preserve".into(); d.wifi_preserve.insert(3);
-        let mut r=initialized(&d); r.registry.owned.extend([2,3]);
-        responses(vec![reply(&[1,2,3,4]),json!({"id":2})]); r.tick(&d,true,true,true,true);
-        RPC.with(|r|assert_eq!(r.borrow().1[1]["args"]["object"],format!("{ROOT}2.")));
+    #[test]
+    fn plan_never_writes_and_failure_prevents_cleanup() {
+        let d = device();
+        let mut r = initialized(&d);
+        responses(vec![reply(&[1, 2]), json!({"busy":false})]);
+        assert!(!r.tick(&d, false, true, true, false));
+        assert!(r.tick(&d, false, true, true, false));
+        assert_eq!(r.results["2"]["state"], "drift");
+        RPC.with(|r| assert!(r.borrow().1.iter().all(|v| v["op"] != "queue")));
+        let mut r = initialized(&d);
+        responses(vec![reply(&[1, 2])]);
+        assert!(r.tick(&d, true, true, true, false));
+        assert_eq!(r.results["inventory"]["state"], "blocked");
     }
-    #[test] fn matched_inventory_apply_performs_no_lifecycle_write() {
-        let d=device(); let mut r=initialized(&d); responses(vec![reply(&[1])]);
-        assert!(r.tick(&d,true,true,true,true)); assert!(r.results.is_empty());
-        RPC.with(|r|assert!(r.borrow().1.iter().all(|v|v["op"]!="queue")));
+    #[test]
+    fn acknowledged_delete_is_not_success_without_absence() {
+        let d = device();
+        let mut r = initialized(&d);
+        responses(vec![
+            reply(&[1, 2]),
+            json!({"id":2}),
+            json!({"state":"completed"}),
+            json!({"id":3}),
+            reply(&[1, 2]),
+        ]);
+        for _ in 0..3 {
+            r.tick(&d, true, true, true, true);
+        }
+        assert_eq!(r.results["2"]["state"], "unknown");
+        assert_eq!(r.registry.pending.as_deref(), Some("deleting"));
     }
-    #[test] fn already_disabled_extra_is_not_written_again() {
-        let mut d=device(); d.wifi_cleanup="disable".into(); let mut r=initialized(&d);
-        responses(vec![reply(&[1,2]),json!({"id":2}),json!({"state":"completed","result":{"parameters":[{"name":format!("{ROOT}2.Enable"),"value":"0"}]}})]);
-        assert!(!r.tick(&d,true,true,true,true)); assert!(r.tick(&d,true,true,true,true));
-        assert_eq!(r.results["2"]["state"],"disabled"); RPC.with(|r|assert!(r.borrow().1.iter().all(|v|v["method"]!="SetParameterValues")));
+    #[test]
+    fn returned_slot_is_verified_before_further_allocation_and_unknown_is_not_replayed() {
+        let mut d = device();
+        d.items[0].parameters[0].name = format!("{ROOT}6.SSID");
+        let mut r = initialized(&d);
+        responses(vec![
+            reply(&[1, 5]),
+            json!({"id":2}),
+            json!({"state":"completed","result":{"instance_number":"2"}}),
+            json!({"id":3}),
+            reply(&[1, 2, 5]),
+            json!({"id":4}),
+            json!({"state":"unknown"}),
+        ]);
+        for _ in 0..4 {
+            r.tick(&d, true, true, false, false);
+        }
+        assert!(r.registry.owned.contains(&2));
+        assert!(!r.existing.contains(&6));
+        assert_eq!(r.results["6"]["state"], "unknown");
+        let calls = RPC.with(|r| r.borrow().1.len());
+        assert!(r.tick(&d, true, true, false, false));
+        RPC.with(|r| assert_eq!(r.borrow().1.len(), calls));
     }
-    #[test] fn reused_instance_response_requires_inventory_and_does_not_loop() {
-        let mut d=device(); d.items[0].parameters[0].name=format!("{ROOT}6.SSID"); let mut r=initialized(&d);
-        responses(vec![reply(&[1,2,5]),json!({"id":2}),json!({"state":"completed","result":{"instance_number":"2"}}),json!({"id":3}),reply(&[1,2,5])]);
-        assert!(!r.tick(&d,true,true,false,false)); assert!(!r.tick(&d,true,true,false,false)); assert!(r.tick(&d,true,true,false,false));
-        assert_eq!(r.results["2"]["state"],"blocked"); assert!(r.registry.pending.is_none()); assert!(r.registry.owned.is_empty());
-        r.block_unresolved(&mut d); assert!(d.items[0].blocked.is_some());
-        RPC.with(|r|assert_eq!(r.borrow().1.iter().filter(|v|v["method"]=="AddObject").count(),1));
+    #[test]
+    fn preserve_policy_removes_owned_only_and_keep_list_wins() {
+        let mut d = device();
+        d.wifi_cleanup = "preserve".into();
+        d.wifi_preserve.insert(3);
+        let mut r = initialized(&d);
+        r.registry.owned.extend([2, 3]);
+        responses(vec![reply(&[1, 2, 3, 4]), json!({"id":2})]);
+        r.tick(&d, true, true, true, true);
+        RPC.with(|r| assert_eq!(r.borrow().1[1]["args"]["object"], format!("{ROOT}2.")));
+    }
+    #[test]
+    fn matched_inventory_apply_performs_no_lifecycle_write() {
+        let d = device();
+        let mut r = initialized(&d);
+        responses(vec![reply(&[1])]);
+        assert!(r.tick(&d, true, true, true, true));
+        assert!(r.results.is_empty());
+        RPC.with(|r| assert!(r.borrow().1.iter().all(|v| v["op"] != "queue")));
+    }
+    #[test]
+    fn already_disabled_extra_is_not_written_again() {
+        let mut d = device();
+        d.wifi_cleanup = "disable".into();
+        let mut r = initialized(&d);
+        responses(vec![
+            reply(&[1, 2]),
+            json!({"id":2}),
+            json!({"state":"completed","result":{"parameters":[{"name":format!("{ROOT}2.Enable"),"value":"0"}]}}),
+        ]);
+        assert!(!r.tick(&d, true, true, true, true));
+        assert!(r.tick(&d, true, true, true, true));
+        assert_eq!(r.results["2"]["state"], "disabled");
+        RPC.with(|r| {
+            assert!(r
+                .borrow()
+                .1
+                .iter()
+                .all(|v| v["method"] != "SetParameterValues"))
+        });
+    }
+    #[test]
+    fn reused_instance_response_requires_inventory_and_does_not_loop() {
+        let mut d = device();
+        d.items[0].parameters[0].name = format!("{ROOT}6.SSID");
+        let mut r = initialized(&d);
+        responses(vec![
+            reply(&[1, 2, 5]),
+            json!({"id":2}),
+            json!({"state":"completed","result":{"instance_number":"2"}}),
+            json!({"id":3}),
+            reply(&[1, 2, 5]),
+        ]);
+        assert!(!r.tick(&d, true, true, false, false));
+        assert!(!r.tick(&d, true, true, false, false));
+        assert!(r.tick(&d, true, true, false, false));
+        assert_eq!(r.results["2"]["state"], "blocked");
+        assert!(r.registry.pending.is_none());
+        assert!(r.registry.owned.is_empty());
+        r.block_unresolved(&mut d);
+        assert!(d.items[0].blocked.is_some());
+        RPC.with(|r| {
+            assert_eq!(
+                r.borrow()
+                    .1
+                    .iter()
+                    .filter(|v| v["method"] == "AddObject")
+                    .count(),
+                1
+            )
+        });
     }
 }
-pub fn load(id:&str)->Result<Registry,String> {
-    let text=match std::fs::read_to_string(path(id)) { Ok(v)=>v,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(Registry::default()),Err(e)=>return Err(format!("read Wi-Fi ownership: {e}")) };
-    let v:Value=serde_json::from_str(&text).map_err(|e|format!("invalid Wi-Fi ownership: {e}"))?;
-    if v["cwmp_id"] != id { return Err("Wi-Fi ownership identity mismatch".into()); }
-    serde_json::from_value(v["registry"].clone()).map_err(|e|format!("invalid Wi-Fi registry: {e}"))
+pub fn load(id: &str) -> Result<Registry, String> {
+    let text = match std::fs::read_to_string(path(id)) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Registry::default()),
+        Err(e) => return Err(format!("read Wi-Fi ownership: {e}")),
+    };
+    let v: Value =
+        serde_json::from_str(&text).map_err(|e| format!("invalid Wi-Fi ownership: {e}"))?;
+    if v["cwmp_id"] != id {
+        return Err("Wi-Fi ownership identity mismatch".into());
+    }
+    serde_json::from_value(v["registry"].clone())
+        .map_err(|e| format!("invalid Wi-Fi registry: {e}"))
 }
-pub fn instance(name:&str)->Option<u32> { name.strip_prefix(ROOT)?.split('.').next()?.parse().ok() }
-fn inventory(v:&Value)->BTreeSet<u32> {
-    v["result"]["parameters"].as_array().into_iter().flatten().filter_map(|p| p["name"].as_str()?.strip_prefix(ROOT)?.strip_suffix('.')?.parse().ok()).collect()
+pub fn instance(name: &str) -> Option<u32> {
+    name.strip_prefix(ROOT)?.split('.').next()?.parse().ok()
+}
+fn inventory(v: &Value) -> BTreeSet<u32> {
+    v["result"]["parameters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            p["name"]
+                .as_str()?
+                .strip_prefix(ROOT)?
+                .strip_suffix('.')?
+                .parse()
+                .ok()
+        })
+        .collect()
 }
 #[derive(Clone)]
 pub struct Reconciler {
-    pub registry:Registry, pub results:BTreeMap<String,Value>, pub stage:String,
-    pub desired:BTreeSet<u32>, existing:BTreeSet<u32>, task:Option<u64>, current:Option<u32>,
-    cleanup:bool, policy:String, preserve:BTreeSet<u32>, prepared:bool, additions:u32, reused:bool,
+    pub registry: Registry,
+    pub results: BTreeMap<String, Value>,
+    pub stage: WifiPhase,
+    pub desired: BTreeSet<u32>,
+    existing: BTreeSet<u32>,
+    task: Option<u64>,
+    current: Option<u32>,
+    cleanup: bool,
+    policy: String,
+    preserve: BTreeSet<u32>,
+    prepared: bool,
+    additions: u32,
+    reused: bool,
 }
 impl Reconciler {
-    pub fn new(d:&Device,registry:Registry,cleanup:bool)->Self {
-        let desired:BTreeSet<_>=d.items.iter().filter(|i|i.kind=="ssid").flat_map(|i|i.parameters.iter().filter_map(|p|instance(&p.name))).collect();
-        let skip=desired.is_empty() && (!cleanup || (d.wifi_cleanup=="preserve" && registry.owned.is_empty()));
-        Self{registry,results:BTreeMap::new(),stage:if skip {"done"} else {"waiting"}.into(),desired,existing:BTreeSet::new(),task:None,current:None,cleanup,policy:d.wifi_cleanup.clone(),preserve:d.wifi_preserve.clone(),prepared:skip,additions:0,reused:false}
-    }
-    pub fn save(&self,id:&str)->Result<(),String> {
-        #[cfg(test)] { let _=id; return Ok(()); }
-        #[cfg(not(test))] {
-            use std::{io::Write,os::unix::fs::OpenOptionsExt};
-            let text=json!({"cwmp_id":id,"registry":self.registry}).to_string(); let path=path(id);
-            if std::fs::read_to_string(&path).ok().as_deref()==Some(&text) { return Ok(()); }
-            let result=(||->std::io::Result<()> {
-                std::fs::create_dir_all("/etc/fttr/wifi-owned")?;
-                let tmp=format!("{path}.tmp"); let mut f=std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-                f.write_all(text.as_bytes())?; f.sync_all()?; std::fs::rename(tmp,path)?;
-                std::fs::File::open("/etc/fttr/wifi-owned")?.sync_all()
-            })(); result.map_err(|e|format!("persist Wi-Fi ownership: {e}"))
+    pub fn new(d: &Device, registry: Registry, cleanup: bool) -> Self {
+        let desired: BTreeSet<_> = d
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Ssid)
+            .flat_map(|i| i.parameters.iter().filter_map(|p| instance(&p.name)))
+            .collect();
+        let skip = desired.is_empty()
+            && (!cleanup || (d.wifi_cleanup == "preserve" && registry.owned.is_empty()));
+        Self {
+            registry,
+            results: BTreeMap::new(),
+            stage: if skip {
+                WifiPhase::Done
+            } else {
+                WifiPhase::Waiting
+            },
+            desired,
+            existing: BTreeSet::new(),
+            task: None,
+            current: None,
+            cleanup,
+            policy: d.wifi_cleanup.clone(),
+            preserve: d.wifi_preserve.clone(),
+            prepared: skip,
+            additions: 0,
+            reused: false,
         }
     }
-    fn fail(&mut self,state:&str,reason:&str) {
-        self.results.insert(self.current.map(|n|n.to_string()).unwrap_or_else(||"inventory".into()),json!({"state":state,"reason":reason,"task_id":self.task}));
-        self.stage="done".into(); self.prepared=true; self.task=None;
+    pub fn save(&self, id: &str) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            let _ = id;
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        {
+            let text = json!({"cwmp_id":id,"registry":self.registry}).to_string();
+            let path = path(id);
+            if std::fs::read_to_string(&path).ok().as_deref() == Some(&text) {
+                return Ok(());
+            }
+            super::storage::write_atomic(&path, text.as_bytes(), true)
+                .map_err(|e| format!("persist Wi-Fi ownership: {e}"))
+        }
     }
-    pub fn block_unresolved(&self,d:&mut Device) {
-        for item in d.items.iter_mut().filter(|i|i.kind=="ssid") {
-            if item.parameters.iter().filter_map(|p|instance(&p.name)).any(|n|!self.existing.contains(&n)) {
-                item.blocked=Some("desired WLAN is absent; allocation not completed (see wifi_lifecycle)".into());
+    fn fail(&mut self, state: &str, reason: &str) {
+        self.results.insert(
+            self.current
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "inventory".into()),
+            json!({"state":state,"reason":reason,"task_id":self.task}),
+        );
+        self.stage = WifiPhase::Done;
+        self.prepared = true;
+        self.task = None;
+    }
+    pub fn block_unresolved(&self, d: &mut Device) {
+        for item in d.items.iter_mut().filter(|i| i.kind == ItemKind::Ssid) {
+            if item
+                .parameters
+                .iter()
+                .filter_map(|p| instance(&p.name))
+                .any(|n| !self.existing.contains(&n))
+            {
+                item.blocked = Some(
+                    "desired WLAN is absent; allocation not completed (see wifi_lifecycle)".into(),
+                );
             }
         }
     }
-    fn queue(&mut self,d:&Device,method:&str,args:Value,stage:&str) {
-        if self.save(&d.cwmp_id).is_err() { self.fail("blocked","cannot persist Wi-Fi lifecycle intent"); return; }
-        let v=acs(json!({"op":"queue","device":d.cwmp_id,"method":method,"args":args}));
-        if let Some(id)=v["id"].as_u64() { self.task=Some(id); self.stage=stage.into(); }
-        else { self.registry.pending=None; self.registry.pending_instance=None; self.fail("failed","cannot queue Wi-Fi RPC"); }
-    }
-    pub fn tick(&mut self,d:&Device,apply:bool,reachable:bool,finish:bool,verified:bool)->bool {
-        if self.stage=="done" { return true; }
-        if self.prepared && !finish { return true; }
-        if !reachable { return false; }
-        if self.task.is_none() && acs(json!({"op":"busy","device":d.cwmp_id}))["busy"]==true { return false; }
-        if self.stage=="waiting" {
-            self.queue(d,"GetParameterNames",json!({"path":ROOT,"next_level":true}),"inventory"); return false;
+    fn queue(&mut self, d: &Device, method: &str, args: Value, stage: WifiPhase) {
+        if self.save(&d.cwmp_id).is_err() {
+            self.fail("blocked", "cannot persist Wi-Fi lifecycle intent");
+            return;
         }
-        if let Some(task)=self.task {
-            let v=acs(json!({"op":"task","id":task})); let state=v["state"].as_str().unwrap_or("missing");
-            if matches!(state,"queued"|"sent") { return false; }
-            if !matches!(state,"completed"|"accepted_pending_apply") {
-                if matches!(state,"fault"|"expired") { self.registry.pending=None; self.registry.pending_instance=None; }
-                self.fail(if state=="unknown" {"unknown"} else {"failed"},"Wi-Fi RPC failed/unknown; no automatic write replay"); return true;
+        let v = acs(json!({"op":"queue","device":d.cwmp_id,"method":method,"args":args}));
+        if let Some(id) = v["id"].as_u64() {
+            self.task = Some(id);
+            self.stage = stage;
+        } else {
+            self.registry.pending = None;
+            self.registry.pending_instance = None;
+            self.fail("failed", "cannot queue Wi-Fi RPC");
+        }
+    }
+    pub fn tick(
+        &mut self,
+        d: &Device,
+        apply: bool,
+        reachable: bool,
+        finish: bool,
+        verified: bool,
+    ) -> bool {
+        if self.stage == WifiPhase::Done {
+            return true;
+        }
+        if self.prepared && !finish {
+            return true;
+        }
+        if !reachable {
+            return false;
+        }
+        if self.task.is_none() && acs(json!({"op":"busy","device":d.cwmp_id}))["busy"] == true {
+            return false;
+        }
+        if self.stage == WifiPhase::Waiting {
+            self.queue(
+                d,
+                "GetParameterNames",
+                json!({"path":ROOT,"next_level":true}),
+                WifiPhase::Inventory,
+            );
+            return false;
+        }
+        if let Some(task) = self.task {
+            let v = acs(json!({"op":"task","id":task}));
+            let state = v["state"].as_str().unwrap_or("missing");
+            if matches!(state, "queued" | "sent") {
+                return false;
             }
-            self.task=None;
-            match self.stage.as_str() {
-                "inventory" => {
-                    self.existing=inventory(&v);
-                    self.registry.owned.retain(|n|self.existing.contains(n));
+            if !matches!(state, "completed" | "accepted_pending_apply") {
+                if matches!(state, "fault" | "expired") {
+                    self.registry.pending = None;
+                    self.registry.pending_instance = None;
+                }
+                self.fail(
+                    if state == "unknown" {
+                        "unknown"
+                    } else {
+                        "failed"
+                    },
+                    "Wi-Fi RPC failed/unknown; no automatic write replay",
+                );
+                return true;
+            }
+            self.task = None;
+            match self.stage {
+                WifiPhase::Inventory => {
+                    self.existing = inventory(&v);
+                    self.registry.owned.retain(|n| self.existing.contains(n));
                     if self.registry.pending.is_some() {
-                        if self.registry.pending.as_deref()==Some("deleting") && self.registry.pending_instance.is_some_and(|n|!self.existing.contains(&n)) {
-                            self.registry.pending=None; self.registry.pending_instance=None;
-                        } else { self.fail("unknown","interrupted Wi-Fi lifecycle; inspect registry and inventory before retry"); return true; }
+                        if self.registry.pending.as_deref() == Some("deleting")
+                            && self
+                                .registry
+                                .pending_instance
+                                .is_some_and(|n| !self.existing.contains(&n))
+                        {
+                            self.registry.pending = None;
+                            self.registry.pending_instance = None;
+                        } else {
+                            self.fail("unknown","interrupted Wi-Fi lifecycle; inspect registry and inventory before retry");
+                            return true;
+                        }
                     }
-                },
-                "adding" => {
-                    let n=v["result"]["instance_number"].as_str().and_then(|n|n.parse::<u32>().ok()).filter(|n|*n>0);
-                    let Some(n)=n else { self.fail("unknown","AddObject did not return a WLAN instance"); return true; };
-                    self.reused=self.existing.contains(&n);
-                    if !self.reused { self.registry.owned.insert(n); } self.registry.pending_instance=Some(n); self.current=Some(n);
-                    self.queue(d,"GetParameterNames",json!({"path":ROOT,"next_level":true}),"verify_add"); return false;
-                },
-                "verify_add" => {
-                    let before=self.existing.clone(); self.existing=inventory(&v);
-                    let n=self.current.unwrap();
-                    if !self.existing.contains(&n) { self.fail("unknown","AddObject acknowledged but WLAN is absent"); return true; }
-                    if self.reused {
-                        if before==self.existing {
-                            self.registry.pending=None; self.registry.pending_instance=None;
-                            self.fail("blocked","firmware reused existing WLAN instance; requested slot cannot be allocated with this contract");
-                        } else { self.fail("unknown","AddObject returned existing instance but inventory changed; inspect before retry"); }
+                }
+                WifiPhase::Adding => {
+                    let n = v["result"]["instance_number"]
+                        .as_str()
+                        .and_then(|n| n.parse::<u32>().ok())
+                        .filter(|n| *n > 0);
+                    let Some(n) = n else {
+                        self.fail("unknown", "AddObject did not return a WLAN instance");
+                        return true;
+                    };
+                    self.reused = self.existing.contains(&n);
+                    if !self.reused {
+                        self.registry.owned.insert(n);
+                    }
+                    self.registry.pending_instance = Some(n);
+                    self.current = Some(n);
+                    self.queue(
+                        d,
+                        "GetParameterNames",
+                        json!({"path":ROOT,"next_level":true}),
+                        WifiPhase::VerifyAdd,
+                    );
+                    return false;
+                }
+                WifiPhase::VerifyAdd => {
+                    let before = self.existing.clone();
+                    self.existing = inventory(&v);
+                    let n = self.current.unwrap();
+                    if !self.existing.contains(&n) {
+                        self.fail("unknown", "AddObject acknowledged but WLAN is absent");
                         return true;
                     }
-                    self.registry.pending=None; self.registry.pending_instance=None;
+                    if self.reused {
+                        if before == self.existing {
+                            self.registry.pending = None;
+                            self.registry.pending_instance = None;
+                            self.fail("blocked","firmware reused existing WLAN instance; requested slot cannot be allocated with this contract");
+                        } else {
+                            self.fail("unknown","AddObject returned existing instance but inventory changed; inspect before retry");
+                        }
+                        return true;
+                    }
+                    self.registry.pending = None;
+                    self.registry.pending_instance = None;
                     self.results.insert(n.to_string(),json!({"state":"created","instance":n,"task_id":task,"reason":"AddObject returned instance, existence verified"}));
-                },
-                "deleting" => { self.queue(d,"GetParameterNames",json!({"path":ROOT,"next_level":true}),"verify_delete"); return false; },
-                "verify_delete" => {
-                    self.existing=inventory(&v); let n=self.current.unwrap();
-                    if self.existing.contains(&n) { self.fail("unknown","DeleteObject acknowledged but WLAN still exists"); return true; }
-                    self.registry.owned.remove(&n); self.registry.pending=None; self.registry.pending_instance=None;
+                }
+                WifiPhase::Deleting => {
+                    self.queue(
+                        d,
+                        "GetParameterNames",
+                        json!({"path":ROOT,"next_level":true}),
+                        WifiPhase::VerifyDelete,
+                    );
+                    return false;
+                }
+                WifiPhase::VerifyDelete => {
+                    self.existing = inventory(&v);
+                    let n = self.current.unwrap();
+                    if self.existing.contains(&n) {
+                        self.fail("unknown", "DeleteObject acknowledged but WLAN still exists");
+                        return true;
+                    }
+                    self.registry.owned.remove(&n);
+                    self.registry.pending = None;
+                    self.registry.pending_instance = None;
                     self.results.insert(n.to_string(),json!({"state":"deleted","instance":n,"task_id":task,"reason":"WLAN absence verified"}));
-                },
-                "reading_disable" | "verifying_disable" => {
-                    let name=format!("{ROOT}{}.Enable",self.current.unwrap());
-                    let disabled=v["result"]["parameters"].as_array().into_iter().flatten().find(|p|p["name"]==name).and_then(|p|p["value"].as_str());
-                    let Some(value)=disabled else { self.fail("failed","missing WLAN Enable readback"); return true; };
-                    if matches!(value,"0"|"false") {
-                        let n=self.current.unwrap(); self.results.insert(n.to_string(),json!({"state":"disabled","instance":n,"task_id":task,"reason":"Enable=0 verified"}));
-                        self.registry.pending=None; self.registry.pending_instance=None;
-                    } else if self.stage=="verifying_disable" { self.fail("unknown","disable accepted/unknown but Enable still true; no replay"); return true; }
-                    else if !apply { self.results.insert(self.current.unwrap().to_string(),json!({"state":"drift","reason":"unconfigured WLAN enabled; apply will disable"})); }
-                    else { self.registry.pending=Some("disabling".into()); self.registry.pending_instance=self.current;
-                        self.queue(d,"SetParameterValues",json!({"parameters":[{"name":name,"value":"0","kind":"boolean"}]}),"disabling"); return false; }
-                },
-                "disabling" => { self.queue(d,"GetParameterValues",json!({"names":[format!("{ROOT}{}.Enable",self.current.unwrap())]}),"verifying_disable"); return false; },
-                _=>(),
+                }
+                WifiPhase::ReadingDisable | WifiPhase::VerifyingDisable => {
+                    let name = format!("{ROOT}{}.Enable", self.current.unwrap());
+                    let disabled = v["result"]["parameters"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|p| p["name"] == name)
+                        .and_then(|p| p["value"].as_str());
+                    let Some(value) = disabled else {
+                        self.fail("failed", "missing WLAN Enable readback");
+                        return true;
+                    };
+                    if matches!(value, "0" | "false") {
+                        let n = self.current.unwrap();
+                        self.results.insert(n.to_string(),json!({"state":"disabled","instance":n,"task_id":task,"reason":"Enable=0 verified"}));
+                        self.registry.pending = None;
+                        self.registry.pending_instance = None;
+                    } else if self.stage == WifiPhase::VerifyingDisable {
+                        self.fail(
+                            "unknown",
+                            "disable accepted/unknown but Enable still true; no replay",
+                        );
+                        return true;
+                    } else if !apply {
+                        self.results.insert(self.current.unwrap().to_string(),json!({"state":"drift","reason":"unconfigured WLAN enabled; apply will disable"}));
+                    } else {
+                        self.registry.pending = Some("disabling".into());
+                        self.registry.pending_instance = self.current;
+                        self.queue(
+                            d,
+                            "SetParameterValues",
+                            json!({"parameters":[{"name":name,"value":"0","kind":"boolean"}]}),
+                            WifiPhase::Disabling,
+                        );
+                        return false;
+                    }
+                }
+                WifiPhase::Disabling => {
+                    self.queue(
+                        d,
+                        "GetParameterValues",
+                        json!({"names":[format!("{ROOT}{}.Enable",self.current.unwrap())]}),
+                        WifiPhase::VerifyingDisable,
+                    );
+                    return false;
+                }
+                WifiPhase::Waiting | WifiPhase::Next | WifiPhase::Done => (),
             }
         }
-        self.stage="next".into();
+        self.stage = WifiPhase::Next;
         if !self.prepared {
-            if let Some(n)=self.desired.difference(&self.existing).next().copied() {
-                self.current=Some(n);
-                if !apply { self.results.insert(n.to_string(),json!({"state":"drift","reason":"desired WLAN absent; apply will allocate"})); self.prepared=true; }
-                else if n>8 || self.additions>=8 { self.fail("blocked","cannot allocate requested instance within verified adapter slots 1..8"); return true; }
-                else {
+            if let Some(n) = self.desired.difference(&self.existing).next().copied() {
+                self.current = Some(n);
+                if !apply {
+                    self.results.insert(n.to_string(),json!({"state":"drift","reason":"desired WLAN absent; apply will allocate"}));
+                    self.prepared = true;
+                } else if n > 8 || self.additions >= 8 {
+                    self.fail(
+                        "blocked",
+                        "cannot allocate requested instance within verified adapter slots 1..8",
+                    );
+                    return true;
+                } else {
                     // Only use actual returned slots. Some firmware reuses an existing
                     // slot; verification above blocks that contract instead of looping.
-                    self.additions+=1; self.registry.pending=Some("adding".into()); self.registry.pending_instance=None;
-                    self.queue(d,"AddObject",json!({"object":ROOT}),"adding"); return false;
+                    self.additions += 1;
+                    self.registry.pending = Some("adding".into());
+                    self.registry.pending_instance = None;
+                    self.queue(d, "AddObject", json!({"object":ROOT}), WifiPhase::Adding);
+                    return false;
                 }
-            } else { self.prepared=true; }
-        }
-        if !finish { return true; }
-        if !verified && apply { self.fail("blocked","desired SSIDs must verify before removing other WLANs"); return true; }
-        if self.cleanup {
-            let candidate=self.existing.iter().copied().find(|n|!self.desired.contains(n) && !self.preserve.contains(n) && (self.policy!="preserve" || self.registry.owned.contains(n)) && !self.results.get(&n.to_string()).is_some_and(|r| matches!(r["state"].as_str(),Some("deleted"|"disabled"|"drift"))));
-            if let Some(n)=candidate {
-                self.current=Some(n);
-                if self.policy=="disable" { self.queue(d,"GetParameterValues",json!({"names":[format!("{ROOT}{n}.Enable")]}),"reading_disable"); return false; }
-                if !apply { self.results.insert(n.to_string(),json!({"state":"drift","reason":"unconfigured WLAN present; apply will delete"})); return false; }
-                self.registry.pending=Some("deleting".into()); self.registry.pending_instance=Some(n);
-                self.queue(d,"DeleteObject",json!({"object":format!("{ROOT}{n}.")}),"deleting"); return false;
+            } else {
+                self.prepared = true;
             }
         }
-        self.stage="done".into(); true
+        if !finish {
+            return true;
+        }
+        if !verified && apply {
+            self.fail(
+                "blocked",
+                "desired SSIDs must verify before removing other WLANs",
+            );
+            return true;
+        }
+        if self.cleanup {
+            let candidate = self.existing.iter().copied().find(|n| {
+                !self.desired.contains(n)
+                    && !self.preserve.contains(n)
+                    && (self.policy != "preserve" || self.registry.owned.contains(n))
+                    && !self.results.get(&n.to_string()).is_some_and(|r| {
+                        matches!(r["state"].as_str(), Some("deleted" | "disabled" | "drift"))
+                    })
+            });
+            if let Some(n) = candidate {
+                self.current = Some(n);
+                if self.policy == "disable" {
+                    self.queue(
+                        d,
+                        "GetParameterValues",
+                        json!({"names":[format!("{ROOT}{n}.Enable")]}),
+                        WifiPhase::ReadingDisable,
+                    );
+                    return false;
+                }
+                if !apply {
+                    self.results.insert(n.to_string(),json!({"state":"drift","reason":"unconfigured WLAN present; apply will delete"}));
+                    return false;
+                }
+                self.registry.pending = Some("deleting".into());
+                self.registry.pending_instance = Some(n);
+                self.queue(
+                    d,
+                    "DeleteObject",
+                    json!({"object":format!("{ROOT}{n}.")}),
+                    WifiPhase::Deleting,
+                );
+                return false;
+            }
+        }
+        self.stage = WifiPhase::Done;
+        true
     }
 }
