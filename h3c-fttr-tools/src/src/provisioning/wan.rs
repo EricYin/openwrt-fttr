@@ -446,7 +446,7 @@ impl Reconciler {
                         );
                         return false;
                     };
-                    if observed.contains("TR069")
+                    if super::contains_service_token(observed, "TR069")
                         || (!observed.is_empty() && observed != o.service_list)
                     {
                         self.fail(device,"blocked","owned WAN now carries protected or reassigned service; manual review required");
@@ -1066,7 +1066,7 @@ mod tests {
             ok(json!([{"name":format!("{ROOT}2.WANIPConnection.1.")}])),
             json!({"id":2}),
             ok(
-                json!([{"name":format!("{ROOT}2.WANIPConnection.1.X_HW_SERVICELIST"),"value":"TR069_INTERNET"},{"name":format!("{ROOT}2.WANIPConnection.1.X_HW_VLAN"),"value":"46"}]),
+                json!([{"name":format!("{ROOT}2.WANIPConnection.1.X_HW_SERVICELIST"),"value":"TR069,INTERNET"},{"name":format!("{ROOT}2.WANIPConnection.1.X_HW_VLAN"),"value":"46"}]),
             ),
         ]);
         for _ in 0..3 {
@@ -1081,6 +1081,7 @@ mod tests {
         assert!(protected("INTERNET", false));
         assert!(!protected("INTERNET", true));
         assert!(protected("TR069,INTERNET", true));
+        assert!(!protected("NOTTR069", true));
         assert!(!protected("OTHER", false));
     }
     #[test]

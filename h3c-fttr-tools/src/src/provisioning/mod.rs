@@ -18,5 +18,6 @@ use controller::acs;
 use controller::RPC;
 pub use controller::{control, snapshot, start};
 pub(crate) use controller::{management_desired, management_result, management_version};
+pub(crate) use policy::contains_service_token;
 #[cfg(feature = "acs")]
 pub(crate) use policy::{owns_business_wan, protected_wan_parent};

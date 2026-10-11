@@ -249,14 +249,16 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             op.finish_item("blocked", "service list missing in readback");
             return;
         };
-        if item.service_type != "tr069" && service.contains("TR069") {
+        if item.service_type != "tr069"
+            && crate::provisioning::contains_service_token(service, "TR069")
+        {
             op.finish_item(
                 "blocked",
                 "WAN carries TR069; dedicated business object required",
             );
             return;
         }
-        if service.split(',').any(|s| s.trim() == "INTERNET")
+        if crate::provisioning::contains_service_token(service, "INTERNET")
             && guard.contains(".WANConnectionDevice.")
         {
             let enabled = if op.device.adapter == "hl202" {

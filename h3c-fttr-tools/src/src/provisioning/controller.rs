@@ -902,7 +902,7 @@ mod tests {
         reply["result"]["parameters"]
             .as_array_mut()
             .unwrap()
-            .push(json!({"name":"guard","value":"TR069_INTERNET"}));
+            .push(json!({"name":"guard","value":"TR069,INTERNET"}));
         responses(vec![reply]);
         advance(&mut o, true);
         assert_eq!(o.results["wifi"]["state"], "blocked");

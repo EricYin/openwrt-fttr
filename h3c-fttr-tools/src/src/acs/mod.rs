@@ -186,7 +186,10 @@ fn protect_management(
                 p["name"].as_str().is_some_and(|n| {
                     n.starts_with("InternetGatewayDevice.ManagementServer.")
                         || ((n.ends_with("ServiceList") || n.ends_with("SERVICELIST"))
-                            && p["value"].as_str().unwrap_or("").contains("TR069"))
+                            && crate::provisioning::contains_service_token(
+                                p["value"].as_str().unwrap_or(""),
+                                "TR069",
+                            ))
                 })
             })
     {
@@ -244,7 +247,7 @@ fn protect_management(
                     })
                     .and_then(|p| p["value"].as_str())
             });
-        if observed.is_none_or(|v| v.contains("TR069")) {
+        if observed.is_none_or(|v| crate::provisioning::contains_service_token(v, "TR069")) {
             return Err("WAN write requires a fresh non-TR069 service readback".into());
         }
     }

@@ -3,6 +3,9 @@ use super::model::{ItemKind, ParameterKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
+pub(super) const CUSTOM_VLAN_SERVICE_LIST_ALLOWED: &[&str] =
+    &["INTERNET", "OTHER", "IPTV", "VOIP"];
+
 #[derive(Clone, Default)]
 pub struct Section {
     pub kind: String,
@@ -23,6 +26,36 @@ impl Section {
             .filter(|n| *n <= max)
             .ok_or_else(|| format!("invalid {key}"))
     }
+}
+
+pub(super) fn normalize_service_list(values: &[String]) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    for value in values {
+        for token in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+            let token = token.to_ascii_uppercase();
+            if token == "TR069" {
+                return Err("TR069 service labels are managed by OMCI".into());
+            }
+            if !CUSTOM_VLAN_SERVICE_LIST_ALLOWED.contains(&token.as_str()) {
+                return Err(format!("unsupported service_list token: {token}"));
+            }
+            if !tokens.contains(&token) {
+                tokens.push(token);
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+pub(super) fn normalize_custom_vlan_service_list(values: &[String]) -> Result<Vec<String>, String> {
+    let tokens = normalize_service_list(values)?;
+    if let Some(token) = tokens
+        .iter()
+        .find(|token| !CUSTOM_VLAN_SERVICE_LIST_ALLOWED.contains(&token.as_str()))
+    {
+        return Err(format!("{token} is not allowed on a custom VLAN"));
+    }
+    Ok(tokens)
 }
 
 // UCI export uses shell quoting, including the '\'' sequence inside strings.
@@ -451,19 +484,28 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
                     false,
                 );
             } else {
-                if auto && s.get("service_list").is_empty() {
+                let service_list_values = ds
+                    .options
+                    .get("service_list")
+                    .cloned()
+                    .unwrap_or_default();
+                let service_list = normalize_service_list(&service_list_values)?.join(",");
+                if auto && service_list.is_empty() {
                     return Err(format!(
                         "{id}: automatic WAN requires explicit vendor service_list"
                     ));
                 }
-                if !s.get("service_list").is_empty()
-                    && (s.get("service_list").contains("TR069") != (item.service_type == "tr069"))
-                {
+                if super::contains_service_token(&service_list, "TR069") {
                     return Err(format!(
-                        "{id}: service_list conflicts with management/business role"
+                        "{id}: TR069 service_list is managed by OMCI"
                     ));
                 }
                 let vlan = service.number("vlan", 4094)?;
+                if item.service_type == "internet" && vlan == 0 {
+                    return Err(format!(
+                        "{id}: untagged INTERNET WAN is not managed by ACS automation"
+                    ));
+                }
                 let priority = if service.get("priority").is_empty() {
                     0
                 } else {
@@ -486,7 +528,7 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
                     ParameterKind::Boolean,
                     false,
                 );
-                if !s.get("service_list").is_empty() {
+                if !service_list.is_empty() {
                     add(
                         &mut item,
                         &path,
@@ -495,7 +537,7 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
                         } else {
                             "X_HW_SERVICELIST"
                         },
-                        s.get("service_list"),
+                        &service_list,
                         ParameterKind::String,
                         false,
                     );
@@ -647,6 +689,17 @@ fn add(item: &mut Item, path: &str, suffix: &str, value: &str, kind: ParameterKi
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn service_list_tokens_are_normalized_and_tr069_is_reserved() {
+        assert_eq!(
+            normalize_service_list(&[" iptv,VOIP ".into(), "IPTV".into()]).unwrap(),
+            ["IPTV", "VOIP"]
+        );
+        assert!(normalize_service_list(&["INTERNET, TR069".into()])
+            .unwrap_err()
+            .contains("TR069"));
+        assert!(normalize_custom_vlan_service_list(&["UNKNOWN".into()]).is_err());
+    }
     #[test]
     fn quoted_export() {
         assert_eq!(

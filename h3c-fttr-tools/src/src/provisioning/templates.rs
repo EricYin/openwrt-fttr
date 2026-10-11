@@ -114,7 +114,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
             "group" => &["name", "template"],
             "template" => &["name"],
             "network" => &[
-                "name", "template", "type", "vlan", "priority", "ssid", "port",
+                "name", "template", "service_list", "vlan", "priority", "ssid", "port",
             ],
             "wifi" => &["template", "ssid", "radio", "security", "key"],
             "management" => &["vlan", "priority", "acs_url"],
@@ -140,10 +140,18 @@ pub fn compile(text: &str) -> Result<Config, String> {
             get(&all, s.get("template"), "template")?;
         }
         if s.kind == "network" {
-            if !matches!(s.get("type"), "internet" | "iptv") {
-                return Err(format!("{id}: business type must be internet or iptv"));
+            let configured = s.options.get("service_list").map(Vec::as_slice).unwrap_or(&[]);
+            let labels = config::normalize_custom_vlan_service_list(configured)?;
+            if labels.is_empty() {
+                return Err(format!("{id}: select at least one WAN Service List label"));
             }
-            s.number("vlan", 4094)?;
+            let vlan = s.number("vlan", 4094)?;
+            if labels.iter().any(|label| label == "INTERNET") && vlan == 0 {
+                return Err(format!("{id}: untagged INTERNET WAN is not managed by ACS automation"));
+            }
+            if !labels.is_empty() && vlan == 0 {
+                return Err(format!("{id}: custom VLAN ServiceList requires a non-zero VLAN ID"));
+            }
             if !s.get("priority").is_empty() {
                 s.number("priority", 7)?;
             }
@@ -269,17 +277,27 @@ pub fn compile(text: &str) -> Result<Config, String> {
             .filter(|(_, s)| s.kind == "network" && s.get("template") == template_id)
         {
             let service = format!("{device}__service__{id}");
-            emit(&mut expanded, "service", &service, s);
+            let configured = s.options.get("service_list").cloned().unwrap_or_default();
+            let labels = config::normalize_custom_vlan_service_list(&configured)?;
+            if d.get("adapter") != "hl202" && labels.iter().any(|label| label == "IPTV") {
+                return Err(format!("{device}: HWTC IPTV service contract not verified"));
+            }
+            // Infer internal adapter behavior from the selected vendor labels.
+            let mut service_config = s.clone();
+            if service_config.get("type").is_empty() {
+                service_config.options.insert(
+                    "type".into(),
+                    vec![if labels.iter().any(|label| label == "INTERNET") {
+                        "internet".into()
+                    } else {
+                        "iptv".into()
+                    }],
+                );
+            }
+            emit(&mut expanded, "service", &service, &service_config);
             let name = format!("{device}__network__{id}");
             network_ids.push(name.clone());
-            // These service labels have been read back on the two physical models.
-            let label = if s.get("type") == "internet" {
-                "INTERNET"
-            } else if d.get("adapter") == "hl202" {
-                "OTHER"
-            } else {
-                return Err(format!("{device}: HWTC IPTV service contract not verified"));
-            };
+            let label = labels.join(",");
             emit(
                 &mut expanded,
                 "device_service",
@@ -289,7 +307,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
                     &[
                         ("device", device),
                         ("service", &service),
-                        ("service_list", label),
+                        ("service_list", &label),
                         (
                             "enabled",
                             if s.get("enabled").is_empty() {
@@ -423,7 +441,7 @@ mod tests {
     use super::*;
     #[test]
     fn hl202_internet_bridge_dhcp_and_second_radio_slots_compile_for_binding() {
-        let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'a2'\n option template 't'\n option ssid 'base2'\n option radio '2g'\nconfig wifi 'a5'\n option template 't'\n option ssid 'base5'\n option radio '5g'\nconfig wifi 'b2'\n option template 't'\n option ssid 'TTTT'\n option radio '2g'\nconfig wifi 'b5'\n option template 't'\n option ssid 'YYYY'\n option radio '5g'\nconfig network 'iot'\n option template 't'\n option type 'internet'\n option vlan '66'\n option priority '6'\n list ssid 'b2'\n list ssid 'b5'";
+        let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'a2'\n option template 't'\n option ssid 'base2'\n option radio '2g'\nconfig wifi 'a5'\n option template 't'\n option ssid 'base5'\n option radio '5g'\nconfig wifi 'b2'\n option template 't'\n option ssid 'TTTT'\n option radio '2g'\nconfig wifi 'b5'\n option template 't'\n option ssid 'YYYY'\n option radio '5g'\nconfig network 'iot'\n option template 't'\n option vlan '66'\n list service_list 'INTERNET'\n option priority '6'\n list ssid 'b2'\n list ssid 'b5'";
         let cfg = compile(text).unwrap();
         let items = &cfg.devices[0].items;
         let service = items
@@ -446,6 +464,74 @@ mod tests {
             .unwrap();
         assert!(binding.blocked.is_none());
         assert_eq!(binding.parameters[0].value, "InternetGatewayDevice.LANDevice.1.WLANConfiguration.2,InternetGatewayDevice.LANDevice.1.WLANConfiguration.6");
+    }
+    #[test]
+    fn custom_vlan_service_list_supports_multiple_tokens() {
+        if !cfg!(feature = "device-hl202") {
+            return;
+        }
+        let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig network 'n'\n option template 't'\n option vlan '123'\n list service_list 'iptv,VOIP'\n list service_list 'OTHER'";
+        let cfg = compile(text).unwrap();
+        let item = cfg.devices[0]
+            .items
+            .iter()
+            .find(|item| item.kind == ItemKind::DeviceService)
+            .unwrap();
+        assert!(item.parameters.iter().any(|p| {
+            p.name.ends_with("X_CU_ServiceList") && p.value == "IPTV,VOIP,OTHER"
+        }));
+
+    }
+    #[test]
+    fn service_list_infers_internet_behavior() {
+        if !cfg!(feature = "device-hl202") {
+            return;
+        }
+        let head = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\n";
+        let internet = format!(
+            "{head}config network 'n'\n option template 't'\n option vlan '123'\n list service_list 'INTERNET,IPTV'"
+        );
+        let cfg = compile(&internet).unwrap();
+        let service = cfg.devices[0]
+            .items
+            .iter()
+            .find(|item| item.kind == ItemKind::DeviceService)
+            .unwrap();
+        assert_eq!(service.service_type, "internet");
+        assert!(service.parameters.iter().any(|parameter| {
+            parameter.name.ends_with("X_CU_ServiceList") && parameter.value == "INTERNET,IPTV"
+        }));
+
+        let other = format!(
+            "{head}config network 'n'\n option template 't'\n option vlan '123'\n list service_list 'OTHER,VOIP'"
+        );
+        let cfg = compile(&other).unwrap();
+        let service = cfg.devices[0]
+            .items
+            .iter()
+            .find(|item| item.kind == ItemKind::DeviceService)
+            .unwrap();
+        assert_eq!(service.service_type, "iptv");
+        assert!(!service
+            .parameters
+            .iter()
+            .any(|parameter| parameter.name.ends_with("X_CU_CloudCPEEnable")));
+    }
+    #[test]
+    fn custom_vlan_service_list_rejects_tr069_and_untagged_internet_is_not_managed() {
+        let head = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\n";
+        let tr069 = format!("{head}config network 'n'\n option template 't'\n option vlan '123'\n list service_list 'IPTV,TR069'");
+        assert!(compile(&tr069).err().unwrap().contains("TR069"));
+        let untagged = format!("{head}config network 'n'\n option template 't'\n option vlan '0'\n list service_list 'INTERNET'");
+        assert!(compile(&untagged)
+            .err()
+            .unwrap()
+            .contains("untagged INTERNET"));
+        let missing = format!("{head}config network 'n'\n option template 't'\n option vlan '123'");
+        assert!(compile(&missing)
+            .err()
+            .unwrap()
+            .contains("select at least one WAN Service List label"));
     }
     #[test]
     fn hl202_binding_contract_accepts_verified_wlan_slots_only() {
@@ -484,7 +570,7 @@ mod tests {
     #[test]
     fn rejects_legacy_and_acs_management() {
         assert!(compile("config device_service 'old'").is_err());
-        assert!(compile("config template 't'\nconfig network 'n'\n option template 't'\n option type 'tr069'\n option vlan '46'").is_err());
+        assert!(compile("config template 't'\nconfig network 'n'\n option template 't'\n option type 'tr069'\n option vlan '46'").err().unwrap().contains("unsupported option type"));
     }
     #[test]
     fn enabled_ssid_requires_radio_but_disabled_ssid_does_not_disable_shared_radio() {
@@ -509,7 +595,7 @@ mod tests {
     }
     #[test]
     fn rejects_cross_template_binding() {
-        assert!(compile("config template 'a'\nconfig template 'b'\nconfig wifi 'w'\n option template 'b'\n option ssid 'x'\n option radio '2g'\nconfig network 'n'\n option template 'a'\n option type 'internet'\n option vlan '1'\n list ssid 'w'").is_err());
+        assert!(compile("config template 'a'\nconfig template 'b'\nconfig wifi 'w'\n option template 'b'\n option ssid 'x'\n option radio '2g'\nconfig network 'n'\n option template 'a'\n option vlan '1'\n list service_list 'INTERNET'\n list ssid 'w'").is_err());
     }
     #[test]
     fn creation_order_changes_revision() {
@@ -534,7 +620,7 @@ mod tests {
     }
     #[test]
     fn group_expansion_keeps_creation_order_and_no_public_indices() {
-        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig network 'z'\n option template 't'\n option type 'internet'\n option vlan '100'\nconfig network 'a'\n option template 't'\n option type 'iptv'\n option vlan '43'\nconfig wifi 'w5'\n option template 't'\n option ssid 'five'\n option radio '5g'\nconfig wifi 'w2'\n option template 't'\n option ssid 'two'\n option radio '2g'";
+        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig network 'z'\n option template 't'\n option vlan '100'\n list service_list 'INTERNET'\nconfig network 'a'\n option template 't'\n option vlan '43'\n list service_list 'OTHER'\nconfig wifi 'w5'\n option template 't'\n option ssid 'five'\n option radio '5g'\nconfig wifi 'w2'\n option template 't'\n option ssid 'two'\n option radio '2g'";
         let cfg = compile(text).unwrap();
         let d = &cfg.devices[0];
         assert_eq!(
@@ -555,6 +641,6 @@ mod tests {
     }
     #[test]
     fn one_endpoint_cannot_belong_to_two_networks() {
-        assert!(compile("config template 't'\nconfig network 'a'\n option template 't'\n option type 'internet'\n option vlan '1'\n list port 'lan1'\nconfig network 'b'\n option template 't'\n option type 'iptv'\n option vlan '2'\n list port 'lan1'").is_err());
+        assert!(compile("config template 't'\nconfig network 'a'\n option template 't'\n option vlan '1'\n list service_list 'INTERNET'\n list port 'lan1'\nconfig network 'b'\n option template 't'\n option vlan '2'\n list service_list 'IPTV'\n list port 'lan1'").is_err());
     }
 }
