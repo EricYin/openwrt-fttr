@@ -24,6 +24,10 @@ enum Phase {
     ManualRequired,
     NotConfigured,
     WaitingAcs,
+    AwaitingApply,
+    DiscoveringManagementWan,
+    ConfiguringManagementWan,
+    VerifyingManagementWan,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -32,6 +36,7 @@ struct Record {
     optical_sn: String,
     cwmp_id: String,
     mqtt_target: Option<String>,
+    binding_source: String,
     method: String,
     desired_version: String,
     generation: u64,
@@ -42,8 +47,10 @@ struct Record {
     updated_at: u64,
     settings_verified_at: Option<u64>,
     last_inform: Option<u64>,
+    expected_acs_url:String,
     last_error: Option<String>,
     transport_epoch: u64,
+    completed_authorization: u64,
     #[serde(skip)]
     worker: Option<u64>,
     #[serde(skip)]
@@ -68,6 +75,8 @@ struct Transport {
 struct Coordinator {
     records: BTreeMap<String, Record>,
     transport: BTreeMap<String, Transport>,
+    links: BTreeMap<String, String>,
+    link_error: Option<String>,
     saved: Vec<u8>,
     persistence_error: Option<String>,
 }
@@ -117,6 +126,20 @@ pub(crate) fn observe_mqtt(topic: &str, time: u64) {
             t.epoch = t.epoch.saturating_add(1);
         }
         t.last_seen = time;
+    }
+}
+
+pub(super) fn observe_onu_links(result: Result<BTreeMap<String, String>, String>) {
+    let mut c = coordinator().lock().unwrap();
+    match result {
+        Ok(links) => {
+            c.links = links;
+            c.link_error = None;
+        }
+        Err(e) => {
+            c.links.clear();
+            c.link_error = Some(e);
+        }
     }
 }
 
@@ -194,13 +217,13 @@ impl Record {
 pub(super) struct Observation<'a> {
     pub device: &'a Device,
     pub management: Option<&'a Management>,
-    pub target: Option<&'a str>,
     pub last_inform: Option<u64>,
     pub online: bool,
     pub new_boot: bool,
     pub freshness: u64,
     pub time: u64,
     pub acs_available: bool,
+    pub authorization: Option<(u64, bool)>,
 }
 
 struct Job {
@@ -209,6 +232,9 @@ struct Job {
     target: String,
     url: String,
     persist_matching: bool,
+    vlan: u32,
+    priority: u32,
+    authorization_epoch:u64,
 }
 
 pub(super) fn retain_devices(ids: &std::collections::BTreeSet<String>) {
@@ -244,24 +270,53 @@ pub(super) fn tick(observation: Observation<'_>) {
                 job.target,
                 job.url,
                 job.persist_matching,
+                job.vlan,
+                job.priority,
+                job.authorization_epoch,
             )
         });
     }
 }
 
 impl Coordinator {
+    fn automatic_target(&self, sn: &str, time: u64) -> Result<Option<String>, &'static str> {
+        let candidates: Vec<_> = self
+            .transport
+            .iter()
+            .filter(|(mac, t)| {
+                t.last_seen <= time
+                    && time.saturating_sub(t.last_seen) <= TRANSPORT_FRESHNESS
+                    && self.links.get(*mac).is_some_and(|linked| linked == sn)
+            })
+            .map(|(mac, _)| mac.clone())
+            .collect();
+        match candidates.as_slice() {
+            [] => Ok(None),
+            [mac] => Ok(Some(mac.clone())),
+            _ => Err("multiple fresh MQTT targets originate from this ONU; automatic identity is ambiguous"),
+        }
+    }
+
     fn schedule(&mut self, observation: Observation<'_>) -> Option<Job> {
         let Observation {
             device,
             management,
-            target,
             last_inform: at,
             online,
             new_boot,
             freshness,
             time,
             acs_available,
+            authorization,
         } = observation;
+        let automatic = self.automatic_target(&device.optical_sn, time);
+        let automatic_target = automatic.as_ref().ok().and_then(|t| t.as_deref());
+        let binding_source = if automatic_target.is_some() {
+            "onu_link"
+        } else {
+            "unresolved"
+        };
+        let target = automatic_target;
         let transport = target
             .and_then(|t| self.transport.get(t))
             .map(|t| (t.last_seen, t.epoch));
@@ -271,7 +326,7 @@ impl Coordinator {
             r.initial_inform = Some(at);
         }
         r.last_observed_time = time;
-        let desired = version(device, management, target);
+        let desired = format!("{}-{}",version(device, management, target),authorization.map(|(epoch,_)|epoch).unwrap_or_default());
         let initialized = !r.desired_version.is_empty();
         if r.initial_inform.is_none() {
             r.initial_inform = Some(at);
@@ -287,6 +342,7 @@ impl Coordinator {
         r.optical_sn = device.optical_sn.clone();
         r.cwmp_id = device.cwmp_id.clone();
         r.mqtt_target = target.map(str::to_owned);
+        r.binding_source = binding_source.into();
         r.method = if device.adapter == "hl202" && cfg!(feature = "device-hl202") {
             "mqtt"
         } else {
@@ -315,7 +371,16 @@ impl Coordinator {
             );
         }
         r.last_inform = at;
-        let fresh = acs_available && r.fresh_inform(at, time, freshness, online);
+        r.expected_acs_url=management.map(|m|m.acs_url.clone()).unwrap_or_default();
+        // A recent Inform proves reachability, but does not prove that the
+        // currently authorized ACS credentials have been written to the CPE.
+        // Require a post-readback Inform before declaring the bootstrap ready.
+        let settings_verified = device.adapter != "hl202"
+            || !cfg!(feature = "device-hl202")
+            || r.settings_verified_at.is_some_and(|verified| at.is_some_and(|at| at >= verified));
+        let fresh = acs_available
+            && settings_verified
+            && r.fresh_inform(at, time, freshness, online);
         if r.state == Phase::Ready && !fresh {
             r.invalidate(
                 time,
@@ -323,6 +388,7 @@ impl Coordinator {
             );
         }
         if fresh {
+            if let Some((epoch, _))=authorization {r.completed_authorization=epoch;}
             r.set_phase(
                 Phase::Ready,
                 time,
@@ -344,10 +410,12 @@ impl Coordinator {
                 time,
                 "local ACS is disabled, unavailable or has a listener error",
             );
+        } else if authorization.is_none_or(|(epoch,automatic)|!automatic && (epoch==0 || epoch==r.completed_authorization)) {
+            r.set_phase(Phase::AwaitingApply,time,"management drift or reset detected; apply management configuration to authorize recovery");
         } else if device.adapter != "hl202" || !cfg!(feature = "device-hl202") {
             r.set_phase(Phase::ManualRequired, time, "automatic ACS bootstrap is unavailable for this adapter; follow the current management settings");
         } else if target.is_none() {
-            r.set_phase(Phase::WaitingIdentity, time, "associate this device with its actual MQTT/br0 MAC using mqtt_mac; optical SN is not a command target");
+            r.set_phase(Phase::WaitingIdentity, time, automatic.err().unwrap_or("waiting for a unique fresh MQTT source MAC learned on this device's online ONU interface"));
         } else if !online
             || transport.is_none_or(|(seen, _)| {
                 seen > time || time.saturating_sub(seen) > TRANSPORT_FRESHNESS
@@ -373,6 +441,9 @@ impl Coordinator {
                     target: target.to_owned(),
                     url: management.acs_url.clone(),
                     persist_matching: r.settings_verified_at.is_none() || r.last_error.is_some(),
+                    vlan: management.vlan,
+                    priority: management.priority,
+                    authorization_epoch:authorization.map(|(epoch,_)|epoch).unwrap_or_default(),
                 });
             }
             if r.state != Phase::WaitingInform {
@@ -412,7 +483,7 @@ fn progress(id: &str, generation: u64, state: Phase, reason: &str) -> bool {
     if r.generation != generation || r.worker != Some(generation) || r.state == Phase::Ready {
         return false;
     }
-    if state == Phase::Configuring {
+    if matches!(state,Phase::Configuring|Phase::ConfiguringManagementWan) {
         r.settings_verified_at = None;
     }
     r.set_phase(state, now(), reason);
@@ -420,9 +491,16 @@ fn progress(id: &str, generation: u64, state: Phase, reason: &str) -> bool {
     true
 }
 
-fn run(id: String, generation: u64, target: String, url: String, persist_matching: bool) {
+fn run(id: String, generation: u64, target: String, url: String, persist_matching: bool, vlan: u32, priority: u32, authorization_epoch:u64) {
     let result = (|| {
-        let matched = crate::devices::read_mqtt_cwmp_settings(&target, &url)?;
+        let credentials=super::management_network::credentials(authorization_epoch).ok_or("management authorization changed before execution")?;
+        if !progress(&id, generation, Phase::DiscoveringManagementWan, "discovering the dedicated TR069 management WAN") { return Ok(false); }
+        crate::devices::ensure_mqtt_management_wan(&target, vlan, priority,persist_matching,|stage|super::management_network::credentials(authorization_epoch).is_some()&&match stage {
+            crate::devices::ManagementWanStage::Configuring=>progress(&id,generation,Phase::ConfiguringManagementWan,"conditionally configuring and persisting the dedicated TR069 WAN"),
+            crate::devices::ManagementWanStage::Verifying=>progress(&id,generation,Phase::VerifyingManagementWan,"reading back management VLAN, routing, DHCP and unbound interfaces"),
+        })?;
+        if !progress(&id,generation,Phase::Reading,"reading CWMP configuration after management WAN verification") {return Ok(false);}
+        let matched = crate::devices::read_authenticated_cwmp_settings(&target, &url,&credentials)?;
         if !matched || persist_matching {
             if !progress(
                 &id,
@@ -432,7 +510,8 @@ fn run(id: String, generation: u64, target: String, url: String, persist_matchin
             ) {
                 return Ok(false);
             }
-            crate::devices::on_mqtt_connected(&target, Some(&url))?;
+            if super::management_network::credentials(authorization_epoch).is_none() {return Ok(false);}
+            crate::devices::configure_authenticated_cwmp_settings(&target, &url,&credentials)?;
         }
         if !progress(
             &id,
@@ -442,7 +521,7 @@ fn run(id: String, generation: u64, target: String, url: String, persist_matchin
         ) {
             return Ok(false);
         }
-        if !crate::devices::read_mqtt_cwmp_settings(&target, &url)? {
+        if !crate::devices::read_authenticated_cwmp_settings(&target, &url,&credentials)? {
             return Err("CWMP settings do not match after configuration".into());
         }
         Ok(true)
@@ -475,6 +554,8 @@ pub(super) fn is_ready(id: &str) -> bool {
         .get(id)
         .is_some_and(|r| r.state == Phase::Ready)
 }
+pub(super) fn is_ready_for_management(id:&str,sn:&str,url:&str,epoch:u64)->bool {coordinator().lock().unwrap().records.get(id).is_some_and(|r|r.state==Phase::Ready&&r.optical_sn==sn&&r.expected_acs_url==url&&r.completed_authorization==epoch)}
+pub(super) fn omci_write_allowed(id:&str,epoch:u64,automatic:bool)->bool {let c=coordinator().lock().unwrap();c.records.get(id).is_none_or(|r|r.state!=Phase::Ready&&(automatic||(epoch!=0&&r.completed_authorization!=epoch)))}
 
 pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Value {
     let c = coordinator().lock().unwrap();
@@ -484,6 +565,7 @@ pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Va
     let mut view = serde_json::to_value(r).unwrap_or_default();
     view["inflight"] = json!(r.worker.is_some());
     view["persistence_error"] = json!(c.persistence_error);
+    view["link_identity_error"] = json!(c.link_error);
     view["listener"] = json!({"enabled":acs["enabled"],"listen":acs["listen"],"path":acs["path"],"error":acs["error"]});
     view["mqtt_last_seen"] = json!(r
         .mqtt_target
@@ -530,28 +612,107 @@ mod tests {
         c: &mut Coordinator,
         d: &Device,
         m: &Management,
-        target: Option<&str>,
+        learned_target: Option<&str>,
         time: u64,
         at: Option<u64>,
     ) -> Option<Job> {
+        if let Some(mac) = learned_target {
+            c.links.insert(mac.into(), d.optical_sn.clone());
+        }
         c.schedule(Observation {
             device: d,
             management: Some(m),
-            target,
             last_inform: at,
             online: true,
             new_boot: false,
             freshness: 180,
             time,
             acs_available: true,
+            authorization: Some((1,true)),
         })
     }
+    #[cfg(feature = "device-hl202")]
+    #[test]
+    fn manual_authorization_is_consumed_by_fresh_inform_and_reset_needs_a_new_grant() {
+        let mut c=Coordinator::default();let d=device("manual","hl202");let m=Management{vlan:46,priority:0,acs_url:"http://192.0.2.1:7547/cwmp".into()};let mac="02AABBCCDDEE";
+        c.links.insert(mac.into(),d.optical_sn.clone());c.transport.insert(mac.into(),Transport{last_seen:100,epoch:1});
+        let observe=|c:&mut Coordinator,time,at,new_boot,epoch|c.schedule(Observation{device:&d,management:Some(&m),last_inform:at,online:true,new_boot,freshness:180,time,acs_available:true,authorization:Some((epoch,false))});
+        let first=observe(&mut c,100,None,false,1).unwrap();c.records.get_mut(&d.id).unwrap().finish(first.generation,Ok(true),101);assert!(observe(&mut c,103,Some(102),false,1).is_none());assert_eq!(c.records[&d.id].state,Phase::Ready);
+        assert!(observe(&mut c,104,None,true,1).is_none());assert_eq!(c.records[&d.id].state,Phase::AwaitingApply);
+        let next=observe(&mut c,105,None,false,2).unwrap();assert_eq!(next.authorization_epoch,2);assert_ne!(next.generation,first.generation);
+    }
+    #[cfg(feature = "device-hl202")]
+    #[test]
+    fn existing_inform_does_not_skip_mqtt_settings_readback_and_post_write_inform_is_required() {
+        let mut c=Coordinator::default();let d=device("manual","hl202");let m=Management{vlan:46,priority:0,acs_url:"http://192.0.2.1:7547/cwmp".into()};let mac="02AABBCCDDEE";
+        c.links.insert(mac.into(),d.optical_sn.clone());c.transport.insert(mac.into(),Transport{last_seen:100,epoch:1});
+        c.records.insert(d.id.clone(),Record{desired_version:format!("{}-1",version(&d,Some(&m),Some(mac))),optical_sn:d.optical_sn.clone(),initial_inform:Some(Some(90)),..Default::default()});
+        let first=schedule(&mut c,&d,&m,Some(mac),100,Some(95)).expect("fresh existing Inform must not skip credential readback");
+        c.records.get_mut(&d.id).unwrap().finish(first.generation,Ok(true),101);
+        assert!(schedule(&mut c,&d,&m,Some(mac),102,Some(95)).is_none());
+        assert_ne!(c.records[&d.id].state,Phase::Ready,"an Inform predating settings verification cannot confirm the new credentials");
+        assert!(schedule(&mut c,&d,&m,Some(mac),103,Some(102)).is_none());
+        assert_eq!(c.records[&d.id].state,Phase::Ready,"a subsequent Inform confirms the verified settings");
+    }
+    #[cfg(feature = "device-hl202")]
+    #[test]
+    fn onu_link_binds_only_unique_fresh_mqtt_source_and_invalidates_reassigned_link() {
+        let mut c = Coordinator::default();
+        let d = device("automatic", "hl202");
+        let m = Management {
+            vlan: 46,
+            priority: 0,
+            acs_url: "http://192.0.2.1/cwmp".into(),
+        };
+        let mac = "02AABBCCDDEE";
+        c.transport.insert(
+            mac.into(),
+            Transport {
+                last_seen: 100,
+                epoch: 1,
+            },
+        );
+        assert!(schedule(&mut c, &d, &m, None, 100, None).is_none());
+        assert_eq!(c.records[&d.id].state, Phase::WaitingIdentity);
+        c.links.insert(mac.into(), d.optical_sn.clone());
+        let job = schedule(&mut c, &d, &m, None, 101, None).unwrap();
+        assert_eq!(job.target, mac);
+        assert_eq!(c.records[&d.id].binding_source, "onu_link");
+        c.links.insert(mac.into(), "OTHER12345678".into());
+        assert!(schedule(&mut c, &d, &m, None, 102, None).is_none());
+        assert_ne!(c.records[&d.id].generation, job.generation);
+        c.records
+            .get_mut(&d.id)
+            .unwrap()
+            .finish(job.generation, Ok(true), 103);
+        assert!(c.records[&d.id].settings_verified_at.is_none());
+        schedule(&mut c, &d, &m, None, 104, None);
+        assert_eq!(c.records[&d.id].state, Phase::WaitingIdentity);
+        c.links.insert(mac.into(), d.optical_sn.clone());
+        c.links.insert("02AABBCCDDFF".into(), d.optical_sn.clone());
+        c.transport.insert(
+            "02AABBCCDDFF".into(),
+            Transport {
+                last_seen: 104,
+                epoch: 1,
+            },
+        );
+        assert!(schedule(&mut c, &d, &m, None, 105, None).is_none());
+        assert!(c.records[&d.id].reason.contains("ambiguous"));
+        c.transport.get_mut(mac).unwrap().last_seen = 170;
+        assert_eq!(
+            c.automatic_target(&d.optical_sn, 170).unwrap(),
+            Some(mac.into())
+        );
+    }
+
     #[cfg(feature = "device-hl202")]
     #[test]
     fn continuously_online_device_retries_without_overlapping_or_blocking_other_devices() {
         let mut c = Coordinator::default();
         let d = device("first", "hl202");
-        let other = device("second", "hl202");
+        let mut other = device("second", "hl202");
+        other.optical_sn = "H3CT87654321".into();
         let m = Management {
             vlan: 46,
             priority: 7,

@@ -123,14 +123,14 @@ pub struct Config {
     pub interval: u64,
     pub freshness: u64,
     pub devices: Vec<Device>,
-    pub mqtt_targets: BTreeMap<String, String>,
     pub assignments: BTreeMap<String, (String, String)>,
     pub groups: BTreeMap<String, String>,
     pub management: Option<Management>,
+    pub management_network: Option<super::management_network::Desired>,
     pub labels: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Management {
     pub vlan: u32,
     pub priority: u32,

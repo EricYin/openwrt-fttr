@@ -53,32 +53,87 @@ struct ChannelLease { id: u8, previous: u16 }
 impl Drop for ChannelLease {
     fn drop(&mut self) { let _ = crate::bosa::exchange_omci_channel(self.id, self.previous); }
 }
+pub(super) struct MibRequest {
+    pub summary: bool,
+    pub deadline: std::time::Instant,
+    pub reply: std::sync::mpsc::Sender<io::Result<String>>,
+}
+
 pub fn read(id: u8, summary: bool) -> io::Result<()> {
-    let _lock = crate::pon_engine::omci_transport::lock_onu(id)?;
+    if !(1..=15).contains(&id) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "ONU_ID must be 1..15"));
+    }
+    let response = crate::ipc::send_ipc_command(&format!("MIB {id} {summary}"))?;
+    if response.trim().is_empty() {
+        return Err(io::Error::other("MIB IPC is unsupported by this daemon; update fttrd together with fttrctl"));
+    }
+    let response: serde_json::Value = serde_json::from_str(&response).map_err(io::Error::other)?;
+    if let Some(error) = response["error"].as_str() {
+        return Err(io::Error::other(error.to_string()));
+    }
+    let output = response["output"].as_str().ok_or_else(|| io::Error::other("invalid MIB IPC response; update fttrd together with fttrctl"))?;
+    print!("{output}");
+    Ok(())
+}
+
+/// Run under the caller's ONU lock and existing OMCC/channel leases.
+pub(super) fn read_owned(id: u8, summary: bool, cancellation: Option<Arc<AtomicBool>>, deadline: std::time::Instant) -> io::Result<String> {
+    use std::fmt::Write;
     if !crate::pon_engine::omci_transport::operation_confirmed(id) {
         return Err(io::Error::new(io::ErrorKind::NotConnected, "read-only MIB requires a currently registered ONU"));
     }
     let mut session = OmciSession::open(id)?;
     session.require_operation();
-    let _lease = StockOmccLease::open(id)?;
-    let _channel = ChannelLease { id, previous: crate::bosa::exchange_omci_channel(id, 0)? };
+    session.finish_before(deadline);
+    if let Some(token) = cancellation { session.cancel_when(token); }
+    let mut output = String::new();
     for (class, mask, label) in [(256,0x8000,"vendor"),(256,0x2000,"serial"),(257,0x8000,"equipment"),(257,0x4000,"OMCC version")] {
         match session.get(class,0,mask) {
-            Ok(frame) => println!("IDENTITY {label} data={:02X?}",&frame.payload[3..]),
-            Err(e) => eprintln!("IDENTITY {label} unavailable: {e}"),
+            Ok(frame) => writeln!(output, "IDENTITY {label} data={:02X?}",&frame.payload[3..]).unwrap(),
+            Err(e) => writeln!(output, "IDENTITY {label} unavailable: {e}").unwrap(),
         }
     }
     let records = session.upload_mib()?;
     if summary {
         let mut classes = std::collections::BTreeMap::new();
         for record in &records { *classes.entry(record.class).or_insert(0usize) += 1; }
-        for (class, count) in classes { println!("MIB_CLASS class={class} records={count}"); }
+        for (class, count) in classes { writeln!(output, "MIB_CLASS class={class} records={count}").unwrap(); }
         for record in &records {
             if [7,11,45,47,84,130,131,171,256,257,262,266,268,272,277,329,65530].contains(&record.class) {
-                println!("MIB_ENTITY class={} instance={:04x} mask={:04x} data={:02X?}",record.class,record.instance,record.mask,record.data);
+                writeln!(output, "MIB_ENTITY class={} instance={:04x} mask={:04x} data={:02X?}",record.class,record.instance,record.mask,record.data).unwrap();
             }
         }
-    } else { println!("MIB_JSON {}",serde_json::to_string(&records).map_err(io::Error::other)?); }
-    println!("RESULT MIB complete=true records={}; no OMCI ME configuration was written",records.len());
-    Ok(())
+    } else { writeln!(output, "MIB_JSON {}",serde_json::to_string(&records).map_err(io::Error::other)?).unwrap(); }
+    writeln!(output, "RESULT MIB complete=true records={}; no OMCI ME configuration was written",records.len()).unwrap();
+    Ok(output)
+}
+
+pub(super) fn control(id: u8, summary: bool, states: &super::service::States) -> io::Result<String> {
+    if !(1..=15).contains(&id) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "ONU_ID must be 1..15"));
+    }
+    if !crate::pon_engine::omci_transport::operation_confirmed(id) {
+        return Err(io::Error::new(io::ErrorKind::NotConnected, "read-only MIB requires a currently registered ONU"));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    match crate::pon_engine::omci_transport::lock_onu(id) {
+        Ok(_lock) => {
+            if !crate::pon_engine::omci_transport::operation_confirmed(id) {
+                return Err(io::Error::new(io::ErrorKind::NotConnected, "read-only MIB requires a currently registered ONU"));
+            }
+            let _lease = StockOmccLease::open(id)?;
+            let _channel = ChannelLease { id, previous: crate::bosa::exchange_omci_channel(id, 0)? };
+            read_owned(id, summary, None, deadline)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            let sender = states.lock().unwrap().get(&id).and_then(|state| state.mib.clone())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "ONU OMCI busy; no active monitor available"))?;
+            let (reply, receive) = std::sync::mpsc::channel();
+            sender.try_send(MibRequest { summary, deadline, reply })
+                .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "ONU MIB queue busy or worker stopped; retry shortly"))?;
+            receive.recv_timeout(std::time::Duration::from_secs(125))
+                .map_err(|error| io::Error::other(format!("MIB worker unavailable: {error}")))?
+        }
+        Err(error) => Err(error),
+    }
 }

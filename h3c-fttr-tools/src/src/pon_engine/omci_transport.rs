@@ -109,7 +109,7 @@ extern "C" {
     fn if_nametoindex(name: *const std::ffi::c_char) -> u32;
     fn close(fd: i32) -> i32;
 }
-pub struct OmciSession { fd: i32, id: u8, next_tci: u16, require_operation: bool, cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> }
+pub struct OmciSession { fd: i32, id: u8, next_tci: u16, require_operation: bool, cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, deadline: Option<Instant> }
 impl OmciSession {
     pub fn open(id: u8) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
@@ -120,7 +120,7 @@ impl OmciSession {
             let fd = unsafe { socket(17, 3, 3u16.to_be() as i32) };
             if fd < 0 { return Err(io::Error::last_os_error()); }
             let next_tci = ((SystemTime::now().duration_since(UNIX_EPOCH).map_err(io::Error::other)?.as_millis() as u16) & 0x7fff).max(1);
-            let session = Self { fd, id, next_tci, require_operation: false, cancellation: None };
+            let session = Self { fd, id, next_tci, require_operation: false, cancellation: None, deadline: None };
             let address = Address { family: 17, protocol: 3u16.to_be(), index: index as i32, hatype: 0, kind: 0, length: 0, bytes: [0;8] };
             if unsafe { bind(fd, &address, std::mem::size_of::<Address>() as u32) } < 0 { return Err(io::Error::last_os_error()); }
             Ok(session)
@@ -130,7 +130,11 @@ impl OmciSession {
     }
     pub fn require_operation(&mut self) { self.require_operation = true; }
     pub fn cancel_when(&mut self, token: std::sync::Arc<std::sync::atomic::AtomicBool>) { self.cancellation = Some(token); }
+    pub fn finish_before(&mut self, deadline: Instant) { self.deadline = Some(deadline); }
     fn check_active(&self) -> io::Result<()> {
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "OMCI diagnostic deadline exceeded"));
+        }
         if self.cancellation.as_ref().is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire))
             || (self.require_operation && !operation_confirmed(self.id)) {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "ONU registration generation no longer active"));
@@ -249,6 +253,18 @@ pub struct MibRecord { pub sequence: u16, pub class: u16, pub instance: u16, pub
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_deadline_and_registration_cancellation_stop_transactions() {
+        let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut session = OmciSession { fd: -1, id: 1, next_tci: 1, require_operation: false,
+            cancellation: Some(token.clone()), deadline: None };
+        assert!(session.check_active().is_ok());
+        session.finish_before(Instant::now() - Duration::from_secs(1));
+        assert_eq!(session.check_active().unwrap_err().kind(), io::ErrorKind::TimedOut);
+        session.finish_before(Instant::now() + Duration::from_secs(120));
+        token.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(session.check_active().unwrap_err().kind(), io::ErrorKind::NotConnected);
+    }
     #[test]
     fn disabling_one_slot_preserves_other_live_slots() {
         let both = enable_bit(enable_bit(0x80000000, 1, true), 2, true);

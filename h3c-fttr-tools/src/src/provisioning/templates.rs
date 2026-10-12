@@ -86,21 +86,12 @@ pub fn compile(text: &str) -> Result<Config, String> {
         }
     }
     if all.iter().filter(|(_, s)| s.kind == "management").count() > 1 {
-        return Err("only one OMCI management network allowed".into());
-    }
-    for (_, s) in all.iter().filter(|(_, s)| s.kind == "management") {
-        s.number("vlan", 4094)?;
-        if !s.get("priority").is_empty() {
-            s.number("priority", 7)?;
-        }
-        if !s.get("acs_url").starts_with("http://") {
-            return Err("OMCI ACS URL must use HTTP".into());
-        }
+        return Err("only one management network allowed".into());
     }
     // Validate every template, including ones not assigned to a group yet.
     for (id, s) in &all {
         let allowed: &[&str] = match s.kind.as_str() {
-            "device" => &["name", "optical_sn", "adapter", "group", "wifi_cleanup", "mqtt_mac"],
+            "device" => &["name", "optical_sn", "adapter", "group", "wifi_cleanup"],
             "group" => &["name", "template"],
             "template" => &["name"],
             "network" => &[
@@ -113,11 +104,10 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 "port",
             ],
             "wifi" => &["template", "ssid", "radio", "security", "key"],
-            "management" => &["vlan", "priority", "acs_url"],
+            "management" => &["enabled", "mode", "vlan", "priority", "address", "dhcp_enabled", "dhcp_start", "dhcp_limit", "dhcp_leasetime"],
             "provisioning" => &["enabled", "mode", "trigger", "interval", "freshness"],
             "acs" => &[
                 "enabled",
-                "listen",
                 "port",
                 "path",
                 "state_file",
@@ -354,15 +344,14 @@ pub fn compile(text: &str) -> Result<Config, String> {
     }
     let mut cfg = config::parse_expanded(&expanded)?;
     if let Some((_, s)) = all.iter().find(|(_, s)| s.kind == "management") {
-        cfg.management = Some(config::Management {
-            vlan: s.number("vlan", 4094)?,
-            priority: if s.get("priority").is_empty() {
-                0
-            } else {
-                s.number("priority", 7)?
-            },
-            acs_url: s.get("acs_url").into(),
-        });
+            let acs = all.iter().find(|(_, s)| s.kind == "acs").map(|(_, s)| s);
+            let mut desired = super::management_network::Desired::parse(s, acs)?;
+            desired.devices = cfg.devices.iter().map(|d|(d.id.clone(),d.optical_sn.clone())).collect();
+            if all.iter().any(|(_, n)| n.kind == "network" && n.get("vlan").parse::<u32>().ok() == Some(desired.management.vlan)) {
+                return Err("management VLAN conflicts with a business VLAN".into());
+            }
+            cfg.management = Some(desired.management.clone());
+            cfg.management_network = Some(desired);
     }
     cfg.groups = all
         .iter()

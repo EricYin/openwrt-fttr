@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::io;
 use std::time::{Duration, Instant};
 pub fn run(command: &str, args: &[String]) -> io::Result<i32> {
-    let usage="fttrctl config check|reload\nfttrctl sync plan|apply [DEVICE|all] [--item SECTION] [--wait SECONDS] [--management]\nfttrctl sync status|operation ID";
+    let usage="fttrctl config check|reload\nfttrctl sync plan|apply [DEVICE|all] [--item SECTION] [--wait SECONDS] [--management]\nfttrctl sync reset_state DEVICE\nfttrctl sync management_plan|management_apply\nfttrctl sync status|operation ID";
     let mut values=Vec::new(); let mut wait=0u64; let mut management=false; let mut item=None; let mut i=0;
     while i < args.len() {
         match args[i].as_str() {
@@ -18,6 +18,8 @@ pub fn run(command: &str, args: &[String]) -> io::Result<i32> {
     let request=match (command,op,values.len()) {
         ("config","check" | "reload",1) | ("sync","status",1) => json!({"op":op}),
         ("sync","plan" | "apply",1..=2) => json!({"op":op,"target":values.get(1).map(String::as_str).unwrap_or("all"),"management":management,"item":item}),
+        ("sync","reset_state",2) if !management && item.is_none() && wait==0 => json!({"op":op,"target":values[1]}),
+        ("sync","management_plan" | "management_apply",1..=2) if !management && item.is_none() && wait==0 => json!({"op":op}),
         ("sync","operation",2) => json!({"op":op,"id":values[1].parse::<u64>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput,"invalid operation ID"))?}),
         _ => return Err(io::Error::new(io::ErrorKind::InvalidInput,usage)),
     };

@@ -1,3 +1,4 @@
 /etc/config/fttr
 /etc/fttr/wan-owned/
 /etc/fttr/wifi-owned/
+/etc/fttr/management-applied.json

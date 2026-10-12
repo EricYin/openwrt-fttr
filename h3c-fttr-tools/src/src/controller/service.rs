@@ -8,6 +8,7 @@ pub(super) struct State {
     pub error: Option<String>,
     pub identity: Option<crate::model::OnuIdentity>,
     pub identity_at: Option<std::time::Instant>,
+    pub mib: Option<std::sync::mpsc::SyncSender<super::inventory::MibRequest>>,
 }
 pub(super) type States = Arc<Mutex<BTreeMap<u8, State>>>;
 pub(super) struct Services { pub states: States, tokens: BTreeMap<u8, Arc<AtomicBool>> }
@@ -20,7 +21,8 @@ impl Services {
     pub fn start(&mut self, id: u8, vendor: String) {
         self.stop(id);
         let generation = self.states.lock().unwrap().get(&id).map_or(1, |state| state.generation + 1);
-        self.states.lock().unwrap().insert(id, State { generation, phase: "Collecting identity".into(), ..State::default() });
+        let (mib, requests) = std::sync::mpsc::sync_channel(1);
+        self.states.lock().unwrap().insert(id, State { generation, phase: "Collecting identity".into(), mib: Some(mib), ..State::default() });
         let token = Arc::new(AtomicBool::new(false));
         self.tokens.insert(id, token.clone());
         let states = self.states.clone();
@@ -68,7 +70,7 @@ impl Services {
                         let phase = adapter.verification_status();
                         println!("[+] ONU {id} generation={generation}: OMCI profile readback complete; {phase}; starting evidence monitor");
                         set(phase, None);
-                        super::health::watch(id, token.clone(), vendor.as_bytes().try_into().map_err(|_| std::io::Error::other("invalid vendor ID"))?)
+                        super::health::watch(id, token.clone(), vendor.as_bytes().try_into().map_err(|_| std::io::Error::other("invalid vendor ID"))?, &requests)
                     });
                 if token.load(Ordering::Acquire) { break; }
                 if let Err(error) = result {

@@ -17,7 +17,7 @@ define Package/h3c-fttr-tools
   CATEGORY:=Network
   SUBMENU:=PON
   TITLE:=H3C HM2004-DU FTTR Micro-OLT utilities and controller daemon
-  DEPENDS:=$(RUST_ARCH_DEPENDS) +kmod-h3c-fmcs +mosquitto-client +mosquitto-ssl
+  DEPENDS:=$(RUST_ARCH_DEPENDS) +kmod-h3c-fmcs +mosquitto-client +mosquitto-ssl +uci +ubus +firewall4 +dnsmasq
 endef
 
 define Package/h3c-fttr-tools/description

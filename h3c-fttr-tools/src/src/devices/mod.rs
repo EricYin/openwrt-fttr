@@ -13,48 +13,23 @@ pub enum Adapter {
     Unavailable,
 }
 
-/// A generic event emitted when a sub-device first appears on MQTT or reconnects.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MqttConnectedEvent {
-    pub device_id: String,
-    pub acs_url: Option<String>,
-}
-
-/// Optional device-specific work performed after its MQTT connection is observed.
-pub trait MqttLifecycleAdapter {
-    fn matches_mqtt_device(&self, device_id: &str) -> bool;
-    fn on_mqtt_connected(&self, event: &MqttConnectedEvent) -> Result<(), String>;
-}
-
-/// Dispatch a generic MQTT lifecycle event to the compiled device adapters.
-pub fn on_mqtt_connected(device_id: &str, acs_url: Option<&str>) -> Result<(), String> {
+#[derive(Clone,Copy)]
+pub enum ManagementWanStage {Configuring,Verifying}
+pub fn ensure_mqtt_management_wan(device_id: &str, vlan: u32, priority: u32, persist_matching:bool, progress:impl FnMut(ManagementWanStage)->bool) -> Result<(), String> {
     #[cfg(feature = "device-hl202")]
-    {
-        let event = MqttConnectedEvent {
-            device_id: device_id.to_string(),
-            acs_url: acs_url.map(str::to_string),
-        };
-        let adapter = hl202::MqttLifecycle;
-        if adapter.matches_mqtt_device(&event.device_id) {
-            return adapter.on_mqtt_connected(&event);
-        }
-    }
+    { hl202::management_wan::ensure(device_id, vlan, priority,persist_matching,progress) }
     #[cfg(not(feature = "device-hl202"))]
-    let _ = (device_id, acs_url);
-
-    Err("automatic MQTT ACS bootstrap adapter unavailable".into())
+    { let _ = (device_id, vlan, priority,persist_matching,progress); Err("MQTT management WAN adapter is not compiled".into()) }
 }
-
-pub fn read_mqtt_cwmp_settings(device_id: &str, acs_url: &str) -> Result<bool, String> {
-    #[cfg(feature = "device-hl202")]
-    {
-        hl202::mqtt_lifecycle::read_settings(device_id, acs_url)
-    }
-    #[cfg(not(feature = "device-hl202"))]
-    {
-        let _ = (device_id, acs_url);
-        Err("automatic MQTT ACS bootstrap adapter unavailable".into())
-    }
+#[derive(Clone,Default)]
+pub struct CwmpCredentials {pub username:String,pub password:String}
+pub fn read_authenticated_cwmp_settings(target:&str,url:&str,credentials:&CwmpCredentials)->Result<bool,String> {
+    #[cfg(feature="device-hl202")] {hl202::mqtt_lifecycle::read_authenticated_settings(target,url,credentials)}
+    #[cfg(not(feature="device-hl202"))] {let _=(target,url,credentials);Err("MQTT CWMP adapter is not compiled".into())}
+}
+pub fn configure_authenticated_cwmp_settings(target:&str,url:&str,credentials:&CwmpCredentials)->Result<(),String> {
+    #[cfg(feature="device-hl202")] {hl202::mqtt_lifecycle::configure_settings(target,url,credentials)}
+    #[cfg(not(feature="device-hl202"))] {let _=(target,url,credentials);Err("MQTT CWMP adapter is not compiled".into())}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,8 +130,8 @@ mod tests {
 
     #[test]
     fn mqtt_connected_dispatch_reports_unsupported_identities() {
-        assert!(on_mqtt_connected("HWTC3C6DE5B3/fttr_data.tar.gz", Some("http://acs"))
+        assert!(configure_authenticated_cwmp_settings("HWTC3C6DE5B3/fttr_data.tar.gz", "http://acs",&CwmpCredentials::default())
             .is_err());
-        assert!(on_mqtt_connected("H3CT12345678", Some("http://acs")).is_err());
+        assert!(configure_authenticated_cwmp_settings("H3CT12345678", "http://acs",&CwmpCredentials::default()).is_err());
     }
 }

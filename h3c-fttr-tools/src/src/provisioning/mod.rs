@@ -6,7 +6,9 @@
 //! provides persistence mechanics without choosing formats or retry behavior.
 mod bootstrap;
 mod config;
+mod management_network;
 mod controller;
+mod link_identity;
 mod model;
 mod policy;
 mod storage;

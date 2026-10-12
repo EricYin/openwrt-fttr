@@ -51,7 +51,26 @@ fn start_ipc_server(
             let mut line = String::new();
             if reader.read_line(&mut line).is_ok() {
                 let line = line.trim();
-                if let Some(request) = line.strip_prefix("PROVISIONING ") {
+                if let Some(request) = line.strip_prefix("MIB ") {
+                    let request = request.to_string();
+                    let services = services.clone();
+                    // MIB sessions validate O5 through STATUS IPC. Keep accepting
+                    // connections while this bounded diagnostic runs.
+                    thread::spawn(move || {
+                        let fields: Vec<_> = request.split_whitespace().collect();
+                        let result = match fields.as_slice() {
+                            [id, summary] => id.parse::<u8>().ok().zip(summary.parse::<bool>().ok())
+                                .ok_or_else(|| std::io::Error::other("invalid MIB request"))
+                                .and_then(|(id, summary)| super::inventory::control(id, summary, &services)),
+                            _ => Err(std::io::Error::other("usage: MIB ONU_ID true|false")),
+                        };
+                        let response = match result {
+                            Ok(output) => serde_json::json!({"output": output}),
+                            Err(error) => serde_json::json!({"error": error.to_string()}),
+                        };
+                        let _ = stream.write_all(response.to_string().as_bytes());
+                    });
+                } else if let Some(request) = line.strip_prefix("PROVISIONING ") {
                     let _ = stream.write_all(crate::provisioning::control(request).as_bytes());
                 } else if let Some(_request) = line.strip_prefix("ACS ") {
                     #[cfg(feature = "acs")]

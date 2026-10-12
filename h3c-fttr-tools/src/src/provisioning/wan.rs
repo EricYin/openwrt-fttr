@@ -25,6 +25,9 @@ pub fn load(id: &str) -> Result<Option<BTreeMap<String, Owned>>, String> {
         .map(Some)
         .map_err(|e| format!("invalid WAN ownership records: {e}"))
 }
+pub fn reset(id: &str) -> Result<(), String> {
+    super::storage::remove_registry(&registry_path(id))
+}
 #[cfg(feature = "acs")]
 pub fn parent_protected(id: &str, parent: u32) -> bool {
     std::fs::read_to_string(registry_path(id))

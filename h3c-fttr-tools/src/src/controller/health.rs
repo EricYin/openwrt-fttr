@@ -97,12 +97,12 @@ pub fn diagnostic() -> io::Result<()> {
         .and_then(|status| status.sub_gateways.into_iter().find(|onu| args.get(1).is_some_and(|id| id == &onu.onu_id.to_string())))
         .and_then(|onu| onu.vendor.as_bytes().try_into().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "live ONU vendor identity unavailable"))?;
-    run(args, None, vendor)
+    run(args, None, vendor, None)
 }
-pub(super) fn watch(id: u8, cancellation: std::sync::Arc<AtomicBool>, vendor: [u8;4]) -> io::Result<()> {
-    run(vec!["integrated-health".into(), id.to_string(), "60".into(), "--stock-omcc".into(), "--1905".into(), "--watch".into()], Some(cancellation), vendor)
+pub(super) fn watch(id: u8, cancellation: std::sync::Arc<AtomicBool>, vendor: [u8;4], requests: &std::sync::mpsc::Receiver<super::inventory::MibRequest>) -> io::Result<()> {
+    run(vec!["integrated-health".into(), id.to_string(), "60".into(), "--stock-omcc".into(), "--1905".into(), "--watch".into()], Some(cancellation), vendor, Some(requests))
 }
-fn run(args: Vec<String>, cancellation: Option<std::sync::Arc<AtomicBool>>, vendor: [u8;4]) -> io::Result<()> {
+fn run(args: Vec<String>, cancellation: Option<std::sync::Arc<AtomicBool>>, vendor: [u8;4], requests: Option<&std::sync::mpsc::Receiver<super::inventory::MibRequest>>) -> io::Result<()> {
     if args.len() < 3 || args[3..].iter().any(|arg| arg != "--stock-omcc" && arg != "--stock-padding" && arg != "--mapped-omcc" && arg != "--arp" && arg != "--1905" && arg != "--activate-verified-link" && arg != "--watch") { return Err(io::Error::new(io::ErrorKind::InvalidInput, "usage: fttr-omci-probe ONU_ID SECONDS [--stock-omcc] [--stock-padding] [--mapped-omcc] [--arp] [--1905] [--activate-verified-link] [--watch]")); }
     let id: u8 = args[1].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput,"ONU_ID"))?;
     let seconds: u64 = args[2].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput,"SECONDS"))?;
@@ -207,9 +207,25 @@ fn run(args: Vec<String>, cancellation: Option<std::sync::Arc<AtomicBool>>, vend
     let mut next_get = start + Duration::from_secs(5);
     let mut next_state = start;
     let management_version=crate::provisioning::management_version();
+    let mut watchdog_start = start;
     while !STOP.load(Ordering::Relaxed) && (watch || start.elapsed() < Duration::from_secs(seconds)) {
         if watch && crate::provisioning::management_version()!=management_version {return Err(io::Error::other("OMCI management configuration changed"));}
         if cancellation.as_ref().is_some_and(|token| token.load(Ordering::Acquire)) { return Ok(()); }
+        if let Some(request) = requests.and_then(|requests| requests.try_recv().ok()) {
+            let result = if Instant::now() >= request.deadline {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "MIB request expired before monitor became ready"))
+            } else {
+                super::inventory::read_owned(id, request.summary, cancellation.clone(), request.deadline)
+            };
+            let complete = result.is_ok();
+            let _ = request.reply.send(result);
+            // The upload is serialized with health GETs under the same lock.
+            // Resume with fresh evidence, without rerunning business provisioning.
+            // A completed, validated upload is fresh OMCI liveness evidence.
+            last_get = complete.then(Instant::now);
+            watchdog_start = Instant::now();
+            next_get = watchdog_start;
+        }
         if watch && Instant::now() >= next_state {
             if !crate::pon_engine::omci_transport::operation_confirmed(id) {
                 return Err(io::Error::new(io::ErrorKind::NotConnected, "ONU registration lost; release OMCC and revalidate"));
@@ -265,7 +281,7 @@ fn run(args: Vec<String>, cancellation: Option<std::sync::Arc<AtomicBool>>, vend
             drop(carrier_lease.take());
             println!("VERIFIED_LINK_DISABLED stale OMCI or data evidence");
         }
-        if watch && last_get.unwrap_or(start).elapsed() >= Duration::from_secs(30) {
+        if watch && last_get.unwrap_or(watchdog_start).elapsed() >= Duration::from_secs(30) {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "OMCI watch lost ONU; supervisor must revalidate service configuration"));
         }
         std::thread::sleep(Duration::from_millis(10));

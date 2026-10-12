@@ -208,7 +208,6 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
     }
     let mut sns = BTreeSet::new();
     let mut ids = BTreeSet::new();
-    let mut mqtt_macs = BTreeSet::new();
     for (id, s) in sections.iter().filter(|(_, s)| s.kind == "device") {
         if s.get("optical_sn").len() != 12
             || !s.get("optical_sn").is_ascii()
@@ -229,23 +228,6 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
             "hwtc" | "k155" if cfg!(feature = "device-hwtc") => "hwtc",
             _ => return Err(format!("{id}: adapter unknown or not compiled")),
         };
-        if !s.get("mqtt_mac").is_empty() {
-            let value = s.get("mqtt_mac");
-            let valid = (value.len() == 12 && value.bytes().all(|b| b.is_ascii_hexdigit()))
-                || (value.len() == 17
-                    && value.bytes().enumerate().all(|(i, b)| {
-                        if i % 3 == 2 {
-                            b == b':'
-                        } else {
-                            b.is_ascii_hexdigit()
-                        }
-                    }));
-            let mac = value.replace(':', "").to_ascii_uppercase();
-            if !valid || !mqtt_macs.insert(mac.clone()) {
-                return Err(format!("{id}: invalid/duplicate mqtt_mac"));
-            }
-            cfg.mqtt_targets.insert(id.clone(), mac);
-        }
         let wifi_cleanup = match s.get("wifi_cleanup") {
             "" | "preserve" => "preserve",
             "delete" => "delete",
@@ -701,24 +683,6 @@ fn add(item: &mut Item, path: &str, suffix: &str, value: &str, kind: ParameterKi
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "device-hl202")]
-    #[test]
-    fn mqtt_associations_are_normalized_unique_and_optional() {
-        let device = |id: &str, serial: &str, mac: &str| {
-            format!("config device '{id}'\n option optical_sn '{serial}'\n option cwmp_id '{id}'\n option adapter 'hl202'\n option mqtt_mac '{mac}'\n")
-        };
-        let first = device("first", "H3CT12345678", "02:aa:bb:cc:dd:ee");
-        let config = parse_expanded(&first).unwrap();
-        assert_eq!(config.mqtt_targets["first"], "02AABBCCDDEE");
-        assert!(
-            parse_expanded(&(first + &device("second", "H3CT87654321", "02AABBCCDDEE"))).is_err()
-        );
-        assert!(parse_expanded(&device("first", "H3CT12345678", "02aabb:ccddee")).is_err());
-        assert!(parse_expanded(&device("first", "H3CT12345678", ""))
-            .unwrap()
-            .mqtt_targets
-            .is_empty());
-    }
     #[test]
     fn service_list_tokens_are_normalized_and_tr069_is_reserved() {
         assert_eq!(

@@ -11,6 +11,16 @@ pub(super) fn registry_path(directory: &str, id: &str) -> String {
     format!("{directory}/{hash:016x}.json")
 }
 
+pub(super) fn remove_registry(path: &str) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => fs::File::open(Path::new(path).parent().unwrap())
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("persist registry removal: {e}")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove ownership registry: {e}")),
+    }
+}
+
 /// Preserve the existing file-fsync/rename sequence. Ownership registries also
 /// fsync their directory; controller history intentionally retains its policy.
 pub(super) fn write_atomic(path: &str, data: &[u8], sync_directory: bool) -> io::Result<()> {
