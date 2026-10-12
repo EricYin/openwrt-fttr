@@ -1,5 +1,4 @@
 use std::env;
-use std::fs;
 use std::path::Path;
 use std::process::{exit, Command};
 
@@ -37,6 +36,14 @@ Commands:\n  \
   subdev <sn> <action> Manage sub-gateway proprietary features (passwords, telnet, iptv, etc.)\n  \
   help                 Show this help message"
     );
+}
+
+fn status_ipc_error(error: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "unavailable",
+        "error": "fttrd status IPC failed",
+        "detail": error,
+    })
 }
 
 #[cfg(feature = "device-hl202")]
@@ -506,7 +513,7 @@ fn main() {
                         }
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     let fpga_st = fpga::get_fpga_status();
                     if fpga_st == fpga::FpgaStatus::Programming {
                         if is_json {
@@ -524,23 +531,12 @@ fn main() {
                         return;
                     }
 
-                    if let Ok(content) = fs::read_to_string(ipc::STATUS_FILE) {
-                        if is_json {
-                            println!("{content}");
-                        } else {
-                            println!("[-] fttrd daemon is offline. Stored telemetry cache:");
-                            match serde_json::from_str::<FttrSystemStatus>(&content) {
-                                Ok(parsed) => print_status_table(&parsed),
-                                Err(_) => println!("{content}"),
-                            }
-                        }
+                    if is_json {
+                        println!("{}", status_ipc_error(&error.to_string()));
                     } else {
-                        if is_json {
-                            println!("{{\"error\": \"fttrd daemon is not running\"}}");
-                        } else {
-                            println!("[-] fttrd daemon is not running and no status file found.");
-                        }
+                        eprintln!("[-] fttrd status unavailable: IPC request failed: {error}");
                     }
+                    exit(1);
                 }
             }
         }
@@ -663,5 +659,20 @@ fn main() {
             print_usage();
             exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_ipc_error;
+
+    #[test]
+    fn ipc_failure_is_an_explicit_unavailable_result_not_device_status() {
+        let response = status_ipc_error("Connection refused");
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["error"], "fttrd status IPC failed");
+        assert_eq!(response["detail"], "Connection refused");
+        assert!(response.get("devices").is_none());
+        assert!(response.get("sub_gateways").is_none());
     }
 }
