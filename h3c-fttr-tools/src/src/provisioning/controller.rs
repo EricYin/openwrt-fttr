@@ -187,7 +187,7 @@ fn controller() -> &'static Mutex<Controller> {
     CONTROLLER.get_or_init(|| Mutex::new(Controller::default()))
 }
 pub(crate) fn management_desired(serial:&str) -> Option<(config::Management, String)> {
-    if !controller().lock().unwrap().config.devices.iter().any(|d|d.optical_sn==serial){return None;}
+    if !controller().lock().unwrap().config.devices.iter().any(|d|d.optical_sn==serial && d.omci_management){return None;}
     let (id,management,version,epoch,automatic)=super::management_network::omci_grant(serial)?;
     super::bootstrap::omci_write_allowed(&id,epoch,automatic).then_some((management,version))
 }
@@ -198,10 +198,24 @@ pub(crate) fn management_result(serial: &str, result: Value) {
         .omci_management
         .insert(serial.into(), result);
 }
-pub(crate) fn management_version() -> String {
-    super::management_network::version()
+pub(crate) fn management_version(serial: &str) -> String {
+    let enabled = controller().lock().unwrap().config.devices.iter()
+        .any(|device| device.optical_sn == serial && device.omci_management);
+    // Disabled devices do not restart their monitor when global management changes.
+    if enabled { format!("{}:enabled", super::management_network::version()) }
+    else { "disabled".into() }
 }
 impl Controller {
+    fn omci_management_view(&self, device: &Device) -> Value {
+        if !device.omci_management {
+            json!({"state":"disabled","enabled":false,"reason":"OMCI management provisioning is disabled for this device"})
+        } else {
+            let mut value = self.omci_management.get(&device.optical_sn).cloned()
+                .unwrap_or_else(|| json!({"state":"pending"}));
+            value["enabled"] = json!(true);
+            value
+        }
+    }
     fn forget_device(&mut self, device: &Device) {
         self.operations.remove(&device.id);
         self.recovered.remove(&device.id);
@@ -350,7 +364,7 @@ impl Controller {
             let services: Vec<_> = items.iter().filter(|i| i["kind"] != "ssid").cloned().collect();
             let wifi_sync=if operation["wifi_lifecycle"].as_object().is_some_and(|m|m.values().any(|i|matches!(i["state"].as_str(),Some("blocked"|"failed"|"unknown")))) { "attention_required" } else if operation["wifi_stage"].is_string() && operation["wifi_stage"] != "done" { "pending" } else { aggregate(&ssids) };
             let assignment=self.config.assignments.get(&d.id);
-            json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"adapter":d.adapter,"omci_management":self.omci_management.get(&d.optical_sn).cloned().unwrap_or_else(||json!({"state":"pending"})),"management":self.management.get(&d.id),"acs_bootstrap":super::bootstrap::view(&d.id,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
+            json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"adapter":d.adapter,"omci_management":self.omci_management_view(d),"management":self.management.get(&d.id),"acs_bootstrap":super::bootstrap::view(&d.id,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
         }).collect();
         json!({"enabled":self.config.enabled,"mode":if self.config.automatic {"auto"} else {"manual"},"method":"diff","revision":self.config.revision,"triggers":self.config.triggers,"interval":self.config.interval,"omci_management":{"desired":self.config.management,"state":"not_verified"},"management_network":super::management_network::view(self.config.management_network.as_ref()),"groups":self.config.groups.iter().map(|(id,t)|json!({"id":id,"name":self.config.labels.get(id),"template":t})).collect::<Vec<_>>(),"error":self.failure,"devices":devices,"pending_devices":devices.iter().filter(|d| d["provisioning"]["state"] != "completed").map(|d| d["device"].clone()).collect::<Vec<_>>()})
     }
@@ -871,6 +885,7 @@ mod tests {
                 optical_sn: "H3CT12345678".into(),
                 cwmp_id: "id".into(),
                 adapter: "hl202".into(),
+                omci_management: false,
                 items: vec![item],
                 wifi_cleanup: "preserve".into(),
                 wifi_preserve: BTreeSet::new(),

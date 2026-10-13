@@ -91,7 +91,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
     // Validate every template, including ones not assigned to a group yet.
     for (id, s) in &all {
         let allowed: &[&str] = match s.kind.as_str() {
-            "device" => &["name", "optical_sn", "adapter", "group", "wifi_cleanup"],
+            "device" => &["name", "optical_sn", "adapter", "group", "wifi_cleanup", "omci_management"],
             "group" => &["name", "template"],
             "template" => &["name"],
             "network" => &[
@@ -418,6 +418,22 @@ pub fn compile(text: &str) -> Result<Config, String> {
 mod tests {
     use super::*;
     use crate::provisioning::model::ItemKind;
+    #[test]
+    fn omci_management_is_opt_in_per_device_and_changes_revision() {
+        if !cfg!(feature = "all-devices") { return; }
+        let config = |option: &str| format!(
+            "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h3c'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\n option omci_management '1'\nconfig device 'k155'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'k155'\n option group 'g'\n{option}"
+        );
+        let default = compile(&config("")).unwrap();
+        assert!(default.devices.iter().find(|d| d.id == "h3c").unwrap().omci_management);
+        assert!(!default.devices.iter().find(|d| d.id == "k155").unwrap().omci_management);
+        let explicit_off = compile(&config(" option omci_management '0'\n")).unwrap();
+        assert!(!explicit_off.devices.iter().find(|d| d.id == "k155").unwrap().omci_management);
+        let enabled = compile(&config(" option omci_management '1'\n")).unwrap();
+        assert!(enabled.devices.iter().all(|d| d.omci_management));
+        assert_ne!(explicit_off.revision, enabled.revision);
+        assert!(compile(&config(" option omci_management 'invalid'\n")).err().unwrap().contains("omci_management"));
+    }
     #[test]
     fn hl202_internet_bridge_dhcp_and_second_radio_slots_compile_for_binding() {
         let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'a2'\n option template 't'\n option ssid 'base2'\n option radio '2g'\nconfig wifi 'a5'\n option template 't'\n option ssid 'base5'\n option radio '5g'\nconfig wifi 'b2'\n option template 't'\n option ssid 'TTTT'\n option radio '2g'\nconfig wifi 'b5'\n option template 't'\n option ssid 'YYYY'\n option radio '5g'\nconfig network 'iot'\n option template 't'\n option vlan '66'\n list service_list 'INTERNET'\n option priority '6'\n list ssid 'b2'\n list ssid 'b5'";

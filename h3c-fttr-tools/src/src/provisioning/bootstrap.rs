@@ -603,6 +603,7 @@ mod tests {
             optical_sn: "H3CT12345678".into(),
             cwmp_id: id.into(),
             adapter: adapter.into(),
+            omci_management: false,
             items: Vec::new(),
             wifi_cleanup: "preserve".into(),
             wifi_preserve: Default::default(),

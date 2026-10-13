@@ -1,8 +1,4 @@
 //! HWTC standard OMCI bridge service; proprietary shell management unavailable.
-pub(super) fn matches(vendor: &str, equipment: Option<&str>) -> bool {
-    let _ = equipment;
-    vendor == "HWTC"
-}
 pub mod service;
 mod bridge;
 pub mod k155;

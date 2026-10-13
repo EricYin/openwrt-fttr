@@ -255,6 +255,8 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
             optical_sn: s.get("optical_sn").to_ascii_uppercase(),
             cwmp_id: s.get("cwmp_id").into(),
             adapter: adapter.into(),
+            omci_management: boolean(s.get("omci_management"), false)
+                .map_err(|error| format!("{id}: omci_management: {error}"))?,
             items: Vec::new(),
             wifi_cleanup: wifi_cleanup.into(),
             wifi_preserve,

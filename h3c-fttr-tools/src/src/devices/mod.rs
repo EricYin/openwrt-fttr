@@ -82,7 +82,7 @@ pub fn select(vendor: &str, identity: &crate::model::OnuIdentity) -> Adapter {
     #[cfg(feature = "device-hl202")]
     if hl202::matches(vendor, equipment) { return Adapter::Hl202; }
     #[cfg(feature = "device-hwtc")]
-    if hwtc::matches(vendor, equipment) { return Adapter::Hwtc(hwtc::profile(equipment)); }
+    if vendor == "HWTC" { return Adapter::Hwtc(hwtc::profile(equipment)); }
     let _ = (vendor, equipment);
     Adapter::Unavailable
 }
@@ -105,6 +105,9 @@ mod tests {
     fn selection_respects_vendor_model_rules_and_whole_device_features() {
         let mut identity = crate::model::OnuIdentity::default();
         assert_eq!(select("H3CT", &identity), Adapter::Unavailable);
+        assert_eq!(select("HWTC", &identity).capabilities().business, cfg!(feature = "device-hwtc"));
+        #[cfg(feature = "device-hwtc")]
+        assert_eq!(select("HWTC", &identity), Adapter::Hwtc(hwtc::Profile::Standard));
         identity.equipment_id = Some("HL202-DU-C".into());
         assert_eq!(select("H3CT", &identity).capabilities().business, cfg!(feature = "device-hl202"));
         assert_eq!(select("HWTC", &identity).capabilities().business, cfg!(feature = "device-hwtc"));

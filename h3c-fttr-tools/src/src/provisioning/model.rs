@@ -109,6 +109,7 @@ pub struct Device {
     pub optical_sn: String,
     pub cwmp_id: String,
     pub adapter: String,
+    pub omci_management: bool,
     pub items: Vec<Item>,
     pub wifi_cleanup: String,
     pub wifi_preserve: BTreeSet<u32>,

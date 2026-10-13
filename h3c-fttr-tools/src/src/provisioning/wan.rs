@@ -985,6 +985,7 @@ mod tests {
             optical_sn: "HWTC12345678".into(),
             cwmp_id: "id".into(),
             adapter: "hwtc".into(),
+            omci_management: false,
             items: vec![Item {
                 id: "internet".into(),
                 kind: ItemKind::DeviceService,

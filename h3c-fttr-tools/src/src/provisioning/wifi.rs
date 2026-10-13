@@ -30,6 +30,7 @@ mod tests {
             optical_sn: "H3CT12345678".into(),
             cwmp_id: "id".into(),
             adapter: "hl202".into(),
+            omci_management: false,
             wifi_cleanup: "delete".into(),
             wifi_preserve: BTreeSet::new(),
             items: vec![Item {
