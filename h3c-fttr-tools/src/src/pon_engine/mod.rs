@@ -5,7 +5,6 @@
 //! - `omci`: ITU-T G.988 MIB baseline provisioning
 
 pub mod omci;
-pub mod omci_transport;
 pub mod ploam;
 
 use self::ploam::{GponOnu, OnuState, PloamFrame};

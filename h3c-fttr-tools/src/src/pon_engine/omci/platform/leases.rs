@@ -1,0 +1,135 @@
+use crate::{bosa, pon_engine::ploam::PloamFrame};
+use std::{io, os::fd::AsRawFd, time::Duration};
+extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
+
+/// Project hardware serialization; a lease restores only its own bitmap bit.
+pub fn update_onu_enable(id: u8, enabled: bool) -> io::Result<()> {
+    if id > 15 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "ONU slot"));
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open("/tmp/fttr-hardware.lock")?;
+    if unsafe { flock(lock.as_raw_fd(), 2) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let value = bosa::read_fpga_reg(0x01000008)?;
+    bosa::write_fpga_reg(0x01000008, enable_bit(value, id, enabled))
+}
+fn enable_bit(value: u32, id: u8, enabled: bool) -> u32 {
+    if enabled {
+        value | (1u32 << id)
+    } else {
+        value & !(1u32 << id)
+    }
+}
+/// Serialize workers and diagnostic processes. Never unlink flock files.
+pub fn lock_onu(id: u8) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(format!("/tmp/fttr-onu-{id}.lock"))?;
+    if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+pub struct ChannelLease {
+    id: u8,
+    previous: u16,
+}
+impl ChannelLease {
+    pub fn open(id: u8, channel: u16) -> io::Result<Self> {
+        Ok(Self {
+            id,
+            previous: bosa::exchange_omci_channel(id, channel)?,
+        })
+    }
+}
+impl Drop for ChannelLease {
+    fn drop(&mut self) {
+        if let Err(e) = bosa::exchange_omci_channel(self.id, self.previous) {
+            eprintln!("OMCI channel restore failed: {e}");
+        }
+    }
+}
+/// Reversible, per-ONU stock OMCC resource ownership (project platform object).
+pub struct StockOmccLease {
+    id: u8,
+    saved: Vec<(u32, u32)>,
+}
+impl StockOmccLease {
+    pub fn open(id: u8) -> io::Result<Self> {
+        if id > 15 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ONU has no verified hardware slot",
+            ));
+        }
+        let mut saved = Vec::new();
+        for addr in [
+            0x01000008,
+            0x0500009c + 16 * id as u32,
+            0x050000a4 + 16 * id as u32,
+        ] {
+            saved.push((addr, bosa::read_fpga_reg(addr)?));
+        }
+        let lease = Self { id, saved };
+        for (i, &(addr, old)) in lease.saved.iter().enumerate() {
+            let value = if i == 0 { old | (1 << id) } else { 0x11000000 };
+            println!("STOCK_OMCC {addr:08x}: {old:08x}->{value:08x}");
+            if i == 0 {
+                update_onu_enable(id, true)?;
+            } else {
+                bosa::write_fpga_reg(addr, value)?;
+            }
+        }
+        lease.configure_port(true)?;
+        std::thread::sleep(Duration::from_millis(500));
+        Ok(lease)
+    }
+    fn configure_port(&self, enable: bool) -> io::Result<()> {
+        let port = 0x100u16 + self.id as u16;
+        let mut p = [0; 10];
+        p[0] = (port >> 4) as u8;
+        p[1] = (port << 4) as u8;
+        p[2] = if enable { 1 } else { 0xff };
+        for _ in 0..3 {
+            bosa::send_ploam_msg(&PloamFrame::new(self.id, 0x0a, p).to_bytes())?;
+        }
+        Ok(())
+    }
+}
+impl Drop for StockOmccLease {
+    fn drop(&mut self) {
+        if let Err(e) = self.configure_port(false) {
+            eprintln!("OMCC disable failed: {e}");
+        }
+        for &(addr, value) in self.saved.iter().rev() {
+            let result = if addr == 0x01000008 {
+                update_onu_enable(self.id, value & (1u32 << self.id) != 0)
+            } else {
+                bosa::write_fpga_reg(addr, value)
+            };
+            if let Err(e) = result {
+                eprintln!("OMCC restore {addr:08x} failed: {e}");
+            }
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn disabling_one_slot_preserves_other_live_slots() {
+        let both = super::enable_bit(super::enable_bit(0x80000000, 1, true), 2, true);
+        assert_eq!(super::enable_bit(both, 1, false), 0x80000004);
+        assert_eq!(super::enable_bit(both, 2, false), 0x80000002);
+    }
+}

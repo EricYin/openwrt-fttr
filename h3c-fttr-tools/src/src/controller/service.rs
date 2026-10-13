@@ -86,3 +86,8 @@ impl Services {
         });
     }
 }
+pub(crate) fn operation_confirmed(id: u8) -> bool {
+    crate::ipc::send_ipc_command("STATUS").ok()
+        .and_then(|reply| serde_json::from_str::<crate::model::FttrSystemStatus>(&reply).ok())
+        .is_some_and(|status| status.sub_gateways.iter().any(|onu| onu.onu_id == id && onu.state == "O5Operation"))
+}

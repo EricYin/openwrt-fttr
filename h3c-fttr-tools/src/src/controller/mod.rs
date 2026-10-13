@@ -6,5 +6,5 @@ pub mod inventory;
 pub mod management;
 pub mod profile;
 mod runtime;
-mod service;
+pub(crate) mod service;
 pub use runtime::run;

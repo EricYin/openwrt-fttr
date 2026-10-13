@@ -1,5 +1,5 @@
 use crate::controller::business::verify;
-use crate::pon_engine::omci_transport::OmciSession;
+use crate::pon_engine::omci::OmciSession;
 use std::{io, sync::{Arc, atomic::AtomicBool}};
 
 pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {

@@ -1,12 +1,7 @@
 //! HWTC standard OMCI bridge profile, initially verified on K155-11.
 use crate::controller::business::verify;
-use crate::pon_engine::omci_transport::{lock_onu, OmciSession, StockOmccLease};
+use crate::pon_engine::omci::{OmciSession,FmcsTransport,platform::leases::{lock_onu,StockOmccLease,ChannelLease}};
 use std::{io, sync::{Arc, atomic::AtomicBool}};
-
-struct ChannelLease { id: u8, previous: u16 }
-impl Drop for ChannelLease {
-    fn drop(&mut self) { let _ = crate::bosa::exchange_omci_channel(self.id, self.previous); }
-}
 
 pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {
     configure_profile(id, cancellation, super::Profile::Standard)
@@ -17,12 +12,11 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
 pub(super) fn configure_profile(id: u8, cancellation: Option<Arc<AtomicBool>>, profile: super::Profile) -> io::Result<()> {
     if !(1..=15).contains(&id) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "ONU ID must be 1..15")); }
     let _lock = lock_onu(id)?;
-    let mut session = OmciSession::open(id)?;
-    session.require_operation();
+    let mut session = OmciSession::new(FmcsTransport::open(id)?);
+    session.guard_registration(move || crate::controller::service::operation_confirmed(id));
     if let Some(token) = cancellation { session.cancel_when(token); }
     let _lease = StockOmccLease::open(id)?;
-    let previous = crate::bosa::exchange_omci_channel(id, 0)?;
-    let _channel = ChannelLease { id, previous };
+    let _channel = ChannelLease::open(id, 0)?;
     verify(&mut session, 256, 0, 0x8000, b"HWTC")?;
     if profile == super::Profile::V152 { super::v152::service::verify_identity(&mut session)?; }
     // Dispatch is vendor-wide by request. Confirm the live ONU-G vendor before

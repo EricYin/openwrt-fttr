@@ -1,0 +1,211 @@
+use super::{
+    attributes::{AttributeBlock, AttributeCodec, AttributeContext, AttributeValue},
+    error::invalid,
+    messages::{check_result, Action, GetResponse, RequestBody},
+    mib::{MibAssembler, MibRecord, MibReport},
+    schema::MeRegistry,
+    tables::TableAssembler,
+    wire::BaselineFrame,
+};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+/// Project transport boundary; returns only validated, ONU-isolated protocol frames.
+pub trait OmciTransport: Send {
+    fn send(&mut self, frame: &BaselineFrame) -> io::Result<()>;
+    fn receive(&mut self) -> io::Result<Option<BaselineFrame>>;
+}
+
+/// OMCI-001/002/003/008 message semantics; retries/guards are project orchestration.
+/// No socket, FPGA register or device topology is owned by this object.
+pub struct OmciSession {
+    transport: Box<dyn OmciTransport>,
+    next_tci: u16,
+    registration: Option<Box<dyn Fn() -> bool + Send>>,
+    cancellation: Option<Arc<AtomicBool>>,
+    deadline: Option<Instant>,
+}
+impl OmciSession {
+    pub fn new(transport: impl OmciTransport + 'static) -> Self {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u16;
+        Self {
+            transport: Box::new(transport),
+            next_tci: (seed & 0x7fff).max(1),
+            registration: None,
+            cancellation: None,
+            deadline: None,
+        }
+    }
+    pub fn guard_registration(&mut self, guard: impl Fn() -> bool + Send + 'static) {
+        self.registration = Some(Box::new(guard));
+    }
+    pub fn cancel_when(&mut self, token: Arc<AtomicBool>) {
+        self.cancellation = Some(token);
+    }
+    pub fn finish_before(&mut self, deadline: Instant) {
+        self.deadline = Some(deadline);
+    }
+    fn check_active(&self) -> io::Result<()> {
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "OMCI diagnostic deadline exceeded",
+            ));
+        }
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|t| t.load(Ordering::Acquire))
+            || self.registration.as_ref().is_some_and(|g| !g())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "ONU registration generation no longer active",
+            ));
+        }
+        Ok(())
+    }
+    /// Raw vendor requests remain explicit at the device adapter boundary.
+    pub fn transact(
+        &mut self,
+        message_type: u8,
+        class_id: u16,
+        entity_id: u16,
+        payload: [u8; 32],
+    ) -> io::Result<BaselineFrame> {
+        let request = BaselineFrame::new(self.next_tci, message_type, class_id, entity_id, payload);
+        self.next_tci = (self.next_tci.wrapping_add(1) & 0x7fff).max(1);
+        for _ in 0..3 {
+            self.check_active()?;
+            self.transport.send(&request)?;
+            let end = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < end {
+                self.check_active()?;
+                match self.transport.receive()? {
+                    Some(frame) if frame.answers(&request) => return Ok(frame),
+                    Some(_) => (),
+                    None => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "OMCI TCI={:04x} class={class_id} entity={entity_id:04x}",
+                request.transaction_id
+            ),
+        ))
+    }
+    fn request(
+        &mut self,
+        action: Action,
+        class_id: u16,
+        entity_id: u16,
+        body: RequestBody<'_>,
+    ) -> io::Result<BaselineFrame> {
+        self.transact(action.request_type(), class_id, entity_id, body.encode()?)
+    }
+    pub fn get(&mut self, class_id: u16, entity_id: u16, mask: u16) -> io::Result<BaselineFrame> {
+        let frame = self.request(Action::Get, class_id, entity_id, RequestBody::Get { mask })?;
+        GetResponse::decode(&frame, mask)?;
+        Ok(frame)
+    }
+    pub fn get_attributes(
+        &mut self,
+        class_id: u16,
+        entity_id: u16,
+        mask: u16,
+    ) -> io::Result<AttributeBlock> {
+        let def = MeRegistry::get(class_id)
+            .filter(|d| d.layout_supported)
+            .ok_or_else(|| invalid("no complete ME layout"))?;
+        let frame = self.get(class_id, entity_id, mask)?;
+        let body = GetResponse::decode(&frame, mask)?;
+        let block =
+            AttributeCodec::decode(def, body.mask, body.data, AttributeContext::GetResponse);
+        if block.undecoded_mask != 0 {
+            return Err(invalid("GET attribute block cannot be fully decoded"));
+        }
+        Ok(block)
+    }
+    pub fn set_attributes(
+        &mut self,
+        class_id: u16,
+        entity_id: u16,
+        values: &[(u8, AttributeValue)],
+    ) -> io::Result<()> {
+        let def = MeRegistry::get(class_id)
+            .filter(|d| d.layout_supported)
+            .ok_or_else(|| invalid("no complete ME layout"))?;
+        let (mask, data) = AttributeCodec::encode(def, values, AttributeContext::SetRequest)?;
+        self.set(class_id, entity_id, mask, &data)
+    }
+    pub fn set(&mut self, class_id: u16, entity_id: u16, mask: u16, data: &[u8]) -> io::Result<()> {
+        let frame = self.request(
+            Action::Set,
+            class_id,
+            entity_id,
+            RequestBody::Set { mask, data },
+        )?;
+        check_result(&frame)
+    }
+    pub fn create(&mut self, class_id: u16, entity_id: u16, data: &[u8]) -> io::Result<()> {
+        let frame = self.request(
+            Action::Create,
+            class_id,
+            entity_id,
+            RequestBody::Create { data },
+        )?;
+        check_result(&frame)
+    }
+    pub fn delete(&mut self, class_id: u16, entity_id: u16) -> io::Result<()> {
+        let frame = self.request(Action::Delete, class_id, entity_id, RequestBody::Empty)?;
+        check_result(&frame)
+    }
+    pub fn get_table(&mut self, class_id: u16, entity_id: u16, mask: u16) -> io::Result<Vec<u8>> {
+        if mask.count_ones() != 1 {
+            return Err(invalid("GET NEXT requires one table attribute"));
+        }
+        let frame = self.get(class_id, entity_id, mask)?;
+        let length = u32::from_be_bytes(frame.payload[3..7].try_into().unwrap()) as usize;
+        let mut table = TableAssembler::new(length)?;
+        for sequence in 0..table.segments() as u16 {
+            let frame = self.request(
+                Action::GetNext,
+                class_id,
+                entity_id,
+                RequestBody::GetNext { mask, sequence },
+            )?;
+            let body = GetResponse::decode(&frame, mask)?;
+            table.push(sequence, body.data)?;
+        }
+        table.finish()
+    }
+    pub fn upload_mib(&mut self) -> io::Result<MibReport> {
+        let frame = self.request(Action::MibUpload, 2, 0, RequestBody::Empty)?;
+        let count = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+        if count == 0 || count > 2048 {
+            return Err(invalid("invalid/beyond supported MIB upload count"));
+        }
+        let mut mib = MibAssembler::new(count);
+        for sequence in 0..count {
+            let frame = self.request(
+                Action::MibUploadNext,
+                2,
+                0,
+                RequestBody::UploadNext { sequence },
+            )?;
+            mib.push(MibRecord::decode(sequence, &frame.payload)?);
+        }
+        Ok(mib.finish())
+    }
+}

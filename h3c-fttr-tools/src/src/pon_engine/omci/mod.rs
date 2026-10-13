@@ -4,11 +4,13 @@ pub mod error;
 pub mod generated;
 pub mod messages;
 pub mod mib;
-pub mod schema;
-pub mod tables;
-pub mod session;
-pub mod wire;
 pub mod platform;
+pub mod schema;
+pub mod session;
+pub mod tables;
+pub mod wire;
 
 pub use session::OmciSession;
+#[cfg(test)]
+mod tests;
 pub use platform::fmcs::FmcsTransport;

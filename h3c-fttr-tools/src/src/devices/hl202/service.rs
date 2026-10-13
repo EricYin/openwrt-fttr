@@ -1,5 +1,5 @@
 //! Verified HL202 service configuration; verify each accepted write by GET.
-use crate::pon_engine::omci_transport::{is_unknown_instance, OmciSession, StockOmccLease};
+use crate::pon_engine::omci::{OmciSession,FmcsTransport,error::is_unknown_instance,platform::leases::{lock_onu,StockOmccLease,ChannelLease}};
 use crate::controller::business::{verify, create_verified, assign_tcont, create_gem};
 use crate::{bosa, pon_engine::ploam::PloamFrame};
 use std::io;
@@ -21,15 +21,6 @@ fn wait_for_operation(id: u8) {
         if attempts % 10 == 0 { println!("WAITING_FOR_O5 id={id}; OMCC mapping untouched"); }
         attempts += 1;
         std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-}
-
-struct ChannelLease { id: u8, previous: u16 }
-impl Drop for ChannelLease {
-    fn drop(&mut self) {
-        if let Err(e) = bosa::exchange_omci_channel(self.id, self.previous) {
-            eprintln!("OMCI channel restore failed: {e}");
-        }
     }
 }
 
@@ -80,17 +71,16 @@ pub fn configure(id: u8, seconds: Option<u64>, transparent: bool, supervised: bo
         return Err(io::Error::new(io::ErrorKind::NotConnected, "registration cancelled before configuration"));
     }
     // Declared before all hardware leases: released only after their Drop.
-    let _operation_lock = crate::pon_engine::omci_transport::lock_onu(id)?;
-    if supervised && !crate::pon_engine::omci_transport::operation_confirmed(id) {
+    let _operation_lock = lock_onu(id)?;
+    if supervised && !crate::controller::service::operation_confirmed(id) {
         return Err(io::Error::new(io::ErrorKind::NotConnected, "ONU went offline before OMCC setup"));
     }
-    let mut session = OmciSession::open(id)?;
-    if supervised { session.require_operation(); }
+    let mut session = OmciSession::new(FmcsTransport::open(id)?);
+    if supervised { session.guard_registration(move || crate::controller::service::operation_confirmed(id)); }
     if let Some(token) = cancellation { session.cancel_when(token); }
     let _lease = StockOmccLease::open(id)?;
     let port = 0x100u16 + id as u16;
-    let previous = bosa::exchange_omci_channel(id, 0)?;
-    let _channel = ChannelLease { id, previous };
+    let _channel = ChannelLease::open(id, 0)?;
     if restore_initial {
         // Assign ONU-ID, not the data T-CONT Alloc-ID.
         // Explicit recovery of earlier diagnostics; require a real GET below.

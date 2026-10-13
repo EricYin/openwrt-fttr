@@ -1,5 +1,5 @@
 //! Standard G.988 ME 340 bootstrap. Association readback is not WAN/Inform proof.
-use crate::{controller::business::{create_verified,verify},pon_engine::omci_transport::{OmciSession,is_unknown_instance}};
+use crate::{controller::business::{create_verified,verify},pon_engine::omci::{OmciSession,error::is_unknown_instance}};
 use std::io;
 pub fn configure(session:&mut OmciSession,instance:u16,url:&str,vlan:u32,priority:u32)->io::Result<()> {
     let tag=management_tag(vlan,priority)?;

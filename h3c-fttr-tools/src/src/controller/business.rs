@@ -1,5 +1,5 @@
 //! Device-independent OMCI writes: preserve existing entities and require readback.
-use crate::pon_engine::omci_transport::{is_unknown_instance, OmciSession};
+use crate::pon_engine::omci::{OmciSession, error::is_unknown_instance, attributes::AttributeValue};
 use std::io;
 
 pub fn matches(attributes: &[u8], expected: &[u8]) -> bool {
@@ -33,7 +33,7 @@ pub fn create_verified(session: &mut OmciSession, class: u16, instance: u16, att
 pub fn assign_tcont(session: &mut OmciSession, instance: u16, alloc: u16) -> io::Result<()> {
     let before = session.get(262, instance, 0x8000)?;
     if before.payload[3..5] != alloc.to_be_bytes() {
-        session.set(262, instance, 0x8000, &alloc.to_be_bytes())?;
+        session.set_attributes(262, instance, &[(1, AttributeValue::number(alloc as u32))])?;
     }
     verify(session, 262, instance, 0x8000, &alloc.to_be_bytes())
 }

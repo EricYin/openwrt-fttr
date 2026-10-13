@@ -4,11 +4,25 @@ use serde::Serialize;
 /// <https://github.com/opencord/omci-lib-go/blob/v2.2.4/generated/attribute.go#L42-L76>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AttributeKind { Unknown, Octets, String, UnsignedInteger, Table, SignedInteger, Pointer, BitField, Enumeration, Counter }
+pub enum AttributeKind {
+    Unknown,
+    Octets,
+    String,
+    UnsignedInteger,
+    Table,
+    SignedInteger,
+    Pointer,
+    BitField,
+    Enumeration,
+    Counter,
+}
 
 /// Stable reference IDs and links are part of the frontend contract (project design).
 #[derive(Debug, Clone, Copy, Serialize)]
-pub struct Reference { pub id: &'static str, pub url: &'static str }
+pub struct Reference {
+    pub id: &'static str,
+    pub url: &'static str,
+}
 
 /// OMCI-005: index, mask, size, access and defaults are imported from the pinned schema.
 /// <https://github.com/opencord/omci-lib-go/blob/v2.2.4/generated/attribute.go#L62-L76>
@@ -43,8 +57,12 @@ pub struct MeDefinition {
     pub reference: Reference,
 }
 impl MeDefinition {
-    pub fn attribute(&self, index: u8) -> Option<&'static AttributeDefinition> { self.attributes.iter().find(|a| a.index == index) }
-    pub fn named(&self, name: &str) -> Option<&'static AttributeDefinition> { self.attributes.iter().find(|a| a.name == name) }
+    pub fn attribute(&self, index: u8) -> Option<&'static AttributeDefinition> {
+        self.attributes.iter().find(|a| a.index == index)
+    }
+    pub fn named(&self, name: &str) -> Option<&'static AttributeDefinition> {
+        self.attributes.iter().find(|a| a.name == name)
+    }
 }
 
 /// OMCI-006: immutable, sorted class registry; unselected classes have names only.
@@ -52,7 +70,12 @@ impl MeDefinition {
 pub struct MeRegistry;
 impl MeRegistry {
     pub fn get(class_id: u16) -> Option<&'static MeDefinition> {
-        super::generated::DEFINITIONS.binary_search_by_key(&class_id, |d| d.class_id).ok().map(|i| &super::generated::DEFINITIONS[i])
+        super::generated::DEFINITIONS
+            .binary_search_by_key(&class_id, |d| d.class_id)
+            .ok()
+            .map(|i| &super::generated::DEFINITIONS[i])
     }
-    pub fn all() -> &'static [MeDefinition] { super::generated::DEFINITIONS }
+    pub fn all() -> &'static [MeDefinition] {
+        super::generated::DEFINITIONS
+    }
 }

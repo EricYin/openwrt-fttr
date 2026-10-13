@@ -57,16 +57,12 @@ fn start_ipc_server(
                     // MIB sessions validate O5 through STATUS IPC. Keep accepting
                     // connections while this bounded diagnostic runs.
                     thread::spawn(move || {
-                        let fields: Vec<_> = request.split_whitespace().collect();
-                        let result = match fields.as_slice() {
-                            [id, summary] => id.parse::<u8>().ok().zip(summary.parse::<bool>().ok())
-                                .ok_or_else(|| std::io::Error::other("invalid MIB request"))
-                                .and_then(|(id, summary)| super::inventory::control(id, summary, &services)),
-                            _ => Err(std::io::Error::other("usage: MIB ONU_ID true|false")),
-                        };
+                        let result = serde_json::from_str::<super::inventory::MibCommand>(&request)
+                            .map_err(std::io::Error::other)
+                            .and_then(|command| super::inventory::control(command.onu_id, command.tables, &services));
                         let response = match result {
-                            Ok(output) => serde_json::json!({"output": output}),
-                            Err(error) => serde_json::json!({"error": error.to_string()}),
+                            Ok(report) => serde_json::to_value(report).expect("serializable MIB report"),
+                            Err(error) => serde_json::json!({"schema_version": 1, "error": {"code": format!("{:?}", error.kind()), "message": error.to_string()}}),
                         };
                         let _ = stream.write_all(response.to_string().as_bytes());
                     });
@@ -338,7 +334,7 @@ pub fn run() {
                     continue;
                 }
                 for id in pending_cleanup.clone() {
-                    if let Ok(_lock) = crate::pon_engine::omci_transport::lock_onu(id) {
+                    if let Ok(_lock) = crate::pon_engine::omci::platform::leases::lock_onu(id) {
                         match clear_offline_hardware(id) {
                             Ok(()) => {
                                 pending_cleanup.remove(&id);

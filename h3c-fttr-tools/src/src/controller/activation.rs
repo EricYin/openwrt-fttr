@@ -1,4 +1,4 @@
-use crate::{bosa, pon_engine::{ploam::PloamFrame, omci_transport::update_onu_enable}};
+use crate::{bosa, pon_engine::{ploam::PloamFrame, omci::platform::leases::update_onu_enable}};
 use std::{io, time::{Duration, Instant}};
 
 pub(super) struct RangingSession {

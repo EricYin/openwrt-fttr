@@ -1,6 +1,6 @@
 //! Shared bridge topology, initially verified on K155-11. Not a WAN creation contract.
 use crate::controller::business::{create_verified, verify, assign_tcont};
-use crate::pon_engine::omci_transport::OmciSession;
+use crate::pon_engine::omci::OmciSession;
 use std::io;
 
 pub(super) fn configure(session: &mut OmciSession, port: u16) -> io::Result<()> {
@@ -24,7 +24,7 @@ pub(super) fn configure(session: &mut OmciSession, port: u16) -> io::Result<()> 
             session.set(268, entity, 0x8000, &port.to_be_bytes())?;
             verify(session, 268, entity, 0xd200, &ctp_readback)?;
         }
-        Err(e) if crate::pon_engine::omci_transport::is_unknown_instance(&e) => {
+        Err(e) if crate::pon_engine::omci::error::is_unknown_instance(&e) => {
             session.create(268, entity, &ctp)?;
             verify(session, 268, entity, 0xd200, &ctp_readback)?;
         }

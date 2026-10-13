@@ -21,6 +21,7 @@ Commands:\n  \
   bosa-init            Initialize BOSA optical transceiver registers\n  \
   bridge-setup         Ensure downstream FTTR switch ports (fttr1~16) are bridged to br-lan\n  \
   status [--json|-j]   Display active FTTR optical link and DSA switch ports (table or JSON)\n  \
+  mib ONU_ID [--summary|--json] [--tables]  Read structured OMCI inventory (default: JSON)\n  \
   fpga-read <addr>     Directly read 32-bit FPGA hardware register\n  \
   fpga-write <a> <v>   Directly write 32-bit FPGA hardware register\n  \
   bosa-read <addr>     Directly read 8-bit BOSA UX3326 optical register\n  \
@@ -542,8 +543,12 @@ fn main() {
         }
         "mib" => {
             let id = args.get(2).and_then(|value| value.parse::<u8>().ok()).filter(|id| (1..=15).contains(id));
-            let Some(id) = id else { eprintln!("Usage: fttrctl mib ONU_ID [--summary]"); exit(1); };
-            if let Err(error) = h3c_fttr_tools::controller::inventory::read(id, args.iter().any(|arg| arg == "--summary")) {
+            let summary = args.iter().any(|arg| arg == "--summary");
+            let Some(id) = id else { eprintln!("Usage: fttrctl mib ONU_ID [--summary|--json] [--tables]"); exit(1); };
+            if args[3..].iter().any(|arg| !matches!(arg.as_str(), "--summary" | "--json" | "--tables")) || (summary && args.iter().any(|arg| arg == "--json")) {
+                eprintln!("Usage: fttrctl mib ONU_ID [--summary|--json] [--tables]"); exit(1);
+            }
+            if let Err(error) = h3c_fttr_tools::controller::inventory::read(id, summary, args.iter().any(|arg| arg == "--tables")) {
                 eprintln!("[-] MIB read failed: {error}"); exit(1);
             }
         }
