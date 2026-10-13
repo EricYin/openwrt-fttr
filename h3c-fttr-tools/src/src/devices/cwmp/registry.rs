@@ -1,12 +1,14 @@
 //! Explicit contract identifiers; an unavailable profile never silently falls back.
 use super::{contract::Contract, vendor};
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub fn available() -> Vec<&'static Contract> {
     let specialized: &[&Contract] = &[
         #[cfg(feature = "device-hl202")]
         &crate::devices::hl202::cwmp::CONTRACT,
         #[cfg(feature = "device-hwtc")]
         &crate::devices::hwtc::cwmp::CONTRACT,
+        #[cfg(feature = "device-hwtc")]
+        &crate::devices::hwtc::cwmp::V152_CONTRACT,
     ];
     vendor::candidates()
         .into_iter()

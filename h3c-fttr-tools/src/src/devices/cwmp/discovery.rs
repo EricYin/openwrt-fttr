@@ -29,6 +29,10 @@ pub fn match_wan(evidence: &[Evidence], parent: &str, connection: &str) -> Resol
 /// Exact known identity takes precedence. Parameter validity is checked later
 /// by the normal read/discover/write pipeline; it must not trigger silent fallback.
 pub fn specialization(optical_vendor: &str, product_class: &str) -> Option<&'static Contract> {
+    #[cfg(feature = "device-hwtc")]
+    if optical_vendor == "HWTC" && product_class == "V152" {
+        return Some(&crate::devices::hwtc::cwmp::V152_CONTRACT);
+    }
     #[cfg(feature = "device-hl202")]
     if optical_vendor == "H3CT" && product_class == "HL202-DU-C" {
         return Some(&crate::devices::hl202::cwmp::CONTRACT);

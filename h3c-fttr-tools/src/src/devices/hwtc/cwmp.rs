@@ -15,3 +15,20 @@ pub const CONTRACT: Contract = Contract {
     },
     ..hw::BASE
 };
+
+// V152 exposes individual unsignedInt 0/1 switches, not a reference string.
+pub const V152_CONTRACT: Contract = Contract {
+    id: "hwtc-v152-hw",
+    references: Some(crate::devices::cwmp::contract::ReferenceEncoding::HwLanBindFlags),
+    wan: crate::devices::cwmp::contract::WanContract {
+        binding: Some(crate::devices::cwmp::contract::unsigned(
+            crate::devices::cwmp::contract::connection("X_HW_LANBIND.Lan1Enable"),
+        )),
+        ..CONTRACT.wan
+    },
+    capability_groups: crate::devices::cwmp::contract::Capabilities {
+        binding: crate::devices::cwmp::contract::Support::Supported,
+        ..CONTRACT.capability_groups
+    },
+    ..CONTRACT
+};

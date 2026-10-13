@@ -1,6 +1,8 @@
 use std::io::{self, BufRead, Read, Write};
 use std::collections::BTreeMap;
-const MAX_BODY: usize = 512 * 1024;
+// Recursive parameter-name responses on HL202/V152 exceed 512 KiB.
+// Keep a finite bound, including for chunked bodies.
+const MAX_BODY: usize = 2 * 1024 * 1024;
 pub struct Request { pub path: String, pub headers: BTreeMap<String, String>, pub body: Vec<u8> }
 fn invalid() -> io::Error { io::Error::new(io::ErrorKind::InvalidData, "invalid or oversized HTTP request") }
 fn line<R: BufRead>(reader: &mut R) -> io::Result<String> {
@@ -40,7 +42,7 @@ pub fn read<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<
         }
     } else {
         let length: usize = headers.get("content-length").map(String::as_str).unwrap_or("0").parse().map_err(|_| invalid())?;
-        if length > MAX_BODY { return Err(invalid()); } body.resize(length, 0); reader.read_exact(&mut body)?;
+        if length > MAX_BODY { return Err(io::Error::new(io::ErrorKind::InvalidData, format!("HTTP body {length} bytes exceeds limit {MAX_BODY}"))); } body.resize(length, 0); reader.read_exact(&mut body)?;
     }
     Ok(Request { path: parts[1].into(), headers, body })
 }
@@ -64,5 +66,15 @@ pub fn basic(user: &str, password: &str) -> String {
         assert!(read(&mut &b"POST / HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n"[..], &mut output).is_err());
         assert!(read(&mut &b"POST / HTTP/1.1\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n"[..], &mut output).is_err());
         assert_eq!(basic("user", "password"), "Basic dXNlcjpwYXNzd29yZA==");
+    }
+    #[test] fn large_parameter_response_and_body_limit() {
+        let body = "x".repeat(700_000);
+        let wire = format!("POST /cwmp HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let mut output = Vec::new();
+        assert_eq!(read(&mut wire.as_bytes(), &mut output).unwrap().body.len(), body.len());
+        let oversized = format!("POST /cwmp HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1);
+        assert!(read(&mut oversized.as_bytes(), &mut output).is_err());
+        let chunked = format!("POST /cwmp HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n", MAX_BODY + 1);
+        assert!(read(&mut chunked.as_bytes(), &mut output).is_err());
     }
 }

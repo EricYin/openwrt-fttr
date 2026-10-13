@@ -1,5 +1,6 @@
 //! Convert business intent to a parameter plan using resolved object instances.
 use super::{codec::encode_services, contract::Contract, path::*};
+use crate::provisioning::model::BindingIntent;
 use crate::provisioning::model::{ConnectionMode, Parameter, ParameterKind, VlanMode, WanIntent};
 
 pub struct Plan {
@@ -89,7 +90,7 @@ pub fn compile_binding(
     if intent.endpoints.is_empty() {
         return Err("binding requires logical endpoints".into());
     }
-    let field = contract
+    let _field = contract
         .wan
         .binding
         .ok_or("LAN/SSID binding contract is unverified")?;
@@ -99,6 +100,41 @@ pub fn compile_binding(
         return Err("binding capability/reference encoding is unverified".into());
     }
     let (parent, connection) = objects.paths()?;
+    if matches!(
+        contract.references,
+        Some(super::contract::ReferenceEncoding::HwLanBindFlags)
+    ) {
+        let mut selected = std::collections::BTreeSet::new();
+        for endpoint in &intent.endpoints {
+            let path = endpoints.resolve(endpoint)?;
+            let (kind, index) = path.rsplit_once('.').ok_or("invalid binding endpoint")?;
+            let index: usize = index.parse().map_err(|_| "invalid binding instance")?;
+            let offset =
+                if kind.ends_with(".LANEthernetInterfaceConfig") && (1..=4).contains(&index) {
+                    index - 1
+                } else if kind.ends_with(".WLANConfiguration") && (1..=8).contains(&index) {
+                    index + 3
+                } else {
+                    return Err("endpoint outside V152 binding switch range".into());
+                };
+            selected.insert(offset);
+        }
+        return Ok(Plan {
+            guard: contract.wan.service.path(&parent, &connection),
+            parameters: contract
+                .binding_fields()
+                .into_iter()
+                .enumerate()
+                .map(|(index, field)| Parameter {
+                    name: field.path(&parent, &connection),
+                    value: if selected.contains(&index) { "1" } else { "0" }.into(),
+                    kind: ParameterKind::UnsignedInt,
+                    secret: false,
+                })
+                .collect(),
+        });
+    }
+    let field = _field;
     let values: Result<Vec<_>, _> = intent
         .endpoints
         .iter()
@@ -251,17 +287,17 @@ pub fn compile_wan(
         ParameterKind::UnsignedInt,
     );
     if !intent.bindings.is_empty() {
-        let field = w.binding.ok_or("binding contract is unverified")?;
-        let paths: Result<Vec<_>, _> = intent
-            .bindings
-            .iter()
-            .map(|e| endpoints.resolve(e))
-            .collect();
-        add(
-            field.path(&parent, &connection),
-            paths?.join(","),
-            ParameterKind::String,
-        );
+        let plan = compile_binding(
+            &BindingIntent {
+                endpoints: intent.bindings.clone(),
+            },
+            contract,
+            objects,
+            endpoints,
+        )?;
+        for p in plan.parameters {
+            add(p.name, p.value, p.kind);
+        }
     }
     add(
         format!("{connection}Enable"),
@@ -277,6 +313,63 @@ pub fn compile_wan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "device-hwtc")]
+    #[test]
+    fn v152_binding_switches_use_actual_instances_and_clear_unselected_ports() {
+        use crate::provisioning::model::EndpointRef;
+        let c = super::super::registry::lookup("hwtc-v152-hw").unwrap();
+        let objects = WanObjects {
+            parent: 3,
+            connection: 2,
+            kind: ConnectionKind::Ip,
+        };
+        let binding = BindingIntent {
+            endpoints: vec![EndpointRef::Lan(1), EndpointRef::Ssid { radio: 5, slot: 2 }],
+        };
+        let mut map = EndpointMap::default();
+        assert!(compile_binding(&binding, c, &objects, &map).is_err());
+        map.0.insert(
+            EndpointRef::Lan(1),
+            "InternetGatewayDevice.LANDevice.1.LANEthernetInterfaceConfig.1".into(),
+        );
+        map.0.insert(
+            EndpointRef::Ssid { radio: 5, slot: 2 },
+            "InternetGatewayDevice.LANDevice.1.WLANConfiguration.6".into(),
+        );
+        let plan = compile_binding(&binding, c, &objects, &map).unwrap();
+        assert_eq!(plan.parameters.len(), 12);
+        assert_eq!(plan.parameters.iter().filter(|p| p.value == "1").count(), 2);
+        for p in &plan.parameters {
+            assert!(p
+                .name
+                .contains("WANConnectionDevice.3.WANIPConnection.2.X_HW_LANBIND."));
+            assert_eq!(p.kind, ParameterKind::UnsignedInt);
+            assert_eq!(
+                p.value,
+                if p.name.ends_with(".Lan1Enable") || p.name.ends_with(".SSID6Enable") {
+                    "1"
+                } else {
+                    "0"
+                }
+            );
+        }
+        let mut wan = intent();
+        wan.bindings = binding.endpoints;
+        let wan_plan = compile_wan(&wan, c, &objects, &map).unwrap();
+        assert_eq!(
+            wan_plan
+                .parameters
+                .iter()
+                .filter(|p| p.name.contains(".X_HW_LANBIND."))
+                .count(),
+            12
+        );
+        map.0.insert(
+            EndpointRef::Lan(1),
+            "InternetGatewayDevice.LANDevice.1.LANEthernetInterfaceConfig.5".into(),
+        );
+        assert!(compile_wan(&wan, c, &objects, &map).is_err());
+    }
     fn intent() -> WanIntent {
         WanIntent {
             services: vec!["OTHER".into()],

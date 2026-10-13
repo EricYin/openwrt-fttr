@@ -340,6 +340,7 @@ impl Discovery {
             ]
             .into_iter()
             .flatten()
+            .chain(c.binding_fields())
             .any(|f| name.ends_with(&format!(".{}", f.name)))
         })
     }
@@ -431,6 +432,39 @@ impl Discovery {
             self.invalidate("identity contract conflicts with discovered parameters");
             return;
         }
+        if matches!(
+            contract.references,
+            Some(super::contract::ReferenceEncoding::HwLanBindFlags)
+        ) {
+            let mut connections = BTreeSet::new();
+            for path in self.names.keys() {
+                if let Some((parent, tail)) = path.split_once(".WANIPConnection.") {
+                    if let Some((instance, _)) = tail.split_once('.') {
+                        connections.insert((
+                            format!("{parent}."),
+                            format!("{parent}.WANIPConnection.{instance}."),
+                        ));
+                    }
+                }
+            }
+            if connections.is_empty()
+                || connections.iter().any(|(parent, connection)| {
+                    contract.binding_fields().iter().any(|field| {
+                        let path = field.path(parent, connection);
+                        self.names.get(&path) != Some(&true)
+                            || !self.values.get(&path).is_some_and(|(kind, value)| {
+                                *kind == ScalarType::UnsignedInt
+                                    && matches!(value.as_str(), "0" | "1")
+                            })
+                    })
+                })
+            {
+                self.invalidate(
+                    "V152 binding switches require complete writable unsignedInt 0/1 evidence",
+                );
+                return;
+            }
+        }
         if !contract.writes_verified {
             self.selected = Some(contract.id.into());
             self.stage = "blocked";
@@ -469,6 +503,64 @@ impl Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "device-hwtc")]
+    #[test]
+    fn v152_requires_complete_current_binding_switch_evidence() {
+        let root = "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.1.";
+        let connection = format!("{root}WANIPConnection.1.");
+        let contract = registry::lookup("hwtc-v152-hw").unwrap();
+        for bad in ["none", "missing", "readonly", "type", "value"] {
+            let mut probe = Discovery::new("auto");
+            let mut id = identity(20);
+            id.product_class = "V152".into();
+            probe.identity = Some(id);
+            let firmware = "InternetGatewayDevice.DeviceInfo.SoftwareVersion";
+            probe.names.insert(firmware.into(), false);
+            probe
+                .values
+                .insert(firmware.into(), (ScalarType::String, "v1".into()));
+            for (field, value) in [
+                (contract.wan.service, "TR069"),
+                (contract.wan.vlan, "46"),
+                (contract.wan.priority, "0"),
+            ] {
+                let path = field.path(root, &connection);
+                probe.names.insert(path.clone(), true);
+                probe.values.insert(path, (field.kind, value.into()));
+            }
+            for (index, field) in contract.binding_fields().into_iter().enumerate() {
+                if bad == "missing" && index == 11 {
+                    continue;
+                }
+                let path = field.path(root, &connection);
+                probe
+                    .names
+                    .insert(path.clone(), !(bad == "readonly" && index == 11));
+                probe.values.insert(
+                    path,
+                    (
+                        if bad == "type" && index == 11 {
+                            ScalarType::String
+                        } else {
+                            ScalarType::UnsignedInt
+                        },
+                        if bad == "value" && index == 11 {
+                            "2"
+                        } else {
+                            "0"
+                        }
+                        .into(),
+                    ),
+                );
+            }
+            probe.resolve();
+            assert_eq!(probe.ready(), bad == "none", "{bad}: {}", probe.reason);
+            if probe.ready() {
+                assert_eq!(probe.selected(), Some("hwtc-v152-hw"));
+            }
+        }
+        super::super::cache::invalidate_record("HWTC00000014");
+    }
     fn identity(n: u32) -> Identity {
         Identity {
             optical_vendor: "HWTC".into(),

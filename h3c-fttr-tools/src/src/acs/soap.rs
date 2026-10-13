@@ -14,8 +14,8 @@ pub struct Message {
 fn bad(message: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, message) }
 pub fn parse(input: &str) -> io::Result<Message> {
     let doc = roxmltree::Document::parse_with_options(input, roxmltree::ParsingOptions {
-        allow_dtd: false, nodes_limit: 30_000, ..Default::default()
-    }).map_err(|_| bad("invalid SOAP XML"))?;
+        allow_dtd: false, nodes_limit: 120_000, ..Default::default()
+    }).map_err(|e| bad(&format!("invalid SOAP XML: {e}")))?;
     let root = doc.root_element();
     if root.tag_name().name() != "Envelope" || root.tag_name().namespace() != Some(SOAP) { return Err(bad("not SOAP 1.1")); }
     let body = root.children().find(|n| n.has_tag_name((SOAP, "Body"))).ok_or_else(|| bad("no SOAP Body"))?;
@@ -88,5 +88,15 @@ mod tests {
         let xml = request("urn:dslforum-org:cwmp-1-0", 1, "SetParameterValues", &serde_json::json!({"parameters":[{"name":"x", "value":"<ssid>&", "kind":"string"}]})).unwrap();
         assert!(xml.contains("&lt;ssid&gt;&amp;")); assert!(parse(&xml).is_ok());
         assert!(request("urn:dslforum-org:cwmp-1-0", 1, "SetParameterValues", &serde_json::json!({"parameters":[{"name":"x", "value":"a", "kind":"evil"}]})).is_err());
+    }
+    #[test] fn full_parameter_tree_exceeding_old_limits() {
+        let rows = (0..6000).map(|i| format!("<ParameterInfoStruct><Name>InternetGatewayDevice.Test.Parameter{i}</Name><Writable>true</Writable></ParameterInfoStruct>")).collect::<String>();
+        let xml = envelope("urn:dslforum-org:cwmp-1-0", "fttr-1", &format!("<cwmp:GetParameterNamesResponse><ParameterList soap-enc:arrayType=\"cwmp:ParameterInfoStruct[6000]\">{rows}</ParameterList></cwmp:GetParameterNamesResponse>"));
+        assert!(xml.len() > 512 * 1024);
+        let parsed = parse(&xml).unwrap();
+        assert_eq!(parsed.data["parameters"].as_array().unwrap().len(), 6000);
+        assert_eq!(parsed.data["parameters"][5999]["writable"], "true");
+        let excessive = envelope("urn:dslforum-org:cwmp-1-0", "fttr-1", &format!("<cwmp:GetParameterNamesResponse>{}</cwmp:GetParameterNamesResponse>", "<x/>".repeat(120_000)));
+        assert!(parse(&excessive).is_err());
     }
 }

@@ -530,7 +530,8 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
             {
                 break
             }
-            Err(_) => {
+            Err(e) => {
+                eprintln!("[ACS] peer={peer} HTTP request rejected: {e}");
                 http::reply(&mut stream, 400, "", "", true)?;
                 break;
             }
@@ -587,11 +588,12 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
             }
         } else {
             let message = match std::str::from_utf8(&req.body)
-                .ok()
-                .and_then(|text| soap::parse(text).ok())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SOAP body is not UTF-8"))
+                .and_then(soap::parse)
             {
-                Some(v) => v,
-                None => {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[ACS] peer={peer} SOAP rejected bytes={}: {e}", req.body.len());
                     http::reply(&mut stream, 400, "", "", true)?;
                     break;
                 }
@@ -615,7 +617,7 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
                 "TransferComplete" if current.is_some() => Some(soap::envelope(&message.namespace, &message.id, "<cwmp:TransferCompleteResponse/>")),
                 _ => {
                     if let Some(device) = &current {
-                        if state.response(device, &message).is_err() { http::reply(&mut stream, 400, "", "", true)?; break; }
+                        if let Err(e) = state.response(device, &message) { eprintln!("[ACS] peer={peer} RPC response rejected method={} id={}: {e}", message.method, message.id); http::reply(&mut stream, 400, "", "", true)?; break; }
                         state.next(device, &message.namespace)?
                     } else { http::reply(&mut stream, 400, "", "", true)?; break; }
                 }

@@ -49,6 +49,7 @@ pub const UNVERIFIED: Capabilities = Capabilities {
 #[derive(Clone, Copy, Debug)]
 pub enum ReferenceEncoding {
     FullPathsComma,
+    HwLanBindFlags,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct OperationRequirements {
@@ -128,6 +129,30 @@ pub struct Contract {
 }
 
 impl Contract {
+    pub fn binding_fields(&self) -> Vec<Field> {
+        if matches!(self.references, Some(ReferenceEncoding::HwLanBindFlags)) {
+            [
+                "X_HW_LANBIND.Lan1Enable",
+                "X_HW_LANBIND.Lan2Enable",
+                "X_HW_LANBIND.Lan3Enable",
+                "X_HW_LANBIND.Lan4Enable",
+                "X_HW_LANBIND.SSID1Enable",
+                "X_HW_LANBIND.SSID2Enable",
+                "X_HW_LANBIND.SSID3Enable",
+                "X_HW_LANBIND.SSID4Enable",
+                "X_HW_LANBIND.SSID5Enable",
+                "X_HW_LANBIND.SSID6Enable",
+                "X_HW_LANBIND.SSID7Enable",
+                "X_HW_LANBIND.SSID8Enable",
+            ]
+            .into_iter()
+            .map(|name| unsigned(connection(name)))
+            .collect()
+        } else {
+            self.wan.binding.into_iter().collect()
+        }
+    }
+
     pub fn capabilities(&self) -> serde_json::Value {
         serde_json::json!({
             "wan":self.capability_groups.wan,
