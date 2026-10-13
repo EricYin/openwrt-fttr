@@ -30,6 +30,22 @@ pub(super) fn protected(service: &str, vlan_enabled: bool) -> bool {
 
 pub(crate) fn contains_service_token(service: &str, token: &str) -> bool {
     service
-        .split(',')
+        .split([',', '_'])
         .any(|value| value.trim().eq_ignore_ascii_case(token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hwtc_combined_services_preserve_management_and_fallback_protection() {
+        assert!(contains_service_token("TR069_INTERNET", "TR069"));
+        assert!(contains_service_token("internet_tr069", "INTERNET"));
+        assert!(protected("TR069_INTERNET", true));
+        assert!(protected("INTERNET_OTHER", false));
+        assert!(protected(" IPTV, TR069 ", true));
+        assert!(!contains_service_token("NOTTR069", "TR069"));
+        assert!(!protected("OTHER", true));
+    }
 }

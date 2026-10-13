@@ -1007,17 +1007,22 @@ mod tests {
     }
     #[test]
     fn management_wan_is_never_converted_to_business_bridge() {
-        let mut o = operation(OperationPhase::Reading, false);
-        o.device.items[0].guard = Some("guard".into());
-        o.device.items[0].service_type = "internet".into();
-        let mut reply = readback("old");
-        reply["result"]["parameters"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"name":"guard","value":"TR069,INTERNET"}));
-        responses(vec![reply]);
-        advance(&mut o, true);
-        assert_eq!(o.results["wifi"]["state"], "blocked");
+        for service in ["TR069,INTERNET", "TR069_INTERNET", "internet_tr069"] {
+            for apply in [false, true] {
+                let mut o = operation(OperationPhase::Reading, apply);
+                o.device.adapter = "hwtc".into();
+                o.device.items[0].guard = Some("guard".into());
+                o.device.items[0].service_type = "internet".into();
+                let mut reply = readback("old");
+                reply["result"]["parameters"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"name":"guard","value":service}));
+                responses(vec![reply]);
+                advance(&mut o, true);
+                assert_eq!(o.results["wifi"]["state"], "blocked", "{service}, apply={apply}");
+            }
+        }
     }
     #[test]
     fn wan_changes_disable_first_and_activation_requires_bindings() {
