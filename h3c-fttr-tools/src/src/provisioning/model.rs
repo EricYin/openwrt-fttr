@@ -35,6 +35,7 @@ wire_enum!(OperationPhase {
     DisablingRead => "disabling_read",
     Writing => "writing",
     Verifying => "verifying",
+    Settling => "settling",
     Completed => "completed",
 });
 
@@ -93,6 +94,8 @@ pub struct Parameter {
 
 #[derive(Clone)]
 pub struct Item {
+    pub wlan_intent: Option<WlanIntent>,
+    pub binding_intent: Option<BindingIntent>,
     pub id: String,
     pub kind: ItemKind,
     pub service_type: String,
@@ -101,6 +104,49 @@ pub struct Item {
     pub blocked: Option<String>,
     pub wan_ref: Option<String>,
     pub auto_instance: Option<u32>,
+    pub wan_intent: Option<WanIntent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WlanIntent {
+    pub endpoint: EndpointRef,
+    pub ssid: String,
+    pub enabled: Option<bool>,
+    pub broadcast: Option<bool>,
+    pub key: Option<String>,
+}
+#[derive(Clone, Debug)]
+pub struct BindingIntent {
+    pub endpoints: Vec<EndpointRef>,
+}
+
+/// Desired business state. Neither vendor fields nor wire paths belong here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WanIntent {
+    pub services: Vec<String>,
+    pub vlan: VlanMode,
+    pub priority: u8,
+    pub mode: ConnectionMode,
+    pub bindings: Vec<EndpointRef>,
+    pub internet: bool,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VlanMode {
+    Untagged,
+    Tagged(u16),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionMode {
+    Bridge,
+    Routed,
+}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EndpointRef {
+    Lan(u32),
+    Ssid { radio: u8, slot: u32 },
+    Named(String),
 }
 
 #[derive(Clone)]
@@ -109,10 +155,21 @@ pub struct Device {
     pub optical_sn: String,
     pub cwmp_id: String,
     pub adapter: String,
+    pub cwmp_contract: String,
     pub omci_management: bool,
     pub items: Vec<Item>,
     pub wifi_cleanup: String,
     pub wifi_preserve: BTreeSet<u32>,
+}
+
+impl Device {
+    pub fn contract(&self) -> &'static crate::devices::cwmp::contract::Contract {
+        crate::devices::cwmp::configuration_contract(
+            &self.cwmp_contract,
+            self.optical_sn.get(..4).unwrap_or(""),
+        )
+        .expect("configuration must validate the CWMP contract")
+    }
 }
 
 #[derive(Clone, Default)]

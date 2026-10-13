@@ -31,6 +31,12 @@ fn roots(item: &Item) -> Vec<String> {
     roots.into_iter().collect()
 }
 pub(super) fn advance(op: &mut Operation, reachable: bool) {
+    if op.stage == OperationPhase::Settling {
+        if reachable && now() >= op.verify_after {
+            queue_read(op, OperationPhase::Verifying);
+        }
+        return;
+    }
     if op.stage == OperationPhase::Waiting {
         if now().saturating_sub(op.started) > 900 {
             op.finish_item(
@@ -115,7 +121,14 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             op.uncertain = state == "unknown";
             op.pending = state == "accepted_pending_apply";
             op.written = state != "unknown";
-            queue_read(op, OperationPhase::Verifying);
+            let delay = op.device.contract().requirements.settle_seconds;
+            if delay == 0 {
+                queue_read(op, OperationPhase::Verifying);
+            } else {
+                op.verify_after = now() + delay;
+                op.task = None;
+                op.stage = OperationPhase::Settling;
+            }
         } else {
             // HL202 rejects the standard PreSharedKey.1.KeyPassphrase on some
             // WLAN instances (fault 9007) but accepts the vendor's top-level
@@ -129,7 +142,7 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
                         .collect()
                 })
                 .unwrap_or_default();
-            if op.device.adapter == "hl202"
+            if op.device.contract().wlan.passphrase_fallback
                 && !op.passphrase_fallback
                 && !parameter_faults.is_empty()
                 && parameter_faults
@@ -160,6 +173,8 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
                 );
                 return;
             }
+            op.capabilities
+                .invalidate("parameter write fault invalidated the capability contract");
             op.finish_item(
                 "failed",
                 "SetParameterValues failed; inspect ACS task for fault",
@@ -168,6 +183,8 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
         return;
     }
     if state != "completed" {
+        op.capabilities
+            .invalidate("parameter discovery/read fault invalidated the capability contract");
         op.finish_item(
             "failed",
             &format!(
@@ -206,7 +223,8 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             .iter()
             .filter(|p| {
                 !(op.writable.contains(&p.name)
-                    || op.device.adapter == "hl202" && p.name.ends_with(".NATEnabled"))
+                    || op.device.contract().wlan.nat_writable_exception
+                        && p.name.ends_with(".NATEnabled"))
             })
             .map(|p| p.name.clone())
             .collect();
@@ -241,6 +259,15 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
         op.stage = OperationPhase::Reading;
     }
     if let Some(guard) = &item.guard {
+        if let Some((root, _)) = guard.rsplit_once('.') {
+            if crate::devices::cwmp::observed::protected(&values, &format!("{root}.")) {
+                op.finish_item(
+                    "blocked",
+                    "cross-contract readback identifies a management/fallback WAN",
+                );
+                return;
+            }
+        }
         let observed = values
             .iter()
             .find(|p| p["name"] == *guard)
@@ -261,28 +288,18 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
         if crate::provisioning::contains_service_token(service, "INTERNET")
             && guard.contains(".WANConnectionDevice.")
         {
-            let enabled = if op.device.adapter == "hl202" {
+            let contract = op.device.contract().wan;
+            let enabled = contract.tagged(|name| {
                 values
                     .iter()
                     .find(|p| {
                         p["name"]
                             .as_str()
-                            .is_some_and(|n| n.ends_with("X_CU_VLANEnabled"))
+                            .is_some_and(|n| n.ends_with(&format!(".{name}")))
                     })
                     .and_then(|p| p["value"].as_str())
-                    .and_then(|v| match v {
-                        "1" | "true" => Some(true),
-                        "0" | "false" => Some(false),
-                        _ => None,
-                    })
-            } else {
-                values
-                    .iter()
-                    .find(|p| p["name"].as_str().is_some_and(|n| n.ends_with("X_HW_VLAN")))
-                    .and_then(|p| p["value"].as_str())
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .map(|v| v != 0)
-            };
+                    .map(str::to_owned)
+            });
             let allocated = item
                 .wan_ref
                 .as_ref()
@@ -354,7 +371,7 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
         changes.clear();
     }
     if item.kind == ItemKind::DeviceService
-        && op.device.adapter == "hl202"
+        && op.device.contract().wlan.nat_writable_exception
         && changes.iter().any(|p| p.name.ends_with(".NATEnabled"))
     {
         if !changes
@@ -382,7 +399,9 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
         op.finish_item("blocked", "TR069 is owned by OMCI");
         return;
     }
-    if matches!(item.kind, ItemKind::DeviceService | ItemKind::PortBinding) {
+    if op.device.contract().requirements.disable_wan_before_write
+        && matches!(item.kind, ItemKind::DeviceService | ItemKind::PortBinding)
+    {
         if let Some(enable) = op
             .changes
             .iter()
@@ -423,12 +442,19 @@ fn queue_read(op: &mut Operation, stage: OperationPhase) {
         .as_ref()
         .filter(|g| g.contains(".WANConnectionDevice."))
     {
-        if op.device.adapter == "hl202" {
+        let contract = op.device.contract().wan;
+        if let Some((root, _)) = guard.rsplit_once('.') {
+            if let Some(extra) = op.capabilities.wan_fields().get(&format!("{root}.")) {
+                names.extend(extra.iter().cloned());
+            }
+        }
+        let field = contract.enabled.unwrap_or(contract.vlan);
+        if field.location == crate::devices::cwmp::contract::Location::Parent {
             if let Some((parent, _)) = guard.split_once(".WANIPConnection.") {
-                names.push(format!("{parent}.X_CU_VLANEnabled"));
+                names.push(format!("{parent}.{}", field.name));
             }
         } else if let Some((root, _)) = guard.rsplit_once('.') {
-            names.push(format!("{root}.X_HW_VLAN"));
+            names.push(format!("{root}.{}", field.name));
         }
     }
     if let Some(g) = &op.item().guard {
@@ -447,23 +473,22 @@ pub(super) fn equivalent(p: &Parameter, observed: &str) -> bool {
             ("1", "true" | "1") | ("0", "false" | "0")
         );
     }
-    if p.name.ends_with("X_CU_LanInterface") {
-        let endpoints = |value: &str| {
-            value
-                .split(',')
-                .filter(|v| !v.is_empty())
-                .filter(|v| {
-                    !matches!(
-                        v.trim_end_matches('.')
-                            .rsplit_once(".WLANConfiguration.")
-                            .map(|(_, n)| n),
-                        Some("10" | "14")
-                    )
-                })
-                .map(str::to_string)
-                .collect::<BTreeSet<_>>()
-        };
-        return endpoints(&p.value) == endpoints(observed);
+    for contract in crate::devices::cwmp::registry::available() {
+        for field in [
+            Some(contract.wan.service),
+            Some(contract.wan.vlan),
+            Some(contract.wan.priority),
+            contract.wan.enabled,
+            contract.wan.binding,
+            contract.wan.cloud_cpe,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if p.name.ends_with(&format!(".{}", field.name)) {
+                return crate::devices::cwmp::contract::equivalent_field(field, &p.value, observed);
+            }
+        }
     }
     p.value == observed
 }

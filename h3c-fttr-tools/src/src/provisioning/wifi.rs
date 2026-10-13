@@ -30,10 +30,13 @@ mod tests {
             optical_sn: "H3CT12345678".into(),
             cwmp_id: "id".into(),
             adapter: "hl202".into(),
+            cwmp_contract: "hl202-cu".into(),
             omci_management: false,
             wifi_cleanup: "delete".into(),
             wifi_preserve: BTreeSet::new(),
             items: vec![Item {
+                wlan_intent: None,
+                binding_intent: None,
                 id: "wifi".into(),
                 kind: ItemKind::Ssid,
                 service_type: String::new(),
@@ -47,6 +50,7 @@ mod tests {
                 blocked: None,
                 wan_ref: None,
                 auto_instance: None,
+                wan_intent: None,
             }],
         }
     }

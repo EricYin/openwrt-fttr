@@ -55,6 +55,8 @@ fn ip_kind() -> String {
 }
 #[derive(Clone)]
 pub struct Reconciler {
+    pub evidence_paths: BTreeMap<String, Vec<String>>,
+    pub protected_roots: BTreeSet<String>,
     pub owned: BTreeMap<String, Owned>,
     pub results: BTreeMap<String, Value>,
     actions: VecDeque<(String, bool)>,
@@ -76,6 +78,8 @@ impl Reconciler {
     pub fn new(device: &Device, owned: BTreeMap<String, Owned>, prune: bool) -> Self {
         let _ = device;
         Self {
+            evidence_paths: BTreeMap::new(),
+            protected_roots: BTreeSet::new(),
             owned,
             results: BTreeMap::new(),
             actions: VecDeque::new(),
@@ -147,6 +151,16 @@ impl Reconciler {
         _management: bool,
         reachable: bool,
     ) -> bool {
+        if !self.initialized
+            && device
+                .items
+                .iter()
+                .any(|item| item.wan_ref.is_some() && item.blocked.is_some())
+        {
+            self.results.entry("inventory".into()).or_insert_with(|| json!({"state":"blocked","reason":"WAN plan or binding failed preflight; lifecycle changes withheld"}));
+            self.stage = WanPhase::Done;
+            return true;
+        }
         if !self.prune && !device.items.iter().any(|i| i.wan_ref.is_some()) {
             self.stage = WanPhase::Done;
             return true;
@@ -278,26 +292,10 @@ impl Reconciler {
                             })
                             .and_then(|p| p["value"].as_str())
                     };
-                    let service = value(if device.adapter == "hl202" {
-                        "X_CU_ServiceList"
-                    } else {
-                        "X_HW_SERVICELIST"
-                    });
-                    let vlan = value(if device.adapter == "hl202" {
-                        "X_CU_VLAN"
-                    } else {
-                        "X_HW_VLAN"
-                    })
-                    .and_then(|v| v.parse::<u32>().ok());
-                    let enabled = if device.adapter == "hl202" {
-                        value("X_CU_VLANEnabled").and_then(|v| match v {
-                            "1" | "true" => Some(true),
-                            "0" | "false" => Some(false),
-                            _ => None,
-                        })
-                    } else {
-                        vlan.map(|v| v != 0)
-                    };
+                    let contract = device.contract().wan;
+                    let service = value(contract.service.name);
+                    let vlan = value(contract.vlan.name).and_then(|v| v.parse::<u32>().ok());
+                    let enabled = contract.tagged(|name| value(name).map(str::to_owned));
                     let (Some(service), Some(vlan), Some(enabled)) = (service, vlan, enabled)
                     else {
                         self.fail(
@@ -310,9 +308,11 @@ impl Reconciler {
                         return true;
                     };
                     self.vlans.insert(parent, (vlan, enabled));
-                    if device.adapter == "hl202" {
+                    if contract.priority.location
+                        == crate::devices::cwmp::contract::Location::Parent
+                    {
                         let Some(priority) =
-                            value("X_CU_802_1p").and_then(|v| v.parse::<u32>().ok())
+                            value(contract.priority.name).and_then(|v| v.parse::<u32>().ok())
                         else {
                             self.fail(device, "blocked", "incomplete parent priority readback");
                             self.stage = WanPhase::Done;
@@ -323,8 +323,12 @@ impl Reconciler {
                     self.discovered.push(Owned {
                         parent,
                         connection,
-                        kind,
-                        state: if protected(service, enabled) {
+                        kind: kind.clone(),
+                        state: if protected(service, enabled)
+                            || crate::devices::cwmp::observed::protected(
+                                parameters.map(Vec::as_slice).unwrap_or_default(),
+                                &format!("{ROOT}{parent}.{kind}.{connection}."),
+                            ) {
                             "protected"
                         } else {
                             "ready"
@@ -426,6 +430,17 @@ impl Reconciler {
                 WanPhase::DeleteGuard => {
                     let id = self.current.as_ref().unwrap().0.clone();
                     let o = &self.owned[&id];
+                    if self
+                        .protected_roots
+                        .contains(&format!("{ROOT}{}.{}.{}.", o.parent, o.kind, o.connection))
+                    {
+                        self.fail(
+                            device,
+                            "blocked",
+                            "cross-contract discovery protects this management/fallback WAN",
+                        );
+                        return false;
+                    }
                     let parameters = v["result"]["parameters"].as_array();
                     let value = |suffix: &str| {
                         parameters
@@ -436,11 +451,8 @@ impl Reconciler {
                             })
                             .and_then(|p| p["value"].as_str())
                     };
-                    let observed = value(if device.adapter == "hl202" {
-                        "X_CU_ServiceList"
-                    } else {
-                        "X_HW_SERVICELIST"
-                    });
+                    let contract = device.contract().wan;
+                    let observed = value(contract.service.name);
                     let Some(observed) = observed else {
                         self.fail(
                             device,
@@ -449,23 +461,16 @@ impl Reconciler {
                         );
                         return false;
                     };
-                    if super::contains_service_token(observed, "TR069")
+                    if crate::devices::cwmp::observed::protected(
+                        parameters.map(Vec::as_slice).unwrap_or_default(),
+                        &format!("{ROOT}{}.{}.{}.", o.parent, o.kind, o.connection),
+                    ) || super::contains_service_token(observed, "TR069")
                         || (!observed.is_empty() && observed != o.service_list)
                     {
                         self.fail(device,"blocked","owned WAN now carries protected or reassigned service; manual review required");
                         return false;
                     }
-                    let enabled = if device.adapter == "hl202" {
-                        value("X_CU_VLANEnabled").and_then(|v| match v {
-                            "1" | "true" => Some(true),
-                            "0" | "false" => Some(false),
-                            _ => None,
-                        })
-                    } else {
-                        value("X_HW_VLAN")
-                            .and_then(|v| v.parse::<u32>().ok())
-                            .map(|v| v != 0)
-                    };
+                    let enabled = contract.tagged(|name| value(name).map(str::to_owned));
                     if enabled.is_none_or(|enabled| protected(observed, enabled)) {
                         self.fail(
                             device,
@@ -636,7 +641,13 @@ impl Reconciler {
                     );
                     return false;
                 }
-                let names = classification_names(device, o.parent, o.connection, &o.kind);
+                let names = classification_names(
+                    device,
+                    o.parent,
+                    o.connection,
+                    &o.kind,
+                    &self.evidence_paths,
+                );
                 self.queue(
                     device,
                     "GetParameterValues",
@@ -708,8 +719,25 @@ impl Reconciler {
         false
     }
     fn discover_next(&mut self, device: &mut Device) {
+        while let Some((parent, child, kind)) = self.discovery.front() {
+            if !self
+                .protected_roots
+                .contains(&format!("{ROOT}{parent}.{kind}.{child}."))
+            {
+                break;
+            }
+            self.discovered.push(Owned {
+                parent: *parent,
+                connection: *child,
+                kind: kind.clone(),
+                state: "protected".into(),
+                service_list: String::new(),
+                baseline: None,
+            });
+            self.discovery.pop_front();
+        }
         if let Some((parent, child, kind)) = self.discovery.front() {
-            let names = classification_names(device, *parent, *child, kind);
+            let names = classification_names(device, *parent, *child, kind, &self.evidence_paths);
             self.queue(
                 device,
                 "GetParameterValues",
@@ -755,10 +783,13 @@ impl Reconciler {
                 .find(|p| p.name.ends_with("ServiceList") || p.name.ends_with("SERVICELIST"))
                 .map(|p| p.value.as_str())
                 .unwrap_or("");
-            let untagged = item.parameters.iter().any(|p| {
-                (p.name.ends_with("X_CU_VLANEnabled") || p.name.ends_with("X_HW_VLAN"))
-                    && matches!(p.value.as_str(), "0" | "false")
-            });
+            let contract = device.contract().wan;
+            let untagged = contract.tagged(|name| {
+                item.parameters
+                    .iter()
+                    .find(|p| p.name.ends_with(&format!(".{name}")))
+                    .map(|p| p.value.clone())
+            }) == Some(false);
             if untagged && protected(service, false) {
                 self.results.insert(id.clone(),json!({"state":"blocked","reason":"untagged INTERNET is reserved for the fallback network"}));
                 continue;
@@ -793,7 +824,7 @@ impl Reconciler {
                 }
             }
             if let Some(o) = editable.get(index) {
-                if device.adapter == "hl202"
+                if contract.vlan.location == crate::devices::cwmp::contract::Location::Parent
                     && self
                         .discovered
                         .iter()
@@ -805,17 +836,17 @@ impl Reconciler {
                     let vlan = item
                         .parameters
                         .iter()
-                        .find(|p| p.name.ends_with("X_CU_VLAN"))
+                        .find(|p| p.name.ends_with(contract.vlan.name))
                         .and_then(|p| p.value.parse::<u32>().ok());
                     let enabled = item
                         .parameters
                         .iter()
-                        .find(|p| p.name.ends_with("X_CU_VLANEnabled"))
+                        .find(|p| contract.enabled.is_some_and(|f| p.name.ends_with(f.name)))
                         .map(|p| matches!(p.value.as_str(), "1" | "true"));
                     let priority = item
                         .parameters
                         .iter()
-                        .find(|p| p.name.ends_with("X_CU_802_1p"))
+                        .find(|p| p.name.ends_with(contract.priority.name))
                         .and_then(|p| p.value.parse::<u32>().ok());
                     if vlan.is_none()
                         || enabled.is_none()
@@ -853,8 +884,52 @@ impl Reconciler {
     }
     fn remap(&self, device: &mut Device, id: &str) {
         let o = &self.owned[id];
+        let contract = device.contract();
         for item in &mut device.items {
             if item.wan_ref.as_deref() == Some(id) && item.auto_instance.is_some() {
+                if item.kind == ItemKind::DeviceService {
+                    if let Some(intent) = &item.wan_intent {
+                        let enable = item
+                            .parameters
+                            .iter()
+                            .find(|p| p.name.ends_with(".Enable"))
+                            .map(|p| p.value.clone());
+                        let activation_separate = enable.is_none();
+                        let objects = crate::devices::cwmp::path::WanObjects {
+                            parent: o.parent,
+                            connection: o.connection,
+                            kind: if o.kind == "WANIPConnection" {
+                                crate::devices::cwmp::path::ConnectionKind::Ip
+                            } else {
+                                crate::devices::cwmp::path::ConnectionKind::Ppp
+                            },
+                        };
+                        match crate::devices::cwmp::compiler::compile_wan(
+                            intent,
+                            contract,
+                            &objects,
+                            &crate::devices::cwmp::path::EndpointMap::default(),
+                        ) {
+                            Ok(mut plan) => {
+                                if activation_separate {
+                                    plan.parameters.retain(|p| !p.name.ends_with(".Enable"));
+                                } else if let Some(value) = &enable {
+                                    for p in plan
+                                        .parameters
+                                        .iter_mut()
+                                        .filter(|p| p.name.ends_with(".Enable"))
+                                    {
+                                        p.value = value.clone();
+                                    }
+                                }
+                                item.parameters = plan.parameters;
+                                item.guard = Some(plan.guard);
+                            }
+                            Err(reason) => item.blocked = Some(reason),
+                        }
+                        continue;
+                    }
+                }
                 for p in &mut item.parameters {
                     p.name = remapped(&p.name, o);
                 }
@@ -927,6 +1002,13 @@ impl Reconciler {
                 .iter()
                 .filter(|o| o.state == "protected")
                 .map(|o| o.parent)
+                .chain(self.protected_roots.iter().filter_map(|root| {
+                    root.strip_prefix(ROOT)?
+                        .split('.')
+                        .next()?
+                        .parse::<u32>()
+                        .ok()
+                }))
                 .collect();
             let text =
                 json!({"cwmp_id":id,"owned":self.owned,"protected_parents":protected_parents})
@@ -940,22 +1022,24 @@ impl Reconciler {
         }
     }
 }
-fn classification_names(device: &Device, parent: u32, child: u32, kind: &str) -> Vec<String> {
+fn classification_names(
+    device: &Device,
+    parent: u32,
+    child: u32,
+    kind: &str,
+    evidence: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
     let root = format!("{ROOT}{parent}.");
     let path = format!("{root}{kind}.{child}.");
-    if device.adapter == "hl202" {
-        vec![
-            format!("{path}X_CU_ServiceList"),
-            format!("{root}X_CU_VLANEnabled"),
-            format!("{root}X_CU_VLAN"),
-            format!("{root}X_CU_802_1p"),
-        ]
-    } else {
-        vec![
-            format!("{path}X_HW_SERVICELIST"),
-            format!("{path}X_HW_VLAN"),
-        ]
-    }
+    device
+        .contract()
+        .wan
+        .classification_paths(&root, &path)
+        .into_iter()
+        .chain(evidence.get(&path).into_iter().flatten().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 fn remapped(name: &str, o: &Owned) -> String {
     let Some((_, tail)) = name.strip_prefix(ROOT).and_then(|n| n.split_once('.')) else {
@@ -985,8 +1069,11 @@ mod tests {
             optical_sn: "HWTC12345678".into(),
             cwmp_id: "id".into(),
             adapter: "hwtc".into(),
+            cwmp_contract: "hwtc-hw".into(),
             omci_management: false,
             items: vec![Item {
+                wlan_intent: None,
+                binding_intent: None,
                 id: "internet".into(),
                 kind: ItemKind::DeviceService,
                 service_type: "internet".into(),
@@ -994,6 +1081,7 @@ mod tests {
                 blocked: None,
                 wan_ref: Some("internet".into()),
                 auto_instance: Some(1000),
+                wan_intent: None,
                 parameters: vec![Parameter {
                     name: format!("{ROOT}1000.WANIPConnection.1.X_HW_SERVICELIST"),
                     value: "INTERNET".into(),
@@ -1036,6 +1124,61 @@ mod tests {
             format!("{ROOT}7.WANIPConnection.3.X_HW_SERVICELIST")
         );
     }
+    #[cfg(feature = "device-hwtc")]
+    #[test]
+    fn resolved_intent_is_recompiled_without_bypassing_separate_activation() {
+        use super::super::model::{ConnectionMode, VlanMode, WanIntent};
+        let mut d = device();
+        d.items[0].wan_intent = Some(WanIntent {
+            services: vec!["INTERNET".into()],
+            vlan: VlanMode::Tagged(66),
+            priority: 6,
+            mode: ConnectionMode::Bridge,
+            bindings: vec![],
+            internet: true,
+            enabled: true,
+        });
+        let mut r = Reconciler::new(&d, BTreeMap::new(), true);
+        r.owned.insert(
+            "internet".into(),
+            Owned {
+                parent: 7,
+                connection: 3,
+                state: "ready".into(),
+                service_list: "INTERNET".into(),
+                kind: ip_kind(),
+                baseline: None,
+            },
+        );
+        r.remap(&mut d, "internet");
+        assert!(d.items[0]
+            .parameters
+            .iter()
+            .all(|p| p.name.starts_with(&format!("{ROOT}7.WANIPConnection.3."))));
+        assert!(d.items[0]
+            .parameters
+            .iter()
+            .any(|p| p.name.ends_with(".X_HW_VLAN") && p.value == "66"));
+        assert!(!d.items[0]
+            .parameters
+            .iter()
+            .any(|p| p.name.ends_with(".Enable")));
+        d.items[0].parameters.push(Parameter {
+            name: format!("{ROOT}7.WANIPConnection.3.Enable"),
+            value: "0".into(),
+            kind: ParameterKind::Boolean,
+            secret: false,
+        });
+        r.owned.get_mut("internet").unwrap().parent = 9;
+        r.remap(&mut d, "internet");
+        assert!(d.items[0]
+            .parameters
+            .iter()
+            .any(|p| p.name == format!("{ROOT}9.WANIPConnection.3.Enable") && p.value == "0"));
+        r.owned.get_mut("internet").unwrap().kind = "WANPPPConnection".into();
+        r.remap(&mut d, "internet");
+        assert!(d.items[0].blocked.is_some());
+    }
     #[test]
     fn plan_allocates_nothing_and_unknown_add_is_not_replayed() {
         let mut d = device();
@@ -1058,6 +1201,21 @@ mod tests {
         }
         assert_eq!(r.results["internet"]["state"], "unknown");
         assert_eq!(r.owned["internet"].parent, 0);
+    }
+    #[test]
+    fn cross_contract_management_roots_are_not_reclassified_or_pruned() {
+        let mut d = device();
+        d.items.clear();
+        d.cwmp_contract = "hl202-cu".into();
+        let mut r = Reconciler::new(&d, BTreeMap::new(), true);
+        r.protected_roots
+            .insert(format!("{ROOT}1.WANIPConnection.1."));
+        r.discovery.push_back((1, 1, ip_kind()));
+        responses(vec![]);
+        r.discover_next(&mut d);
+        assert_eq!(r.discovered[0].state, "protected");
+        assert!(r.actions.is_empty());
+        assert!(r.owned.is_empty());
     }
     #[test]
     fn pruning_refuses_a_management_or_reassigned_wan() {
@@ -1121,6 +1279,7 @@ mod tests {
     fn shared_protected_parent_blocks_mutation() {
         let mut d = device();
         d.adapter = "hl202".into();
+        d.cwmp_contract = "hl202-cu".into();
         let mut r = Reconciler::new(&d, BTreeMap::new(), true);
         r.discovered = vec![
             Owned {
@@ -1274,5 +1433,45 @@ mod tests {
         assert!(d.items[1].parameters[0]
             .name
             .contains("7.WANIPConnection.3."));
+    }
+
+    #[test]
+    fn failed_wan_or_binding_preflight_prevents_lifecycle_rpcs() {
+        for binding in [false, true] {
+            let mut d = device();
+            if binding {
+                let mut item = d.items[0].clone();
+                item.id = "binding".into();
+                item.kind = ItemKind::PortBinding;
+                item.blocked = Some("binding contract is unverified".into());
+                d.items.push(item);
+            } else {
+                d.items[0].blocked = Some("service encoding is unverified".into());
+                d.items[0].parameters.clear();
+            }
+            let mut reconciler = Reconciler::new(&d, BTreeMap::new(), true);
+            super::super::controller::RPC.with(|r| *r.borrow_mut() = (VecDeque::new(), Vec::new()));
+            assert!(reconciler.tick(&mut d, true, false, true));
+            assert_eq!(reconciler.results["inventory"]["state"], "blocked");
+            super::super::controller::RPC.with(|r| assert!(r.borrow().1.is_empty()));
+            assert!(reconciler.owned.is_empty());
+        }
+    }
+
+    #[test]
+    fn preflight_does_not_discard_an_inflight_lifecycle_task() {
+        let mut d = device();
+        d.items[0].blocked = Some("later item failure".into());
+        let mut r = Reconciler::new(&d, BTreeMap::new(), true);
+        r.initialized = true;
+        r.stage = WanPhase::AddingParent;
+        r.task = Some(7);
+        responses(vec![json!({"state":"sent"})]);
+        assert!(!r.tick(&mut d, true, false, true));
+        assert_eq!(r.task, Some(7));
+        assert_eq!(r.stage, WanPhase::AddingParent);
+        super::super::controller::RPC.with(|rpc| {
+            assert_eq!(rpc.borrow().1, vec![json!({"op":"task","id":7})]);
+        });
     }
 }

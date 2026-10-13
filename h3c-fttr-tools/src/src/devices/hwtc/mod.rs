@@ -1,5 +1,6 @@
 //! HWTC standard OMCI bridge service; proprietary shell management unavailable.
 pub mod service;
+pub mod cwmp;
 mod bridge;
 pub mod k155;
 pub mod v152;

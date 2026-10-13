@@ -9,7 +9,7 @@ mod config;
 mod management_network;
 mod controller;
 mod link_identity;
-mod model;
+pub mod model;
 mod policy;
 mod storage;
 mod templates;

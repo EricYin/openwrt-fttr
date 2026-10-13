@@ -1,5 +1,5 @@
+use super::model::ItemKind;
 pub(super) use super::model::{Config, Device, Item, Management, Parameter};
-use super::model::{ItemKind, ParameterKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
@@ -250,11 +250,20 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
                     .ok_or("invalid wifi_preserve instance")
             })
             .collect::<Result<BTreeSet<_>, _>>()?;
+        let cwmp_contract = if s.get("cwmp_contract").is_empty() {
+            "auto"
+        } else {
+            s.get("cwmp_contract")
+        };
+        if cwmp_contract != "auto" {
+            crate::devices::cwmp::registry::lookup(cwmp_contract)?;
+        }
         cfg.devices.push(Device {
             id: id.clone(),
             optical_sn: s.get("optical_sn").to_ascii_uppercase(),
             cwmp_id: s.get("cwmp_id").into(),
             adapter: adapter.into(),
+            cwmp_contract: cwmp_contract.into(),
             omci_management: boolean(s.get("omci_management"), false)
                 .map_err(|error| format!("{id}: omci_management: {error}"))?,
             items: Vec::new(),
@@ -275,6 +284,8 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
             .find(|d| d.id == s.get("device"))
             .ok_or_else(|| format!("{id}: unknown device"))?;
         let mut item = Item {
+            wlan_intent: None,
+            binding_intent: None,
             id: id.clone(),
             kind,
             service_type: String::new(),
@@ -283,6 +294,7 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
             blocked: None,
             wan_ref: None,
             auto_instance: None,
+            wan_intent: None,
         };
         if s.kind == "ssid" {
             let profile = reference(&sections, s.get("profile"), "wifi_profile")?;
@@ -298,99 +310,41 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
                 "5g" => 4,
                 _ => return Err("radio must be 2g or 5g".into()),
             };
-            let instance = if s.get("instance").is_empty() {
-                base + slot
-            } else {
-                s.number("instance", 32)?
-            };
+            if !s.get("instance").is_empty() {
+                return Err(
+                    "WLAN instance overrides were removed; use a logical radio/slot".into(),
+                );
+            }
+            let instance = base + slot;
             if instance == 0 {
                 return Err("invalid WLAN instance".into());
             }
-            let path = format!("InternetGatewayDevice.LANDevice.1.WLANConfiguration.{instance}.");
-            add(
-                &mut item,
-                &path,
-                "SSID",
-                profile.get("ssid"),
-                ParameterKind::String,
-                false,
-            );
-            for field in ["Enable", "BeaconAdvertisementEnabled"] {
-                let key = if field == "Enable" {
-                    "enabled"
-                } else {
-                    "broadcast"
-                };
-                if !profile.get(key).is_empty() {
-                    add(
-                        &mut item,
-                        &path,
-                        field,
-                        if boolean(profile.get(key), true)? {
-                            "1"
-                        } else {
-                            "0"
-                        },
-                        ParameterKind::Boolean,
-                        false,
-                    );
-                }
+            let endpoint = super::model::EndpointRef::Ssid {
+                radio: if base == 0 { 2 } else { 5 },
+                slot: (instance - base),
+            };
+            if !profile.get("security").is_empty() && profile.get("security") != "wpa2-psk" {
+                return Err("security must be wpa2-psk".into());
             }
-            // An enabled SSID also needs its shared radio enabled. Never turn
-            // that radio off for a disabled SSID: other SSIDs may still use it.
-            if boolean(profile.get("enabled"), true)? {
-                add(
-                    &mut item,
-                    &path,
-                    "RadioEnabled",
-                    "1",
-                    ParameterKind::Boolean,
-                    false,
-                );
+            let intent = super::model::WlanIntent {
+                endpoint,
+                ssid: profile.get("ssid").into(),
+                enabled: (!profile.get("enabled").is_empty())
+                    .then(|| boolean(profile.get("enabled"), true))
+                    .transpose()?,
+                broadcast: (!profile.get("broadcast").is_empty())
+                    .then(|| boolean(profile.get("broadcast"), true))
+                    .transpose()?,
+                key: (!profile.get("security").is_empty()).then(|| profile.get("key").to_owned()),
+            };
+            if intent
+                .key
+                .as_ref()
+                .is_some_and(|key| !(8..=63).contains(&key.len()))
+            {
+                return Err("WPA2 key must be 8..63 bytes".into());
             }
-            if !profile.get("security").is_empty() {
-                if profile.get("security") != "wpa2-psk" {
-                    return Err("security must be wpa2-psk".into());
-                }
-                let key = profile.get("key");
-                if !(8..=63).contains(&key.len()) {
-                    return Err("WPA2 key must be 8..63 bytes".into());
-                }
-                // HL202 reports WPA2 and rejects the standard 11i token with
-                // CWMP fault 9007; K155 accepts 11i.
-                add(
-                    &mut item,
-                    &path,
-                    "BeaconType",
-                    if d.adapter == "hl202" { "WPA2" } else { "11i" },
-                    ParameterKind::String,
-                    false,
-                );
-                add(
-                    &mut item,
-                    &path,
-                    "IEEE11iEncryptionModes",
-                    "AESEncryption",
-                    ParameterKind::String,
-                    false,
-                );
-                add(
-                    &mut item,
-                    &path,
-                    "IEEE11iAuthenticationMode",
-                    "PSKAuthentication",
-                    ParameterKind::String,
-                    false,
-                );
-                add(
-                    &mut item,
-                    &path,
-                    "PreSharedKey.1.KeyPassphrase",
-                    key,
-                    ParameterKind::String,
-                    true,
-                );
-            }
+            item.wlan_intent = Some(intent);
             if !s.get("device_service").is_empty() {
                 let ds = reference(&sections, s.get("device_service"), "device_service")?;
                 if ds.get("device") != d.id {
@@ -399,9 +353,9 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
                 if !sections.values().any(|b| {
                     b.kind == "port_binding"
                         && b.get("device_service") == s.get("device_service")
-                        && b.options
-                            .get("interface")
-                            .is_some_and(|v| v.contains(&path.trim_end_matches('.').to_string()))
+                        && b.options.get("interface").is_some_and(|v| {
+                            v.contains(&format!("ssid:{}:{}", if base == 0 { 2 } else { 5 }, slot))
+                        })
                 }) {
                     return Err(format!("{id}: device_service requires explicit port_binding interface for this WLAN object"));
                 }
@@ -416,6 +370,12 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
                 return Err(format!("{id}: cross-device binding"));
             }
             let auto = matches!(ds.get("wan_instance"), "" | "auto");
+            if !auto {
+                return Err(
+                    "WAN instance overrides were removed; instances are resolved from inventory"
+                        .into(),
+                );
+            }
             let instance = if auto {
                 1000 + sections
                     .keys()
@@ -441,16 +401,6 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
             if auto {
                 item.auto_instance = Some(instance);
             }
-            let root = format!("InternetGatewayDevice.WANDevice.1.WANConnectionDevice.{instance}.");
-            let path = format!("{root}WANIPConnection.1.");
-            item.guard = Some(format!(
-                "{path}{}",
-                if d.adapter == "hl202" {
-                    "X_CU_ServiceList"
-                } else {
-                    "X_HW_SERVICELIST"
-                }
-            ));
             let service = reference(&sections, ds.get("service"), "service")?;
             item.service_type = match service.get("type") {
                 "internet" => "internet",
@@ -462,28 +412,15 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
                 if item.service_type == "tr069" {
                     return Err("TR069 management WAN cannot have business port bindings".into());
                 }
-                if d.adapter != "hl202" {
-                    item.blocked = Some("HWTC LAN/SSID binding contract not verified".into());
-                }
                 let interfaces = s
                     .options
                     .get("interface")
-                    .ok_or("port_binding requires interface object paths")?;
-                if interfaces.iter().any(|v| {
-                    !v.starts_with("InternetGatewayDevice.LANDevice.1.")
-                        || v.ends_with('.')
-                        || v.contains(',')
-                }) {
-                    return Err("invalid binding interface path".into());
-                }
-                add(
-                    &mut item,
-                    &path,
-                    "X_CU_LanInterface",
-                    &interfaces.join(","),
-                    ParameterKind::String,
-                    false,
-                );
+                    .ok_or("port_binding requires logical endpoints")?;
+                let endpoints = interfaces
+                    .iter()
+                    .map(|v| crate::devices::cwmp::path::parse_endpoint(v))
+                    .collect::<Result<Vec<_>, _>>()?;
+                item.binding_intent = Some(super::model::BindingIntent { endpoints });
             } else {
                 let service_list_values =
                     ds.options.get("service_list").cloned().unwrap_or_default();
@@ -507,105 +444,20 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
                 } else {
                     service.number("priority", 7)?
                 };
-                let connection_type = "IP_Bridged";
-                add(
-                    &mut item,
-                    &path,
-                    "ConnectionType",
-                    connection_type,
-                    ParameterKind::String,
-                    false,
-                );
-                add(
-                    &mut item,
-                    &path,
-                    "NATEnabled",
-                    "0",
-                    ParameterKind::Boolean,
-                    false,
-                );
-                if !service_list.is_empty() {
-                    add(
-                        &mut item,
-                        &path,
-                        if d.adapter == "hl202" {
-                            "X_CU_ServiceList"
-                        } else {
-                            "X_HW_SERVICELIST"
-                        },
-                        &service_list,
-                        ParameterKind::String,
-                        false,
-                    );
-                }
-                if d.adapter == "hl202" {
-                    // HL202's bridge-local DHCP uses CloudCPE, as on the
-                    // fallback INTERNET WAN. AddressingType reads blank in
-                    // bridge mode even after accepting a DHCP write.
-                    if item.service_type == "internet" {
-                        add(
-                            &mut item,
-                            &path,
-                            "X_CU_CloudCPEEnable",
-                            "1",
-                            ParameterKind::Boolean,
-                            false,
-                        );
-                    }
-                    add(
-                        &mut item,
-                        &root,
-                        "X_CU_VLANEnabled",
-                        if vlan == 0 { "0" } else { "1" },
-                        ParameterKind::Boolean,
-                        false,
-                    );
-                    add(
-                        &mut item,
-                        &root,
-                        "X_CU_VLAN",
-                        &vlan.to_string(),
-                        ParameterKind::UnsignedInt,
-                        false,
-                    );
-                    add(
-                        &mut item,
-                        &root,
-                        "X_CU_802_1p",
-                        &priority.to_string(),
-                        ParameterKind::UnsignedInt,
-                        false,
-                    );
-                } else {
-                    add(
-                        &mut item,
-                        &path,
-                        "X_HW_VLAN",
-                        &vlan.to_string(),
-                        ParameterKind::UnsignedInt,
-                        false,
-                    );
-                    add(
-                        &mut item,
-                        &path,
-                        "X_HW_PRI",
-                        &priority.to_string(),
-                        ParameterKind::UnsignedInt,
-                        false,
-                    );
-                }
-                add(
-                    &mut item,
-                    &path,
-                    "Enable",
-                    if boolean(ds.get("enabled"), true)? {
-                        "1"
+                let intent = super::model::WanIntent {
+                    services: normalize_service_list(&service_list_values)?,
+                    vlan: if vlan == 0 {
+                        super::model::VlanMode::Untagged
                     } else {
-                        "0"
+                        super::model::VlanMode::Tagged(vlan as u16)
                     },
-                    ParameterKind::Boolean,
-                    false,
-                );
+                    priority: priority as u8,
+                    mode: super::model::ConnectionMode::Bridge,
+                    bindings: Vec::new(),
+                    internet: item.service_type == "internet",
+                    enabled: boolean(ds.get("enabled"), true)?,
+                };
+                item.wan_intent = Some(intent);
             }
         }
         d.items.push(item);
@@ -636,6 +488,9 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
     }
     // Stable revision over provisioning sections only; ACS credentials never enter it.
     let mut hash = 0xcbf29ce484222325u64;
+    for byte in crate::devices::cwmp::registry::VERSION.to_le_bytes() {
+        hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+    }
     for (id, s) in sections.iter().filter(|(_, s)| {
         matches!(
             s.kind.as_str(),
@@ -672,14 +527,6 @@ fn boolean(value: &str, default: bool) -> Result<bool, String> {
         "0" | "false" => Ok(false),
         _ => Err("invalid boolean".into()),
     }
-}
-fn add(item: &mut Item, path: &str, suffix: &str, value: &str, kind: ParameterKind, secret: bool) {
-    item.parameters.push(Parameter {
-        name: format!("{path}{suffix}"),
-        value: value.into(),
-        kind,
-        secret,
-    });
 }
 
 #[cfg(test)]

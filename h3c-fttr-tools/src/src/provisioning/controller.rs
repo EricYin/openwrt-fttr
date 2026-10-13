@@ -43,6 +43,9 @@ pub(super) fn acs(v: Value) -> Value {
 
 #[derive(Clone)]
 struct Operation {
+    verify_after: u64,
+    compiled: bool,
+    capabilities: crate::devices::cwmp::runtime::Discovery,
     id: u64,
     device: Device,
     revision: String,
@@ -101,6 +104,9 @@ impl Operation {
         let wan = wan::Reconciler::new(&device, BTreeMap::new(), false);
         let wifi = wifi::Reconciler::new(&device, wifi::Registry::default(), false);
         Self {
+            verify_after: 0,
+            compiled: false,
+            capabilities: crate::devices::cwmp::runtime::Discovery::new(&device.cwmp_contract),
             id,
             device,
             revision,
@@ -162,7 +168,7 @@ impl Operation {
         for i in self.device.items.iter().skip(self.index) {
             items.push(json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":if i.id == self.item().id { self.stage.as_str() } else {"pending"},"task_id":if i.id == self.item().id {self.task} else {None},"revision":self.revision}));
         }
-        json!({"operation_id":self.id,"device":self.device.id,"optical_sn":self.device.optical_sn,"cwmp_id":self.device.cwmp_id,"revision":self.revision,"mode":if self.apply {"apply"} else {"plan"},"state":self.stage,"started_at":self.started,"items":items,"wan_objects":self.wan.owned,"wan_lifecycle":self.wan.results,"wan_stage":self.wan.stage,"wifi_objects":self.wifi.registry,"wifi_lifecycle":self.wifi.results,"wifi_stage":self.wifi.stage,"wifi_cleanup":self.device.wifi_cleanup})
+        json!({"operation_id":self.id,"device":self.device.id,"optical_sn":self.device.optical_sn,"cwmp_id":self.device.cwmp_id,"revision":self.revision,"mode":if self.apply {"apply"} else {"plan"},"state":self.stage,"started_at":self.started,"items":items,"cwmp_contract":self.capabilities.view(),"wan_objects":self.wan.owned,"wan_lifecycle":self.wan.results,"wan_stage":self.wan.stage,"wifi_objects":self.wifi.registry,"wifi_lifecycle":self.wifi.results,"wifi_stage":self.wifi.stage,"wifi_cleanup":self.device.wifi_cleanup})
     }
 }
 #[derive(Default)]
@@ -174,6 +180,7 @@ struct Controller {
     management: BTreeMap<String, Value>,
     last_online: BTreeSet<String>,
     last_boot: BTreeMap<String, u64>,
+    optical_epochs: BTreeMap<String, (u16, u64)>,
     last_periodic: u64,
     recovered: BTreeMap<String, Value>,
     saved: String,
@@ -186,10 +193,20 @@ static CONTROLLER: OnceLock<Mutex<Controller>> = OnceLock::new();
 fn controller() -> &'static Mutex<Controller> {
     CONTROLLER.get_or_init(|| Mutex::new(Controller::default()))
 }
-pub(crate) fn management_desired(serial:&str) -> Option<(config::Management, String)> {
-    if !controller().lock().unwrap().config.devices.iter().any(|d|d.optical_sn==serial && d.omci_management){return None;}
-    let (id,management,version,epoch,automatic)=super::management_network::omci_grant(serial)?;
-    super::bootstrap::omci_write_allowed(&id,epoch,automatic).then_some((management,version))
+pub(crate) fn management_desired(serial: &str) -> Option<(config::Management, String)> {
+    if !controller()
+        .lock()
+        .unwrap()
+        .config
+        .devices
+        .iter()
+        .any(|d| d.optical_sn == serial && d.omci_management)
+    {
+        return None;
+    }
+    let (id, management, version, epoch, automatic) =
+        super::management_network::omci_grant(serial)?;
+    super::bootstrap::omci_write_allowed(&id, epoch, automatic).then_some((management, version))
 }
 pub(crate) fn management_result(serial: &str, result: Value) {
     controller()
@@ -199,18 +216,29 @@ pub(crate) fn management_result(serial: &str, result: Value) {
         .insert(serial.into(), result);
 }
 pub(crate) fn management_version(serial: &str) -> String {
-    let enabled = controller().lock().unwrap().config.devices.iter()
+    let enabled = controller()
+        .lock()
+        .unwrap()
+        .config
+        .devices
+        .iter()
         .any(|device| device.optical_sn == serial && device.omci_management);
     // Disabled devices do not restart their monitor when global management changes.
-    if enabled { format!("{}:enabled", super::management_network::version()) }
-    else { "disabled".into() }
+    if enabled {
+        format!("{}:enabled", super::management_network::version())
+    } else {
+        "disabled".into()
+    }
 }
 impl Controller {
     fn omci_management_view(&self, device: &Device) -> Value {
         if !device.omci_management {
             json!({"state":"disabled","enabled":false,"reason":"OMCI management provisioning is disabled for this device"})
         } else {
-            let mut value = self.omci_management.get(&device.optical_sn).cloned()
+            let mut value = self
+                .omci_management
+                .get(&device.optical_sn)
+                .cloned()
                 .unwrap_or_else(|| json!({"state":"pending"}));
             value["enabled"] = json!(true);
             value
@@ -230,9 +258,13 @@ impl Controller {
         json!({"operations":history.values().collect::<Vec<_>>(),"owned":self.owned}).to_string()
     }
     fn reset_device(&mut self, target: &str) -> Result<Value, String> {
-        let device = self.config.devices.iter()
+        let device = self
+            .config
+            .devices
+            .iter()
             .find(|d| d.id == target || d.optical_sn == target)
-            .cloned().ok_or("select one configured device to reset")?;
+            .cloned()
+            .ok_or("select one configured device to reset")?;
         // Hold the controller lock throughout: no provisioning tick can queue an
         // old write after ACS discards this device's tasks and session tokens.
         #[cfg(feature = "acs")]
@@ -244,8 +276,12 @@ impl Controller {
         }
         self.forget_device(&device);
         let saved = self.history();
-        super::storage::write_atomic("/var/lib/fttr/provisioning-state.json", saved.as_bytes(), false)
-            .map_err(|e| format!("persist device state reset: {e}"))?;
+        super::storage::write_atomic(
+            "/var/lib/fttr/provisioning-state.json",
+            saved.as_bytes(),
+            false,
+        )
+        .map_err(|e| format!("persist device state reset: {e}"))?;
         self.saved = saved;
         wan::reset(&device.cwmp_id)?;
         wifi::reset(&device.cwmp_id)?;
@@ -297,7 +333,14 @@ impl Controller {
         if devices.is_empty() {
             return Err("no configured device matches target".into());
         }
-        if apply&&self.config.management_network.as_ref().is_some_and(|d|!super::management_network::matches_desired(d)||devices.iter().any(|device|!super::bootstrap::is_ready(&device.id))) {
+        if apply
+            && self.config.management_network.as_ref().is_some_and(|d| {
+                !super::management_network::matches_desired(d)
+                    || devices
+                        .iter()
+                        .any(|device| !super::bootstrap::is_ready(&device.id))
+            })
+        {
             return Err("apply and verify management configuration and fresh device Inform before business synchronization".into());
         }
         if devices.iter().any(|d| {
@@ -551,7 +594,12 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
         super::bootstrap::observe_onu_links(super::link_identity::discover(&online_onus));
         let devices = acs(json!({"op":"devices"}));
         let acs_status = acs(json!({"op":"status"}));
-        let desired = controller().lock().unwrap().config.management_network.clone();
+        let desired = controller()
+            .lock()
+            .unwrap()
+            .config
+            .management_network
+            .clone();
         super::management_network::tick(desired.as_ref());
         let active_management = super::management_network::active();
         let mut c = controller().lock().unwrap();
@@ -566,6 +614,19 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
         let config = c.config.clone();
         super::bootstrap::retain_devices(&config.devices.iter().map(|d| d.id.clone()).collect());
         let time = now();
+        c.optical_epochs.retain(|serial, _| online.contains(serial));
+        for (id, serial) in &online_onus {
+            if c.optical_epochs
+                .get(serial)
+                .is_none_or(|(previous, _)| previous != id)
+            {
+                let epoch = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                c.optical_epochs.insert(serial.clone(), (*id, epoch));
+            }
+        }
         let periodic = config.interval > 0
             && time.saturating_sub(c.last_periodic) >= config.interval
             && config.triggers.contains("periodic");
@@ -575,7 +636,12 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
         let mut fresh = BTreeSet::new();
         for d in &config.devices {
             let observed = &devices["devices"][&d.cwmp_id];
-            let at = (observed["endpoint_id"]==c.acs_status["endpoint_id"] && c.acs_status["endpoint_id"].as_str().is_some_and(|id|!id.is_empty())).then(||observed["last_inform"].as_u64()).flatten();
+            let at = (observed["endpoint_id"] == c.acs_status["endpoint_id"]
+                && c.acs_status["endpoint_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty()))
+            .then(|| observed["last_inform"].as_u64())
+            .flatten();
             let reachable = online.contains(&d.optical_sn)
                 && at.is_some_and(|at| time.saturating_sub(at) <= config.freshness);
             c.management.insert(d.id.clone(), json!({"cwmp_id":d.cwmp_id,"state":if reachable {"online"} else if at.is_none() {"waiting_inform"} else {"offline_or_stale"},"optical_online":online.contains(&d.optical_sn),"last_inform":at,"age_seconds":at.map(|at| time.saturating_sub(at))}));
@@ -600,13 +666,24 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                 new_boot,
                 freshness: config.freshness,
                 time,
-                acs_available: active_management.is_some() && c.acs_status["enabled"] == true && c.acs_status["error"].is_null(),
-                authorization: super::management_network::grant(&d.id,&d.optical_sn),
+                acs_available: active_management.is_some()
+                    && c.acs_status["enabled"] == true
+                    && c.acs_status["error"].is_null(),
+                authorization: super::management_network::grant(&d.id, &d.optical_sn),
             });
-            let host_matches=config.management_network.as_ref().is_none_or(super::management_network::matches_desired);
-            let reachable = host_matches&&reachable && super::bootstrap::is_ready(&d.id);
+            let host_matches = config
+                .management_network
+                .as_ref()
+                .is_none_or(super::management_network::matches_desired);
+            let reachable = host_matches && reachable && super::bootstrap::is_ready(&d.id);
             if let Some(m) = c.management.get_mut(&d.id) {
-                m["state"] = json!(if reachable { "online" } else if at.is_none() { "waiting_inform" } else { "offline_or_stale" });
+                m["state"] = json!(if reachable {
+                    "online"
+                } else if at.is_none() {
+                    "waiting_inform"
+                } else {
+                    "offline_or_stale"
+                });
             }
             if !reachable {
                 fresh.remove(&d.id);
@@ -643,7 +720,45 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
             {
                 let _ = c.start(&d.id, true, false);
             }
+            use std::hash::{Hash, Hasher};
+            let mut epoch_hash = std::collections::hash_map::DefaultHasher::new();
+            (
+                c.last_boot.get(&d.id).copied().unwrap_or(0),
+                c.optical_epochs
+                    .get(&d.optical_sn)
+                    .map(|(_, epoch)| *epoch)
+                    .unwrap_or(0),
+            )
+                .hash(&mut epoch_hash);
+            let capability_epoch = epoch_hash.finish();
+            let version = |suffix: &str| {
+                observed["inform"]["parameters"]
+                    .as_array()
+                    .and_then(|p| {
+                        p.iter()
+                            .find(|p| p["name"].as_str().is_some_and(|n| n.ends_with(suffix)))
+                    })
+                    .and_then(|p| p["value"].as_str())
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            let capability_identity = crate::devices::cwmp::identity::Identity {
+                optical_vendor: d.optical_sn[..4].into(),
+                optical_serial: d.optical_sn.clone(),
+                cwmp_serial: observed["serial"].as_str().unwrap_or("").into(),
+                product_class: observed["product_class"].as_str().unwrap_or("").into(),
+                software_version: version(".SoftwareVersion"),
+                hardware_version: version(".HardwareVersion"),
+            };
             if let Some(op) = c.operations.get_mut(&d.id) {
+                if op.stage == OperationPhase::Completed
+                    && (new_boot
+                        || op
+                            .capabilities
+                            .observation_changed(&capability_identity, capability_epoch))
+                {
+                    op.capabilities.invalidate("identity, firmware, optical registration or BOOTSTRAP changed; evidence is stale");
+                }
                 if op.device.cwmp_id.starts_with("pending:") && !d.cwmp_id.starts_with("pending:") {
                     op.device.cwmp_id = d.cwmp_id.clone();
                     match (wan::load(&d.cwmp_id), wifi::load(&d.cwmp_id)) {
@@ -666,7 +781,72 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                     }
                 }
                 if op.stage != OperationPhase::Completed {
-                    if config.management_network.is_some()&&!host_matches {continue;}
+                    if config.management_network.is_some() && !host_matches {
+                        continue;
+                    }
+                    op.capabilities.tick(
+                        &op.device.cwmp_id,
+                        capability_identity,
+                        capability_epoch,
+                        reachable,
+                        acs,
+                    );
+                    if !op.capabilities.ready() && now().saturating_sub(op.started) >= 900 {
+                        op.capabilities
+                            .invalidate("capability discovery deadline exceeded");
+                    }
+                    if op.capabilities.blocked() {
+                        let reason = op.capabilities.view()["reason"]
+                            .as_str()
+                            .unwrap_or("capability contract unresolved")
+                            .to_owned();
+                        for item in &op.device.items {
+                            op.results.entry(item.id.clone()).or_insert_with(||json!({"id":item.id,"kind":item.kind,"state":"blocked","reason":reason,"revision":op.revision}));
+                        }
+                        op.stage = OperationPhase::Completed;
+                        continue;
+                    }
+                    if !op.capabilities.ready() {
+                        continue;
+                    }
+                    op.device.cwmp_contract = op.capabilities.selected().unwrap().to_owned();
+                    if !op.compiled {
+                        match op.capabilities.endpoints(&op.device) {
+                            Ok(endpoints) => {
+                                crate::devices::cwmp::compiler::compile_device(
+                                    &mut op.device,
+                                    &endpoints,
+                                );
+                                let mut prepared = Operation::new(
+                                    op.id,
+                                    op.device.clone(),
+                                    op.revision.clone(),
+                                    op.apply,
+                                    op.management,
+                                );
+                                prepared.wan = wan::Reconciler::new(
+                                    &prepared.device,
+                                    op.wan.owned.clone(),
+                                    op.wan.full_sync(),
+                                );
+                                prepared.wifi = wifi::Reconciler::new(
+                                    &prepared.device,
+                                    op.wifi.registry.clone(),
+                                    op.wan.full_sync(),
+                                );
+                                op.device = prepared.device;
+                                op.wan = prepared.wan;
+                                op.wifi = prepared.wifi;
+                                op.compiled = true;
+                            }
+                            Err(reason) => {
+                                op.capabilities.invalidate(&reason);
+                                continue;
+                            }
+                        }
+                    }
+                    op.wan.protected_roots = op.capabilities.protected_wan();
+                    op.wan.evidence_paths = op.capabilities.wan_fields();
                     let ready = op
                         .wan
                         .tick(&mut op.device, op.apply, op.management, reachable);
@@ -797,11 +977,17 @@ mod tests {
         let mut c = Controller::default();
         c.config.devices.push(device.clone());
         c.operations.insert(device.id.clone(), op);
-        c.recovered.insert(device.id.clone(), json!({"state":"interrupted"}));
-        c.recovered.insert("other".into(), json!({"device":"other","state":"completed"}));
+        c.recovered
+            .insert(device.id.clone(), json!({"state":"interrupted"}));
+        c.recovered.insert(
+            "other".into(),
+            json!({"device":"other","state":"completed"}),
+        );
         c.owned.insert(device.cwmp_id.clone(), BTreeMap::new());
-        c.wifi_owned.insert(device.cwmp_id.clone(), wifi::Registry::default());
-        c.wifi_owned.insert("other".into(), wifi::Registry::default());
+        c.wifi_owned
+            .insert(device.cwmp_id.clone(), wifi::Registry::default());
+        c.wifi_owned
+            .insert("other".into(), wifi::Registry::default());
         c.forget_device(&device);
         assert!(c.operations.is_empty());
         assert!(!c.recovered.contains_key(&device.id));
@@ -810,7 +996,10 @@ mod tests {
         assert!(!c.wifi_owned.contains_key(&device.cwmp_id));
         assert!(c.wifi_owned.contains_key("other"));
         let snapshot = c.snapshot();
-        assert_eq!(snapshot["devices"][0]["provisioning"]["state"], "not_started");
+        assert_eq!(
+            snapshot["devices"][0]["provisioning"]["state"],
+            "not_started"
+        );
         assert!(snapshot["devices"][0]["provisioning"]["operation_id"].is_null());
         let history: Value = serde_json::from_str(&c.history()).unwrap();
         assert_eq!(history["operations"].as_array().unwrap().len(), 1);
@@ -850,7 +1039,7 @@ mod tests {
         };
         assert!(equivalent(&p, "true"));
         assert!(!equivalent(&p, "false"));
-        p.name = "X_CU_LanInterface".into();
+        p.name = "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.1.WANIPConnection.1.X_CU_LanInterface".into();
         p.kind = ParameterKind::String;
         p.value = "a,b".into();
         assert!(equivalent(&p, "b,a"));
@@ -864,6 +1053,8 @@ mod tests {
     }
     fn operation(stage: OperationPhase, secret: bool) -> Operation {
         let item = Item {
+            wlan_intent: None,
+            binding_intent: None,
             id: "wifi".into(),
             kind: ItemKind::Ssid,
             service_type: String::new(),
@@ -871,6 +1062,7 @@ mod tests {
             blocked: None,
             wan_ref: None,
             auto_instance: None,
+            wan_intent: None,
             parameters: vec![Parameter {
                 name: "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.SSID".into(),
                 value: "wanted".into(),
@@ -885,6 +1077,7 @@ mod tests {
                 optical_sn: "H3CT12345678".into(),
                 cwmp_id: "id".into(),
                 adapter: "hl202".into(),
+                cwmp_contract: "hl202-cu".into(),
                 omci_management: false,
                 items: vec![item],
                 wifi_cleanup: "preserve".into(),
@@ -992,6 +1185,7 @@ mod tests {
     fn hwtc_passphrase_fault_does_not_retry() {
         let mut o = operation(OperationPhase::Writing, true);
         o.device.adapter = "hwtc".into();
+        o.device.cwmp_contract = "hwtc-hw".into();
         o.changes = vec![Parameter {
             name:
                 "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.KeyPassphrase"
@@ -1011,6 +1205,7 @@ mod tests {
             for apply in [false, true] {
                 let mut o = operation(OperationPhase::Reading, apply);
                 o.device.adapter = "hwtc".into();
+                o.device.cwmp_contract = "hwtc-hw".into();
                 o.device.items[0].guard = Some("guard".into());
                 o.device.items[0].service_type = "internet".into();
                 let mut reply = readback("old");
@@ -1020,7 +1215,10 @@ mod tests {
                     .push(json!({"name":"guard","value":service}));
                 responses(vec![reply]);
                 advance(&mut o, true);
-                assert_eq!(o.results["wifi"]["state"], "blocked", "{service}, apply={apply}");
+                assert_eq!(
+                    o.results["wifi"]["state"], "blocked",
+                    "{service}, apply={apply}"
+                );
             }
         }
     }
@@ -1029,6 +1227,8 @@ mod tests {
         let mut base = operation(OperationPhase::Reading, false);
         let root = "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.4.WANIPConnection.1.";
         let service = Item {
+            wlan_intent: None,
+            binding_intent: None,
             id: "wan".into(),
             kind: ItemKind::DeviceService,
             service_type: "internet".into(),
@@ -1036,6 +1236,7 @@ mod tests {
             blocked: None,
             wan_ref: Some("wan".into()),
             auto_instance: None,
+            wan_intent: None,
             parameters: vec![
                 Parameter {
                     name: format!("{root}Enable"),

@@ -1,4 +1,5 @@
 //! Whole-device compile-time registry. Core activation/inventory never depend on adapters.
+pub mod cwmp;
 #[cfg(feature = "device-hl202")]
 pub mod hl202;
 #[cfg(feature = "device-hwtc")]

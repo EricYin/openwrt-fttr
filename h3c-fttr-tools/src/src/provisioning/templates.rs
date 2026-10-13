@@ -91,7 +91,15 @@ pub fn compile(text: &str) -> Result<Config, String> {
     // Validate every template, including ones not assigned to a group yet.
     for (id, s) in &all {
         let allowed: &[&str] = match s.kind.as_str() {
-            "device" => &["name", "optical_sn", "adapter", "group", "wifi_cleanup", "omci_management"],
+            "device" => &[
+                "name",
+                "optical_sn",
+                "adapter",
+                "cwmp_contract",
+                "group",
+                "wifi_cleanup",
+                "omci_management",
+            ],
             "group" => &["name", "template"],
             "template" => &["name"],
             "network" => &[
@@ -104,7 +112,17 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 "port",
             ],
             "wifi" => &["template", "ssid", "radio", "security", "key"],
-            "management" => &["enabled", "mode", "vlan", "priority", "address", "dhcp_enabled", "dhcp_start", "dhcp_limit", "dhcp_leasetime"],
+            "management" => &[
+                "enabled",
+                "mode",
+                "vlan",
+                "priority",
+                "address",
+                "dhcp_enabled",
+                "dhcp_start",
+                "dhcp_limit",
+                "dhcp_leasetime",
+            ],
             "provisioning" => &["enabled", "mode", "trigger", "interval", "freshness"],
             "acs" => &[
                 "enabled",
@@ -273,10 +291,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
             let service = format!("{device}__service__{id}");
             let configured = s.options.get("service_list").cloned().unwrap_or_default();
             let labels = config::normalize_custom_vlan_service_list(&configured)?;
-            if d.get("adapter") != "hl202" && labels.iter().any(|label| label == "IPTV") {
-                return Err(format!("{device}: HWTC IPTV service contract not verified"));
-            }
-            // Infer internal adapter behavior from the selected vendor labels.
+            // Business classification is independent of the device's OMCI family.
             let mut service_config = s.clone();
             if service_config.get("type").is_empty() {
                 service_config.options.insert(
@@ -316,16 +331,12 @@ pub fn compile(text: &str) -> Result<Config, String> {
             let interfaces: Vec<String> = list(s, "ssid")
                 .map(|id| {
                     format!(
-                        "InternetGatewayDevice.LANDevice.1.WLANConfiguration.{}",
-                        wifi_instances[id]
+                        "ssid:{}:{}",
+                        if wifi_instances[id] <= 4 { 2 } else { 5 },
+                        (wifi_instances[id] - 1) % 4 + 1
                     )
                 })
-                .chain(list(s, "port").map(|p| {
-                    format!(
-                        "InternetGatewayDevice.LANDevice.1.LANEthernetInterfaceConfig.{}",
-                        &p[3..]
-                    )
-                }))
+                .chain(list(s, "port").map(|p| format!("lan:{}", &p[3..])))
                 .collect();
             if !interfaces.is_empty() {
                 let binding = format!("{device}__binding__{id}");
@@ -344,14 +355,21 @@ pub fn compile(text: &str) -> Result<Config, String> {
     }
     let mut cfg = config::parse_expanded(&expanded)?;
     if let Some((_, s)) = all.iter().find(|(_, s)| s.kind == "management") {
-            let acs = all.iter().find(|(_, s)| s.kind == "acs").map(|(_, s)| s);
-            let mut desired = super::management_network::Desired::parse(s, acs)?;
-            desired.devices = cfg.devices.iter().map(|d|(d.id.clone(),d.optical_sn.clone())).collect();
-            if all.iter().any(|(_, n)| n.kind == "network" && n.get("vlan").parse::<u32>().ok() == Some(desired.management.vlan)) {
-                return Err("management VLAN conflicts with a business VLAN".into());
-            }
-            cfg.management = Some(desired.management.clone());
-            cfg.management_network = Some(desired);
+        let acs = all.iter().find(|(_, s)| s.kind == "acs").map(|(_, s)| s);
+        let mut desired = super::management_network::Desired::parse(s, acs)?;
+        desired.devices = cfg
+            .devices
+            .iter()
+            .map(|d| (d.id.clone(), d.optical_sn.clone()))
+            .collect();
+        if all.iter().any(|(_, n)| {
+            n.kind == "network"
+                && n.get("vlan").parse::<u32>().ok() == Some(desired.management.vlan)
+        }) {
+            return Err("management VLAN conflicts with a business VLAN".into());
+        }
+        cfg.management = Some(desired.management.clone());
+        cfg.management_network = Some(desired);
     }
     cfg.groups = all
         .iter()
@@ -417,22 +435,96 @@ pub fn compile(text: &str) -> Result<Config, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Existing end-to-end expectations now cross the intent/compiler boundary
+    // explicitly, using a known HL202/HWTC object-map fixture.
+    fn plan(mut cfg: Config) -> Result<Config, String> {
+        for device in &mut cfg.devices {
+            assert!(device.items.iter().all(|i| i.parameters.is_empty()));
+            let mut endpoints = crate::devices::cwmp::path::EndpointMap::default();
+            for n in 1..=4 {
+                endpoints.0.insert(
+                    super::super::model::EndpointRef::Lan(n),
+                    format!("InternetGatewayDevice.LANDevice.1.LANEthernetInterfaceConfig.{n}"),
+                );
+            }
+            for radio in [2, 5] {
+                for slot in 1..=4 {
+                    endpoints.0.insert(
+                        super::super::model::EndpointRef::Ssid { radio, slot },
+                        format!(
+                            "InternetGatewayDevice.LANDevice.1.WLANConfiguration.{}",
+                            if radio == 2 { slot } else { slot + 4 }
+                        ),
+                    );
+                }
+            }
+            crate::devices::cwmp::compiler::compile_device(device, &endpoints);
+        }
+        Ok(cfg)
+    }
+    fn compile(text: &str) -> Result<Config, String> {
+        plan(super::compile(text)?)
+    }
+
+    #[test]
+    fn configuration_outputs_only_business_intent_before_discovery() {
+        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'hwtc'\n option group 'g'\nconfig network 'n'\n option template 't'\n option vlan '66'\n list service_list 'OTHER'\n list port 'lan2'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '5g'";
+        let cfg = super::compile(text).unwrap();
+        assert!(cfg.devices[0]
+            .items
+            .iter()
+            .all(|i| i.parameters.is_empty() && i.guard.is_none()));
+        assert!(cfg.devices[0].items.iter().any(|i| i.wan_intent.is_some()));
+        assert!(cfg.devices[0].items.iter().any(|i| i.wlan_intent.is_some()));
+        assert!(cfg.devices[0].items.iter().any(|i| i
+            .binding_intent
+            .as_ref()
+            .is_some_and(|b| b.endpoints == [super::super::model::EndpointRef::Lan(2)])));
+    }
     use crate::provisioning::model::ItemKind;
     #[test]
     fn omci_management_is_opt_in_per_device_and_changes_revision() {
-        if !cfg!(feature = "all-devices") { return; }
-        let config = |option: &str| format!(
+        if !cfg!(feature = "all-devices") {
+            return;
+        }
+        let config = |option: &str| {
+            format!(
             "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h3c'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\n option omci_management '1'\nconfig device 'k155'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'k155'\n option group 'g'\n{option}"
-        );
+        )
+        };
         let default = compile(&config("")).unwrap();
-        assert!(default.devices.iter().find(|d| d.id == "h3c").unwrap().omci_management);
-        assert!(!default.devices.iter().find(|d| d.id == "k155").unwrap().omci_management);
+        assert!(
+            default
+                .devices
+                .iter()
+                .find(|d| d.id == "h3c")
+                .unwrap()
+                .omci_management
+        );
+        assert!(
+            !default
+                .devices
+                .iter()
+                .find(|d| d.id == "k155")
+                .unwrap()
+                .omci_management
+        );
         let explicit_off = compile(&config(" option omci_management '0'\n")).unwrap();
-        assert!(!explicit_off.devices.iter().find(|d| d.id == "k155").unwrap().omci_management);
+        assert!(
+            !explicit_off
+                .devices
+                .iter()
+                .find(|d| d.id == "k155")
+                .unwrap()
+                .omci_management
+        );
         let enabled = compile(&config(" option omci_management '1'\n")).unwrap();
         assert!(enabled.devices.iter().all(|d| d.omci_management));
         assert_ne!(explicit_off.revision, enabled.revision);
-        assert!(compile(&config(" option omci_management 'invalid'\n")).err().unwrap().contains("omci_management"));
+        assert!(compile(&config(" option omci_management 'invalid'\n"))
+            .err()
+            .unwrap()
+            .contains("omci_management"));
     }
     #[test]
     fn hl202_internet_bridge_dhcp_and_second_radio_slots_compile_for_binding() {
@@ -555,7 +647,7 @@ mod tests {
         let text = text
             .replace("config ssid 'a'", "config ssid 'ssid_a'")
             .replace("config ssid 'b'", "config ssid 'ssid_b'");
-        let cfg = config::parse_expanded(&text).unwrap();
+        let cfg = plan(config::parse_expanded(&text).unwrap()).unwrap();
         let items = &cfg.devices[0].items;
         assert!(items[0]
             .parameters
