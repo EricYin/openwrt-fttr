@@ -16,11 +16,11 @@ pub enum Adapter {
 
 #[derive(Clone,Copy)]
 pub enum ManagementWanStage {Configuring,Verifying}
-pub fn ensure_mqtt_management_wan(device_id: &str, vlan: u32, priority: u32, persist_matching:bool, progress:impl FnMut(ManagementWanStage)->bool) -> Result<(), String> {
+pub fn ensure_mqtt_management_wan(device_id: &str, vlans: &[u32], priority: u32, persist_matching:bool, progress:impl FnMut(ManagementWanStage)->bool) -> Result<u32, String> {
     #[cfg(feature = "device-hl202")]
-    { hl202::management_wan::ensure(device_id, vlan, priority,persist_matching,progress) }
+    { hl202::management_wan::ensure(device_id, vlans, priority,persist_matching,progress) }
     #[cfg(not(feature = "device-hl202"))]
-    { let _ = (device_id, vlan, priority,persist_matching,progress); Err("MQTT management WAN adapter is not compiled".into()) }
+    { let _ = (device_id, vlans, priority,persist_matching,progress); Err("MQTT management WAN adapter is not compiled".into()) }
 }
 #[derive(Clone,Default)]
 pub struct CwmpCredentials {pub username:String,pub password:String}

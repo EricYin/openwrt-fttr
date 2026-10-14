@@ -190,6 +190,7 @@ pub struct Config {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Management {
+    pub vlans: Vec<u32>,
     pub vlan: u32,
     pub priority: u32,
     pub acs_url: String,

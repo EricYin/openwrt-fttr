@@ -73,6 +73,9 @@ pub fn compile(text: &str) -> Result<Config, String> {
             }
             "option" | "list" if w.len() == 3 => {
                 let s = &mut all.last_mut().ok_or("option without section")?.1;
+                if s.kind == "management" && w[1] == "vlan" && w[0] != "list" {
+                    return Err("management VLAN requires list vlan; scalar option vlan is unsupported".into());
+                }
                 if w[0] == "option" {
                     s.options.insert(w[1].clone(), vec![w[2].clone()]);
                 } else {
@@ -364,7 +367,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
             .collect();
         if all.iter().any(|(_, n)| {
             n.kind == "network"
-                && n.get("vlan").parse::<u32>().ok() == Some(desired.management.vlan)
+                && n.get("vlan").parse::<u32>().ok().is_some_and(|v|desired.management.vlans.contains(&v))
         }) {
             return Err("management VLAN conflicts with a business VLAN".into());
         }
@@ -464,6 +467,16 @@ mod tests {
     }
     fn compile(text: &str) -> Result<Config, String> {
         plan(super::compile(text)?)
+    }
+
+    #[test]
+    fn management_vlan_list_is_strict_ordered_and_reserves_every_member() {
+        let head="config management 'management'\n option address '192.0.2.1/24'\n";
+        for values in ["", " option vlan '46'\n", " list vlan '0'\n", " list vlan '4095'\n", " list vlan 'abc'\n", " list vlan '+46'\n", " list vlan '46'\n list vlan '046'\n"] {assert!(super::compile(&format!("{head}{values}")).is_err(),"accepted {values:?}");}
+        let config=super::compile(&format!("{head} list vlan '47'\n list vlan '46'\n")).unwrap();let m=config.management.unwrap();assert_eq!(m.vlans,[47,46]);assert_eq!(m.vlan,47);
+        assert_eq!(super::compile(&format!("{head} list vlan '46'\n")).unwrap().management.unwrap().vlans,[46]);
+        let business="config template 't'\nconfig network 'n'\n option template 't'\n option vlan '46'\n list service_list 'INTERNET'\n";
+        let error=super::compile(&format!("{head} list vlan '47'\n list vlan '46'\n{business}")).err().unwrap();assert!(error.contains("conflicts with a business VLAN"));
     }
 
     #[test]

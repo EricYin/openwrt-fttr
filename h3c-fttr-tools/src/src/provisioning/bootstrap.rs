@@ -46,6 +46,7 @@ struct Record {
     next_retry_at: u64,
     updated_at: u64,
     settings_verified_at: Option<u64>,
+    selected_vlan: Option<u32>,
     last_inform: Option<u64>,
     expected_acs_url:String,
     last_error: Option<String>,
@@ -166,6 +167,7 @@ impl Record {
     fn invalidate(&mut self, time: u64, reason: &str) {
         self.generation = self.generation.saturating_add(1);
         self.settings_verified_at = None;
+        self.selected_vlan = None;
         self.require_inform_after = time;
         self.attempts = 0;
         self.next_retry_at = 0;
@@ -232,7 +234,7 @@ struct Job {
     target: String,
     url: String,
     persist_matching: bool,
-    vlan: u32,
+    vlans: Vec<u32>,
     priority: u32,
     authorization_epoch:u64,
 }
@@ -270,7 +272,7 @@ pub(super) fn tick(observation: Observation<'_>) {
                 job.target,
                 job.url,
                 job.persist_matching,
-                job.vlan,
+                job.vlans,
                 job.priority,
                 job.authorization_epoch,
             )
@@ -441,7 +443,7 @@ impl Coordinator {
                     target: target.to_owned(),
                     url: management.acs_url.clone(),
                     persist_matching: r.settings_verified_at.is_none() || r.last_error.is_some(),
-                    vlan: management.vlan,
+                    vlans: management.vlans.clone(),
                     priority: management.priority,
                     authorization_epoch:authorization.map(|(epoch,_)|epoch).unwrap_or_default(),
                 });
@@ -491,14 +493,15 @@ fn progress(id: &str, generation: u64, state: Phase, reason: &str) -> bool {
     true
 }
 
-fn run(id: String, generation: u64, target: String, url: String, persist_matching: bool, vlan: u32, priority: u32, authorization_epoch:u64) {
+fn run(id: String, generation: u64, target: String, url: String, persist_matching: bool, vlans: Vec<u32>, priority: u32, authorization_epoch:u64) {
     let result = (|| {
         let credentials=super::management_network::credentials(authorization_epoch).ok_or("management authorization changed before execution")?;
         if !progress(&id, generation, Phase::DiscoveringManagementWan, "discovering the dedicated TR069 management WAN") { return Ok(false); }
-        crate::devices::ensure_mqtt_management_wan(&target, vlan, priority,persist_matching,|stage|super::management_network::credentials(authorization_epoch).is_some()&&match stage {
+        let selected=crate::devices::ensure_mqtt_management_wan(&target, &vlans, priority,persist_matching,|stage|super::management_network::credentials(authorization_epoch).is_some()&&match stage {
             crate::devices::ManagementWanStage::Configuring=>progress(&id,generation,Phase::ConfiguringManagementWan,"conditionally configuring and persisting the dedicated TR069 WAN"),
             crate::devices::ManagementWanStage::Verifying=>progress(&id,generation,Phase::VerifyingManagementWan,"reading back management VLAN, routing, DHCP and unbound interfaces"),
         })?;
+        {let mut c=coordinator().lock().unwrap();let Some(r)=c.records.get_mut(&id) else{return Ok(false);};if r.generation!=generation||r.worker!=Some(generation){return Ok(false);}r.selected_vlan=Some(selected);c.persist();}
         if !progress(&id,generation,Phase::Reading,"reading CWMP configuration after management WAN verification") {return Ok(false);}
         let matched = crate::devices::read_authenticated_cwmp_settings(&target, &url,&credentials)?;
         if !matched || persist_matching {
@@ -574,7 +577,7 @@ pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Va
         .map(|t| t.last_seen));
     if let Some(m) = management {
         let url = public_url(&m.acs_url);
-        view["desired"] = json!({"vlan":m.vlan,"priority":m.priority,"acs_url":url});
+        view["desired"] = json!({"vlan":r.selected_vlan.filter(|v|m.vlans.contains(v)).unwrap_or(m.vlan),"vlans":m.vlans,"priority":m.priority,"acs_url":url});
         if let (Some(listen), Some(path)) = (acs["listen"].as_str(), acs["path"].as_str()) {
             let expected = format!("http://{listen}{path}");
             if url != expected {
@@ -636,7 +639,7 @@ mod tests {
     #[cfg(feature = "device-hl202")]
     #[test]
     fn manual_authorization_is_consumed_by_fresh_inform_and_reset_needs_a_new_grant() {
-        let mut c=Coordinator::default();let d=device("manual","hl202");let m=Management{vlan:46,priority:0,acs_url:"http://192.0.2.1:7547/cwmp".into()};let mac="02AABBCCDDEE";
+        let mut c=Coordinator::default();let d=device("manual","hl202");let m=Management{vlans:vec![46],vlan:46,priority:0,acs_url:"http://192.0.2.1:7547/cwmp".into()};let mac="02AABBCCDDEE";
         c.links.insert(mac.into(),d.optical_sn.clone());c.transport.insert(mac.into(),Transport{last_seen:100,epoch:1});
         let observe=|c:&mut Coordinator,time,at,new_boot,epoch|c.schedule(Observation{device:&d,management:Some(&m),last_inform:at,online:true,new_boot,freshness:180,time,acs_available:true,authorization:Some((epoch,false))});
         let first=observe(&mut c,100,None,false,1).unwrap();c.records.get_mut(&d.id).unwrap().finish(first.generation,Ok(true),101);assert!(observe(&mut c,103,Some(102),false,1).is_none());assert_eq!(c.records[&d.id].state,Phase::Ready);
@@ -646,7 +649,7 @@ mod tests {
     #[cfg(feature = "device-hl202")]
     #[test]
     fn existing_inform_does_not_skip_mqtt_settings_readback_and_post_write_inform_is_required() {
-        let mut c=Coordinator::default();let d=device("manual","hl202");let m=Management{vlan:46,priority:0,acs_url:"http://192.0.2.1:7547/cwmp".into()};let mac="02AABBCCDDEE";
+        let mut c=Coordinator::default();let d=device("manual","hl202");let m=Management{vlans:vec![46],vlan:46,priority:0,acs_url:"http://192.0.2.1:7547/cwmp".into()};let mac="02AABBCCDDEE";
         c.links.insert(mac.into(),d.optical_sn.clone());c.transport.insert(mac.into(),Transport{last_seen:100,epoch:1});
         c.records.insert(d.id.clone(),Record{desired_version:format!("{}-1",version(&d,Some(&m),Some(mac))),optical_sn:d.optical_sn.clone(),initial_inform:Some(Some(90)),..Default::default()});
         let first=schedule(&mut c,&d,&m,Some(mac),100,Some(95)).expect("fresh existing Inform must not skip credential readback");
@@ -662,6 +665,7 @@ mod tests {
         let mut c = Coordinator::default();
         let d = device("automatic", "hl202");
         let m = Management {
+            vlans: vec![46],
             vlan: 46,
             priority: 0,
             acs_url: "http://192.0.2.1/cwmp".into(),
@@ -716,6 +720,7 @@ mod tests {
         let mut other = device("second", "hl202");
         other.optical_sn = "H3CT87654321".into();
         let m = Management {
+            vlans: vec![46],
             vlan: 46,
             priority: 7,
             acs_url: "http://192.0.2.1:7547/cwmp".into(),
@@ -762,6 +767,7 @@ mod tests {
         let mut c = Coordinator::default();
         let d = device("first", "hl202");
         let mut m = Management {
+            vlans: vec![46],
             vlan: 46,
             priority: 0,
             acs_url: "http://192.0.2.1/cwmp".into(),
@@ -791,6 +797,7 @@ mod tests {
         let mut c = Coordinator::default();
         let d = device("manual", "hwtc");
         let m = Management {
+            vlans: vec![46],
             vlan: 46,
             priority: 4,
             acs_url: "http://192.0.2.1/cwmp".into(),

@@ -49,16 +49,20 @@ for p in $parents; do
 done
 printf 'FTTR_WAN_COMPLETE\n'"#;
 
-pub fn ensure(target:&str,vlan:u32,priority:u32,persist_matching:bool,mut progress:impl FnMut(super::super::ManagementWanStage)->bool) -> Result<(),String> {
-    if vlan==0||vlan>4094||priority>7 {return Err("invalid management VLAN/priority".into());}
+fn select_vlan(vlans:&[u32],existing:Option<&Connection>)->u32 {
+    existing.filter(|c|c.service.trim()=="TR069").and_then(|c|c.vlan.parse::<u32>().ok()).filter(|v|vlans.contains(v)).unwrap_or(vlans[0])
+}
+pub fn ensure(target:&str,vlans:&[u32],priority:u32,persist_matching:bool,mut progress:impl FnMut(super::super::ManagementWanStage)->bool) -> Result<u32,String> {
+    if vlans.is_empty()||vlans.iter().any(|v|*v==0||*v>4094)||priority>7 {return Err("invalid management VLAN/priority".into());}
     let target=mqtt_target(target).ok_or("invalid MQTT management target")?;
     let (parents,connections)=parse(execute(&target,INVENTORY)?.trim())?;
     let tr069:Vec<_>=connections.iter().filter(|c|c.service.to_uppercase().contains("TR069")).collect();
     if tr069.len()>1 {return Err("multiple TR069 connections require explicit resolution".into());}
+    let vlan=select_vlan(vlans,tr069.first().copied());
     let (p,c,create)=if let Some(connection)=tr069.first() {
         if connection.service.trim()!="TR069" {return Err("combined-service TR069 WAN cannot be rewritten as a dedicated management WAN".into());}
         if connections.iter().any(|other|other.parent==connection.parent&&other.child!=connection.child) {return Err("TR069 WAN shares VLAN settings with another connection".into());}
-        if matches(connection,vlan,priority)&&!persist_matching {return Ok(());}
+        if matches(connection,vlan,priority)&&!persist_matching {return Ok(vlan);}
         (connection.parent,connection.child,false)
     } else {let p=(0..=parents.len() as u32).find(|p|!parents.contains(p)).ok_or("no free management WAN parent")?;(p,0,true)};
     let parent=format!("Wan_PVC{p}");let node=format!("{parent}_Entry{c}");
@@ -80,8 +84,12 @@ pub fn ensure(target:&str,vlan:u32,priority:u32,persist_matching:bool,mut progre
     if !progress(super::super::ManagementWanStage::Verifying) {return Err("management WAN authorization changed before verification".into());}
     let (_,connections)=parse(execute(&target,INVENTORY)?.trim())?;
     if !connections.iter().any(|x|x.parent==p&&x.child==c&&matches(x,vlan,priority)) {return Err("management WAN readback does not match".into());}
-    Ok(())
+    Ok(vlan)
 }
 fn matches(c:&Connection,vlan:u32,priority:u32)->bool {c.service=="TR069"&&c.vlan==vlan.to_string()&&c.priority==priority.to_string()&&c.active=="Yes"&&c.mode=="Route"&&c.isp=="0"&&c.settings_verified}
 
-#[cfg(test)]mod tests {use super::*;#[test]fn discovery_uses_actual_instances_and_requires_completion(){let(p,c)=parse("P|7\nC|7|2|TR069|46|0|Yes|Route|0|1\nFTTR_WAN_COMPLETE").unwrap();assert!(p.contains(&7));assert_eq!(c[0].child,2);assert!(matches(&c[0],46,0));assert!(parse("P|7").is_err());assert!(parse("unexpected\nFTTR_WAN_COMPLETE").is_err());assert!(parse("C|7|2|TR069|46|0|Yes|Route|0|1\nFTTR_WAN_COMPLETE").is_err());}}
+#[cfg(test)]mod tests {
+    use super::*;
+    #[test]fn discovery_uses_actual_instances_and_requires_completion(){let(p,c)=parse("P|7\nC|7|2|TR069|46|0|Yes|Route|0|1\nFTTR_WAN_COMPLETE").unwrap();assert!(p.contains(&7));assert_eq!(c[0].child,2);assert!(matches(&c[0],46,0));assert!(parse("P|7").is_err());assert!(parse("unexpected\nFTTR_WAN_COMPLETE").is_err());assert!(parse("C|7|2|TR069|46|0|Yes|Route|0|1\nFTTR_WAN_COMPLETE").is_err());}
+    #[test]fn existing_dedicated_vlan_wins_over_fallback_even_when_settings_need_repair(){let(_,mut c)=parse("P|7\nC|7|2|TR069|46|7|No|Route|0|0\nFTTR_WAN_COMPLETE").unwrap();assert_eq!(select_vlan(&[47,46],Some(&c[0])),46);assert_eq!(select_vlan(&[47,48],Some(&c[0])),47);assert_eq!(select_vlan(&[47,46],None),47);c[0].service="TR069_INTERNET".into();assert_eq!(select_vlan(&[47,46],Some(&c[0])),47);}
+}

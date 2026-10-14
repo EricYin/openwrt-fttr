@@ -29,8 +29,14 @@ pub struct Desired {
 impl Desired {
     pub(super) fn parse(s: &Section, acs: Option<&Section>) -> Result<Self, String> {
         let (ip, prefix) = cidr(s.get("address"))?;
-        let vlan = s.number("vlan", 4094)?;
-        if vlan == 0 { return Err("isolated management network requires a tagged VLAN".into()); }
+        let mut vlans = Vec::new();
+        for value in s.options.get("vlan").into_iter().flatten() {
+            if value.is_empty()||!value.bytes().all(|c|c.is_ascii_digit()) {return Err("management VLAN must be an integer in 1..4094".into());}
+            let vlan = value.parse::<u32>().ok().filter(|v|(1..=4094).contains(v)).ok_or("management VLAN must be in 1..4094")?;
+            if vlans.contains(&vlan) {return Err("duplicate management VLAN".into());}
+            vlans.push(vlan);
+        }
+        let vlan = *vlans.first().ok_or("management VLAN list must not be empty")?;
         let mode = s.get("mode");
         if !matches!(mode, "" | "manual" | "auto") { return Err("invalid management application mode".into()); }
         let get = |key: &str, fallback: &str| acs.map(|a| a.get(key)).filter(|v| !v.is_empty()).unwrap_or(fallback).to_string();
@@ -51,14 +57,14 @@ impl Desired {
         if !lease.bytes().all(|c| c.is_ascii_digit() || matches!(c, b's'|b'm'|b'h'|b'd')) || !lease.bytes().any(|c| c.is_ascii_digit()) { return Err("invalid management DHCP lease time".into()); }
         let flag = |key: &str, fallback: bool| -> Result<bool, String> { match s.get(key) { "" => Ok(fallback), "1" => Ok(true), "0" => Ok(false), _ => Err(format!("invalid management flag {key}")) } };
         let priority=number("priority",0)?; if priority>7 {return Err("invalid management priority".into());}
-        Ok(Self { management: Management { vlan, priority, acs_url: format!("http://{ip}:{port}{path}") }, enabled: flag("enabled", true)?, automatic: mode == "auto", address: ip.to_string(), prefix, dhcp: flag("dhcp_enabled", true)?, start, limit, lease, acs_enabled: get("enabled", "1") == "1", port, path, username, password,devices:BTreeMap::new() })
+        Ok(Self { management: Management { vlans, vlan, priority, acs_url: format!("http://{ip}:{port}{path}") }, enabled: flag("enabled", true)?, automatic: mode == "auto", address: ip.to_string(), prefix, dhcp: flag("dhcp_enabled", true)?, start, limit, lease, acs_enabled: get("enabled", "1") == "1", port, path, username, password,devices:BTreeMap::new() })
     }
     fn version(&self) -> String {
         let bytes = serde_json::to_vec(self).unwrap_or_default();
         let hash = bytes.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3));
         format!("{hash:016x}")
     }
-    fn public(&self) -> Value { json!({"enabled":self.enabled,"mode":if self.automatic {"auto"} else {"manual"},"vlan":self.management.vlan,"priority":self.management.priority,"address":format!("{}/{}",self.address,self.prefix),"acs_url":self.management.acs_url,"port":self.port,"path":self.path,"dhcp_enabled":self.dhcp}) }
+    fn public(&self) -> Value { json!({"enabled":self.enabled,"mode":if self.automatic {"auto"} else {"manual"},"vlan":self.management.vlans,"priority":self.management.priority,"address":format!("{}/{}",self.address,self.prefix),"acs_url":self.management.acs_url,"port":self.port,"path":self.path,"dhcp_enabled":self.dhcp}) }
 }
 fn cidr(value: &str) -> Result<(Ipv4Addr, u8), String> {
     let (ip, prefix) = value.split_once('/').ok_or("management address requires an IPv4 prefix")?;
@@ -74,12 +80,12 @@ fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default
 #[derive(Clone,Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Journal { authorized: Option<Desired>, applied: Option<Desired>, previous:Option<Desired>, cleanup_pending:bool,pending: bool, epoch: u64,applied_epoch:u64 }
-struct Coordinator { journal: Journal, busy: bool, state: String, error: Option<String>, plan: Value, next_retry: u64, attempts: u32, ready: bool, last_discovery: u64 }
+struct Coordinator { journal: Journal, requires_apply: bool, busy: bool, state: String, error: Option<String>, plan: Value, next_retry: u64, attempts: u32, ready: bool, last_discovery: u64 }
 static COORDINATOR: OnceLock<Mutex<Coordinator>> = OnceLock::new();
 fn coordinator() -> &'static Mutex<Coordinator> {
     COORDINATOR.get_or_init(|| {
-        let (journal, error) = match std::fs::read(JOURNAL) { Ok(bytes) => match serde_json::from_slice(&bytes) { Ok(j) => (j, None), Err(_) => (Journal::default(), Some("management journal is invalid".into())) }, Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Journal::default(), None), Err(_) => (Journal::default(), Some("management journal cannot be read".into())) };
-        Mutex::new(Coordinator { journal, busy:false, state:"discovering".into(), error, plan:json!([]), next_retry:0, attempts:0, ready:false, last_discovery:0 })
+        let (journal, error) = match std::fs::read(JOURNAL) { Ok(bytes) => match serde_json::from_slice(&bytes) { Ok(j) => (j, None), Err(_) => (Journal::default(), Some("management journal is invalid or uses the old scalar VLAN format; explicitly apply the VLAN list configuration".into())) }, Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Journal::default(), None), Err(_) => (Journal::default(), Some("management journal cannot be read".into())) };
+        Mutex::new(Coordinator { journal, requires_apply:error.is_some(), busy:false, state:"discovering".into(), error, plan:json!([]), next_retry:0, attempts:0, ready:false, last_discovery:0 })
     })
 }
 fn persist(c: &Coordinator) -> Result<(), String> { storage::write_atomic(JOURNAL, &serde_json::to_vec(&c.journal).map_err(|_| "cannot encode management journal")?, true).map_err(|_| "cannot persist management authorization".into()) }
@@ -99,13 +105,14 @@ pub(super) fn request(desired: Desired, apply: bool) -> Result<Value, String> {
 fn start(desired: Desired, apply: bool, fresh_grant: bool) -> Result<Value, String> {
     let mut c = coordinator().lock().unwrap();
     if c.busy { return Err("management operation already active".into()); }
+    if apply && c.requires_apply && !fresh_grant {return Err("management journal requires an explicit apply".into());}
     if apply {
         let before=c.journal.clone();
         let changed=c.journal.authorized.as_ref().is_none_or(|a|a.version()!=desired.version());
         if let Some(applied)=&c.journal.applied {
             if desired.enabled&&c.journal.previous.is_some()&&resource_version(applied)!=resource_version(&desired) {return Err("finish the current management migration before applying another network revision".into());}
             if desired.enabled && applied.enabled && endpoint_changed(applied,&desired) && c.journal.previous.is_none() {
-                if (applied.management.vlan!=desired.management.vlan || applied.address!=desired.address || applied.prefix!=desired.prefix) && subnets_overlap(applied,&desired) {return Err("staged management VLAN/address migration requires a non-overlapping new subnet".into());}
+                if (applied.address!=desired.address || applied.prefix!=desired.prefix) && subnets_overlap(applied,&desired) {return Err("staged management address migration requires a non-overlapping new subnet".into());}
                 c.journal.previous=Some(applied.clone());
             }
         }
@@ -113,8 +120,9 @@ fn start(desired: Desired, apply: bool, fresh_grant: bool) -> Result<Value, Stri
         c.journal.authorized = Some(desired.clone());
         if fresh_grant||changed||!c.ready||c.journal.pending {c.journal.pending=true;if let Err(e)=persist(&c){c.journal=before;return Err(e);}}
         if fresh_grant||changed {c.ready=false;}
+        c.requires_apply=false;
     }
-    c.busy = true; c.state = "discovering".into(); c.error = None;
+    c.busy = true; c.state = "discovering".into(); if !c.requires_apply {c.error = None;}
     drop(c);
     std::thread::spawn(move || execute(desired, apply));
     Ok(json!({"started":true,"mode":if apply {"apply"} else {"plan"}}))
@@ -131,7 +139,7 @@ pub(super) fn tick(desired: Option<&Desired>) {
     if c.journal.cleanup_pending || (c.ready&&c.journal.previous.is_some()&&c.journal.applied.as_ref().is_some_and(|a|!a.enabled||!a.acs_enabled||a.devices.iter().all(|(id,sn)|super::bootstrap::is_ready_for_management(id,sn,&a.management.acs_url,c.journal.applied_epoch)))) {
         if let Some(applied)=c.journal.applied.clone() {c.journal.cleanup_pending=true;if let Err(e)=persist(&c) {c.error=Some(e);return;}c.busy=true;c.state="cleaning_previous".into();drop(c);std::thread::spawn(move||cleanup_previous(applied));return;}
     }
-    let apply = application_authorized(&c.journal,desired);
+    let apply = !c.requires_apply && application_authorized(&c.journal,desired);
     if !apply && !c.ready {
         if let Some(applied)=c.journal.applied.clone() {
             c.busy=true;drop(c);std::thread::spawn(move||restore(applied));return;
@@ -148,7 +156,7 @@ fn restore(d:Desired) {
 }
 fn application_authorized(j:&Journal,d:&Desired)->bool {d.automatic||(j.pending&&j.authorized.as_ref().is_some_and(|a|a.version()==d.version()))}
 fn resource_version(d:&Desired)->String {let mut d=d.clone();d.devices.clear();d.automatic=false;d.version()}
-fn endpoint_changed(a:&Desired,b:&Desired)->bool {a.management.vlan!=b.management.vlan||a.address!=b.address||a.prefix!=b.prefix||a.port!=b.port||a.path!=b.path||a.username!=b.username||a.password!=b.password}
+fn endpoint_changed(a:&Desired,b:&Desired)->bool {a.address!=b.address||a.prefix!=b.prefix||a.port!=b.port||a.path!=b.path||a.username!=b.username||a.password!=b.password}
 fn subnets_overlap(a:&Desired,b:&Desired)->bool {let mask=u32::MAX << (32-a.prefix.min(b.prefix));u32::from(a.address.parse::<Ipv4Addr>().unwrap())&mask==u32::from(b.address.parse::<Ipv4Addr>().unwrap())&mask}
 fn phase(state: &str) { coordinator().lock().unwrap().state = state.into(); }
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
@@ -176,9 +184,13 @@ fn discover() -> Result<Sections, String> { let mut all=Sections::new(); for pac
 fn expected(d: &Desired) -> Sections {
     let mut out=Sections::new();
     let mut add=|id:&str,kind:&str,fields:Vec<(&str,String)>| {out.insert(id.into(),Section {kind:kind.into(),options:fields.into_iter().map(|(k,v)|(k.into(),vec![v])).collect()});};
-    add("network.fttr_tr069_vlan","device",vec![("type","8021q".into()),("ifname","br-lan".into()),("name",format!("br-lan.{}",d.management.vlan)),("vid",d.management.vlan.to_string()),("egress_qos_mapping",format!("0:{}",d.management.priority))]);
-    add("network.fttr_tr069","interface",vec![("device",format!("br-lan.{}",d.management.vlan)),("proto","static".into()),("ipaddr",format!("{}/{}",d.address,d.prefix)),("auto",if d.enabled {"1"} else {"0"}.into()),("delegate","0".into())]);
+    for vlan in &d.management.vlans {
+        add(&format!("network.fttr_tr069_vlan_{vlan}"),"device",vec![("type","8021q".into()),("ifname","br-lan".into()),("name",format!("br-lan.{vlan}")),("vid",vlan.to_string()),("egress_qos_mapping",format!("0:{}",d.management.priority))]);
+    }
+    add("network.fttr_tr069_bridge","device",vec![("type","bridge".into()),("name","br-tr069".into()),("vlan_filtering","0".into()),("bridge_empty","1".into())]);
+    add("network.fttr_tr069","interface",vec![("device","br-tr069".into()),("proto","static".into()),("ipaddr",format!("{}/{}",d.address,d.prefix)),("auto",if d.enabled {"1"} else {"0"}.into()),("delegate","0".into())]);
     add("dhcp.fttr_tr069","dhcp",vec![("interface","fttr_tr069".into()),("start",d.start.to_string()),("limit",d.limit.to_string()),("leasetime",d.lease.clone()),("ignore",if d.enabled&&d.dhcp {"0"} else {"1"}.into()),("dhcpv4",if d.enabled&&d.dhcp {"server"} else {"disabled"}.into()),("dhcpv6","disabled".into()),("ra","disabled".into()),("ndp","disabled".into())]);
+    out.get_mut("network.fttr_tr069_bridge").unwrap().options.insert("ports".into(),d.management.vlans.iter().map(|v|format!("br-lan.{v}")).collect());
     out.get_mut("dhcp.fttr_tr069").unwrap().options.insert("dhcp_option".into(),vec!["3".into(),"6".into()]);
     add_section(&mut out,"firewall.fttr_tr069","zone",&[("name","fttr_tr069"),("network","fttr_tr069"),("input","REJECT"),("output","ACCEPT"),("forward","REJECT"),("masq","0"),("masq6","0")]);
     add_section(&mut out,"firewall.fttr_tr069_dhcp","rule",&[("name","FTTR management DHCP"),("src","fttr_tr069"),("family","ipv4"),("proto","udp"),("dest_port","67"),("target","ACCEPT"),("enabled",if d.enabled&&d.dhcp {"1"}else{"0"})]);
@@ -186,11 +198,18 @@ fn expected(d: &Desired) -> Sections {
     out
 }
 fn add_section(out:&mut Sections,id:&str,kind:&str,fields:&[(&str,&str)]) {out.insert(id.into(),Section{kind:kind.into(),options:fields.iter().map(|(k,v)|(k.to_string(),vec![v.to_string()])).collect()});}
+fn owned_vlan(id:&str,s:&Section)->bool {
+    let reserved=id=="network.fttr_tr069_vlan" || id.strip_prefix("network.fttr_tr069_vlan_").is_some_and(|suffix|suffix==s.get("vid"));
+    reserved && s.kind=="device" && s.get("type")=="8021q" && s.get("ifname")=="br-lan" && s.get("vid").parse::<u32>().is_ok_and(|v|(1..=4094).contains(&v)&&s.get("name")==format!("br-lan.{v}")) && s.options.keys().all(|k|matches!(k.as_str(),"type"|"ifname"|"name"|"vid"|"egress_qos_mapping"))
+}
 fn resources(d:&Desired,previous:Option<&Desired>)->Sections {
     let mut out=expected(d);
     if let Some(previous)=previous {
-        if previous.management.vlan!=d.management.vlan||previous.address!=d.address||previous.prefix!=d.prefix {
-            for (id,mut s) in expected(previous).into_iter().filter(|(id,_)|id.starts_with("network.")||id.starts_with("dhcp.")) {
+        for (id,s) in expected(previous).into_iter().filter(|(id,_)|id.starts_with("network.fttr_tr069_vlan_")) {out.entry(id).or_insert(s);}
+        let ports=out.get_mut("network.fttr_tr069_bridge").unwrap().options.get_mut("ports").unwrap();
+        for vlan in &previous.management.vlans {let name=format!("br-lan.{vlan}");if !ports.contains(&name){ports.push(name);}}
+        if previous.address!=d.address||previous.prefix!=d.prefix {
+            for (id,mut s) in expected(previous).into_iter().filter(|(id,_)|id=="network.fttr_tr069"||id.starts_with("dhcp.")) {
                 let id=id.replace("fttr_tr069","fttr_tr069_previous");
                 if s.kind=="dhcp" {s.options.insert("interface".into(),vec!["fttr_tr069_previous".into()]);}
                 out.insert(id,s);
@@ -210,9 +229,17 @@ fn plan(d:&Desired, actual:&Sections) -> Result<Vec<Action>,String> {
 }
 fn plan_resources(d:&Desired,previous:Option<&Desired>, actual:&Sections) -> Result<Vec<Action>,String> {
     let desired=resources(d,previous); let mut actions=Vec::new();
+    let members=&desired["network.fttr_tr069_bridge"].options["ports"];
     for (id,s) in actual {
+        if (id=="network.fttr_tr069_vlan"||id.starts_with("network.fttr_tr069_vlan_")) && !owned_vlan(id,s) {return Err(format!("reserved management VLAN resource was changed externally: {id}"));}
         if s.kind=="zone" && id!="firewall.fttr_tr069" && s.get("name")=="fttr_tr069" {return Err(format!("duplicate management firewall zone: {id}"));}
-        if !desired.contains_key(id) && s.kind=="device" && s.get("name")==format!("br-lan.{}",d.management.vlan) { return Err(format!("VLAN device belongs to another section: {id}")); }
+        if !desired.contains_key(id) && s.kind=="device" && (s.get("name")=="br-tr069" || members.iter().any(|name|s.get("name")==name)) && !owned_vlan(id,s) { return Err(format!("VLAN/bridge device belongs to another section: {id}")); }
+        if !desired.contains_key(id) && owned_vlan(id,s) {
+            if actual.iter().any(|(other,section)|!desired.contains_key(other)&&(section.get("device")==s.get("name")||section.options.get("ports").is_some_and(|ports|ports.iter().any(|p|p==s.get("name"))))) {return Err(format!("obsolete management VLAN is used by another network: {id}"));}
+            actions.push(Action{operation:"delete".into(),key:id.clone(),value:vec![]});
+        }
+        if s.kind=="interface" && !matches!(id.as_str(),"network.fttr_tr069"|"network.fttr_tr069_previous") && (s.get("device")=="br-tr069" || members.iter().any(|p|s.get("device")==p)) {return Err(format!("management device is assigned to another interface: {id}"));}
+        if s.kind=="device" && id!="network.fttr_tr069_bridge" && s.options.get("ports").is_some_and(|ports|ports.iter().any(|p|members.contains(p)||p=="br-tr069")) {return Err(format!("management VLAN is a port of another bridge: {id}"));}
         if s.kind=="interface" && id!="network.fttr_tr069" { for address in s.options.get("ipaddr").into_iter().flatten() { let address=if address.contains('/') {address.clone()}else{let prefix=s.get("netmask").parse::<Ipv4Addr>().map(|m|u32::from(m).count_ones()).unwrap_or(24);format!("{address}/{prefix}")}; if let Ok((ip,prefix))=cidr(&address) {let common=prefix.min(d.prefix); let mask=u32::MAX << (32-common); if (u32::from(ip)&mask)==(u32::from(d.address.parse::<Ipv4Addr>().unwrap())&mask) {return Err(format!("management subnet overlaps {id}"));}} } }
         if s.kind=="forwarding" && (s.get("src")=="fttr_tr069" || s.get("dest")=="fttr_tr069") {return Err(format!("cross-zone management forwarding exists: {id}"));}
         if s.kind=="rule" && !desired.contains_key(id) && s.get("target")=="ACCEPT" && matches!(s.get("src"),"*"|"fttr_tr069") && s.get("enabled")!="0" {return Err(format!("external firewall rule bypasses management isolation: {id}"));}
@@ -221,9 +248,10 @@ fn plan_resources(d:&Desired,previous:Option<&Desired>, actual:&Sections) -> Res
     for (id,s) in desired {
         if let Some(old)=actual.get(&id) {
             if old.kind!=s.kind {return Err(format!("resource type conflict: {id}"));}
+            if s.kind=="device" && (old.get("type")!=s.get("type")||old.get("name")!=s.get("name")|| (s.get("type")=="8021q"&&old.get("ifname")!=s.get("ifname"))) {return Err(format!("same-named device is used by another network: {id}"));}
             if (s.kind=="zone"&&(!old.get("name").is_empty()&&old.get("name")!="fttr_tr069"||old.options.contains_key("device")||old.options.contains_key("subnet"))) || (s.kind=="interface"&&!matches!(old.get("proto"),""|"static")) || (s.kind=="dhcp"&&!old.get("interface").is_empty()&&old.get("interface")!=s.get("interface")) {return Err(format!("same-named resource is used by another network: {id}"));}
         } else {actions.push(Action{operation:"set".into(),key:id.clone(),value:vec![s.kind.clone()]});}
-        for (key,value) in s.options { let old=actual.get(&id).and_then(|s|s.options.get(&key)); if old!=Some(&value) {actions.push(Action{operation:if value.len()>1 || key=="egress_qos_mapping" {"replace_list"}else{"set"}.into(),key:format!("{id}.{key}"),value});} }
+        for (key,value) in s.options { let old=actual.get(&id).and_then(|s|s.options.get(&key)); if old!=Some(&value) {actions.push(Action{operation:if value.len()>1 || matches!(key.as_str(),"egress_qos_mapping"|"ports") {"replace_list"}else{"set"}.into(),key:format!("{id}.{key}"),value});} }
         // Remove stale fields that would override the managed IPv4/IPv6 policy.
         for key in ["netmask","ip6addr","ip6assign"] {if actual.get(&id).is_some_and(|s|s.options.contains_key(key)) {actions.push(Action{operation:"delete".into(),key:format!("{id}.{key}"),value:vec![]});}}
     }
@@ -250,7 +278,7 @@ fn runtime_plan(d:&Desired,previous:Option<&Desired>, actions:&mut Vec<Action>) 
     if !d.enabled {return;}
     let ready=run("ubus",&["call","network.interface.fttr_tr069","status"]).ok().and_then(|s|serde_json::from_str::<Value>(&s).ok()).is_some_and(|s|s["up"]==true&&s["ipv4-address"].as_array().is_some_and(|a|a.iter().any(|a|a["address"]==d.address&&a["mask"]==d.prefix)));
     let firewall=run("nft",&["-j","list","table","inet","fw4"]).ok().and_then(|s|serde_json::from_str::<Value>(&s).ok()).is_some_and(|v|verify_firewall(d,previous,&v).is_ok());
-    if !ready||!firewall||verify_dhcp(d,"fttr_tr069").is_err() {actions.push(Action{operation:"reload_runtime".into(),key:"management.runtime".into(),value:vec!["network, firewall or DHCP runtime requires reconciliation".into()]});}
+    if !ready||!firewall||verify_bridge(d,previous).is_err()||verify_dhcp(d,"fttr_tr069").is_err() {actions.push(Action{operation:"reload_runtime".into(),key:"management.runtime".into(),value:vec!["network, firewall or DHCP runtime requires reconciliation".into()]});}
 }
 fn verify_firewall(d:&Desired,previous:Option<&Desired>,rules:&Value) -> Result<(),String> {
     let entries=rules["nftables"].as_array().ok_or("missing nftables runtime inventory")?;
@@ -261,7 +289,7 @@ fn verify_firewall(d:&Desired,previous:Option<&Desired>,rules:&Value) -> Result<
     let allowed=|rule:&Value,name:&str,proto:&str,port:u16|rule["comment"].as_str().is_some_and(|c|c.contains(name))&&rule["expr"].as_array().is_some_and(|expr|expr.iter().any(|e|e.get("accept").is_some())&&expr.iter().any(|e|e["match"]["left"]["payload"]["protocol"]==proto&&e["match"]["left"]["payload"]["field"]=="dport"&&e["match"]["right"]==port)&&expr.iter().any(|e|e["match"]["left"]["meta"]["key"]=="nfproto"&&e["match"]["right"]=="ipv4"));
     if (d.acs_enabled&&!input.iter().any(|r|allowed(r,"FTTR management ACS","tcp",d.port)))||(d.dhcp&&!input.iter().any(|r|allowed(r,"FTTR management DHCP","udp",67))) {return Err("management DHCP/ACS exceptions are missing or have the wrong protocol/port/family".into());}
     if input.iter().any(|r|r["expr"].as_array().is_some_and(|expr|expr.iter().any(|e|e.get("accept").is_some()))&&!((d.acs_enabled&&allowed(r,"FTTR management ACS","tcp",d.port))||(d.dhcp&&allowed(r,"FTTR management DHCP","udp",67))||previous.is_some_and(|p|p.acs_enabled&&allowed(r,"FTTR previous management ACS","tcp",p.port)))) {return Err("unexpected management input acceptance is installed".into());}
-    for interface in std::iter::once(format!("br-lan.{}",d.management.vlan)).chain(previous.filter(|p|p.management.vlan!=d.management.vlan).map(|p|format!("br-lan.{}",p.management.vlan))) {
+    for interface in ["br-tr069".to_string()] {
         for chain in ["input","forward"] {let target=format!("{chain}_fttr_tr069");if !chain_rules(chain).iter().any(|r|r["expr"].as_array().is_some_and(|expr|expr.iter().any(|e|e["jump"]["target"]==target)&&expr.iter().any(|e|e["match"]["left"]["meta"]["key"]=="iifname"&&(e["match"]["right"]==interface||e["match"]["right"]["set"].as_array().is_some_and(|s|s.iter().any(|v|v==&interface)))))) {return Err("management interface is not dispatched to its isolated firewall zone".into());}}
     }
     Ok(())
@@ -285,6 +313,19 @@ fn verify_dhcp(d:&Desired,interface:&str)->Result<(),String> {
     }
     Err("the running DHCP service does not contain the desired management pool".into())
 }
+fn verify_bridge(d:&Desired,previous:Option<&Desired>)->Result<(),String> {
+    let root="/sys/class/net/br-tr069";
+    if std::fs::read_to_string(format!("{root}/bridge/vlan_filtering")).map_err(|_|"management bridge is missing")?.trim()!="0" {return Err("management bridge VLAN filtering must be disabled".into());}
+    let mut ports:Vec<String>=resources(d,previous)["network.fttr_tr069_bridge"].options["ports"].clone();ports.sort();
+    let mut actual=std::fs::read_dir(format!("{root}/brif")).map_err(|_|"management bridge ports are unavailable")?.map(|e|e.map(|e|e.file_name().to_string_lossy().into_owned())).collect::<Result<Vec<_>,_>>().map_err(|_|"cannot inspect management bridge ports")?;actual.sort();
+    if actual!=ports {return Err("management bridge runtime membership differs from the VLAN list".into());}
+    let links:Value=serde_json::from_str(&run("ip",&["-j","-d","link","show"])?).map_err(|_|"invalid VLAN link inventory")?;
+    let links=links.as_array().ok_or("missing VLAN links")?;
+    for port in ports {let vlan=port.strip_prefix("br-lan.").and_then(|v|v.parse::<u32>().ok()).ok_or("invalid managed VLAN name")?;
+        if !links.iter().any(|l|l["ifname"]==port&&l["master"]=="br-tr069"&&l["link"]=="br-lan"&&l["linkinfo"]["info_kind"]=="vlan"&&l["linkinfo"]["info_data"]["id"]==vlan) {return Err(format!("management VLAN runtime differs: {port}"));}
+    }
+    Ok(())
+}
 fn verify_network(d:&Desired,previous:Option<&Desired>) -> Result<(),String> {
     if !plan_resources(d,previous,&discover()?)?.is_empty() {return Err("management UCI readback differs from the plan".into());}
     if !d.enabled {let status:Value=serde_json::from_str(&run("ubus",&["call","network.interface","dump"])?).map_err(|_|"invalid netifd inventory")?;if status["interface"].as_array().is_some_and(|a|a.iter().any(|i|i["interface"]=="fttr_tr069"&&i["up"]==true)){return Err("disabled management interface is still up".into());}return Ok(());}
@@ -292,8 +333,9 @@ fn verify_network(d:&Desired,previous:Option<&Desired>) -> Result<(),String> {
     loop {let text=run("ubus",&["call","network.interface.fttr_tr069","status"])?; let status:Value=serde_json::from_str(&text).map_err(|_|"invalid netifd status")?; if status["up"]==true && status["ipv4-address"].as_array().is_some_and(|a|a.iter().any(|a|a["address"]==d.address&&a["mask"]==d.prefix)) {break;} if Instant::now()>=deadline {return Err("management interface address did not become ready".into());} std::thread::sleep(Duration::from_millis(250));}
     let rules:Value=serde_json::from_str(&run("nft",&["-j","list","table","inet","fw4"])?).map_err(|_|"invalid nftables runtime status")?;
     verify_firewall(d,previous,&rules)?;
+    verify_bridge(d,previous)?;
     verify_dhcp(d,"fttr_tr069")?;
-    if let Some(p)=previous.filter(|p|p.management.vlan!=d.management.vlan||p.address!=d.address||p.prefix!=d.prefix) {
+    if let Some(p)=previous.filter(|p|p.address!=d.address||p.prefix!=d.prefix) {
         let status:Value=serde_json::from_str(&run("ubus",&["call","network.interface.fttr_tr069_previous","status"])?).map_err(|_|"invalid previous management status")?;
         if status["up"]!=true||!status["ipv4-address"].as_array().is_some_and(|a|a.iter().any(|i|i["address"]==p.address&&i["mask"]==p.prefix)) {return Err("previous management path was not retained".into());}
         verify_dhcp(p,"fttr_tr069_previous")?;
@@ -352,6 +394,22 @@ fn cleanup_previous(d:Desired) {
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn vlan_membership_changes_share_resources_and_remove_only_owned_devices() {
+        let old=desired();let mut next=old.clone();next.management.vlans=vec![46,47];
+        assert!(!endpoint_changed(&old,&next));
+        let expanded=expected(&next);assert_eq!(expanded["network.fttr_tr069_bridge"].options["ports"],["br-lan.46","br-lan.47"]);
+        assert_eq!(expanded.values().filter(|s|s.kind=="interface").count(),1);assert_eq!(expanded.values().filter(|s|s.kind=="dhcp").count(),1);
+        assert!(plan(&next,&expanded).unwrap().is_empty());
+        let reduced=plan(&old,&expanded).unwrap();assert!(reduced.iter().any(|a|a.operation=="delete"&&a.key=="network.fttr_tr069_vlan_47"));
+        assert!(!reduced.iter().any(|a|a.key=="network.fttr_tr069.ipaddr"));
+        let mut legacy=expected(&old);let device=legacy.remove("network.fttr_tr069_vlan_46").unwrap();legacy.insert("network.fttr_tr069_vlan".into(),device);
+        assert!(plan(&old,&legacy).unwrap().iter().any(|a|a.key=="network.fttr_tr069_vlan"&&a.operation=="delete"));
+        let mut foreign=expanded.clone();foreign.get_mut("network.fttr_tr069_vlan_47").unwrap().options.insert("mtu".into(),vec!["1400".into()]);assert!(plan(&old,&foreign).is_err());
+        let mut foreign=expanded;add_section(&mut foreign,"network.other","interface",&[("device","br-lan.47")]);assert!(plan(&old,&foreign).err().unwrap().contains("used by another network"));
+    }
+    #[test] fn old_journal_is_rejected_instead_of_authorizing_a_new_topology() {
+        let journal=Journal{applied:Some(desired()),..Default::default()};let mut value=serde_json::to_value(journal).unwrap();value["applied"]["management"].as_object_mut().unwrap().remove("vlans");assert!(serde_json::from_value::<Journal>(value).is_err());
+    }
     fn desired() -> Desired {let mut s=Section::default();for (k,v) in [("vlan","46"),("address","192.0.2.1/24")] {s.options.insert(k.into(),vec![v.into()]);}Desired::parse(&s,None).unwrap()}
     #[test] fn manual_is_default_and_url_has_one_address_source() {let d=desired();assert!(!d.automatic);assert_eq!(d.management.acs_url,"http://192.0.2.1:7547/cwmp");assert!(cidr("192.0.2.0/24").is_err());assert!(cidr("192.0.2.255/24").is_err());}
     #[test] fn acs_credentials_must_be_configured_as_a_pair() {let mut s=Section::default();for (k,v) in [("vlan","46"),("address","192.0.2.1/24")] {s.options.insert(k.into(),vec![v.into()]);}let mut a=Section::default();a.options.insert("username".into(),vec!["cpe-user".into()]);let error=Desired::parse(&s,Some(&a)).err().unwrap();assert!(error.contains("both be set"));a.options.insert("password".into(),vec!["secret".into()]);let d=Desired::parse(&s,Some(&a)).unwrap();assert_eq!(d.username,"cpe-user");assert_eq!(d.password,"secret");}
@@ -366,7 +424,7 @@ fn cleanup_previous(d:Desired) {
         journal.pending=false;assert!(!application_authorized(&journal,&next));next.automatic=true;assert!(application_authorized(&journal,&next));
     }
     #[test] fn migration_retains_owned_old_path_and_cleanup_is_idempotent() {
-        let old=desired();let mut next=old.clone();next.address="198.51.100.1".into();next.management.vlan=47;next.port=7548;next.management.acs_url="http://198.51.100.1:7548/cwmp".into();
+        let old=desired();let mut next=old.clone();next.address="198.51.100.1".into();next.management.vlan=47;next.management.vlans=vec![47];next.port=7548;next.management.acs_url="http://198.51.100.1:7548/cwmp".into();
         assert!(!subnets_overlap(&old,&next));let actions=plan_resources(&next,Some(&old),&expected(&old)).unwrap();assert!(actions.iter().any(|a|a.key=="network.fttr_tr069_previous"));
         let staged=resources(&next,Some(&old));assert!(plan_resources(&next,Some(&old),&staged).unwrap().is_empty());assert_eq!(staged["firewall.fttr_tr069"].options["network"],["fttr_tr069","fttr_tr069_previous"]);
         let cleanup=cleanup_actions(&next,&old,&staged).unwrap();assert!(cleanup.iter().any(|a|a.operation=="delete"&&a.key=="network.fttr_tr069_previous"));assert!(cleanup_actions(&next,&old,&expected(&next)).unwrap().is_empty());
@@ -378,7 +436,7 @@ fn cleanup_previous(d:Desired) {
     }
     #[test] fn firewall_validation_requires_exact_ports_isolated_forwarding_and_dispatch() {
         let d=desired();let exception=|name:&str,proto:&str,port:u16|json!({"rule":{"chain":"input_fttr_tr069","comment":name,"expr":[{"match":{"left":{"meta":{"key":"nfproto"}},"right":"ipv4"}},{"match":{"left":{"payload":{"protocol":proto,"field":"dport"}},"right":port}},{"accept":null}]}});
-        let mut rules=json!({"nftables":[exception("FTTR management ACS","tcp",7547),exception("FTTR management DHCP","udp",67),{"rule":{"chain":"input_fttr_tr069","expr":[{"reject":null}]}},{"rule":{"chain":"forward_fttr_tr069","expr":[{"reject":null}]}},{"rule":{"chain":"input","expr":[{"match":{"left":{"meta":{"key":"iifname"}},"right":"br-lan.46"}},{"jump":{"target":"input_fttr_tr069"}}]}},{"rule":{"chain":"forward","expr":[{"match":{"left":{"meta":{"key":"iifname"}},"right":"br-lan.46"}},{"jump":{"target":"forward_fttr_tr069"}}]}}]});
+        let mut rules=json!({"nftables":[exception("FTTR management ACS","tcp",7547),exception("FTTR management DHCP","udp",67),{"rule":{"chain":"input_fttr_tr069","expr":[{"reject":null}]}},{"rule":{"chain":"forward_fttr_tr069","expr":[{"reject":null}]}},{"rule":{"chain":"input","expr":[{"match":{"left":{"meta":{"key":"iifname"}},"right":"br-tr069"}},{"jump":{"target":"input_fttr_tr069"}}]}},{"rule":{"chain":"forward","expr":[{"match":{"left":{"meta":{"key":"iifname"}},"right":"br-tr069"}},{"jump":{"target":"forward_fttr_tr069"}}]}}]});
         assert!(verify_firewall(&d,None,&rules).is_ok());rules["nftables"][0]["rule"]["expr"][1]["match"]["right"]=json!(22);assert!(verify_firewall(&d,None,&rules).is_err());rules["nftables"][0]=exception("FTTR management ACS","tcp",7547);
         rules["nftables"].as_array_mut().unwrap().push(json!({"rule":{"chain":"forward_fttr_tr069","expr":[{"accept":null}]}}));assert!(verify_firewall(&d,None,&rules).is_err());
     }
