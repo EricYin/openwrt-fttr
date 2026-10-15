@@ -107,8 +107,8 @@ pub fn observe(source: &str, payload: Vec<u8>, received: u64) -> bool {
     if !store.queue.put(source, payload, received, &protected) {
         return false;
     }
-    let seen = store.queue.seen.keys().cloned().collect::<Vec<_>>();
-    store.states.retain(|key, _| seen.contains(key));
+    let Store { queue, states } = &mut *store;
+    states.retain(|key, _| queue.seen.contains_key(key));
     if let Some(mac) = crate::mqtt_identity::normalize_target(source) {
         let state = store.states.entry(mac).or_default();
         if received < state.last_received {
@@ -124,6 +124,12 @@ pub fn snapshot(mac: &str) -> Option<serde_json::Value> {
     let (mutex, _) = shared();
     let store = mutex.lock().ok()?;
     serde_json::to_value(store.states.get(mac)?).ok()
+}
+
+pub fn revision(mac: &str) -> Option<u64> {
+    let (mutex, _) = shared();
+    let store = mutex.lock().ok()?;
+    Some(store.states.get(mac)?.revision)
 }
 
 pub(super) fn next() -> Option<(String, Option<Vec<u8>>, u64)> {
@@ -152,6 +158,37 @@ pub(super) fn complete(mac: String, received: u64, result: Result<Report, String
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn revision_is_absent_when_source_has_no_state() {
+        assert_eq!(super::revision("revision-test-missing"), None);
+    }
+
+    #[test]
+    fn revision_matches_snapshot_when_report_is_retained_after_error() {
+        let mac = "revision-test-retained";
+        let report = super::super::parse(&super::super::tests::fixture(&[("unknown", b"raw text")])).unwrap();
+        let mut state = super::State::default();
+        state.apply(10, Ok(report));
+        state.apply(11, Err("invalid gzip".into()));
+        super::shared().0.lock().unwrap().states.insert(mac.into(), state);
+        let revision = super::revision(mac);
+        let snapshot = super::snapshot(mac).unwrap();
+        assert_eq!(revision, Some(2));
+        assert_eq!(snapshot["revision"], serde_json::json!(2));
+        assert_eq!(snapshot["report"]["members"][0]["text"], "raw text");
+        assert_eq!(snapshot["error"], "invalid gzip");
+        super::shared().0.lock().unwrap().states.remove(mac);
+    }
+
+    #[test]
+    fn revision_returns_zero_when_state_is_pending() {
+        let mac = "revision-test-pending";
+        super::shared().0.lock().unwrap().states.insert(mac.into(), super::State::default());
+        let revision = super::revision(mac);
+        assert_eq!(revision, Some(0));
+        super::shared().0.lock().unwrap().states.remove(mac);
+    }
+
     #[test]
     fn telemetry_ingest_pending_receipt_does_not_regress_on_older_completion() {
         let mut state = super::State {

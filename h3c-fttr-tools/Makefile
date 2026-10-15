@@ -33,11 +33,11 @@ define Package/h3c-fttr-tools/config
   config FTTR_DEVICE_HWTC
     bool "Compile HWTC adapters (standard OMCI and model profiles)"
     depends on PACKAGE_h3c-fttr-tools
-    default n
+    default y
   config FTTR_ACS
     bool "Compile embedded minimal CWMP ACS (runtime UCI switch)"
     depends on PACKAGE_h3c-fttr-tools
-    default n
+    default y
 endef
 
 RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC),device-hwtc) $(if $(CONFIG_FTTR_ACS),acs)

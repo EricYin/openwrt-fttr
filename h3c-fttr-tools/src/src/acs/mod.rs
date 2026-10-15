@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::{
@@ -86,16 +86,16 @@ impl Server {
                 fs::create_dir_all(parent)?;
             }
             let temp = format!("{}.tmp", self.state_file);
-            let mut file = OpenOptions::new()
+            let file = OpenOptions::new()
                 .create(true)
                 .truncate(true)
                 .write(true)
                 .mode(0o600)
                 .open(&temp)?;
-            let data = serde_json::to_vec(state)
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, state)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            file.write_all(&data)?;
-            file.flush()?;
+            writer.flush()?;
             fs::rename(temp, path)
         })();
         if let Err(err) = &result {
@@ -647,6 +647,40 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn save_preserves_completed_results_and_private_mode_when_replacing_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = listener_test_server();
+        fs::write(&server.state_file, b"previous state").unwrap();
+        let mut state = State::default();
+        state.next_id = 7;
+        state.tasks.insert(7, Task {
+            id: 7, device: "save-test".into(), method: "GetParameterValues".into(),
+            args: json!({"names":["InternetGatewayDevice."]}), state: TaskState::Completed,
+            created: 1, sent: Some(2), result: Some(json!({"raw":"\"\\\n".repeat(100_000)})),
+        });
+        let result = server.save(&state);
+        result.unwrap();
+        let saved = fs::read(&server.state_file).unwrap();
+        assert_eq!(saved, serde_json::to_vec(&state).unwrap());
+        assert_eq!(fs::metadata(&server.state_file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!std::path::Path::new(&format!("{}.tmp", server.state_file)).exists());
+        fs::remove_file(&server.state_file).unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn save_preserves_previous_state_when_buffer_flush_fails() {
+        let server = listener_test_server();
+        fs::write(&server.state_file, b"previous state").unwrap();
+        let temp = format!("{}.tmp", server.state_file);
+        std::os::unix::fs::symlink("/dev/full", &temp).unwrap();
+        let result = server.save(&State::default());
+        assert!(result.is_err());
+        assert_eq!(fs::read(&server.state_file).unwrap(), b"previous state");
+        assert!(server.failure.lock().unwrap().as_deref().unwrap().starts_with("state persistence:"));
+        fs::remove_file(temp).unwrap();
+        fs::remove_file(&server.state_file).unwrap();
+    }
     #[test]
     fn management_writes_and_unowned_wan_are_blocked_even_when_queued() {
         let mut state = State::default();

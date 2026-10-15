@@ -71,8 +71,7 @@ pub fn control(input: &str, devices: &[Device]) -> Value {
                 let mqtt = sources.iter().find(|source| source.reason == "ready"
                     && source.optical_sn.as_deref() == Some(&device.optical_sn)
                     && source.onu_id == Some(device.onu_id));
-                let report_revision = mqtt.and_then(|source| super::telemetry::store::snapshot(&source.mqtt_mac))
-                    .and_then(|state| state.get("revision").and_then(Value::as_u64));
+                let report_revision = mqtt.and_then(|source| super::telemetry::store::revision(&source.mqtt_mac));
                 json!({"optical_sn":device.optical_sn,"onu_id":device.onu_id,"model":device.model,
                     "optical_online":device.online,"can_execute":device.online && mqtt.is_some(),
                     "mqtt":mqtt,"report_revision":report_revision})
