@@ -619,7 +619,7 @@ mod tests {
         let mut first = Discovery::new("auto");
         run(&mut first, identity.clone(), false);
         assert!(first.ready());
-        assert_eq!(first.selected(), Some("hwtc-hw"));
+        assert_eq!(first.selected(), Some("hwtc-k155-hw"));
         assert!(first.protected_wan().contains(
             "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.1.WANIPConnection.1."
         ));

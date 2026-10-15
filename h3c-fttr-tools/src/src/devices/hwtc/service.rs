@@ -19,6 +19,7 @@ pub(super) fn configure_profile(id: u8, cancellation: Option<Arc<AtomicBool>>, p
     let _channel = ChannelLease::open(id, 0)?;
     verify(&mut session, 256, 0, 0x8000, b"HWTC")?;
     if profile == super::Profile::V152 { super::v152::service::verify_identity(&mut session)?; }
+    if profile == super::Profile::K155 { super::k155::service::verify_identity(&mut session)?; }
     // Dispatch is vendor-wide by request. Confirm the live ONU-G vendor before
     // any profile writes; per-model topology still requires validation.
     // The live MIB exposes these ONU-created endpoints and priority queues.

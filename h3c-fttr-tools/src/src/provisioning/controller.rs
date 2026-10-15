@@ -94,6 +94,9 @@ impl Operation {
             .iter_mut()
             .filter(|i| i.kind == ItemKind::PortBinding)
         {
+            if binding.parameters.is_empty() {
+                continue;
+            }
             if let Some(activation) = activations.iter().find(|i| i.wan_ref == binding.wan_ref) {
                 let mut enable = activation.parameters[0].clone();
                 enable.value = "0".into();

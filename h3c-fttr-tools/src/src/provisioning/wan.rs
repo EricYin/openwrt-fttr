@@ -923,7 +923,7 @@ impl Reconciler {
                                     }
                                 }
                                 item.parameters = plan.parameters;
-                                item.guard = Some(plan.guard);
+                                item.guard = (!plan.guard.is_empty()).then_some(plan.guard);
                             }
                             Err(reason) => item.blocked = Some(reason),
                         }

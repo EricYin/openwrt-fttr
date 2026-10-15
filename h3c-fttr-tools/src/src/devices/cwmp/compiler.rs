@@ -90,6 +90,12 @@ pub fn compile_binding(
     if intent.endpoints.is_empty() {
         return Err("binding requires logical endpoints".into());
     }
+    if contract.capability_groups.binding == super::contract::Support::Unsupported {
+        return Ok(Plan {
+            parameters: Vec::new(),
+            guard: String::new(),
+        });
+    }
     let _field = contract
         .wan
         .binding
@@ -434,5 +440,22 @@ mod tests {
             .iter()
             .any(|p| p.name.ends_with("WANIPConnection.4.X_CU_LanInterface")
                 && p.value.ends_with(".7")));
+    }
+    #[cfg(feature = "device-hwtc")]
+    #[test]
+    fn k155_binding_unsupported_produces_empty_plan() {
+        use crate::provisioning::model::EndpointRef;
+        let c = super::super::registry::lookup("hwtc-k155-hw").unwrap();
+        let endpoints = EndpointMap::default();
+        let binding = BindingIntent {
+            endpoints: vec![EndpointRef::Lan(1)],
+        };
+        let objects = WanObjects {
+            parent: 1,
+            connection: 1,
+            kind: ConnectionKind::Ip,
+        };
+        let plan = compile_binding(&binding, c, &objects, &endpoints).unwrap();
+        assert!(plan.parameters.is_empty());
     }
 }

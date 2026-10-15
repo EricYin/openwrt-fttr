@@ -90,6 +90,13 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             op.finish_item("blocked", &reason);
             return;
         }
+        if op.item().parameters.is_empty() {
+            op.finish_item(
+                "verified",
+                "device contract bridges all endpoints; no binding parameters required",
+            );
+            return;
+        }
         op.roots = roots(op.item());
         let root = op.roots.remove(0);
         queue(
@@ -458,10 +465,11 @@ fn queue_read(op: &mut Operation, stage: OperationPhase) {
         }
     }
     if let Some(g) = &op.item().guard {
-        if !names.contains(g) {
+        if !g.is_empty() && !names.contains(g) {
             names.push(g.clone());
         }
     }
+    names.retain(|s| !s.is_empty());
     names.sort();
     names.dedup();
     queue(op, "GetParameterValues", json!({"names":names}), stage);

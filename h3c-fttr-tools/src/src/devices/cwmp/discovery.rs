@@ -33,6 +33,10 @@ pub fn specialization(optical_vendor: &str, product_class: &str) -> Option<&'sta
     if optical_vendor == "HWTC" && product_class == "V152" {
         return Some(&crate::devices::hwtc::cwmp::V152_CONTRACT);
     }
+    #[cfg(feature = "device-hwtc")]
+    if optical_vendor == "HWTC" && product_class == "K155-11" {
+        return Some(&crate::devices::hwtc::cwmp::K155_CONTRACT);
+    }
     #[cfg(feature = "device-hl202")]
     if optical_vendor == "H3CT" && product_class == "HL202-DU-C" {
         return Some(&crate::devices::hl202::cwmp::CONTRACT);
@@ -96,5 +100,12 @@ mod tests {
         assert_eq!(specialization("H3CT", "HL202-DU-C").unwrap().id, "hl202-cu");
         assert!(specialization("H3CT", "HL202-other").is_none());
         assert!(specialization("HWTC", "HL202-DU-C").is_none());
+    }
+    #[cfg(feature = "device-hwtc")]
+    #[test]
+    fn hwtc_identity_has_explicit_specialization() {
+        assert_eq!(specialization("HWTC", "V152").unwrap().id, "hwtc-v152-hw");
+        assert_eq!(specialization("HWTC", "K155-11").unwrap().id, "hwtc-k155-hw");
+        assert!(specialization("HWTC", "other").is_none());
     }
 }

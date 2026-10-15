@@ -32,3 +32,21 @@ pub const V152_CONTRACT: Contract = Contract {
     },
     ..CONTRACT
 };
+
+// K155-11 is a pure bridge FTTR sub-gateway with hardware-bridged SSIDs; no LAN/SSID binding switches.
+pub const K155_CONTRACT: Contract = Contract {
+    id: "hwtc-k155-hw",
+    writes_verified: true,
+    wlan: crate::devices::cwmp::contract::WlanContract {
+        radio_slots: Some([[1, 2, 3, 4], [5, 6, 7, 8]]),
+        wpa2_beacon: "11i",
+        nat_writable_exception: false,
+        passphrase_fallback: false,
+    },
+    capability_groups: crate::devices::cwmp::contract::Capabilities {
+        wan: crate::devices::cwmp::contract::Support::Supported,
+        wlan: crate::devices::cwmp::contract::Support::Supported,
+        binding: crate::devices::cwmp::contract::Support::Unsupported,
+    },
+    ..hw::BASE
+};
