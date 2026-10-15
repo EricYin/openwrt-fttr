@@ -231,6 +231,8 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 	u16 vlan_tci, vlan_id, priority;
 	u16 onu_id;
 	const u8 *eth_hdr;
+	u8 eth_buf[VLAN_ETH_HLEN];
+	int mac_len;
 	size_t total_len;
 
 	if (!dev || strcmp(dev->name, "fttr0") != 0)
@@ -239,16 +241,19 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 	if (!priv)
 		goto out;
 
-	if (skb_linearize(skb))
-		goto out;
-
 	if (!skb_mac_header_was_set(skb))
 		goto out;
 	eth_hdr = skb_mac_header(skb);
 	if (eth_hdr < skb->head || eth_hdr > skb->data)
 		goto out;
-	total_len = skb->data - eth_hdr + skb->len;
+	mac_len = skb->data - eth_hdr;
+	total_len = mac_len + skb->len;
 	if (total_len < ETH_HLEN)
+		goto out;
+	eth_hdr = skb_header_pointer(skb, -mac_len,
+				     min_t(size_t, total_len, sizeof(eth_buf)),
+				     eth_buf);
+	if (!eth_hdr)
 		goto out;
 
 	if (skb_vlan_tag_present(skb)) {
@@ -268,7 +273,7 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 
 	/* Priority 1 (0x2000): OMCI response frame from sub-gateway */
 	if (priority == 1 && onu_id <= 15) {
-		const u8 *omci_payload;
+		int omci_offset;
 		u8 omci_buf[56];
 
 		if (skb_vlan_tag_present(skb)) {
@@ -279,11 +284,11 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 			 */
 			if (total_len < 12 + 48)
 				goto out;
-			omci_payload = eth_hdr + 12;
+			omci_offset = 12;
 		} else {
 			if (total_len < 16 + 48)
 				goto out;
-			omci_payload = eth_hdr + 16;
+			omci_offset = 16;
 		}
 
 		/*
@@ -294,7 +299,9 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 		 */
 		*(__be32 *)&omci_buf[0] = cpu_to_be32(3);
 		*(__be32 *)&omci_buf[4] = cpu_to_be32(onu_id);
-		memcpy(&omci_buf[8], omci_payload, 48);
+		if (skb_copy_bits(skb, omci_offset - mac_len,
+				  &omci_buf[8], 48))
+			goto out;
 
 		pr_debug("fmcs: OMCI RX fttr0 onu_id %u len %zu\n", onu_id, sizeof(omci_buf));
 		fmcs_rx_omci_frame(priv, omci_buf, sizeof(omci_buf));
@@ -305,26 +312,25 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 	if (priority == 0 && vlan_id >= 0x101 && vlan_id <= 0x10f) {
 		struct net_device *sub_dev = priv->fttr_devs[vlan_id - 0x101];
 		if (sub_dev && (sub_dev->flags & IFF_UP)) {
-			bool tagged = !skb_vlan_tag_present(skb);
-			struct sk_buff *cskb;
-
-			if (tagged && total_len < VLAN_ETH_HLEN)
+			if (!skb_vlan_tag_present(skb) && total_len < VLAN_ETH_HLEN)
 				goto out;
-			cskb = netdev_alloc_skb(sub_dev, total_len + 2);
-			if (cskb) {
-				skb_reserve(cskb, 2);
-				if (tagged) {
-					skb_put_data(cskb, eth_hdr, 12);
-					skb_put_data(cskb, eth_hdr + 16, total_len - 16);
-				} else {
-					skb_put_data(cskb, eth_hdr, total_len);
-				}
-				cskb->dev = sub_dev;
-				cskb->protocol = eth_type_trans(cskb, sub_dev);
-				sub_dev->stats.rx_packets++;
-				sub_dev->stats.rx_bytes += cskb->len;
-				netif_rx(cskb);
-			}
+			/* Packet taps share the skb with the original RX path. Only
+			 * clone its descriptor; keep GRO/GSO fragments and metadata.
+			 */
+			skb = skb_share_check(skb, GFP_ATOMIC);
+			if (!skb)
+				return NET_RX_DROP;
+			skb_push_rcsum(skb, mac_len);
+			if (skb_vlan_pop(skb))
+				goto out;
+			skb_scrub_packet(skb, false);
+			skb->dev = sub_dev;
+			skb->protocol = eth_type_trans(skb, sub_dev);
+			skb_postpull_rcsum(skb, skb_mac_header(skb), ETH_HLEN);
+			sub_dev->stats.rx_packets++;
+			sub_dev->stats.rx_bytes += skb->len;
+			netif_rx(skb);
+			return NET_RX_SUCCESS;
 		}
 	}
 
@@ -415,6 +421,7 @@ int fmcs_netdevs_init(struct fmcs_priv *priv)
 		}
 
 		dev->netdev_ops = &fmcs_fttr_ops;
+		dev->priv_flags &= ~IFF_TX_SKB_SHARING;
 		port_priv = netdev_priv(dev);
 		port_priv->priv = priv;
 		port_priv->port_idx = i + 1;
