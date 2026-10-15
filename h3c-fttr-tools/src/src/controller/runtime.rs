@@ -1,5 +1,5 @@
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::Command;
@@ -47,11 +47,18 @@ fn start_ipc_server(
                 Err(_) => continue,
             };
 
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+            let reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
-            if reader.read_line(&mut line).is_ok() {
+            if reader.take(524296).read_line(&mut line).is_ok() && line.ends_with('\n') {
                 let line = line.trim();
-                if let Some(request) = line.strip_prefix("MIB ") {
+                if let Some(request) = line.strip_prefix("HL202 ") {
+                    #[cfg(feature = "device-hl202")]
+                    super::hl202::start(stream, request.to_string(), pon_engine.clone(), services.clone());
+                    #[cfg(not(feature = "device-hl202"))]
+                    { let _ = request; let _ = stream.write_all(b"{\"schema_version\":1,\"error\":{\"code\":\"adapter_disabled\",\"message\":\"HL202 adapter not compiled\"}}"); }
+                } else if let Some(request) = line.strip_prefix("MIB ") {
                     let request = request.to_string();
                     let services = services.clone();
                     // MIB sessions validate O5 through STATUS IPC. Keep accepting
@@ -597,53 +604,41 @@ pub fn run() {
             match client.read_packet() {
                 Ok(Some((topic, payload))) => {
                     if let Some(dev_id) = topic.strip_prefix(prefix) {
+                        let Some(mac) = crate::mqtt_identity::normalize_target(dev_id) else { continue; };
+                        let dev_id = mac.as_str();
+                        let payload_bytes = payload.len();
                         println!(
                             "[+] Telemetry packet received from sub-gateway: {} ({} bytes)",
                             dev_id,
                             payload.len()
                         );
 
-                        // Save telemetry
-                        let dir = format!("{}/{}", ipc::SUBDEV_DIR, dev_id);
-                        let _ = fs::create_dir_all(&dir);
-                        let file_path = format!("{dir}/telemetry.bin");
-                        if let Ok(mut f) = File::create(&file_path) {
-                            let _ = f.write_all(&payload);
-                        }
 
                         // Telemetry is observation only: it must not enable
                         // carrier or publish unverified configuration payloads.
 
                         // Update device list
-                        let mut devs = devices.lock().unwrap();
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
 
-                        let mut found = false;
-                        for dev in devs.iter_mut() {
-                            if dev.id == dev_id {
-                                dev.last_seen = now;
-                                dev.payload_bytes = payload.len();
-                                found = true;
-                                break;
-                            }
-                        }
-
-                        if !found {
-                            println!("[+] New sub-gateway joined network: {}", dev_id);
-                            devs.push(SubDevice {
-                                id: dev_id.to_string(),
-                                last_seen: now,
-                                payload_bytes: payload.len(),
-                            });
-                        }
+                        let protected = crate::mqtt_identity::shared().lock()
+                            .map(|state| state.snapshots(now).into_iter()
+                                .filter(|source| source.reason == "ready")
+                                .map(|source| source.mqtt_mac).collect()).unwrap_or_default();
+                        let mut devs = devices.lock().unwrap();
+                        crate::telemetry_sources::observe(&mut devs, SubDevice {
+                            id: dev_id.to_string(), last_seen: now, payload_bytes,
+                        }, &protected);
 
                         let _ = ipc::update_status_file(&devs);
                         drop(devs);
 
                         crate::provisioning::observe_mqtt(dev_id, now);
+                        if !crate::devices::observe_mqtt_report(dev_id, payload, now) {
+                            eprintln!("[-] Telemetry report not queued for {}", dev_id);
+                        }
                     }
                 }
                 Ok(None) => {}

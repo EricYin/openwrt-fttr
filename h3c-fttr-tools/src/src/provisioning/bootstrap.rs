@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use crate::mqtt_identity::{normalize_target, Transport};
 
 const STATE_FILE: &str = "/var/lib/fttr/acs-bootstrap.json";
 const TRANSPORT_FRESHNESS: u64 = 60;
@@ -67,12 +68,6 @@ struct Record {
 }
 
 #[derive(Default)]
-struct Transport {
-    last_seen: u64,
-    epoch: u64,
-}
-
-#[derive(Default)]
 struct Coordinator {
     records: BTreeMap<String, Record>,
     transport: BTreeMap<String, Transport>,
@@ -110,16 +105,10 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn normalize_target(topic: &str) -> Option<String> {
-    let value = topic
-        .strip_suffix("/fttr_data.tar.gz")
-        .unwrap_or(topic)
-        .replace(':', "");
-    (value.len() == 12 && value.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| value.to_ascii_uppercase())
-}
-
 pub(crate) fn observe_mqtt(topic: &str, time: u64) {
+    if let Ok(mut registry) = crate::mqtt_identity::shared().lock() {
+        registry.observe(topic, time);
+    }
     if let Some(target) = normalize_target(topic) {
         let mut c = coordinator().lock().unwrap();
         let t = c.transport.entry(target).or_default();
@@ -282,21 +271,7 @@ pub(super) fn tick(observation: Observation<'_>) {
 
 impl Coordinator {
     fn automatic_target(&self, sn: &str, time: u64) -> Result<Option<String>, &'static str> {
-        let candidates: Vec<_> = self
-            .transport
-            .iter()
-            .filter(|(mac, t)| {
-                t.last_seen <= time
-                    && time.saturating_sub(t.last_seen) <= TRANSPORT_FRESHNESS
-                    && self.links.get(*mac).is_some_and(|linked| linked == sn)
-            })
-            .map(|(mac, _)| mac.clone())
-            .collect();
-        match candidates.as_slice() {
-            [] => Ok(None),
-            [mac] => Ok(Some(mac.clone())),
-            _ => Err("multiple fresh MQTT targets originate from this ONU; automatic identity is ambiguous"),
-        }
+        crate::mqtt_identity::automatic_target(&self.transport, &self.links, (sn, time))
     }
 
     fn schedule(&mut self, observation: Observation<'_>) -> Option<Job> {

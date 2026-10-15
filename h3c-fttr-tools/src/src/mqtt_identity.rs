@@ -1,0 +1,84 @@
+//! Fresh MQTT source identities, independent of ACS configuration and Inform readiness.
+mod registry;
+pub use registry::Registry;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) const FRESHNESS: u64 = 60;
+
+#[derive(Clone, Default)]
+pub(crate) struct Transport {
+    pub last_seen: u64,
+    pub epoch: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Selection {
+    pub optical_sn: String,
+    pub onu_id: u16,
+    pub binding_generation: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Snapshot {
+    pub mqtt_mac: String,
+    pub optical_sn: Option<String>,
+    pub onu_id: Option<u16>,
+    pub binding_generation: String,
+    pub last_seen: u64,
+    pub reason: String,
+}
+
+pub(crate) fn normalize_target(topic: &str) -> Option<String> {
+    let value = topic.strip_suffix("/fttr_data.tar.gz").unwrap_or(topic);
+    let valid = match value.len() {
+        12 => value.bytes().all(|b| b.is_ascii_hexdigit()),
+        17 => value.bytes().enumerate().all(|(i, b)| {
+            if i % 3 == 2 {
+                b == b':'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        }),
+        _ => false,
+    };
+    valid.then(|| value.replace(':', "").to_ascii_uppercase())
+}
+
+pub(crate) fn automatic_target(
+    transport: &BTreeMap<String, Transport>,
+    links: &BTreeMap<String, String>,
+    selection: (&str, u64),
+) -> Result<Option<String>, &'static str> {
+    let (serial, time) = selection;
+    let mut matches = transport.iter().filter(|(mac, observation)| {
+        observation.last_seen <= time
+            && time - observation.last_seen <= FRESHNESS
+            && links.get(*mac).is_some_and(|sn| sn == serial)
+    });
+    match (matches.next(), matches.next()) {
+        (None, _) => Ok(None),
+        (Some((mac, _)), None) => Ok(Some(mac.clone())),
+        _ => Err(
+            "multiple fresh MQTT targets originate from this ONU; automatic identity is ambiguous",
+        ),
+    }
+}
+
+static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+pub(crate) fn shared() -> &'static Mutex<Registry> {
+    REGISTRY.get_or_init(|| {
+        let epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        Mutex::new(Registry::new(format!("{}-{epoch:x}", std::process::id())))
+    })
+}
+
+#[cfg(test)]
+#[path = "mqtt_identity/tests.rs"]
+mod tests;

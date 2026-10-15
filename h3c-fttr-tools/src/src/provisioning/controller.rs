@@ -591,7 +591,11 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
             .map(|o| (u16::from(o.onu_id), o.full_sn_str()))
             .collect();
         let online: BTreeSet<_> = online_onus.values().cloned().collect();
-        super::bootstrap::observe_onu_links(super::link_identity::discover(&online_onus));
+        let source_links = super::link_identity::discover(&online_onus);
+        if let Ok(mut registry) = crate::mqtt_identity::shared().lock() {
+            registry.update_topology(online_onus.clone(), source_links.clone(), now());
+        }
+        super::bootstrap::observe_onu_links(source_links);
         let devices = acs(json!({"op":"devices"}));
         let acs_status = acs(json!({"op":"status"}));
         let desired = controller()

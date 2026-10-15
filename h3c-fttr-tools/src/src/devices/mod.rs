@@ -1,5 +1,12 @@
 //! Whole-device compile-time registry. Core activation/inventory never depend on adapters.
 pub mod cwmp;
+
+pub fn observe_mqtt_report(source: &str, payload: Vec<u8>, received: u64) -> bool {
+    #[cfg(feature = "device-hl202")]
+    { hl202::telemetry::store::observe(source, payload, received) }
+    #[cfg(not(feature = "device-hl202"))]
+    { let _ = (source, payload, received); false }
+}
 #[cfg(feature = "device-hl202")]
 pub mod hl202;
 #[cfg(feature = "device-hwtc")]

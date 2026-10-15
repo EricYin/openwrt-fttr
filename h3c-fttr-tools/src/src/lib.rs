@@ -1,7 +1,11 @@
 pub mod bosa;
 pub mod fpga;
 pub mod ipc;
+pub mod hl202_ipc;
 pub mod mqtt;
+pub mod mqtt_identity;
+mod telemetry_sources;
+mod mqtt_limits;
 pub mod pon_engine;
 pub mod devices;
 #[cfg(feature = "device-hl202")]

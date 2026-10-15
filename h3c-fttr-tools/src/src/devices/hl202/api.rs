@@ -1,0 +1,198 @@
+use crate::mqtt_identity::Selection;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+#[derive(Serialize)]
+pub struct Device {
+    pub optical_sn: String,
+    pub onu_id: u16,
+    pub model: String,
+    pub online: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Query {
+    List,
+    Report { target: Selection },
+    SourceReport { target: SourceSelection },
+    Run { request: super::request::Request },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSelection {
+    pub mqtt_mac: String,
+    pub binding_generation: String,
+}
+
+fn source_report(
+    registry: &crate::mqtt_identity::Registry,
+    target: &SourceSelection,
+    now: u64,
+) -> Value {
+    match registry.snapshots(now).into_iter().find(|snapshot| {
+        snapshot.mqtt_mac == target.mqtt_mac
+            && snapshot.binding_generation == target.binding_generation
+    }) {
+        Some(snapshot) => json!({"schema_version":1,"target":snapshot,
+            "report":super::telemetry::store::snapshot(&snapshot.mqtt_mac),"read_only":true}),
+        None => error(
+            "stale_source",
+            "MQTT source observation changed or is no longer available",
+        ),
+    }
+}
+
+fn error(code: &str, message: &str) -> Value {
+    json!({"schema_version":1,"error":{"code":code,"message":message}})
+}
+
+pub fn control(input: &str, devices: &[Device]) -> Value {
+    if input.len() > crate::hl202_ipc::MAX_REQUEST_BYTES {
+        return error("invalid_request", "HL202 request exceeds the byte limit");
+    }
+    let query = match serde_json::from_str::<Query>(input) {
+        Ok(query) => query,
+        Err(_) => return error("invalid_request", "invalid HL202 request schema"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let registry = crate::mqtt_identity::shared();
+    match query {
+        Query::List => {
+            let sources = match registry.lock() {
+                Ok(state) => state.snapshots(now),
+                Err(_) => return error("unavailable", "MQTT identity state unavailable"),
+            };
+            let rows: Vec<Value> = devices.iter().map(|device| {
+                let mqtt = sources.iter().find(|source| source.reason == "ready"
+                    && source.optical_sn.as_deref() == Some(&device.optical_sn)
+                    && source.onu_id == Some(device.onu_id));
+                let report_revision = mqtt.and_then(|source| super::telemetry::store::snapshot(&source.mqtt_mac))
+                    .and_then(|state| state.get("revision").and_then(Value::as_u64));
+                json!({"optical_sn":device.optical_sn,"onu_id":device.onu_id,"model":device.model,
+                    "optical_online":device.online,"can_execute":device.online && mqtt.is_some(),
+                    "mqtt":mqtt,"report_revision":report_revision})
+            }).collect();
+            json!({"schema_version":1,"devices":rows,"sources":sources})
+        }
+        Query::Report { target } => match registry.lock() {
+            Ok(state) => match state.resolve(&target, now) {
+                Ok(snapshot) => {
+                    let report = super::telemetry::store::snapshot(&snapshot.mqtt_mac);
+                    let state = if report.is_some() {
+                        "received"
+                    } else {
+                        "report_unavailable"
+                    };
+                    json!({"schema_version":1,"target":snapshot,"report":report,"state":state})
+                }
+                Err(message) => error("stale_target", message),
+            },
+            Err(_) => error("unavailable", "MQTT identity state unavailable"),
+        },
+        Query::SourceReport { target } => match registry.lock() {
+            Ok(state) => source_report(&state, &target, now),
+            Err(_) => error("unavailable", "MQTT identity state unavailable"),
+        },
+        Query::Run { request } => {
+            if !devices.iter().any(|device| {
+                device.online
+                    && device.optical_sn == request.target.optical_sn
+                    && device.onu_id == request.target.onu_id
+                    && device.model == "HL202-DU-C"
+            }) {
+                return error(
+                    "unsupported_target",
+                    "selected device is not an online HL202",
+                );
+            }
+            let encoded = match serde_json::to_string(&request) {
+                Ok(encoded) => encoded,
+                Err(_) => return error("invalid_request", "invalid HL202 request schema"),
+            };
+            let request = match super::request::parse(&encoded) {
+                Ok(request) => request,
+                Err(_) => return error("invalid_request", "invalid HL202 action parameters"),
+            };
+            match request.action {
+                super::request::Action::Exec {
+                    script,
+                    timeout_seconds,
+                } => {
+                    match super::command_binding::execute(
+                        &request.target,
+                        &script,
+                        std::time::Duration::from_secs(u64::from(timeout_seconds)),
+                    ) {
+                        Ok(result) => json!({"schema_version":1,"operation":result}),
+                        Err(cause) => error("command_failed", &cause.to_string()),
+                    }
+                }
+                action @ (super::request::Action::AccountsRead
+                | super::request::Action::AccountSetPassword { .. }
+                | super::request::Action::AccountSetActive { .. }) => {
+                    match super::accounts::run(&request.target, &action) {
+                        Ok(result) => result,
+                        Err(_) => error(
+                            "account_failed",
+                            "account command failed or returned unsupported metadata",
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hl202_request_unbound_source_report_requires_its_own_generation() {
+        let mut registry = crate::mqtt_identity::Registry::new("source-test".into());
+        registry.update_topology(Default::default(), Ok(Default::default()), 10);
+        registry.observe("020000000001", 10);
+        let snapshot = registry.snapshots(10).pop().unwrap();
+        let target = SourceSelection {
+            mqtt_mac: snapshot.mqtt_mac,
+            binding_generation: snapshot.binding_generation,
+        };
+        let reply = source_report(&registry, &target, 10);
+        assert_eq!(reply["target"]["reason"], "unmatched");
+        assert!(reply.get("operation").is_none());
+        let other = SourceSelection {
+            mqtt_mac: "020000000002".into(),
+            ..target
+        };
+        assert_eq!(
+            source_report(&registry, &other, 10)["error"]["code"],
+            "stale_source"
+        );
+    }
+
+    #[test]
+    fn hl202_request_api_rejects_malformed_without_returning_body() {
+        let reply = control("{private-credential", &[]);
+        assert_eq!(reply["error"]["code"], "invalid_request");
+        assert!(!reply.to_string().contains("private-credential"));
+    }
+
+    #[test]
+    fn hl202_request_api_lists_optical_device_without_mqtt_as_unavailable() {
+        let devices = vec![Device {
+            optical_sn: "H3CT12345678".into(),
+            onu_id: 2,
+            model: "HL202-DU-C".into(),
+            online: true,
+        }];
+        let reply = control("{\"method\":\"list\"}", &devices);
+        assert_eq!(reply["devices"][0]["optical_sn"], "H3CT12345678");
+        assert_eq!(reply["devices"][0]["can_execute"], false);
+        assert_eq!(reply["devices"][0]["mqtt"], Value::Null);
+    }
+}

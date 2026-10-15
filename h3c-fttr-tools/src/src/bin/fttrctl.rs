@@ -7,9 +7,13 @@ use h3c_fttr_tools::fpga;
 use h3c_fttr_tools::ipc;
 use h3c_fttr_tools::model::{FttrSystemStatus, IpcResponse};
 #[cfg(feature = "device-hl202")]
-use h3c_fttr_tools::devices::hl202::command::{self as subdev_command, CommandResult};
+#[path = "fttrctl/mqtt_command.rs"]
+mod mqtt_command;
 #[cfg(feature = "device-hl202")]
-use std::time::Duration;
+#[path = "fttrctl/hl202.rs"]
+mod hl202;
+#[cfg(feature = "device-hl202")]
+use mqtt_command::handle as handle_mqtt_command;
 
 fn print_usage() {
     eprintln!(
@@ -47,104 +51,9 @@ fn status_ipc_error(error: &str) -> serde_json::Value {
     })
 }
 
-#[cfg(feature = "device-hl202")]
-fn print_command_usage() {
-    eprintln!("Usage:\n  fttrctl exec [--wait|--no-wait] [--timeout SECONDS] [--json] <mac> 'shell command'\n  fttrctl cmd [--wait] [--json] <mac> 'shell command'\n  fttrctl broadcast [--wait] [--targets MAC,MAC] [--timeout SECONDS] [--json] 'shell command'\n\nOptions must precede the shell command; -- ends option parsing.\nThe target is the child br0 MAC, not its optical SN. Default timeout: 5 seconds (1..300).\nBroadcast --wait fans out to fresh telemetry devices (last seen <=15s), or explicit --targets.\nDispatch success only means a QoS 0 socket write. Timeout does not cancel execution.");
-}
-
 #[cfg(not(feature = "device-hl202"))]
 fn handle_mqtt_command(_: &[String]) -> Result<i32, String> {
     Err("HL202 adapter not compiled; enable device-hl202".into())
-}
-#[cfg(feature = "device-hl202")]
-fn handle_mqtt_command(args: &[String]) -> Result<i32, String> {
-    let mode = args[0].as_str();
-    let broadcast = mode == "broadcast";
-    let mut wait = mode == "exec";
-    let mut json = false;
-    let mut seconds = 5u64;
-    let mut target = None;
-    let mut targets = None;
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => { print_command_usage(); return Ok(0); }
-            "--wait" => wait = true,
-            "--no-wait" => wait = false,
-            "--json" | "-j" => json = true,
-            "--timeout" => {
-                i += 1;
-                seconds = args.get(i).ok_or("--timeout needs seconds")?.parse()
-                    .map_err(|_| "invalid timeout")?;
-                if !(1..=300).contains(&seconds) { return Err("timeout must be 1..300 seconds".into()); }
-            }
-            "--targets" => {
-                i += 1;
-                if !broadcast { return Err("--targets is only valid for broadcast --wait".into()); }
-                targets = Some(args.get(i).ok_or("--targets needs comma-separated MACs")?.clone());
-            }
-            "--" => { i += 1; break; }
-            option if option.starts_with('-') => return Err(format!("unknown option: {option}")),
-            _ if !broadcast && target.is_none() => target = Some(args[i].clone()),
-            _ => break,
-        }
-        i += 1;
-    }
-    if i >= args.len() || (!broadcast && target.is_none()) {
-        print_command_usage();
-        return Err("missing target or shell command".into());
-    }
-    if targets.is_some() && !wait { return Err("--targets requires --wait".into()); }
-    let command = args[i..].join(" ");
-    let devices = if broadcast && wait {
-        let values = if let Some(values) = targets {
-            values.split(',').map(str::to_string).collect::<Vec<_>>()
-        } else {
-            let reply = ipc::send_ipc_command("STATUS").map_err(|e| format!("cannot discover devices: {e}; use --targets"))?;
-            let status: FttrSystemStatus = serde_json::from_str(&reply).map_err(|e| format!("invalid STATUS response: {e}"))?;
-            status.telemetry_gateways.into_iter().filter(|d| d.last_seen_sec_ago <= 15)
-                // Older fttrd keeps the complete telemetry topic suffix in id.
-                .map(|d| d.id.split('/').next().unwrap_or("").to_string()).collect()
-        };
-        let mut macs = Vec::new();
-        for value in values {
-            let mac = subdev_command::normalize_mac(&value).map_err(|e| e.to_string())?;
-            if !macs.contains(&mac) { macs.push(mac); }
-        }
-        if macs.is_empty() { return Err("no fresh telemetry devices; specify --targets MAC,MAC".into()); }
-        macs
-    } else if broadcast {
-        vec!["all".to_string()]
-    } else {
-        vec![subdev_command::normalize_mac(&target.unwrap()).map_err(|e| e.to_string())?]
-    };
-    let mut results = Vec::new();
-    for device in devices {
-        let result = if wait {
-            subdev_command::execute(&device, &command, Duration::from_secs(seconds))
-        } else {
-            subdev_command::dispatch(&device, &command)
-        }.unwrap_or_else(|e| CommandResult::failed(&device, e));
-        if !json {
-            if let Some(output) = &result.output { print!("{output}"); }
-            if let Some(error) = &result.error {
-                eprintln!("[-] {} {}: {error}", result.target, result.status);
-            } else if let Some(code) = result.exit_code {
-                eprintln!("[{}] {} executed, exit={code}", if code == 0 { "+" } else { "-" }, result.target);
-            } else {
-                println!("[+] {} dispatched (device execution not confirmed)", result.target);
-            }
-        }
-        results.push(result);
-    }
-    let code = if results.iter().all(CommandResult::success) { 0 }
-        else if results.len() == 1 { results[0].exit_code.filter(|c| (1..=255).contains(c)).unwrap_or(1) }
-        else { 1 };
-    if json {
-        if broadcast { println!("{}", serde_json::to_string(&results).unwrap()); }
-        else { println!("{}", serde_json::to_string(&results[0]).unwrap()); }
-    }
-    Ok(code)
 }
 
 fn print_subdev_usage() {
@@ -599,6 +508,15 @@ fn main() {
                 Ok(code) => exit(code),
                 Err(error) => { eprintln!("[-] {error}"); exit(1); }
             }
+        }
+        "hl202" => {
+            #[cfg(feature = "device-hl202")]
+            match hl202::handle(&args[2..]) {
+                Ok(code) => exit(code),
+                Err(error) => { eprintln!("[-] {error}"); exit(1); }
+            }
+            #[cfg(not(feature = "device-hl202"))]
+            { eprintln!("HL202 adapter not compiled"); exit(1); }
         }
         "subdev" => {
             handle_subdev_command(&args[1..]);

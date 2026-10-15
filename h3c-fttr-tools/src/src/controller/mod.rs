@@ -6,5 +6,7 @@ pub mod inventory;
 pub mod management;
 pub mod profile;
 mod runtime;
+#[cfg(feature = "device-hl202")]
+mod hl202;
 pub(crate) mod service;
 pub use runtime::run;

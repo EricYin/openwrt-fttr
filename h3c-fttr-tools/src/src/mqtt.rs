@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use mqttrs2::*;
+use crate::mqtt_limits;
 
 /// A lightweight, robust MQTT 3.1.1 client using `mqttrs2` protocol codec
 /// over a standard synchronous `TcpStream`.
@@ -174,7 +175,7 @@ impl MqttClient {
             payload: data,
         };
 
-        let mut send_buf = vec![0u8; 128 + topic.len() + data.len()];
+        let mut send_buf = vec![0u8; mqtt_limits::publish_size(topic.len(), data.len())?];
         let n = encode_slice(&Packet::Publish(publish), &mut send_buf)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("MQTT publish encode error: {e:?}")))?;
         self.stream.write_all(&send_buf[..n])
@@ -205,6 +206,7 @@ impl MqttClient {
         loop {
             // 1. Process any complete packets already buffered in `read_buf`
             if !self.read_buf.is_empty() {
+                mqtt_limits::declared_size(&self.read_buf)?;
                 match decode_slice_with_len(&self.read_buf) {
                     Ok(Some((consumed_len, packet))) => {
                         let extracted_msg = match packet {
@@ -238,7 +240,12 @@ impl MqttClient {
 
             // 2. Read incoming chunk from the TCP stream
             let mut chunk = [0u8; 2048];
-            match self.stream.read(&mut chunk) {
+            let available = mqtt_limits::MAX_PACKET_BYTES.saturating_sub(self.read_buf.len());
+            if available == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "MQTT packet buffer limit exceeded"));
+            }
+            let capacity = available.min(chunk.len());
+            match self.stream.read(&mut chunk[..capacity]) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
