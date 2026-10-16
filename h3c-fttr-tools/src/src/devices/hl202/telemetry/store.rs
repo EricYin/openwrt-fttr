@@ -1,40 +1,19 @@
 use super::Report;
-use serde::Serialize;
+#[path = "store_state.rs"]
+mod state;
+pub use state::State;
 use std::{
     collections::BTreeMap,
     sync::{Condvar, Mutex, OnceLock},
 };
 
-#[derive(Default, Serialize)]
-pub struct State {
-    pub revision: u64,
-    pub last_received: u64,
-    pub last_processed_receipt: Option<u64>,
-    pub last_good: Option<u64>,
-    pub error: Option<String>,
-    pub report: Option<Report>,
-}
-
-impl State {
-    fn apply(&mut self, received: u64, result: Result<Report, String>) {
-        self.revision = self.revision.wrapping_add(1);
-        self.last_received = self.last_received.max(received);
-        self.last_processed_receipt = Some(received);
-        match result {
-            Ok(report) => {
-                self.last_good = Some(received);
-                self.report = Some(report);
-                self.error = None;
-            }
-            Err(error) => self.error = Some(error),
-        }
-    }
-}
-
 struct Pending {
     payload: Option<Vec<u8>>,
     received: u64,
+    budget_evicted: bool,
 }
+
+const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 struct Queue {
@@ -62,7 +41,16 @@ impl Queue {
             self.pending.remove(&oldest);
         }
         self.seen.insert(mac.clone(), received);
-        self.pending.insert(mac, Pending { payload, received });
+        self.pending.insert(mac, Pending { payload, received, budget_evicted: false });
+        while self.pending.values().filter_map(|item| item.payload.as_ref()).map(Vec::len).sum::<usize>() > MAX_PENDING_BYTES {
+            let oldest = self.pending.values_mut()
+                .filter(|item| item.payload.is_some())
+                .min_by_key(|item| item.received);
+            if let Some(item) = oldest {
+                item.payload = None;
+                item.budget_evicted = true;
+            }
+        }
         true
     }
 
@@ -82,6 +70,19 @@ struct Store {
     states: BTreeMap<String, State>,
 }
 static SHARED: OnceLock<(Mutex<Store>, Condvar)> = OnceLock::new();
+
+impl Store {
+    fn take(&mut self) -> Option<(String, Pending)> {
+        while let Some((mac, item)) = self.queue.take() {
+            if item.budget_evicted {
+                self.states.entry(mac).or_default().apply(item.received, Err("pending telemetry byte budget exceeded".into()));
+            } else {
+                return Some((mac, item));
+            }
+        }
+        None
+    }
+}
 
 fn shared() -> &'static (Mutex<Store>, Condvar) {
     SHARED.get_or_init(|| {
@@ -136,7 +137,7 @@ pub(super) fn next() -> Option<(String, Option<Vec<u8>>, u64)> {
     let (mutex, signal) = shared();
     let mut store = mutex.lock().ok()?;
     loop {
-        if let Some((mac, item)) = store.queue.take() {
+        if let Some((mac, item)) = store.take() {
             return Some((mac, item.payload, item.received));
         }
         store = signal.wait(store).ok()?;
@@ -155,6 +156,10 @@ pub(super) fn complete(mac: String, received: u64, result: Result<Report, String
         }
     }
 }
+
+#[cfg(test)]
+#[path = "store_budget_tests.rs"]
+mod budget_tests;
 
 #[cfg(test)]
 mod tests {

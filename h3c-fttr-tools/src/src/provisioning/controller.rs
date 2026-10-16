@@ -3,6 +3,11 @@ use super::model::{ItemKind, OperationPhase, ParameterKind};
 use super::{config, wan, wifi};
 #[path = "parameters.rs"]
 mod parameters;
+#[path = "controller/lifecycle.rs"]
+mod lifecycle;
+#[cfg(test)]
+#[path = "controller/lifecycle_tests.rs"]
+mod lifecycle_tests;
 use config::{Config, Device, Item, Parameter};
 use parameters::advance;
 #[cfg(test)]
@@ -212,11 +217,10 @@ pub(crate) fn management_desired(serial: &str) -> Option<(config::Management, St
     super::bootstrap::omci_write_allowed(&id, epoch, automatic).then_some((management, version))
 }
 pub(crate) fn management_result(serial: &str, result: Value) {
-    controller()
-        .lock()
-        .unwrap()
-        .omci_management
-        .insert(serial.into(), result);
+    let mut c = controller().lock().unwrap();
+    if c.config.devices.iter().any(|d| d.optical_sn == serial) {
+        c.omci_management.insert(serial.into(), result);
+    }
 }
 pub(crate) fn management_version(serial: &str) -> String {
     let enabled = controller()
@@ -252,13 +256,6 @@ impl Controller {
         self.recovered.remove(&device.id);
         self.owned.remove(&device.cwmp_id);
         self.wifi_owned.remove(&device.cwmp_id);
-    }
-    fn history(&self) -> String {
-        let mut history = self.recovered.clone();
-        for (id, operation) in &self.operations {
-            history.insert(id.clone(), operation.view());
-        }
-        json!({"operations":history.values().collect::<Vec<_>>(),"owned":self.owned}).to_string()
     }
     fn reset_device(&mut self, target: &str) -> Result<Value, String> {
         let device = self
@@ -372,9 +369,9 @@ impl Controller {
                 let previous = self
                     .operations
                     .get(&d.id)
-                    .map(Operation::view)
-                    .or_else(|| self.recovered.get(&d.id).cloned());
-                if let Some(items) = previous.as_ref().and_then(|p| p["items"].as_array()) {
+                    .map(Operation::view);
+                if let Some(items) = previous.as_ref().or_else(|| self.recovered.get(&d.id))
+                    .and_then(|p| p["items"].as_array()) {
                     for i in items {
                         if let Some(id) = i["id"].as_str() {
                             if !d.items.iter().any(|selected| selected.id == id) {
@@ -387,6 +384,7 @@ impl Controller {
             if d.items.is_empty() {
                 op.stage = OperationPhase::WanReconciling;
             }
+            self.recovered.remove(&d.id);
             self.operations.insert(d.id.clone(), op);
         }
         Ok(ids)
@@ -479,15 +477,8 @@ pub fn control(request: &str) -> String {
             "reload" => {
                 let cfg = config::load()?;
                 let mut c = controller().lock().unwrap();
-                // Do not allow old queued writes to race a new configuration revision.
-                if c.operations
-                    .values()
-                    .any(|o| o.stage != OperationPhase::Completed)
-                {
-                    return Err("active synchronization: finish operation before reload".into());
-                }
                 let changed = cfg.revision != c.config.revision;
-                c.config = cfg;
+                c.replace_config(cfg)?;
                 c.failure = None;
                 if changed
                     && c.config.enabled
@@ -507,8 +498,7 @@ pub fn control(request: &str) -> String {
                 let cfg = config::load()?;
                 let desired = cfg.management_network.clone().ok_or("configure the management IPv4 address/prefix first")?;
                 let mut c = controller().lock().unwrap();
-                if c.operations.values().any(|o| o.stage != OperationPhase::Completed) { return Err("active business synchronization: finish operation before changing management".into()); }
-                c.config = cfg;
+                c.replace_config(cfg)?;
                 super::management_network::request(desired, v["op"] == "management_apply")
             }
             "operation" => {
@@ -540,32 +530,17 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
     {
         let mut c = controller().lock().unwrap();
         match config::load() {
-            Ok(cfg) => c.config = cfg,
+            Ok(cfg) => {
+                if let Err(e) = c.replace_config(cfg) {
+                    c.failure = Some(e);
+                }
+            }
             Err(e) => c.failure = Some(e),
         }
         if let Ok(data) = std::fs::read("/var/lib/fttr/provisioning-state.json") {
-            if let Ok(v) = serde_json::from_slice::<Value>(&data) {
-                if let Some(owned) = v.get("owned") {
-                    if let Ok(owned) = serde_json::from_value(owned.clone()) {
-                        c.owned = owned;
-                    }
-                }
-                if let Some(a) = v.as_array().or_else(|| v["operations"].as_array()) {
-                    for operation in a {
-                        let mut operation = operation.clone();
-                        c.next_id = c
-                            .next_id
-                            .max(operation["operation_id"].as_u64().unwrap_or(0));
-                        if operation["state"] != "completed" {
-                            operation["state"] = json!("interrupted");
-                        }
-                        if let Some(id) = operation["device"].as_str().map(str::to_string) {
-                            c.recovered.insert(id, operation);
-                        }
-                    }
-                }
-            }
+            c.recover(&data);
         }
+        c.retain_configured_state();
         let identities: Vec<_> = c.config.devices.iter().map(|d| d.cwmp_id.clone()).collect();
         for id in identities {
             match wan::load(&id) {
@@ -596,9 +571,8 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
         let online: BTreeSet<_> = online_onus.values().cloned().collect();
         let source_links = super::link_identity::discover(&online_onus);
         if let Ok(mut registry) = crate::mqtt_identity::shared().lock() {
-            registry.update_topology(online_onus.clone(), source_links.clone(), now());
+            registry.update_topology(online_onus.clone(), source_links, now());
         }
-        super::bootstrap::observe_onu_links(source_links);
         let devices = acs(json!({"op":"devices"}));
         let acs_status = acs(json!({"op":"status"}));
         let desired = controller()
@@ -611,18 +585,16 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
         let active_management = super::management_network::active();
         let mut c = controller().lock().unwrap();
         c.acs_status = acs_status;
-        for d in &mut c.config.devices {
-            if d.cwmp_id.starts_with("pending:") {
-                if let Some(id) = discovered_identity(&devices, &d.optical_sn, &d.adapter) {
-                    d.cwmp_id = id;
-                }
-            }
-        }
+        c.resolve_pending_identities(&devices);
         let config = c.config.clone();
         super::bootstrap::retain_devices(&config.devices.iter().map(|d| d.id.clone()).collect());
         let time = now();
-        c.optical_epochs.retain(|serial, _| online.contains(serial));
+        c.optical_epochs.retain(|serial, _| online.contains(serial)
+            && config.devices.iter().any(|d| &d.optical_sn == serial));
         for (id, serial) in &online_onus {
+            if !config.devices.iter().any(|d| &d.optical_sn == serial) {
+                continue;
+            }
             if c.optical_epochs
                 .get(serial)
                 .is_none_or(|(previous, _)| previous != id)
@@ -1058,7 +1030,7 @@ mod tests {
         ));
         assert!(!equivalent(&p, &format!("{root}2,{root}6,{root}11")));
     }
-    fn operation(stage: OperationPhase, secret: bool) -> Operation {
+    pub(super) fn operation(stage: OperationPhase, secret: bool) -> Operation {
         let item = Item {
             wlan_intent: None,
             binding_intent: None,

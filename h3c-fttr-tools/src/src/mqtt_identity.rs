@@ -48,11 +48,11 @@ pub(crate) fn normalize_target(topic: &str) -> Option<String> {
     valid.then(|| value.replace(':', "").to_ascii_uppercase())
 }
 
-pub(crate) fn automatic_target(
-    transport: &BTreeMap<String, Transport>,
+fn automatic_target<'a>(
+    transport: &'a BTreeMap<String, Transport>,
     links: &BTreeMap<String, String>,
     selection: (&str, u64),
-) -> Result<Option<String>, &'static str> {
+) -> Result<Option<(&'a str, &'a Transport)>, &'static str> {
     let (serial, time) = selection;
     let mut matches = transport.iter().filter(|(mac, observation)| {
         observation.last_seen <= time
@@ -61,7 +61,7 @@ pub(crate) fn automatic_target(
     });
     match (matches.next(), matches.next()) {
         (None, _) => Ok(None),
-        (Some((mac, _)), None) => Ok(Some(mac.clone())),
+        (Some((mac, source)), None) => Ok(Some((mac.as_str(), source))),
         _ => Err(
             "multiple fresh MQTT targets originate from this ONU; automatic identity is ambiguous",
         ),

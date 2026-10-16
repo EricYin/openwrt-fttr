@@ -1,0 +1,161 @@
+use super::*;
+use serde_json::value::{to_raw_value, RawValue};
+
+fn server() -> Arc<Server> {
+    super::tests::listener_test_server()
+}
+
+fn task(id: u64) -> Task {
+    Task {
+        id, device: "compact-test".into(), method: "GetParameterValues".into(),
+        args: json!({"names":["InternetGatewayDevice."]}), state: TaskState::Sent,
+        created: now(), sent: Some(now()), result: None,
+    }
+}
+
+#[test]
+fn large_result_survives_response_save_load_and_direct_query() {
+    let server = server();
+    let parameters: Vec<_> = (0..24_000).map(|n| json!({
+        "name":format!("InternetGatewayDevice.LANDevice.1.Test.{n}"),
+        "value":format!("{n}:\"\\\n{}", "x".repeat(170)), "type":"xsd:string"
+    })).collect();
+    let expected = json!({"parameters":parameters});
+    let mut state = State::default();
+    state.tasks.insert(1, task(1));
+    let mut message = soap::parse(&soap::envelope("urn:dslforum-org:cwmp-1-0", "fttr-1", "<cwmp:GetParameterValuesResponse/>")).unwrap();
+    message.data = expected.clone();
+
+    state.response("compact-test", &message).unwrap();
+    server.save(&state).unwrap();
+    let loaded = State::load(&server.state_file).unwrap();
+    *server.state.lock().unwrap() = loaded;
+    let reply = server.execute(json!({"op":"task","id":1}));
+
+    assert!(reply.len() > 6 * 1024 * 1024);
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["result"], expected);
+    assert_eq!(reply["state"], "completed");
+    fs::remove_file(&server.state_file).unwrap();
+}
+
+#[test]
+fn query_serializes_raw_result_without_a_dom_round_trip() {
+    let server = server();
+    let raw = r#"{ "parameters" : [ ], "number" : 1e+02 }"#;
+    let mut record = task(1);
+    record.state = TaskState::Completed;
+    record.result = Some(RawValue::from_string(raw.into()).unwrap());
+    server.state.lock().unwrap().tasks.insert(1, record);
+
+    let reply = server.execute(json!({"op":"task","id":1}));
+
+    assert!(reply.contains(raw));
+}
+
+#[test]
+fn malformed_or_oversized_state_blocks_queries_mutation_and_replacement() {
+    for contents in [b"{invalid".to_vec(), vec![b' '; 8 * 1024 * 1024 + 1]] {
+        let server = server();
+        fs::write(&server.state_file, &contents).unwrap();
+        *server.state.lock().unwrap() = State::load_or_block(&server.state_file);
+
+        let query: Value = serde_json::from_str(&server.execute(json!({"op":"task","id":1}))).unwrap();
+        let reset: Value = serde_json::from_str(&server.execute(json!({"op":"reset_device_tasks","device":"compact-test"}))).unwrap();
+        let saved = server.save(&server.state.lock().unwrap());
+        let activated = transition(server.clone(), true, "127.0.0.1:0", "/cwmp", "", "", false);
+
+        assert!(query["error"].as_str().unwrap().starts_with("state load:"));
+        assert!(reset["error"].as_str().unwrap().starts_with("state load:"));
+        assert!(saved.is_err());
+        assert!(activated.is_err());
+        assert_eq!(fs::read(&server.state_file).unwrap(), contents);
+        fs::remove_file(&server.state_file).unwrap();
+    }
+}
+
+#[test]
+fn restart_marks_sent_unknown_without_losing_completed_results() {
+    let server = server();
+    let mut state = State::default();
+    state.tasks.insert(7, task(7));
+    let mut completed = task(8);
+    completed.state = TaskState::Completed;
+    completed.result = Some(to_raw_value(&json!({"status":"1","instance_number":"12"})).unwrap());
+    state.tasks.insert(8, completed);
+    server.save(&state).unwrap();
+
+    let loaded = State::load(&server.state_file).unwrap();
+
+    assert_eq!(loaded.tasks[&7].state, TaskState::Unknown);
+    assert!(loaded.tasks[&7].result.as_ref().unwrap().get().contains("execution is unknown"));
+    assert_eq!(loaded.tasks[&8].result.as_ref().unwrap().get(), state.tasks[&8].result.as_ref().unwrap().get());
+    assert_eq!(loaded.next_id, 8);
+    fs::remove_file(&server.state_file).unwrap();
+}
+
+#[test]
+fn fault_and_add_object_fields_survive_raw_retention() {
+    for (method, body, expected_state) in [
+        ("SetParameterValues", "<soap:Fault><faultcode>Client</faultcode><faultstring>CWMP fault</faultstring><detail><cwmp:Fault><FaultCode>9003</FaultCode><FaultString>Invalid arguments</FaultString><SetParameterValuesFault><ParameterName>bad.name</ParameterName><FaultCode>9005</FaultCode><FaultString>Invalid parameter</FaultString></SetParameterValuesFault></cwmp:Fault></detail></soap:Fault>", TaskState::Fault),
+        ("AddObject", "<cwmp:AddObjectResponse><InstanceNumber>12</InstanceNumber><Status>1</Status></cwmp:AddObjectResponse>", TaskState::AcceptedPendingApply),
+    ] {
+        let mut state = State::default();
+        let mut record = task(1);
+        record.method = method.into();
+        state.tasks.insert(1, record);
+        let message = soap::parse(&soap::envelope("urn:dslforum-org:cwmp-1-0", "fttr-1", body)).unwrap();
+        let expected = message.data.clone();
+
+        state.response("compact-test", &message).unwrap();
+
+        assert_eq!(state.tasks[&1].state, expected_state);
+        assert_eq!(serde_json::from_str::<Value>(state.tasks[&1].result.as_ref().unwrap().get()).unwrap(), expected);
+    }
+}
+
+#[test]
+fn wan_readback_guard_requires_eligible_fresh_non_management_result() {
+    let prefix = "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.3.WANIPConnection.1.";
+    let mut state = State::default();
+    let mut record = task(1);
+    record.state = TaskState::Completed;
+    record.result = Some(to_raw_value(&json!({"parameters":[{"name":format!("{prefix}X_CU_ServiceList"),"value":"INTERNET"}]})).unwrap());
+    state.tasks.insert(1, record.clone());
+
+    let observed = readback::observed(&state, "compact-test", prefix);
+
+    assert_eq!(observed, Some(false));
+    for (device, method, status, sent) in [
+        ("other", "GetParameterValues", TaskState::Completed, now()),
+        ("compact-test", "GetParameterNames", TaskState::Completed, now()),
+        ("compact-test", "GetParameterValues", TaskState::Fault, now()),
+        ("compact-test", "GetParameterValues", TaskState::Completed, now() - 91),
+    ] {
+        let mut ineligible = record.clone();
+        ineligible.device = device.into(); ineligible.method = method.into();
+        ineligible.state = status; ineligible.sent = Some(sent);
+        state.tasks.insert(1, ineligible);
+        assert_eq!(readback::observed(&state, "compact-test", prefix), None);
+    }
+}
+
+#[test]
+fn wan_readback_guard_fails_closed_on_management_or_malformed_results() {
+    let prefix = "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.3.WANIPConnection.1.";
+    for data in [
+        json!({"parameters":[{"name":format!("{prefix}X_CU_ServiceList"),"value":"INTERNET_TR069"}]}),
+        json!({"parameters":[{"name":format!("{prefix}X_CU_ServiceList"),"value":false}]}),
+        json!({"parameters":null}),
+    ] {
+        let mut state = State::default();
+        let mut record = task(1);
+        record.state = TaskState::Completed;
+        record.result = Some(to_raw_value(&data).unwrap());
+        state.tasks.insert(1, record);
+
+        let observed = readback::observed(&state, "compact-test", prefix);
+
+        assert_eq!(observed, Some(true));
+    }
+}

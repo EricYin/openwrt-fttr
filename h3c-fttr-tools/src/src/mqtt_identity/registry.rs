@@ -7,6 +7,7 @@ pub struct Registry {
     source_epoch: u64,
     clock: u64,
     topology_seen: Option<u64>,
+    topology_error: Option<String>,
     sources: BTreeMap<String, Transport>,
     onus: BTreeMap<u16, String>,
     links: BTreeMap<String, String>,
@@ -20,6 +21,7 @@ impl Registry {
             source_epoch: 0,
             clock: 0,
             topology_seen: None,
+            topology_error: None,
             sources: BTreeMap::new(),
             onus: BTreeMap::new(),
             links: BTreeMap::new(),
@@ -34,6 +36,9 @@ impl Registry {
             self.topology_epoch = self.topology_epoch.saturating_add(1);
         }
         self.clock = time;
+        self.sources.retain(|_, source| {
+            source.last_seen <= time && time - source.last_seen <= FRESHNESS
+        });
     }
 
     pub fn observe(&mut self, topic: &str, time: u64) {
@@ -70,7 +75,16 @@ impl Registry {
         time: u64,
     ) {
         self.advance(time);
-        let links = observation.unwrap_or_default();
+        let links = match observation {
+            Ok(links) => {
+                self.topology_error = None;
+                links
+            }
+            Err(error) => {
+                self.topology_error = Some(error);
+                BTreeMap::new()
+            }
+        };
         if self.onus != onus || self.links != links {
             self.topology_epoch = self.topology_epoch.saturating_add(1);
         }
@@ -121,15 +135,48 @@ impl Registry {
             .collect()
     }
 
+    pub(crate) fn automatic_source(
+        &self,
+        serial: &str,
+        time: u64,
+    ) -> Result<Option<(&str, &Transport)>, &'static str> {
+        if time < self.clock
+            || self.topology_seen.is_none_or(|seen| seen > time || time - seen > FRESHNESS)
+        {
+            return Ok(None);
+        }
+        let mut onus = self.onus.values().filter(|sn| sn.as_str() == serial);
+        match (onus.next(), onus.next()) {
+            (Some(_), None) => automatic_target(&self.sources, &self.links, (serial, time)),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn last_seen(&self, target: &str) -> Option<u64> {
+        self.sources.get(target).map(|source| source.last_seen)
+    }
+
+    pub(crate) fn topology_error(&self) -> Option<&str> {
+        self.topology_error.as_deref()
+    }
+
     pub fn resolve(&self, selection: &Selection, time: u64) -> Result<Snapshot, &'static str> {
-        self.snapshots(time)
-            .into_iter()
-            .find(|snapshot| {
-                snapshot.reason == "ready"
-                    && snapshot.optical_sn.as_deref() == Some(selection.optical_sn.as_str())
-                    && snapshot.onu_id == Some(selection.onu_id)
-                    && snapshot.binding_generation == selection.binding_generation
-            })
-            .ok_or("stale or unresolved MQTT target; refresh the device selection")
+        let unresolved = "stale or unresolved MQTT target; refresh the device selection";
+        let (mac, source) = self.automatic_source(&selection.optical_sn, time)?
+            .ok_or(unresolved)?;
+        let generation = format!("{}-{}-{}-{mac}", self.daemon_epoch, self.topology_epoch, source.epoch);
+        if self.onus.get(&selection.onu_id) != Some(&selection.optical_sn)
+            || generation != selection.binding_generation
+        {
+            return Err(unresolved);
+        }
+        Ok(Snapshot {
+            mqtt_mac: mac.to_owned(),
+            optical_sn: Some(selection.optical_sn.clone()),
+            onu_id: Some(selection.onu_id),
+            binding_generation: generation,
+            last_seen: source.last_seen,
+            reason: "ready".into(),
+        })
     }
 }

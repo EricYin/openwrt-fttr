@@ -1,5 +1,8 @@
 use std::io::Write;
 
+#[path = "archive_tests.rs"]
+mod archive_tests;
+
 pub(super) fn fixture(members: &[(&str, &[u8])]) -> Vec<u8> {
     let mut builder = tar::Builder::new(Vec::new());
     for (name, data) in members {

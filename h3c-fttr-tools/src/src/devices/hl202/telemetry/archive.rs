@@ -1,7 +1,7 @@
 use super::model::Member;
 use std::{
     collections::BTreeSet,
-    io::{self, Cursor, Read},
+    io::{self, Read},
 };
 
 pub(super) const MAX_COMPRESSED: usize = 2 * 1024 * 1024;
@@ -19,18 +19,8 @@ pub(super) fn read(input: &[u8]) -> io::Result<(Vec<Member>, usize)> {
         return Err(invalid("compressed telemetry limit exceeded"));
     }
     let decoder = flate2::read::MultiGzDecoder::new(input);
-    let mut expanded = Vec::new();
-    decoder
-        .take(u64::try_from(MAX_DECOMPRESSED + 1).map_err(io::Error::other)?)
-        .read_to_end(&mut expanded)?;
-    if expanded.len() > MAX_DECOMPRESSED {
-        return Err(invalid("decompressed telemetry limit exceeded"));
-    }
-    if expanded.len() < 1024 || expanded.len() % 512 != 0 {
-        return Err(invalid("truncated tar container"));
-    }
-    let expanded_len = expanded.len();
-    let mut archive = tar::Archive::new(Cursor::new(expanded));
+    let limit = u64::try_from(MAX_DECOMPRESSED + 1).map_err(io::Error::other)?;
+    let mut archive = tar::Archive::new(decoder.take(limit));
     let mut names = BTreeSet::new();
     let mut members = Vec::new();
     let mut text_bytes = 0;
@@ -83,14 +73,23 @@ pub(super) fn read(input: &[u8]) -> io::Result<(Vec<Member>, usize)> {
             text_omitted,
         });
     }
-    let cursor = archive.into_inner();
-    let consumed = usize::try_from(cursor.position()).map_err(io::Error::other)?;
-    if cursor
-        .get_ref()
-        .get(consumed..)
-        .is_none_or(|tail| tail.iter().any(|byte| *byte != 0))
-    {
-        return Err(invalid("invalid trailing tar data"));
+    let mut remaining = archive.into_inner();
+    let mut chunk = [0; 4096];
+    loop {
+        let count = remaining.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        if chunk[..count].iter().any(|byte| *byte != 0) {
+            return Err(invalid("invalid trailing tar data"));
+        }
+    }
+    let expanded_len = usize::try_from(limit - remaining.limit()).map_err(io::Error::other)?;
+    if expanded_len > MAX_DECOMPRESSED {
+        return Err(invalid("decompressed telemetry limit exceeded"));
+    }
+    if expanded_len < 1024 || expanded_len % 512 != 0 {
+        return Err(invalid("truncated tar container"));
     }
     Ok((members, expanded_len))
 }

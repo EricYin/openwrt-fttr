@@ -1,6 +1,12 @@
 //! Task records retain their existing wire/persistence representation.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::value::{to_raw_value, RawValue};
+
+pub(super) fn error_result(message: &str) -> Box<RawValue> {
+    #[expect(clippy::expect_used, reason = "serializing a string-only JSON error cannot fail")]
+    to_raw_value(&super::error(message)).expect("string-only JSON error is serializable")
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
@@ -69,7 +75,7 @@ pub(super) struct Task {
     pub(super) state: TaskState,
     pub(super) created: u64,
     pub(super) sent: Option<u64>,
-    pub(super) result: Option<Value>,
+    pub(super) result: Option<Box<RawValue>>,
 }
 
 #[cfg(test)]

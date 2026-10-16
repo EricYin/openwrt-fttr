@@ -5,10 +5,9 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::mqtt_identity::{normalize_target, Transport};
+use crate::mqtt_identity::Registry;
 
 const STATE_FILE: &str = "/var/lib/fttr/acs-bootstrap.json";
-const TRANSPORT_FRESHNESS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -70,9 +69,6 @@ struct Record {
 #[derive(Default)]
 struct Coordinator {
     records: BTreeMap<String, Record>,
-    transport: BTreeMap<String, Transport>,
-    links: BTreeMap<String, String>,
-    link_error: Option<String>,
     saved: Vec<u8>,
     persistence_error: Option<String>,
 }
@@ -89,11 +85,7 @@ fn coordinator() -> &'static Mutex<Coordinator> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => c.persistence_error = Some(format!("bootstrap state read: {e}")),
         }
-        for r in c.records.values_mut() {
-            r.state = Phase::WaitingTransport;
-            r.reason = "daemon restarted; fresh transport and Inform required".into();
-            r.next_retry_at = 0;
-        }
+        c.restart(now());
         Mutex::new(c)
     })
 }
@@ -108,28 +100,6 @@ fn now() -> u64 {
 pub(crate) fn observe_mqtt(topic: &str, time: u64) {
     if let Ok(mut registry) = crate::mqtt_identity::shared().lock() {
         registry.observe(topic, time);
-    }
-    if let Some(target) = normalize_target(topic) {
-        let mut c = coordinator().lock().unwrap();
-        let t = c.transport.entry(target).or_default();
-        if t.last_seen == 0 || time.saturating_sub(t.last_seen) > TRANSPORT_FRESHNESS {
-            t.epoch = t.epoch.saturating_add(1);
-        }
-        t.last_seen = time;
-    }
-}
-
-pub(super) fn observe_onu_links(result: Result<BTreeMap<String, String>, String>) {
-    let mut c = coordinator().lock().unwrap();
-    match result {
-        Ok(links) => {
-            c.links = links;
-            c.link_error = None;
-        }
-        Err(e) => {
-            c.links.clear();
-            c.link_error = Some(e);
-        }
     }
 }
 
@@ -249,8 +219,10 @@ pub(super) fn retain_devices(ids: &std::collections::BTreeSet<String>) {
 
 /// Scheduler entry point. Remote commands execute outside controller and bootstrap locks.
 pub(super) fn tick(observation: Observation<'_>) {
+    let Ok(sources) = crate::mqtt_identity::shared().lock() else { return; };
     let mut c = coordinator().lock().unwrap();
-    let job = c.schedule(observation);
+    let job = c.schedule(observation, &sources);
+    drop(sources);
     c.persist();
     drop(c);
     if let Some(job) = job {
@@ -270,11 +242,13 @@ pub(super) fn tick(observation: Observation<'_>) {
 }
 
 impl Coordinator {
-    fn automatic_target(&self, sn: &str, time: u64) -> Result<Option<String>, &'static str> {
-        crate::mqtt_identity::automatic_target(&self.transport, &self.links, (sn, time))
+    fn restart(&mut self, time: u64) {
+        for record in self.records.values_mut() {
+            record.invalidate(time, "daemon restarted; fresh transport and Inform required");
+        }
     }
 
-    fn schedule(&mut self, observation: Observation<'_>) -> Option<Job> {
+    fn schedule(&mut self, observation: Observation<'_>, sources: &Registry) -> Option<Job> {
         let Observation {
             device,
             management,
@@ -286,17 +260,15 @@ impl Coordinator {
             acs_available,
             authorization,
         } = observation;
-        let automatic = self.automatic_target(&device.optical_sn, time);
-        let automatic_target = automatic.as_ref().ok().and_then(|t| t.as_deref());
+        let automatic = sources.automatic_source(&device.optical_sn, time);
+        let automatic_target = automatic.as_ref().ok().and_then(|source| source.map(|(mac, _)| mac));
         let binding_source = if automatic_target.is_some() {
             "onu_link"
         } else {
             "unresolved"
         };
         let target = automatic_target;
-        let transport = target
-            .and_then(|t| self.transport.get(t))
-            .map(|t| (t.last_seen, t.epoch));
+        let transport = automatic.as_ref().ok().and_then(|source| source.map(|(_, source)| source.epoch));
         let r = self.records.entry(device.id.clone()).or_default();
         if r.last_observed_time > time {
             r.invalidate(time, "system clock moved backwards; fresh Inform required");
@@ -333,7 +305,7 @@ impl Coordinator {
             );
         }
         r.optical_online = online;
-        if let Some((_, epoch)) = transport {
+        if let Some(epoch) = transport {
             if r.transport_epoch != epoch {
                 if r.transport_epoch != 0 {
                     r.invalidate(time, "MQTT transport reappeared; recheck device settings");
@@ -393,11 +365,7 @@ impl Coordinator {
             r.set_phase(Phase::ManualRequired, time, "automatic ACS bootstrap is unavailable for this adapter; follow the current management settings");
         } else if target.is_none() {
             r.set_phase(Phase::WaitingIdentity, time, automatic.err().unwrap_or("waiting for a unique fresh MQTT source MAC learned on this device's online ONU interface"));
-        } else if !online
-            || transport.is_none_or(|(seen, _)| {
-                seen > time || time.saturating_sub(seen) > TRANSPORT_FRESHNESS
-            })
-        {
+        } else if !online {
             r.set_phase(
                 Phase::WaitingTransport,
                 time,
@@ -536,6 +504,9 @@ pub(super) fn is_ready_for_management(id:&str,sn:&str,url:&str,epoch:u64)->bool 
 pub(super) fn omci_write_allowed(id:&str,epoch:u64,automatic:bool)->bool {let c=coordinator().lock().unwrap();c.records.get(id).is_none_or(|r|r.state!=Phase::Ready&&(automatic||(epoch!=0&&r.completed_authorization!=epoch)))}
 
 pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Value {
+    let Ok(sources) = crate::mqtt_identity::shared().lock() else {
+        return json!({"state":"unavailable","reason":"MQTT identity state unavailable"});
+    };
     let c = coordinator().lock().unwrap();
     let Some(r) = c.records.get(id) else {
         return json!({"state":"pending","reason":"bootstrap observation not started"});
@@ -543,13 +514,12 @@ pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Va
     let mut view = serde_json::to_value(r).unwrap_or_default();
     view["inflight"] = json!(r.worker.is_some());
     view["persistence_error"] = json!(c.persistence_error);
-    view["link_identity_error"] = json!(c.link_error);
+    view["link_identity_error"] = json!(sources.topology_error());
     view["listener"] = json!({"enabled":acs["enabled"],"listen":acs["listen"],"path":acs["path"],"error":acs["error"]});
     view["mqtt_last_seen"] = json!(r
         .mqtt_target
         .as_ref()
-        .and_then(|t| c.transport.get(t))
-        .map(|t| t.last_seen));
+        .and_then(|t| sources.last_seen(t)));
     if let Some(m) = management {
         let url = public_url(&m.acs_url);
         view["desired"] = json!({"vlan":r.selected_vlan.filter(|v|m.vlans.contains(v)).unwrap_or(m.vlan),"vlans":m.vlans,"priority":m.priority,"acs_url":url});
@@ -575,6 +545,37 @@ pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mqtt_identity::normalize_target;
+
+    struct TestCoordinator {
+        coordinator: Coordinator,
+        sources: Registry,
+        links: BTreeMap<String, String>,
+    }
+    impl Default for TestCoordinator {
+        fn default() -> Self {
+            Self {
+                coordinator: Coordinator::default(),
+                sources: Registry::new("bootstrap-test".into()),
+                links: BTreeMap::new(),
+            }
+        }
+    }
+    impl std::ops::Deref for TestCoordinator {
+        type Target = Coordinator;
+        fn deref(&self) -> &Coordinator { &self.coordinator }
+    }
+    impl std::ops::DerefMut for TestCoordinator {
+        fn deref_mut(&mut self) -> &mut Coordinator { &mut self.coordinator }
+    }
+    impl TestCoordinator {
+        fn schedule(&mut self, observation: Observation<'_>) -> Option<Job> {
+            let onus = self.links.values().collect::<std::collections::BTreeSet<_>>()
+                .into_iter().enumerate().map(|(index, sn)| (u16::try_from(index).unwrap(), sn.clone())).collect();
+            self.sources.update_topology(onus, Ok(self.links.clone()), observation.time);
+            self.coordinator.schedule(observation, &self.sources)
+        }
+    }
     fn device(id: &str, adapter: &str) -> Device {
         Device {
             id: id.into(),
@@ -589,7 +590,7 @@ mod tests {
         }
     }
     fn schedule(
-        c: &mut Coordinator,
+        c: &mut TestCoordinator,
         d: &Device,
         m: &Management,
         learned_target: Option<&str>,
@@ -613,10 +614,77 @@ mod tests {
     }
     #[cfg(feature = "device-hl202")]
     #[test]
+    fn registry_admission_cannot_be_bypassed_by_bootstrap() {
+        let mut c = TestCoordinator::default();
+        let d = device("bounded", "hl202");
+        let m = Management { vlans: vec![46], vlan: 46, priority: 0, acs_url: "http://192.0.2.1/cwmp".into() };
+        c.links = (0..64).map(|index| (format!("02000000{index:04X}"), "OTHER12345678".into())).collect();
+        c.links.insert("02AABBCCDDEE".into(), d.optical_sn.clone());
+        c.sources.update_topology(BTreeMap::from([(1, d.optical_sn.clone())]), Ok(c.links.clone()), 100);
+        for index in 0..64 {
+            c.sources.observe(&format!("02000000{index:04X}"), 100);
+        }
+
+        c.sources.observe("02AABBCCDDEE", 100);
+        let job = schedule(&mut c, &d, &m, None, 100, None);
+
+        assert!(job.is_none());
+        assert_eq!(c.records[&d.id].state, Phase::WaitingIdentity);
+        assert_eq!(c.sources.snapshots(100).len(), 64);
+    }
+
+    #[cfg(feature = "device-hl202")]
+    #[test]
+    fn reconnect_invalidates_verified_settings_before_a_fresh_inform_can_mark_ready() {
+        let mut c = TestCoordinator::default();
+        let d = device("reconnect", "hl202");
+        let m = Management { vlans: vec![46], vlan: 46, priority: 0, acs_url: "http://192.0.2.1/cwmp".into() };
+        let mac = "02AABBCCDDEE";
+        c.sources.observe(mac, 100);
+        let first = schedule(&mut c, &d, &m, Some(mac), 100, None).unwrap();
+        c.records.get_mut(&d.id).unwrap().finish(first.generation, Ok(true), 101);
+        let epoch = c.records[&d.id].transport_epoch;
+
+        c.sources.observe(mac, 161);
+        let next = schedule(&mut c, &d, &m, None, 162, Some(162)).unwrap();
+
+        assert_ne!(next.generation, first.generation);
+        assert!(c.records[&d.id].transport_epoch > epoch);
+        assert!(c.records[&d.id].settings_verified_at.is_none());
+        assert_eq!(c.records[&d.id].state, Phase::Reading);
+    }
+
+    #[cfg(feature = "device-hl202")]
+    #[test]
+    fn restart_discards_persisted_settings_even_when_the_source_epoch_matches() {
+        let mut c = TestCoordinator::default();
+        let d = device("restart", "hl202");
+        let m = Management { vlans: vec![46], vlan: 46, priority: 0, acs_url: "http://192.0.2.1/cwmp".into() };
+        let mac = "02AABBCCDDEE";
+        c.sources.observe(mac, 100);
+        let first = schedule(&mut c, &d, &m, Some(mac), 100, None).unwrap();
+        c.records.get_mut(&d.id).unwrap().finish(first.generation, Ok(true), 101);
+        schedule(&mut c, &d, &m, None, 103, Some(102));
+        assert_eq!(c.records[&d.id].state, Phase::Ready);
+        let bytes = serde_json::to_vec(&c.records).unwrap();
+        let mut restarted = TestCoordinator::default();
+        restarted.records = serde_json::from_slice(&bytes).unwrap();
+
+        restarted.restart(200);
+        restarted.sources.observe(mac, 201);
+        let next = schedule(&mut restarted, &d, &m, Some(mac), 202, Some(202)).unwrap();
+
+        assert_ne!(next.generation, first.generation);
+        assert_eq!(restarted.records[&d.id].transport_epoch, c.records[&d.id].transport_epoch);
+        assert!(restarted.records[&d.id].settings_verified_at.is_none());
+    }
+
+    #[cfg(feature = "device-hl202")]
+    #[test]
     fn manual_authorization_is_consumed_by_fresh_inform_and_reset_needs_a_new_grant() {
-        let mut c=Coordinator::default();let d=device("manual","hl202");let m=Management{vlans:vec![46],vlan:46,priority:0,acs_url:"http://192.0.2.1:7547/cwmp".into()};let mac="02AABBCCDDEE";
-        c.links.insert(mac.into(),d.optical_sn.clone());c.transport.insert(mac.into(),Transport{last_seen:100,epoch:1});
-        let observe=|c:&mut Coordinator,time,at,new_boot,epoch|c.schedule(Observation{device:&d,management:Some(&m),last_inform:at,online:true,new_boot,freshness:180,time,acs_available:true,authorization:Some((epoch,false))});
+        let mut c=TestCoordinator::default();let d=device("manual","hl202");let m=Management{vlans:vec![46],vlan:46,priority:0,acs_url:"http://192.0.2.1:7547/cwmp".into()};let mac="02AABBCCDDEE";
+        c.links.insert(mac.into(),d.optical_sn.clone());c.sources.observe(mac,100);
+        let observe=|c:&mut TestCoordinator,time,at,new_boot,epoch|c.schedule(Observation{device:&d,management:Some(&m),last_inform:at,online:true,new_boot,freshness:180,time,acs_available:true,authorization:Some((epoch,false))});
         let first=observe(&mut c,100,None,false,1).unwrap();c.records.get_mut(&d.id).unwrap().finish(first.generation,Ok(true),101);assert!(observe(&mut c,103,Some(102),false,1).is_none());assert_eq!(c.records[&d.id].state,Phase::Ready);
         assert!(observe(&mut c,104,None,true,1).is_none());assert_eq!(c.records[&d.id].state,Phase::AwaitingApply);
         let next=observe(&mut c,105,None,false,2).unwrap();assert_eq!(next.authorization_epoch,2);assert_ne!(next.generation,first.generation);
@@ -624,8 +692,8 @@ mod tests {
     #[cfg(feature = "device-hl202")]
     #[test]
     fn existing_inform_does_not_skip_mqtt_settings_readback_and_post_write_inform_is_required() {
-        let mut c=Coordinator::default();let d=device("manual","hl202");let m=Management{vlans:vec![46],vlan:46,priority:0,acs_url:"http://192.0.2.1:7547/cwmp".into()};let mac="02AABBCCDDEE";
-        c.links.insert(mac.into(),d.optical_sn.clone());c.transport.insert(mac.into(),Transport{last_seen:100,epoch:1});
+        let mut c=TestCoordinator::default();let d=device("manual","hl202");let m=Management{vlans:vec![46],vlan:46,priority:0,acs_url:"http://192.0.2.1:7547/cwmp".into()};let mac="02AABBCCDDEE";
+        c.links.insert(mac.into(),d.optical_sn.clone());c.sources.observe(mac,100);
         c.records.insert(d.id.clone(),Record{desired_version:format!("{}-1",version(&d,Some(&m),Some(mac))),optical_sn:d.optical_sn.clone(),initial_inform:Some(Some(90)),..Default::default()});
         let first=schedule(&mut c,&d,&m,Some(mac),100,Some(95)).expect("fresh existing Inform must not skip credential readback");
         c.records.get_mut(&d.id).unwrap().finish(first.generation,Ok(true),101);
@@ -637,7 +705,7 @@ mod tests {
     #[cfg(feature = "device-hl202")]
     #[test]
     fn onu_link_binds_only_unique_fresh_mqtt_source_and_invalidates_reassigned_link() {
-        let mut c = Coordinator::default();
+        let mut c = TestCoordinator::default();
         let d = device("automatic", "hl202");
         let m = Management {
             vlans: vec![46],
@@ -646,13 +714,7 @@ mod tests {
             acs_url: "http://192.0.2.1/cwmp".into(),
         };
         let mac = "02AABBCCDDEE";
-        c.transport.insert(
-            mac.into(),
-            Transport {
-                last_seen: 100,
-                epoch: 1,
-            },
-        );
+        c.sources.observe(mac, 100);
         assert!(schedule(&mut c, &d, &m, None, 100, None).is_none());
         assert_eq!(c.records[&d.id].state, Phase::WaitingIdentity);
         c.links.insert(mac.into(), d.optical_sn.clone());
@@ -671,18 +733,13 @@ mod tests {
         assert_eq!(c.records[&d.id].state, Phase::WaitingIdentity);
         c.links.insert(mac.into(), d.optical_sn.clone());
         c.links.insert("02AABBCCDDFF".into(), d.optical_sn.clone());
-        c.transport.insert(
-            "02AABBCCDDFF".into(),
-            Transport {
-                last_seen: 104,
-                epoch: 1,
-            },
-        );
+        c.sources.observe("02AABBCCDDFF", 104);
         assert!(schedule(&mut c, &d, &m, None, 105, None).is_none());
         assert!(c.records[&d.id].reason.contains("ambiguous"));
-        c.transport.get_mut(mac).unwrap().last_seen = 170;
+        c.sources.observe(mac, 170);
+        c.sources.update_topology(BTreeMap::from([(1, d.optical_sn.clone())]), Ok(c.links.clone()), 170);
         assert_eq!(
-            c.automatic_target(&d.optical_sn, 170).unwrap(),
+            c.sources.automatic_source(&d.optical_sn, 170).unwrap().map(|(mac, _)|mac.to_owned()),
             Some(mac.into())
         );
     }
@@ -690,7 +747,7 @@ mod tests {
     #[cfg(feature = "device-hl202")]
     #[test]
     fn continuously_online_device_retries_without_overlapping_or_blocking_other_devices() {
-        let mut c = Coordinator::default();
+        let mut c = TestCoordinator::default();
         let d = device("first", "hl202");
         let mut other = device("second", "hl202");
         other.optical_sn = "H3CT87654321".into();
@@ -701,22 +758,10 @@ mod tests {
             acs_url: "http://192.0.2.1:7547/cwmp".into(),
         };
         let mac = "02AABBCCDDEE";
-        c.transport.insert(
-            mac.into(),
-            Transport {
-                last_seen: 100,
-                epoch: 1,
-            },
-        );
+        c.sources.observe(mac, 100);
         let first = schedule(&mut c, &d, &m, Some(mac), 100, None).unwrap();
         assert!(schedule(&mut c, &d, &m, Some(mac), 101, None).is_none());
-        c.transport.insert(
-            "02AABBCCDDFF".into(),
-            Transport {
-                last_seen: 101,
-                epoch: 1,
-            },
-        );
+        c.sources.observe("02AABBCCDDFF", 101);
         assert!(schedule(&mut c, &other, &m, Some("02AABBCCDDFF"), 101, None).is_some());
         c.records.get_mut("first").unwrap().finish(
             first.generation,
@@ -724,7 +769,7 @@ mod tests {
             102,
         );
         assert!(schedule(&mut c, &d, &m, Some(mac), 106, None).is_none());
-        c.transport.get_mut(mac).unwrap().last_seen = 107;
+        c.sources.observe(mac, 107);
         let retry = schedule(&mut c, &d, &m, Some(mac), 107, None).unwrap();
         assert_eq!(c.records["first"].attempts, 2);
         assert!(retry.persist_matching);
@@ -739,7 +784,7 @@ mod tests {
     #[cfg(feature = "device-hl202")]
     #[test]
     fn new_configuration_waits_for_old_worker_then_uses_new_url_and_discards_old_result() {
-        let mut c = Coordinator::default();
+        let mut c = TestCoordinator::default();
         let d = device("first", "hl202");
         let mut m = Management {
             vlans: vec![46],
@@ -748,13 +793,7 @@ mod tests {
             acs_url: "http://192.0.2.1/cwmp".into(),
         };
         let mac = "02AABBCCDDEE";
-        c.transport.insert(
-            mac.into(),
-            Transport {
-                last_seen: 100,
-                epoch: 1,
-            },
-        );
+        c.sources.observe(mac, 100);
         let old = schedule(&mut c, &d, &m, Some(mac), 100, None).unwrap();
         m.acs_url = "http://192.0.2.2/cwmp".into();
         assert!(schedule(&mut c, &d, &m, Some(mac), 101, None).is_none());
@@ -769,7 +808,7 @@ mod tests {
     }
     #[test]
     fn manual_device_becomes_ready_without_mqtt_and_clock_rollback_cannot_reuse_old_inform() {
-        let mut c = Coordinator::default();
+        let mut c = TestCoordinator::default();
         let d = device("manual", "hwtc");
         let m = Management {
             vlans: vec![46],

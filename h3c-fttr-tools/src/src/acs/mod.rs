@@ -2,19 +2,24 @@
 mod http;
 mod soap;
 mod task;
+mod persistence;
+mod readback;
+#[cfg(test)]
+mod compact_tests;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::fs;
+use std::io::{self, BufReader, Read};
+#[cfg(test)]
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::OpenOptionsExt;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use task::{Task, TaskState};
+use task::{error_result, Task, TaskState};
 
 fn now() -> u64 {
     SystemTime::now()
@@ -44,6 +49,8 @@ struct State {
     next_id: u64,
     #[serde(skip)]
     sessions: BTreeMap<String, (String, String, u64)>,
+    #[serde(skip)]
+    load_failure: Option<String>,
 }
 struct Server {
     state: Arc<Mutex<State>>,
@@ -70,41 +77,36 @@ fn init() -> Arc<Server> {
         // A configured address is not authorization to activate a listener.
         let enabled = false;
         let state_file = env("FTTR_ACS_STATE", "/var/lib/fttr/acs-state.json");
-        let mut state: State = fs::metadata(&state_file).ok().filter(|m| m.len() <= 8 * 1024 * 1024).and_then(|_| fs::read(&state_file).ok()).and_then(|data| serde_json::from_slice(&data).ok()).unwrap_or_default();
-        for task in state.tasks.values_mut().filter(|t| t.state == TaskState::Sent) { task.state = TaskState::Unknown; task.result = Some(error("daemon restarted after dispatch; execution is unknown, not automatically retried")); }
-        state.next_id = state.next_id.max(state.tasks.keys().next_back().copied().unwrap_or(0));
+        let state = State::load_or_block(&state_file);
+        let failure = state.load_failure.clone();
         let user = env("FTTR_ACS_USERNAME", ""); let password = env("FTTR_ACS_PASSWORD", "");
         Mutex::new(Arc::new(Server { state: Arc::new(Mutex::new(state)), enabled, listen: String::new(), path: "/cwmp".into(), state_file,
-            auth: (!user.is_empty()).then(|| http::basic(&user, &password)), failure: Mutex::new(None), requests:Arc::new(AtomicUsize::new(0)), endpoint_id:String::new(), drain_deadline:Mutex::new(None),legacy:Mutex::new(Vec::new()), stopping:AtomicBool::new(false), stopped:AtomicBool::new(true) }))
+            auth: (!user.is_empty()).then(|| http::basic(&user, &password)), failure: Mutex::new(failure), requests:Arc::new(AtomicUsize::new(0)), endpoint_id:String::new(), drain_deadline:Mutex::new(None),legacy:Mutex::new(Vec::new()), stopping:AtomicBool::new(false), stopped:AtomicBool::new(true) }))
     }).lock().unwrap().clone()
 }
 impl Server {
-    fn save(&self, state: &State) -> io::Result<()> {
-        let result = (|| -> io::Result<()> {
-            let path = std::path::Path::new(&self.state_file);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
+    fn execute(&self, request: Value) -> String {
+        if request["op"] == "task" {
+            let mut state = self.state.lock().unwrap();
+            if let Some(reason) = &state.load_failure {
+                return error(reason).to_string();
             }
-            let temp = format!("{}.tmp", self.state_file);
-            let file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .mode(0o600)
-                .open(&temp)?;
-            let mut writer = BufWriter::new(file);
-            serde_json::to_writer(&mut writer, state)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            writer.flush()?;
-            fs::rename(temp, path)
-        })();
-        if let Err(err) = &result {
-            *self.failure.lock().unwrap() = Some(format!("state persistence: {err}"));
+            state.expire();
+            return match request["id"].as_u64().and_then(|id| state.tasks.get(&id)) {
+                Some(task) => serde_json::to_string(task)
+                    .unwrap_or_else(|err| error(&format!("task serialization: {err}")).to_string()),
+                None => error("unknown task").to_string(),
+            };
         }
-        result
+        self.execute_small(request).to_string()
     }
-    fn execute(&self, request: Value) -> Value {
+    fn execute_small(&self, request: Value) -> Value {
         let mut state = self.state.lock().unwrap();
+        if request["op"] != "status" {
+            if let Some(reason) = &state.load_failure {
+                return error(reason);
+            }
+        }
         state.expire();
         match request["op"].as_str().unwrap_or("") {
             "status" => {
@@ -126,11 +128,6 @@ impl Server {
             "busy" => {
                 json!({"busy":state.tasks.values().any(|t| t.device == request["device"].as_str().unwrap_or("") && t.state.is_active())})
             }
-            "task" => request["id"]
-                .as_u64()
-                .and_then(|id| state.tasks.get(&id))
-                .map(|t| json!(t))
-                .unwrap_or_else(|| error("unknown task")),
             "queue" => {
                 if !self.enabled {
                     return error("ACS disabled by UCI");
@@ -247,29 +244,8 @@ fn protect_management(
         let prefix = connection
             .map(|(kind, n)| format!("{ROOT}{parent}.{kind}.{n}."))
             .unwrap_or_else(|| format!("{ROOT}{parent}."));
-        let observed = state
-            .tasks
-            .values()
-            .rev()
-            .filter(|t| {
-                t.device == device
-                    && t.method == "GetParameterValues"
-                    && t.state == TaskState::Completed
-                    && now().saturating_sub(t.sent.unwrap_or(0)) <= 90
-            })
-            .find_map(|t| {
-                t.result.as_ref()?["parameters"]
-                    .as_array()?
-                    .iter()
-                    .find(|p| {
-                        p["name"].as_str().is_some_and(|n| {
-                            n.starts_with(&prefix)
-                                && (n.ends_with("ServiceList") || n.ends_with("SERVICELIST"))
-                        })
-                    })
-                    .and_then(|p| p["value"].as_str())
-            });
-        if observed.is_none_or(|v| crate::provisioning::contains_service_token(v, "TR069")) {
+        let observed = readback::observed(state, device, &prefix);
+        if observed.is_none_or(|management| management) {
             return Err("WAN write requires a fresh non-TR069 service readback".into());
         }
     }
@@ -326,12 +302,12 @@ impl State {
         for t in self.tasks.values_mut() {
             if t.state == TaskState::Sent && time.saturating_sub(t.sent.unwrap_or(time)) >= 90 {
                 t.state = TaskState::Unknown;
-                t.result = Some(error(
+                t.result = Some(error_result(
                     "response timeout: device execution is unknown; no automatic write retry",
                 ));
             } else if t.state == TaskState::Queued && time.saturating_sub(t.created) >= 600 {
                 t.state = TaskState::Expired;
-                t.result = Some(error("no device session within 600 seconds"));
+                t.result = Some(error_result("no device session within 600 seconds"));
             }
         }
     }
@@ -352,7 +328,7 @@ impl State {
                 let id = task.id;
                 let task = self.tasks.get_mut(&id).unwrap();
                 task.state = TaskState::Fault;
-                task.result = Some(error(&reason));
+                task.result = Some(error_result(&reason));
                 return Ok(None);
             }
         }
@@ -422,19 +398,18 @@ impl State {
                 "RPC response method mismatch",
             ));
         }
-        task.result = Some(message.data.clone());
+        task.result = Some(serde_json::value::to_raw_value(&message.data)?);
         Ok(())
     }
 }
 pub fn control(request: &str) -> String {
-    let reply = if request.len() > 64 * 1024 {
-        error("ACS request too large")
+    if request.len() > 64 * 1024 {
+        error("ACS request too large").to_string()
     } else {
         serde_json::from_str(request)
             .map(|v| init().execute(v))
-            .unwrap_or_else(|_| error("invalid ACS JSON"))
-    };
-    reply.to_string()
+            .unwrap_or_else(|_| error("invalid ACS JSON").to_string())
+    }
 }
 pub fn start_from_env() {
     let _ = init();
@@ -458,6 +433,7 @@ fn stop_listener(server:&Server) {
     server.stopping.store(true,Ordering::Release);
 }
 fn transition(old:Arc<Server>,enabled:bool,listen:&str,path:&str,username:&str,password:&str,retain_previous:bool)->Result<Arc<Server>,String> {
+    if let Some(reason) = &old.state.lock().unwrap().load_failure { return Err(reason.clone()); }
     let auth = (!username.is_empty()).then(|| http::basic(username, password));
     if old.enabled == enabled && old.listen == listen && old.path == path && old.auth == auth && old.failure.lock().unwrap().is_none() && (!enabled || !old.stopped.load(Ordering::Acquire)) { return Ok(old); }
     let listener = if enabled {
@@ -604,7 +580,7 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
                     let device = format!("{}:{}:{}", message.oui.to_ascii_uppercase(), message.product, message.serial);
                     if state.devices.len() >= 64 && !state.devices.contains_key(&device) { http::reply(&mut stream, 503, "", "", true)?; break; }
                     // A new Inform is a new session; uncertain outstanding writes are never replayed.
-                    for task in state.tasks.values_mut().filter(|t| t.device == device && t.state == TaskState::Sent) { task.state = TaskState::Unknown; task.result = Some(error("new Inform before RPC response")); }
+                    for task in state.tasks.values_mut().filter(|t| t.device == device && t.state == TaskState::Sent) { task.state = TaskState::Unknown; task.result = Some(error_result("new Inform before RPC response")); }
                     state.sessions.retain(|_,(id,_,_)| *id != device);
                     let key = token()?; state.sessions.insert(key.clone(), (device.clone(), peer.clone(), now()));
                     extra = format!("Set-Cookie: fttr_session={key}; Path={}; HttpOnly; SameSite=Strict\r\n", policy.path);
@@ -657,7 +633,7 @@ mod tests {
         state.tasks.insert(7, Task {
             id: 7, device: "save-test".into(), method: "GetParameterValues".into(),
             args: json!({"names":["InternetGatewayDevice."]}), state: TaskState::Completed,
-            created: 1, sent: Some(2), result: Some(json!({"raw":"\"\\\n".repeat(100_000)})),
+            created: 1, sent: Some(2), result: Some(serde_json::value::to_raw_value(&json!({"raw":"\"\\\n".repeat(100_000)})).unwrap()),
         });
         let result = server.save(&state);
         result.unwrap();
@@ -775,7 +751,7 @@ mod tests {
         let occupied=TcpListener::bind("127.0.0.1:0").unwrap();assert!(transition(old.clone(),true,&occupied.local_addr().unwrap().to_string(),"/new","","",true).is_err());
         assert!(!old.stopping.load(Ordering::Acquire));assert!(TcpStream::connect(&old.listen).is_ok());stop_listener(&old);
     }
-    fn listener_test_server()->Arc<Server> {
+    pub(super) fn listener_test_server()->Arc<Server> {
         Arc::new(Server{state:Arc::new(Mutex::new(State::default())),enabled:false,listen:String::new(),path:"/cwmp".into(),state_file:format!("/tmp/fttr-listener-test-{}-{}.json",std::process::id(),token().unwrap()),auth:None,failure:Mutex::new(None),requests:Arc::new(AtomicUsize::new(0)),endpoint_id:String::new(),drain_deadline:Mutex::new(None),legacy:Mutex::new(Vec::new()),stopping:AtomicBool::new(false),stopped:AtomicBool::new(true)})
     }
     #[test]
@@ -853,7 +829,7 @@ mod tests {
         let (headers, body) = exchange(&mut client, &mut reader, &inform);
         assert!(headers.contains("Set-Cookie: fttr_session="));
         assert!(body.contains("InformResponse"));
-        let task=server.execute(json!({"op":"queue","device":"ABCDEF:test:mock","method":"GetParameterValues","args":{"names":["InternetGatewayDevice.DeviceInfo.ModelName"]}}));
+        let task: Value=serde_json::from_str(&server.execute(json!({"op":"queue","device":"ABCDEF:test:mock","method":"GetParameterValues","args":{"names":["InternetGatewayDevice.DeviceInfo.ModelName"]}}))).unwrap();
         assert_eq!(task["id"], 1);
         let (_, rpc) = exchange(&mut client, &mut reader, "");
         assert!(rpc.contains("GetParameterValues"));
@@ -863,7 +839,7 @@ mod tests {
         assert!(body.is_empty());
         thread.join().unwrap();
         assert_eq!(
-            server.execute(json!({"op":"task","id":1}))["result"]["parameters"][0]["value"],
+            serde_json::from_str::<Value>(&server.execute(json!({"op":"task","id":1}))).unwrap()["result"]["parameters"][0]["value"],
             "mock"
         );
         fs::remove_file(state_file).unwrap();

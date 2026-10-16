@@ -10,7 +10,7 @@ default = ["device-hl202"]
 device-hl202 = ["dep:flate2", "dep:tar"]
 device-hwtc = []
 all-devices = ["device-hl202", "device-hwtc"]
-acs = ["dep:roxmltree"]
+acs = ["dep:roxmltree", "serde_json/raw_value"]
 
 [dependencies]
 mqttrs2 = "0.1.0"

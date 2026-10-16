@@ -5,6 +5,13 @@ use std::time::{Duration, Instant};
 use mqttrs2::*;
 use crate::mqtt_limits;
 
+const IDLE_READ_CAPACITY: usize = 4096;
+const LARGE_READ_CAPACITY: usize = 64 * 1024;
+
+#[cfg(test)]
+#[path = "mqtt/buffer_tests.rs"]
+mod buffer_tests;
+
 /// A lightweight, robust MQTT 3.1.1 client using `mqttrs2` protocol codec
 /// over a standard synchronous `TcpStream`.
 pub struct MqttClient {
@@ -63,6 +70,12 @@ pub enum MqttEvent {
 }
 
 impl MqttClient {
+    fn reclaim_read_buffer(&mut self) {
+        if self.read_buf.capacity() > LARGE_READ_CAPACITY && self.read_buf.len() <= IDLE_READ_CAPACITY {
+            self.read_buf.shrink_to(IDLE_READ_CAPACITY);
+        }
+    }
+
     /// Connects to the local/remote MQTT broker and completes the MQTT 3.1.1 handshake.
     pub fn connect(addr: &str, client_id: &str) -> io::Result<Self> {
         let mut stream = TcpStream::connect(addr)?;
@@ -206,7 +219,11 @@ impl MqttClient {
         loop {
             // 1. Process any complete packets already buffered in `read_buf`
             if !self.read_buf.is_empty() {
-                mqtt_limits::declared_size(&self.read_buf)?;
+                if let Err(error) = mqtt_limits::declared_size(&self.read_buf) {
+                    self.read_buf.clear();
+                    self.reclaim_read_buffer();
+                    return Err(error);
+                }
                 match decode_slice_with_len(&self.read_buf) {
                     Ok(Some((consumed_len, packet))) => {
                         let extracted_msg = match packet {
@@ -221,6 +238,7 @@ impl MqttClient {
                         };
                         // Now packet borrow ends, we can drain the consumed bytes
                         self.read_buf.drain(..consumed_len);
+                        self.reclaim_read_buffer();
 
                         return Ok(Some(extracted_msg));
                     }
@@ -230,6 +248,7 @@ impl MqttClient {
                     Err(e) => {
                         // Protocol framing error; clear buffer to prevent deadlocks
                         self.read_buf.clear();
+                        self.reclaim_read_buffer();
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!("MQTT stream decode error: {e:?}"),
@@ -242,11 +261,15 @@ impl MqttClient {
             let mut chunk = [0u8; 2048];
             let available = mqtt_limits::MAX_PACKET_BYTES.saturating_sub(self.read_buf.len());
             if available == 0 {
+                self.read_buf.clear();
+                self.reclaim_read_buffer();
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "MQTT packet buffer limit exceeded"));
             }
             let capacity = available.min(chunk.len());
             match self.stream.read(&mut chunk[..capacity]) {
                 Ok(0) => {
+                    self.read_buf.clear();
+                    self.reclaim_read_buffer();
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "MQTT broker closed connection",
@@ -260,6 +283,8 @@ impl MqttClient {
                     return Ok(None);
                 }
                 Err(e) => {
+                    self.read_buf.clear();
+                    self.reclaim_read_buffer();
                     return Err(e);
                 }
             }

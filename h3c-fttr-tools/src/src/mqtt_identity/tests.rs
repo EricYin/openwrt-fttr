@@ -125,3 +125,64 @@ fn mqtt_identity_failed_fdb_observation_invalidates_the_binding() {
     assert_ne!(current.binding_generation, old.binding_generation);
     assert!(current.optical_sn.is_none());
 }
+
+#[test]
+fn automatic_source_rejects_stale_topology_even_when_mqtt_is_fresh() {
+    let mut registry = Registry::new("daemon-a".into());
+    registry.update_topology(online(), Ok(links()), 100);
+    registry.observe("02AABBCCDDEE", 161);
+
+    let source = registry.automatic_source("H3CT12345678", 161).unwrap();
+
+    assert!(source.is_none());
+}
+
+#[test]
+fn expired_linked_sources_release_capacity_and_reconnect_gets_a_new_epoch() {
+    let mut registry = Registry::new("daemon-a".into());
+    let mapping = (0..64).map(|index| (format!("02000000{index:04X}"), "H3CT12345678".into())).collect();
+    registry.update_topology(online(), Ok(mapping), 100);
+    for index in 0..64 {
+        registry.observe(&format!("02000000{index:04X}"), 100);
+    }
+    let old = registry.snapshots(100)[0].binding_generation.clone();
+
+    registry.observe("020000000000", 161);
+    registry.observe("02AABBCCDDEE", 161);
+    registry.update_topology(online(), Ok(links()), 161);
+
+    assert_eq!(registry.snapshots(161).len(), 2);
+    assert_ne!(registry.snapshots(161)[0].binding_generation, old);
+    assert_eq!(registry.automatic_source("H3CT12345678", 161).unwrap().unwrap().0, "02AABBCCDDEE");
+}
+
+#[test]
+fn many_distinct_sources_keep_a_bound_target_and_reconnect_ambiguity_is_rejected() {
+    let mut registry = Registry::new("daemon-a".into());
+    registry.update_topology(online(), Ok(links()), 100);
+    registry.observe("02AABBCCDDEE", 100);
+    for index in 0..4096 {
+        registry.observe(&format!("02000000{index:04X}"), 100);
+    }
+    assert_eq!(registry.snapshots(100).len(), 64);
+    assert_eq!(registry.automatic_source("H3CT12345678", 100).unwrap().unwrap().0, "02AABBCCDDEE");
+
+    registry.observe("02AABBCCDDEE", 161);
+    registry.observe("02AABBCCDDEF", 161);
+    let mut mapping = links();
+    mapping.insert("02AABBCCDDEF".into(), "H3CT12345678".into());
+    registry.update_topology(online(), Ok(mapping), 161);
+
+    assert!(registry.automatic_source("H3CT12345678", 161).is_err());
+}
+
+#[test]
+fn automatic_source_requires_one_online_onu() {
+    let mut registry = Registry::new("daemon-a".into());
+    registry.observe("02AABBCCDDEE", 100);
+    registry.update_topology(BTreeMap::from([(1, "H3CT12345678".into()), (2, "H3CT12345678".into())]), Ok(links()), 100);
+
+    let source = registry.automatic_source("H3CT12345678", 100).unwrap();
+
+    assert!(source.is_none());
+}
