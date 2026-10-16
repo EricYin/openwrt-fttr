@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::Command;
@@ -21,6 +21,8 @@ use super::activation::{RangingSession, clear_offline_hardware};
 use crate::pon_engine::ploam::PloamFrame;
 use std::collections::{BTreeMap, BTreeSet};
 
+mod ipc_server;
+
 fn setup_bridge() {
     println!("[*] Initializing downstream FTTR DSA switch ports (fttr1 ~ fttr16)...");
     let _ = Command::new("ip").args(["link", "set", "molt_ploam", "up"]).status();
@@ -40,19 +42,15 @@ fn start_ipc_server(
     pon_engine: Arc<Mutex<PonEngine>>,
     services: super::service::States,
 ) {
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let mut stream = match stream {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+    ipc_server::start(listener, ipc_handler(devices, pon_engine, services));
+}
 
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-            let reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            if reader.take(524296).read_line(&mut line).is_ok() && line.ends_with('\n') {
-                let line = line.trim();
+fn ipc_handler(
+    devices: Arc<Mutex<Vec<SubDevice>>>,
+    pon_engine: Arc<Mutex<PonEngine>>,
+    services: super::service::States,
+) -> impl Fn(std::os::unix::net::UnixStream, &str) + Send + Sync + 'static {
+    move |mut stream, line| {
                 if let Some(request) = line.strip_prefix("HL202 ") {
                     #[cfg(feature = "device-hl202")]
                     super::hl202::start(stream, request.to_string(), pon_engine.clone(), services.clone());
@@ -60,10 +58,6 @@ fn start_ipc_server(
                     { let _ = request; let _ = stream.write_all(b"{\"schema_version\":1,\"error\":{\"code\":\"adapter_disabled\",\"message\":\"HL202 adapter not compiled\"}}"); }
                 } else if let Some(request) = line.strip_prefix("MIB ") {
                     let request = request.to_string();
-                    let services = services.clone();
-                    // MIB sessions validate O5 through STATUS IPC. Keep accepting
-                    // connections while this bounded diagnostic runs.
-                    thread::spawn(move || {
                         let result = serde_json::from_str::<super::inventory::MibCommand>(&request)
                             .map_err(std::io::Error::other)
                             .and_then(|command| super::inventory::control(command.onu_id, command.tables, &services));
@@ -72,7 +66,6 @@ fn start_ipc_server(
                             Err(error) => serde_json::json!({"schema_version": 1, "error": {"code": format!("{:?}", error.kind()), "message": error.to_string()}}),
                         };
                         let _ = stream.write_all(response.to_string().as_bytes());
-                    });
                 } else if let Some(request) = line.strip_prefix("PROVISIONING ") {
                     let _ = stream.write_all(crate::provisioning::control(request).as_bytes());
                 } else if let Some(_request) = line.strip_prefix("ACS ") {
@@ -195,7 +188,14 @@ fn start_ipc_server(
                         telemetry_gateways,
                     };
 
-                    if let Ok(json_str) = serde_json::to_string_pretty(&sys_status) {
+                    #[derive(serde::Serialize)]
+                    struct Status<'a> {
+                        #[serde(flatten)]
+                        system: &'a FttrSystemStatus,
+                        ipc: ipc_server::metrics::Snapshot,
+                    }
+                    let status = Status { system: &sys_status, ipc: ipc_server::metrics::snapshot() };
+                    if let Ok(json_str) = serde_json::to_string_pretty(&status) {
                         let _ = stream.write_all(json_str.as_bytes());
                         let _ = stream.write_all(b"\n");
                     }
@@ -222,9 +222,7 @@ fn start_ipc_server(
                 } else if line.starts_with("SUBDEV ") {
                     let _ = stream.write_all(crate::devices::legacy_command(line).to_json_line().as_bytes());
                 }
-            }
-        }
-    });
+    }
 }
 
 pub fn run() {
