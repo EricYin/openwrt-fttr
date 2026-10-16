@@ -4,8 +4,11 @@ mod soap;
 mod task;
 mod persistence;
 mod readback;
+mod transaction;
 #[cfg(test)]
 mod compact_tests;
+#[cfg(test)]
+mod durability_tests;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -117,12 +120,9 @@ impl Server {
                 let Some(device) = request["device"].as_str().filter(|id| !id.is_empty()) else {
                     return error("device required");
                 };
-                let mut cleared = state.clone();
-                cleared.forget_tasks(device);
-                if let Err(err) = self.save(&cleared) {
+                if let Err(err) = self.reset_tasks(&mut state, device) {
                     return error(&format!("cannot persist device task reset: {err}"));
                 }
-                *state = cleared;
                 json!({"reset":true})
             }
             "busy" => {
@@ -147,20 +147,9 @@ impl Server {
                 if state.tasks.values().filter(|t| t.state.is_active()).count() >= 128 {
                     return error("ACS queue full");
                 }
-                while state.tasks.len() >= 256 {
-                    let expired = state
-                        .tasks
-                        .iter()
-                        .find(|(_, t)| !t.state.is_active())
-                        .map(|(id, _)| *id);
-                    if let Some(id) = expired {
-                        state.tasks.remove(&id);
-                    } else {
-                        return error("ACS task history full");
-                    }
-                }
-                state.next_id += 1;
-                let id = state.next_id;
+                let Some(id) = state.next_id.checked_add(1) else {
+                    return error("ACS task IDs exhausted");
+                };
                 let task = Task {
                     id,
                     device: device.into(),
@@ -171,9 +160,7 @@ impl Server {
                     sent: None,
                     result: None,
                 };
-                state.tasks.insert(id, task.clone());
-                let _ = self.save(&state);
-                json!(task)
+                self.enqueue(&mut state, task)
             }
             _ => error("unknown ACS operation"),
         }
@@ -291,6 +278,7 @@ fn validate(method: &str, args: &Value) -> Result<(), String> {
     Ok(())
 }
 impl State {
+    #[cfg(test)]
     fn forget_tasks(&mut self, device: &str) {
         self.tasks.retain(|_, task| task.device != device);
         self.sessions.retain(|_, (id, _, _)| id != device);
@@ -311,7 +299,7 @@ impl State {
             }
         }
     }
-    fn next(&mut self, device: &str, namespace: &str) -> io::Result<Option<String>> {
+    fn next(&mut self, device: &str, namespace: &str) -> io::Result<Option<transaction::PreparedRpc>> {
         if self
             .tasks
             .values()
@@ -338,9 +326,10 @@ impl State {
             .find(|t| t.device == device && t.state == TaskState::Queued);
         if let Some(task) = task {
             let xml = soap::request(namespace, task.id, &task.method, &task.args)?;
+            let undo = transaction::DispatchUndo { id: task.id, sent: task.sent };
             task.state = TaskState::Sent;
             task.sent = Some(now());
-            return Ok(Some(xml));
+            return Ok(Some(transaction::PreparedRpc { xml, undo }));
         }
         Ok(None)
     }
@@ -554,11 +543,16 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
                 });
         }
         let mut extra = String::new();
+        let mut dispatch = None;
         let response = if req.body.is_empty() {
             if let Some(device) = &current {
                 let namespace = state.devices[device].namespace.clone();
-                state.next(device, &namespace)?
+                state.next(device, &namespace)?.map(|rpc| {
+                    dispatch = Some(rpc.undo);
+                    rpc.xml
+                })
             } else {
+                drop(state);
                 http::reply(&mut stream, 400, "", "", true)?;
                 break;
             }
@@ -570,21 +564,22 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("[ACS] peer={peer} SOAP rejected bytes={}: {e}", req.body.len());
+                    drop(state);
                     http::reply(&mut stream, 400, "", "", true)?;
                     break;
                 }
             };
             match message.method.as_str() {
                 "Inform" => {
-                    if message.serial.is_empty() || message.serial.len() > 128 || message.oui.len() != 6 || !message.oui.bytes().all(|b| b.is_ascii_hexdigit()) || message.product.len() > 128 { http::reply(&mut stream, 400, "", "", true)?; break; }
+                    if message.serial.is_empty() || message.serial.len() > 128 || message.oui.len() != 6 || !message.oui.bytes().all(|b| b.is_ascii_hexdigit()) || message.product.len() > 128 { drop(state); http::reply(&mut stream, 400, "", "", true)?; break; }
                     let device = format!("{}:{}:{}", message.oui.to_ascii_uppercase(), message.product, message.serial);
-                    if state.devices.len() >= 64 && !state.devices.contains_key(&device) { http::reply(&mut stream, 503, "", "", true)?; break; }
+                    if state.devices.len() >= 64 && !state.devices.contains_key(&device) { drop(state); http::reply(&mut stream, 503, "", "", true)?; break; }
                     // A new Inform is a new session; uncertain outstanding writes are never replayed.
                     for task in state.tasks.values_mut().filter(|t| t.device == device && t.state == TaskState::Sent) { task.state = TaskState::Unknown; task.result = Some(error_result("new Inform before RPC response")); }
                     state.sessions.retain(|_,(id,_,_)| *id != device);
                     let key = token()?; state.sessions.insert(key.clone(), (device.clone(), peer.clone(), now()));
                     extra = format!("Set-Cookie: fttr_session={key}; Path={}; HttpOnly; SameSite=Strict\r\n", policy.path);
-                    if server.stopping.load(Ordering::Acquire) {http::reply(&mut stream,503,"","",true)?;break;}
+                    if server.stopping.load(Ordering::Acquire) {drop(state);http::reply(&mut stream,503,"","",true)?;break;}
                     state.devices.insert(device.clone(), Device { serial:message.serial, oui:message.oui, product_class:message.product, peer:peer.clone(), namespace:message.namespace.clone(), last_inform:now(), endpoint_id:policy.endpoint_id.clone(),inform:message.data });
                     current = Some(device);
                     Some(soap::envelope(&message.namespace, &message.id, "<cwmp:InformResponse><MaxEnvelopes>1</MaxEnvelopes></cwmp:InformResponse>"))
@@ -593,13 +588,23 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
                 "TransferComplete" if current.is_some() => Some(soap::envelope(&message.namespace, &message.id, "<cwmp:TransferCompleteResponse/>")),
                 _ => {
                     if let Some(device) = &current {
-                        if let Err(e) = state.response(device, &message) { eprintln!("[ACS] peer={peer} RPC response rejected method={} id={}: {e}", message.method, message.id); http::reply(&mut stream, 400, "", "", true)?; break; }
-                        state.next(device, &message.namespace)?
-                    } else { http::reply(&mut stream, 400, "", "", true)?; break; }
+                        if let Err(e) = state.response(device, &message) { eprintln!("[ACS] peer={peer} RPC response rejected method={} id={}: {e}", message.method, message.id); drop(state); http::reply(&mut stream, 400, "", "", true)?; break; }
+                        state.next(device, &message.namespace)?.map(|rpc| {
+                            dispatch = Some(rpc.undo);
+                            rpc.xml
+                        })
+                    } else { drop(state); http::reply(&mut stream, 400, "", "", true)?; break; }
                 }
             }
         };
-        let _ = server.save(&state);
+        if server.save(&state).is_err() {
+            if let Some(undo) = dispatch {
+                undo.restore(&mut state);
+            }
+            drop(state);
+            http::reply(&mut stream, 503, "", "", true)?;
+            break;
+        }
         drop(state);
         let close = response.is_none()
             || req
@@ -709,6 +714,7 @@ mod tests {
             .next("a", "urn:dslforum-org:cwmp-1-0")
             .unwrap()
             .unwrap()
+            .xml
             .contains("fttr-4"));
         assert!(s.next("a", "urn:dslforum-org:cwmp-1-0").unwrap().is_none());
         let msg = soap::parse(&soap::envelope(
