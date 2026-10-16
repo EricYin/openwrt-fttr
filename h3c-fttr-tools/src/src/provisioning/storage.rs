@@ -1,7 +1,7 @@
 //! Persistence mechanics only; callers retain format and retry decisions.
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 pub(super) fn registry_path(directory: &str, id: &str) -> String {
@@ -13,10 +13,25 @@ pub(super) fn registry_path(directory: &str, id: &str) -> String {
 
 pub(super) fn remove_registry(path: &str) -> Result<(), String> {
     match fs::remove_file(path) {
-        Ok(()) => fs::File::open(Path::new(path).parent().unwrap())
-            .and_then(|directory| directory.sync_all())
-            .map_err(|e| format!("persist registry removal: {e}")),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => fs::File::open(
+            Path::new(path)
+                .parent()
+                .ok_or("state path has no directory")?,
+        )
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| format!("persist registry removal: {e}")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let directory = Path::new(path)
+                .parent()
+                .ok_or("state path has no directory")?;
+            match fs::File::open(directory) {
+                Ok(directory) => directory
+                    .sync_all()
+                    .map_err(|e| format!("persist registry removal: {e}")),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("open registry directory: {e}")),
+            }
+        }
         Err(e) => Err(format!("remove ownership registry: {e}")),
     }
 }
@@ -24,9 +39,9 @@ pub(super) fn remove_registry(path: &str) -> Result<(), String> {
 /// Preserve the existing file-fsync/rename sequence. Ownership registries also
 /// fsync their directory; controller history intentionally retains its policy.
 pub(super) fn write_atomic(path: &str, data: &[u8], sync_directory: bool) -> io::Result<()> {
-    let directory = Path::new(path)
-        .parent()
-        .expect("state path has a directory");
+    let directory = Path::new(path).parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "state path has no directory")
+    })?;
     fs::create_dir_all(directory)?;
     let temporary = format!("{path}.tmp");
     let mut file = OpenOptions::new()
@@ -35,11 +50,15 @@ pub(super) fn write_atomic(path: &str, data: &[u8], sync_directory: bool) -> io:
         .truncate(true)
         .mode(0o600)
         .open(&temporary)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     file.write_all(data)?;
     file.sync_all()?;
     fs::rename(temporary, path)?;
     if sync_directory {
         fs::File::open(directory)?.sync_all()?;
+        if let Some(parent) = directory.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
     }
     Ok(())
 }

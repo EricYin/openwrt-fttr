@@ -1,4 +1,5 @@
 /etc/config/fttr
 /etc/fttr/wan-owned/
 /etc/fttr/wifi-owned/
+/etc/fttr/reset-pending/
 /etc/fttr/management-applied.json

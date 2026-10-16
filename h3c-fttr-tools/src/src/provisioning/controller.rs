@@ -5,6 +5,8 @@ use super::{config, wan, wifi};
 mod parameters;
 #[path = "controller/lifecycle.rs"]
 mod lifecycle;
+#[path = "controller/reset.rs"]
+mod reset;
 #[cfg(test)]
 #[path = "controller/lifecycle_tests.rs"]
 mod lifecycle_tests;
@@ -181,6 +183,7 @@ impl Operation {
 }
 #[derive(Default)]
 struct Controller {
+    resets: reset::Resets,
     config: Config,
     failure: Option<String>,
     next_id: u64,
@@ -251,41 +254,12 @@ impl Controller {
             value
         }
     }
-    fn forget_device(&mut self, device: &Device) {
-        self.operations.remove(&device.id);
-        self.recovered.remove(&device.id);
-        self.owned.remove(&device.cwmp_id);
-        self.wifi_owned.remove(&device.cwmp_id);
-    }
-    fn reset_device(&mut self, target: &str) -> Result<Value, String> {
-        let device = self
-            .config
-            .devices
-            .iter()
-            .find(|d| d.id == target || d.optical_sn == target)
-            .cloned()
-            .ok_or("select one configured device to reset")?;
-        // Hold the controller lock throughout: no provisioning tick can queue an
-        // old write after ACS discards this device's tasks and session tokens.
-        #[cfg(feature = "acs")]
-        {
-            let reply = acs(json!({"op":"reset_device_tasks","device":device.cwmp_id}));
-            if let Some(error) = reply["error"].as_str() {
-                return Err(error.into());
-            }
-        }
-        self.forget_device(&device);
-        let saved = self.history();
-        super::storage::write_atomic(
-            "/var/lib/fttr/provisioning-state.json",
-            saved.as_bytes(),
-            false,
-        )
-        .map_err(|e| format!("persist device state reset: {e}"))?;
-        self.saved = saved;
-        wan::reset(&device.cwmp_id)?;
-        wifi::reset(&device.cwmp_id)?;
-        Ok(json!({"reset":true,"device":device.id}))
+    fn forget_device(&mut self, serial: &str, cwmp_id: &str) {
+        let device_id = self.config.devices.iter().find(|d| d.optical_sn == serial).map(|d| &d.id);
+        self.operations.retain(|id, op| Some(id) != device_id && op.device.optical_sn != serial);
+        self.recovered.retain(|id, op| Some(id) != device_id && op["optical_sn"] != serial);
+        self.owned.remove(cwmp_id);
+        self.wifi_owned.remove(cwmp_id);
     }
     fn start(&mut self, target: &str, apply: bool, management: bool) -> Result<Vec<u64>, String> {
         self.start_selected(target, apply, management, None)
@@ -332,6 +306,9 @@ impl Controller {
         }
         if devices.is_empty() {
             return Err("no configured device matches target".into());
+        }
+        if devices.iter().any(|d| self.resets.blocks(&d.optical_sn)) {
+            return Err("device reset pending; retry reset before synchronization".into());
         }
         if apply
             && self.config.management_network.as_ref().is_some_and(|d| {
@@ -393,6 +370,9 @@ impl Controller {
         let devices: Vec<_> = self.config.devices.iter().map(|d| {
             let mut operation = self.operations.get(&d.id).map(Operation::view).or_else(|| self.recovered.get(&d.id).cloned()).unwrap_or_else(|| json!({"state":"not_started","items":d.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":"not_started"})).collect::<Vec<_>>() }));
             operation["current_revision"] = json!(operation["revision"] == self.config.revision);
+            if self.resets.blocks(&d.optical_sn) {
+                operation = json!({"state":"reset_pending","items":[],"reason":self.resets.reason(&d.optical_sn)});
+            }
             operation["management_fresh"] = json!(self.management.get(&d.id).is_some_and(|m| m["state"] == "online"));
             if let Some(owned)=self.owned.get(&d.cwmp_id) { operation["wan_objects"]=json!(owned); }
             if let Some(owned)=self.wifi_owned.get(&d.cwmp_id) { operation["wifi_objects"]=json!(owned); }
@@ -537,11 +517,13 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
             }
             Err(e) => c.failure = Some(e),
         }
+        c.load_reset_intents();
         if let Ok(data) = std::fs::read("/var/lib/fttr/provisioning-state.json") {
             c.recover(&data);
         }
         c.retain_configured_state();
-        let identities: Vec<_> = c.config.devices.iter().map(|d| d.cwmp_id.clone()).collect();
+        c.resume_resets();
+        let identities: Vec<_> = c.config.devices.iter().filter(|d| !c.resets.blocks(&d.optical_sn)).map(|d| d.cwmp_id.clone()).collect();
         for id in identities {
             match wan::load(&id) {
                 Ok(Some(owned)) => {
@@ -614,6 +596,9 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
         }
         let mut fresh = BTreeSet::new();
         for d in &config.devices {
+            if c.resets.blocks(&d.optical_sn) {
+                continue;
+            }
             let observed = &devices["devices"][&d.cwmp_id];
             let at = (observed["endpoint_id"] == c.acs_status["endpoint_id"]
                 && c.acs_status["endpoint_id"]
@@ -967,7 +952,7 @@ mod tests {
             .insert(device.cwmp_id.clone(), wifi::Registry::default());
         c.wifi_owned
             .insert("other".into(), wifi::Registry::default());
-        c.forget_device(&device);
+        c.forget_device(&device.optical_sn, &device.cwmp_id);
         assert!(c.operations.is_empty());
         assert!(!c.recovered.contains_key(&device.id));
         assert!(c.recovered.contains_key("other"));
