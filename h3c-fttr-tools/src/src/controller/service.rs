@@ -10,6 +10,18 @@ pub(super) struct State {
     pub identity_at: Option<std::time::Instant>,
     pub mib: Option<std::sync::mpsc::SyncSender<super::inventory::MibRequest>>,
 }
+impl State {
+    pub fn business_status(&self, carrier: bool, management_ready: bool) -> String {
+        let phase = match self.phase.as_str() {
+            "WAN bootstrap pending" if management_ready && carrier => "Verified",
+            "WAN bootstrap pending" if management_ready => "Verifying",
+            "Verifying" if carrier => "Verified",
+            phase => phase,
+        };
+        format!("{} (generation {}){}", phase, self.generation,
+            self.error.as_ref().map(|error| format!(": {error}")).unwrap_or_default())
+    }
+}
 pub(super) type States = Arc<Mutex<BTreeMap<u8, State>>>;
 pub(super) struct Services { pub states: States, tokens: BTreeMap<u8, Arc<AtomicBool>> }
 impl Services {
@@ -90,4 +102,44 @@ pub(crate) fn operation_confirmed(id: u8) -> bool {
     crate::ipc::send_ipc_command("STATUS").ok()
         .and_then(|reply| serde_json::from_str::<crate::model::FttrSystemStatus>(&reply).ok())
         .is_some_and(|status| status.sub_gateways.iter().any(|onu| onu.onu_id == id && onu.state == "O5Operation"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::State;
+
+    #[test]
+    fn business_status_tracks_management_and_carrier_readiness() {
+        // Given: a configured V152 waiting for management bootstrap.
+        let state = State { phase: "WAN bootstrap pending".into(), generation: 1, ..State::default() };
+        for (carrier, management_ready, expected) in [
+            (true, true, "Verified (generation 1)"),
+            (false, true, "Verifying (generation 1)"),
+            (true, false, "WAN bootstrap pending (generation 1)"),
+            (false, false, "WAN bootstrap pending (generation 1)"),
+        ] {
+            // When: status is requested with current readiness evidence.
+            let status = state.business_status(carrier, management_ready);
+            // Then: neither CWMP nor carrier alone certifies V152 business readiness.
+            assert_eq!(status, expected, "carrier={carrier}, management_ready={management_ready}");
+        }
+    }
+
+    #[test]
+    fn business_status_preserves_other_worker_phases_and_errors() {
+        // Given: worker states outside the V152 bootstrap gate.
+        for (phase, carrier, error, expected) in [
+            ("Verifying", true, None, "Verified (generation 2)"),
+            ("Verifying", false, None, "Verifying (generation 2)"),
+            ("Configuring", true, None, "Configuring (generation 2)"),
+            ("Retrying", true, Some("readback failed"), "Retrying (generation 2): readback failed"),
+            ("Offline", true, None, "Offline (generation 2)"),
+        ] {
+            let state = State { phase: phase.into(), generation: 2, error: error.map(str::to_owned), ..State::default() };
+            // When: current CWMP readiness is available.
+            let status = state.business_status(carrier, true);
+            // Then: readiness does not hide worker transitions or errors.
+            assert_eq!(status, expected);
+        }
+    }
 }

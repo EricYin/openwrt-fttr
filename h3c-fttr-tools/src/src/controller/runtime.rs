@@ -140,8 +140,7 @@ fn ipc_handler(
                             wifi_sync: desired["wifi_sync"].as_str().unwrap_or("not_configured").into(),
                             business_status: services.lock().unwrap().get(&onu.onu_id).map(|state| {
                                 let verified = fs::read_to_string(format!("/sys/class/net/fttr{}/carrier", onu.onu_id)).is_ok_and(|value| value.trim() == "1");
-                                format!("{} (generation {}){}", if state.phase == "Verifying" && verified { "Verified" } else { &state.phase }, state.generation,
-                                    state.error.as_ref().map(|error| format!(": {error}")).unwrap_or_default())
+                                state.business_status(verified, onu.state == OnuState::O5Operation && desired["management"]["state"] == "online")
                             }).unwrap_or_else(|| "Not started".into()),
                             identity: identity.clone(),
                             identity_age_seconds: service.as_ref().and_then(|state| state.identity_at).map(|at| at.elapsed().as_secs()),
