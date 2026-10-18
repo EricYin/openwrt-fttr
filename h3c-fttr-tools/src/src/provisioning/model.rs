@@ -24,6 +24,57 @@ macro_rules! wire_enum {
     };
 }
 
+wire_enum!(TaskOutcome {
+    Queued => "queued",
+    Sent => "sent",
+    Completed => "completed",
+    AcceptedPendingApply => "accepted_pending_apply",
+    Unknown => "unknown",
+    Fault => "fault",
+    Expired => "expired",
+    Missing => "missing",
+});
+
+impl TaskOutcome {
+    pub(super) fn from_task(task: &serde_json::Value) -> Self {
+        serde_json::from_value(task["state"].clone()).unwrap_or(Self::Missing)
+    }
+}
+
+wire_enum!(ItemOutcome {
+    Verified => "verified",
+    Failed => "failed",
+    Blocked => "blocked",
+    Unknown => "unknown",
+    AcceptedPendingApply => "accepted_pending_apply",
+    AcceptedUnverified => "accepted_unverified",
+    Drift => "drift",
+    Created => "created",
+    Deleted => "deleted",
+    Disabled => "disabled",
+});
+
+impl ItemOutcome {
+    pub(super) fn from_result(result: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value(result["state"].clone()).ok()
+    }
+}
+
+wire_enum!(WanOwnershipState {
+    Ready => "ready",
+    Protected => "protected",
+    AddingParent => "adding_parent",
+    DiscoveringChild => "discovering_child",
+    AddingChild => "adding_child",
+    Deleting => "deleting",
+});
+
+wire_enum!(WifiPendingAction {
+    Adding => "adding",
+    Disabling => "disabling",
+    Deleting => "deleting",
+});
+
 wire_enum!(OperationPhase {
     Waiting => "waiting",
     WanReconciling => "wan_reconciling",
