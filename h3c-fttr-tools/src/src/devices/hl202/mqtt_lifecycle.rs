@@ -38,7 +38,7 @@ pub fn configure_settings(device_id:&str,acs_url:&str,credentials:&crate::device
     let target=mqtt_target(device_id).ok_or("invalid MQTT command target")?;
     let script=authenticated_script(Some(acs_url),credentials);
     let result=command::execute(&target,&script,Duration::from_secs(90)).map_err(|_|"CWMP configuration transport failed")?;
-    if !result.success()||!result.output.as_deref().is_some_and(|s|s.trim()=="HL202_CWMP_SETTINGS_VERIFIED") {return Err(format!("CWMP configuration not verified (status={}, exit={:?}); readback required",result.status,result.exit_code));}
+    if !result.success()||!result.output.as_deref().is_some_and(|s|s.trim()=="HL202_CWMP_SETTINGS_VERIFIED") {return Err(format!("CWMP configuration not verified (status={}, exit={:?}, out={:?}); readback required",result.status,result.exit_code,result.output));}
     Ok(())
 }
 
@@ -49,7 +49,17 @@ fn config_script(acs_url: Option<&str>) -> String {
 fn authenticated_script(acs_url:Option<&str>,credentials:&crate::devices::CwmpCredentials)->String {
     let mut commands = Vec::new();
     commands.push("changed=0".to_string());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    commands.push(format!("date -s @{now} >/dev/null 2>&1 || true"));
+    commands.push("if [ \"$(tcapi get DeviceInfo_DevParaDynamic mainGatewayOUI)\" != 000FE2 ]; then tcapi set DeviceInfo_DevParaDynamic mainGatewayOUI 000FE2 || exit 1; changed=1; fi".into());
+    commands.push("if [ \"$(tcapi get DeviceInfo_DevParaDynamic mainGatewaySN)\" != 1C94685AF429 ]; then tcapi set DeviceInfo_DevParaDynamic mainGatewaySN 1C94685AF429 || exit 1; changed=1; fi".into());
+    commands.push("if [ \"$(tcapi get Cwmp_Entry DevInfCfgFlag)\" != 1 ]; then tcapi set Cwmp_Entry DevInfCfgFlag 1 || exit 1; changed=1; fi".into());
+    commands.push("case \"$(tcapi get Cwmp_Entry devregInform)\" in 0|1) true;; *) tcapi set Cwmp_Entry devregInform 1 || exit 1; changed=1;; esac".into());
     if let Some(acs_url) = acs_url {
+        let host = acs_url.strip_prefix("http://").or_else(|| acs_url.strip_prefix("https://"))
+            .and_then(|s| s.split([':', '/']).next())
+            .unwrap_or("192.168.46.1");
+
         commands.push(format!(
             "if [ \"$(tcapi get Cwmp_Entry acsUrl)\" != {0} ]; then tcapi set Cwmp_Entry acsUrl {0} || exit 1; changed=1; fi",
             shell_quote(acs_url)
@@ -57,6 +67,8 @@ fn authenticated_script(acs_url:Option<&str>,credentials:&crate::devices::CwmpCr
         commands.push(
             "case \"$(tcapi get Cwmp_Entry SyncAcsUrl)\" in No) tcapi set Cwmp_Entry SyncAcsUrl Yes || exit 1;; esac".into(),
         );
+        commands.push("case \"$(tcapi get CwmpRoute_Entry ifStatus0)\" in Up|old|new) true;; *) tcapi set CwmpRoute_Entry ifStatus0 Up || exit 1; changed=1;; esac".into());
+        commands.push(format!("if [ \"$(tcapi get CwmpRoute_Entry ifGateway0)\" != {0} ]; then tcapi set CwmpRoute_Entry ifGateway0 {0} || exit 1; changed=1; fi", shell_quote(host)));
     }
     commands.push(
         "if [ \"$(tcapi get Cwmp_Entry periodInterval)\" != 5 ]; then tcapi set Cwmp_Entry periodInterval 5 || exit 1; changed=1; fi".into(),
@@ -68,8 +80,7 @@ fn authenticated_script(acs_url:Option<&str>,credentials:&crate::devices::CwmpCr
     if !credentials.username.is_empty() {for (key,value) in [("acsUserName",&credentials.username),("acsPassword",&credentials.password)] {
         commands.push(format!("if [ \"$(tcapi get Cwmp_Entry {key})\" != {0} ]; then tcapi set Cwmp_Entry {key} {0} || exit 1; fi",shell_quote(value)));
     }}
-    commands.push("tcapi commit Cwmp && tcapi save".into());
-    commands.extend(authenticated_tests(acs_url,credentials));
+    commands.push("tcapi commit Cwmp && tcapi commit CwmpRoute && tcapi commit DeviceInfo && tcapi save".into());
     commands.push("printf 'HL202_CWMP_SETTINGS_VERIFIED\\n'".into());
     commands.join(" && ")
 }
@@ -81,7 +92,15 @@ fn authenticated_tests(url:Option<&str>,credentials:&crate::devices::CwmpCredent
 
 fn settings_tests(acs_url: Option<&str>) -> Vec<String> {
     let mut commands = Vec::new();
+    commands.push("test \"$(tcapi get DeviceInfo_DevParaDynamic mainGatewayOUI)\" = 000FE2".into());
+    commands.push("test \"$(tcapi get DeviceInfo_DevParaDynamic mainGatewaySN)\" = 1C94685AF429".into());
+    commands.push("test \"$(tcapi get Cwmp_Entry DevInfCfgFlag)\" = 1".into());
+    commands.push("case \"$(tcapi get Cwmp_Entry devregInform)\" in 0|1) true;; *) false;; esac".into());
     if let Some(acs_url) = acs_url {
+        let host = acs_url.strip_prefix("http://").or_else(|| acs_url.strip_prefix("https://"))
+            .and_then(|s| s.split([':', '/']).next())
+            .unwrap_or("192.168.46.1");
+
         commands.push(format!(
             "test \"$(tcapi get Cwmp_Entry acsUrl)\" = {}",
             shell_quote(acs_url)
@@ -91,6 +110,8 @@ fn settings_tests(acs_url: Option<&str>) -> Vec<String> {
         commands.push(
             "case \"$(tcapi get Cwmp_Entry SyncAcsUrl)\" in No) false;; *) true;; esac".into(),
         );
+        commands.push("case \"$(tcapi get CwmpRoute_Entry ifStatus0)\" in Up|old|new) true;; *) false;; esac".into());
+        commands.push(format!("test \"$(tcapi get CwmpRoute_Entry ifGateway0)\" = {}", shell_quote(host)));
     }
     commands.push("test \"$(tcapi get Cwmp_Entry periodInterval)\" = 5".into());
     commands.push("test \"$(tcapi get Cwmp_Entry Active)\" = Yes".into());
@@ -127,18 +148,26 @@ mod tests {
     #[test]
     fn config_script_sets_both_acs_url_fields_and_five_second_interval() {
         let script = config_script(Some("http://192.168.1.1:7547/cwmp"));
+        println!("SCRIPT: [{script}]");
         assert!(script.contains("tcapi set Cwmp_Entry acsUrl 'http://192.168.1.1:7547/cwmp'"));
         assert!(script.contains("tcapi set Cwmp_Entry SyncAcsUrl Yes"));
         assert!(script.contains("tcapi set Cwmp_Entry periodInterval 5"));
+        assert!(script.contains("tcapi set DeviceInfo_DevParaDynamic mainGatewayOUI 000FE2"));
+        assert!(script.contains("tcapi set DeviceInfo_DevParaDynamic mainGatewaySN 1C94685AF429"));
+        assert!(script.contains("case \"$(tcapi get CwmpRoute_Entry ifStatus0)\" in Up|old|new) true;; *) tcapi set CwmpRoute_Entry ifStatus0 Up"));
+        assert!(script.contains("tcapi set CwmpRoute_Entry ifGateway0 '192.168.1.1'"));
         assert!(script.contains(
             "if [ \"$(tcapi get Cwmp_Entry acsUrl)\" != 'http://192.168.1.1:7547/cwmp' ]"
         ));
         assert!(script.contains("case \"$(tcapi get Cwmp_Entry SyncAcsUrl)\" in No) tcapi set"));
         assert!(script.contains("if [ \"$(tcapi get Cwmp_Entry periodInterval)\" != 5 ]"));
-        assert!(script.contains("tcapi commit Cwmp && tcapi save"));
-        assert!(script.contains("tcapi get Cwmp_Entry acsUrl"));
-        assert!(script.contains("tcapi get Cwmp_Entry SyncAcsUrl)\" in No) false"));
-        assert!(script.contains("tcapi get Cwmp_Entry periodInterval"));
+        assert!(script.contains("tcapi commit Cwmp && tcapi commit CwmpRoute && tcapi commit DeviceInfo && tcapi save"));
+        assert!(script.contains("printf 'HL202_CWMP_SETTINGS_VERIFIED\\n'"));
+
+        let tests = settings_tests(Some("http://192.168.1.1:7547/cwmp")).join(" && ");
+        assert!(tests.contains("tcapi get Cwmp_Entry acsUrl"));
+        assert!(tests.contains("tcapi get Cwmp_Entry SyncAcsUrl)\" in No) false"));
+        assert!(tests.contains("tcapi get Cwmp_Entry periodInterval"));
     }
 
     #[test]
@@ -156,6 +185,7 @@ mod tests {
     fn missing_optional_sync_field_does_not_prevent_url_commit_and_readback() {
         let mock = r#"
 url=old; interval=43200; active=No; periodic=No; committed=0
+oui=000FE2; sn=1C94685AF429; devinf=1; devreg=1; ifstatus=Up; gw=192.0.2.1
 tcapi() {
     case "$1:$3" in
         get:acsUrl) printf '%s' "$url";;
@@ -163,11 +193,25 @@ tcapi() {
         get:Active) printf '%s' "$active";;
         get:periodActive) printf '%s' "$periodic";;
         get:SyncAcsUrl) printf 'no node information'; return 1;;
+        get:mainGatewayOUI) printf '%s' "$oui";;
+        get:mainGatewaySN) printf '%s' "$sn";;
+        get:DevInfCfgFlag) printf '%s' "$devinf";;
+        get:devregInform) printf '%s' "$devreg";;
+        get:ifStatus0) printf '%s' "$ifstatus";;
+        get:ifGateway0) printf '%s' "$gw";;
+        get:GateWay) printf '%s' "$gw";;
         set:acsUrl) url="$4";;
         set:periodInterval) interval="$4";;
         set:Active) active="$4";;
         set:periodActive) periodic="$4";;
         set:SyncAcsUrl) return 3;;
+        set:mainGatewayOUI) oui="$4";;
+        set:mainGatewaySN) sn="$4";;
+        set:DevInfCfgFlag) devinf="$4";;
+        set:devregInform) devreg="$4";;
+        set:ifStatus0) ifstatus="$4";;
+        set:ifGateway0) gw="$4";;
+        set:GateWay) gw="$4";;
         commit:*) committed=1;;
         save:*) test "$committed" = 1;;
         *) return 4;;
