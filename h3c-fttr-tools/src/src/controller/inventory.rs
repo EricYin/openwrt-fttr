@@ -1,10 +1,10 @@
 //! Read-only identity/MIB operations coordinated with the registered ONU worker.
 use crate::pon_engine::omci::{
-    mib::{MibReport, TableSnapshot},
+    mib::MibReport,
     platform::leases::{lock_onu, ChannelLease, StockOmccLease},
-    schema::{AttributeKind, MeRegistry},
     FmcsTransport, OmciSession,
 };
+mod tables;
 use std::{
     io,
     sync::{
@@ -27,7 +27,7 @@ pub(super) fn collect(
     }
     let mut session = OmciSession::new(FmcsTransport::open(id)?);
     session.guard_registration(move || super::service::operation_confirmed(id));
-    session.cancel_when(cancellation);
+    session.cancel_when(cancellation.clone());
     let _lease = StockOmccLease::open(id)?;
     let _channel = ChannelLease::open(id, 0)?;
     let mut identity = crate::model::OnuIdentity::default();
@@ -78,6 +78,9 @@ pub(super) fn collect(
             }
             Err(error) => identity.errors.push(format!("{label}: {error}")),
         }
+    }
+    if identity.equipment_id.is_some() {
+        super::telemetry::start(id, cancellation);
     }
     Ok(identity)
 }
@@ -194,28 +197,7 @@ pub(super) fn read_owned(
     report.onu_id = Some(id);
     report.tables_requested = tables;
     if tables {
-        // Only the VLAN operation table used by current bridge profiles is necessary.
-        // Enhanced optional tables retain schema/type/raw display without speculative reads.
-        for entity in report.entities.iter().filter(|e| e.class_id == 171) {
-            let attr = MeRegistry::get(171).unwrap().attribute(6).unwrap();
-            debug_assert_eq!(attr.kind, AttributeKind::Table);
-            let result = session.get_table(171, entity.entity_id, attr.mask);
-            if result.as_ref().is_err_and(|e| {
-                matches!(
-                    e.kind(),
-                    io::ErrorKind::NotConnected | io::ErrorKind::TimedOut
-                )
-            }) {
-                return Err(result.unwrap_err());
-            }
-            report.tables.push(TableSnapshot::from_result(
-                171,
-                entity.entity_id,
-                attr,
-                result,
-            ));
-        }
-        report.tables_collected = report.tables.iter().all(|t| t.collected);
+        self::tables::collect(&mut session, &mut report)?;
     }
     Ok(report)
 }

@@ -6,6 +6,8 @@ pub mod inventory;
 pub mod management;
 pub mod profile;
 mod runtime;
+mod status;
+mod telemetry;
 #[cfg(feature = "device-hl202")]
 mod hl202;
 pub(crate) mod service;
