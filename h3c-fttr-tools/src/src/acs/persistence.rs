@@ -21,6 +21,7 @@ impl State {
             task.result = Some(error_result("daemon restarted after dispatch; execution is unknown, not automatically retried"));
         }
         state.next_id = state.next_id.max(state.tasks.keys().next_back().copied().unwrap_or(0));
+        state.prune();
         Ok(state)
     }
 

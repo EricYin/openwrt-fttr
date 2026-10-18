@@ -105,13 +105,22 @@ impl Server {
     }
     fn execute_small(&self, request: Value) -> Value {
         let mut state = self.state.lock().unwrap();
-        if request["op"] != "status" {
+        if request["op"] != "status" && request["op"] != "clean" {
             if let Some(reason) = &state.load_failure {
                 return error(reason);
             }
         }
         state.expire();
         match request["op"].as_str().unwrap_or("") {
+            "clean" => {
+                state.tasks.retain(|_, t| t.state.is_active());
+                state.load_failure = None;
+                *self.failure.lock().unwrap() = None;
+                if let Err(err) = self.save(&state) {
+                    return error(&format!("cannot persist cleaned state: {err}"));
+                }
+                json!({"cleaned":true, "tasks":state.tasks.len()})
+            }
             "status" => {
                 json!({"compiled":true, "enabled":self.enabled && !self.stopped.load(Ordering::Acquire), "listen":self.listen, "path":self.path, "endpoint_id":self.endpoint_id,"auth":self.auth.is_some(), "devices":state.devices.len(), "tasks":state.tasks.len(), "http_requests":self.requests.load(Ordering::Relaxed), "error":self.failure.lock().unwrap().clone()})
             }
@@ -255,7 +264,13 @@ fn validate(method: &str, args: &Value) -> Result<(), String> {
         "GetParameterNames" if path(&args["path"]) && args["next_level"].is_boolean() => (),
         "GetParameterValues"
             if args["names"].as_array().is_some_and(|a| {
-                !a.is_empty() && a.len() <= 64 && a.iter().all(|v| path(v) && v != "")
+                !a.is_empty()
+                    && a.len() <= 64
+                    && a.iter().all(|v| {
+                        path(v)
+                            && v != ""
+                            && !v.as_str().is_some_and(|s| s.ends_with('.'))
+                    })
             }) => {}
         "SetParameterValues"
             if args["parameters"].as_array().is_some_and(|a| {
@@ -283,6 +298,34 @@ impl State {
         self.tasks.retain(|_, task| task.device != device);
         self.sessions.retain(|_, (id, _, _)| id != device);
     }
+    pub(super) fn prune(&mut self) {
+        let time = now();
+        self.tasks.retain(|_, task| {
+            task.state.is_active() || time.saturating_sub(task.sent.unwrap_or(task.created)) < 1800
+        });
+        let mut total_result_bytes: usize = self
+            .tasks
+            .values()
+            .filter_map(|t| t.result.as_ref())
+            .map(|r| r.get().len())
+            .sum();
+        if total_result_bytes > 4 * 1024 * 1024 {
+            let inactive_ids: Vec<(u64, usize)> = self
+                .tasks
+                .iter()
+                .filter(|(_, t)| !t.state.is_active())
+                .map(|(id, t)| (*id, t.result.as_ref().map(|r| r.get().len()).unwrap_or(0)))
+                .collect();
+            let max_drop = inactive_ids.len().saturating_sub(1);
+            for (id, size) in inactive_ids.into_iter().take(max_drop) {
+                if total_result_bytes <= 4 * 1024 * 1024 {
+                    break;
+                }
+                self.tasks.remove(&id);
+                total_result_bytes = total_result_bytes.saturating_sub(size);
+            }
+        }
+    }
     fn expire(&mut self) {
         let time = now();
         self.sessions
@@ -298,6 +341,7 @@ impl State {
                 t.result = Some(error_result("no device session within 600 seconds"));
             }
         }
+        self.prune();
     }
     fn next(&mut self, device: &str, namespace: &str) -> io::Result<Option<transaction::PreparedRpc>> {
         if self
@@ -388,6 +432,7 @@ impl State {
             ));
         }
         task.result = Some(serde_json::value::to_raw_value(&message.data)?);
+        self.prune();
         Ok(())
     }
 }

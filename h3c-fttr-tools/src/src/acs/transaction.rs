@@ -27,6 +27,7 @@ impl DispatchUndo {
 
 impl Server {
     pub(super) fn enqueue(&self, state: &mut State, task: Task) -> Value {
+        state.prune();
         let mut evicted = Vec::new();
         while state.tasks.len() >= 256 {
             let oldest = state

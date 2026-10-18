@@ -159,3 +159,80 @@ fn wan_readback_guard_fails_closed_on_management_or_malformed_results() {
         assert_eq!(observed, Some(true));
     }
 }
+
+#[test]
+fn test_prune_bounds_inactive_tasks_and_preserves_active() {
+    let mut state = State::default();
+    let current_time = now();
+
+    // 50 completed tasks, half old (> 1800s)
+    for i in 1..=50 {
+        let mut t = task(i);
+        t.state = TaskState::Completed;
+        t.created = if i <= 25 { current_time - 2000 } else { current_time - 100 };
+        t.sent = Some(t.created);
+        state.tasks.insert(i, t);
+    }
+    // 2 active tasks (one queued, one sent, both old)
+    let mut active1 = task(101);
+    active1.state = TaskState::Queued;
+    active1.created = current_time - 2000;
+    state.tasks.insert(101, active1);
+
+    let mut active2 = task(102);
+    active2.state = TaskState::Sent;
+    active2.created = current_time - 2000;
+    active2.sent = Some(current_time - 2000);
+    state.tasks.insert(102, active2);
+
+    state.prune();
+
+    // Active tasks must remain
+    assert!(state.tasks.contains_key(&101));
+    assert!(state.tasks.contains_key(&102));
+
+    // Old tasks (1..=25) must be pruned by TTL
+    for i in 1..=25 {
+        assert!(!state.tasks.contains_key(&i));
+    }
+
+    // Fresh inactive tasks (26..=50) remain
+    let inactive_count = state.tasks.values().filter(|t| !t.state.is_active()).count();
+    assert_eq!(inactive_count, 25);
+}
+
+#[test]
+fn test_get_parameter_values_rejects_trailing_dot_wildcards() {
+    let wildcard = json!({"names": ["InternetGatewayDevice."]});
+    assert!(validate("GetParameterValues", &wildcard).is_err());
+
+    let leaf = json!({"names": ["InternetGatewayDevice.DeviceInfo.SoftwareVersion"]});
+    assert!(validate("GetParameterValues", &leaf).is_ok());
+}
+
+#[test]
+fn test_clean_op_clears_inactive_tasks_and_resets_load_failure() {
+    let server = server();
+    let mut state = State::default();
+    state.load_failure = Some("state load: ACS state exceeds 8 MiB".into());
+
+    let mut inactive = task(1);
+    inactive.state = TaskState::Completed;
+    state.tasks.insert(1, inactive);
+
+    let mut active = task(2);
+    active.state = TaskState::Queued;
+    state.tasks.insert(2, active);
+
+    *server.state.lock().unwrap() = state;
+
+    let res: Value = serde_json::from_str(&server.execute(json!({"op": "clean"}))).unwrap();
+    assert_eq!(res["cleaned"], true);
+    assert_eq!(res["tasks"], 1);
+
+    let state = server.state.lock().unwrap();
+    assert!(state.load_failure.is_none());
+    assert!(!state.tasks.contains_key(&1));
+    assert!(state.tasks.contains_key(&2));
+    let _ = fs::remove_file(&server.state_file);
+}
