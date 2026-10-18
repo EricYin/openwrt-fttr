@@ -301,7 +301,7 @@ impl State {
     pub(super) fn prune(&mut self) {
         let time = now();
         self.tasks.retain(|_, task| {
-            task.state.is_active() || time.saturating_sub(task.sent.unwrap_or(task.created)) < 1800
+            task.state.is_active() || time.saturating_sub(task.sent.unwrap_or(task.created)) < 180
         });
         let mut total_result_bytes: usize = self
             .tasks
@@ -309,16 +309,18 @@ impl State {
             .filter_map(|t| t.result.as_ref())
             .map(|r| r.get().len())
             .sum();
-        if total_result_bytes > 4 * 1024 * 1024 {
+        if total_result_bytes > 256 * 1024 {
             let inactive_ids: Vec<(u64, usize)> = self
                 .tasks
                 .iter()
-                .filter(|(_, t)| !t.state.is_active())
+                .filter(|(_, t)| {
+                    !t.state.is_active()
+                        && time.saturating_sub(t.sent.unwrap_or(t.created)) >= 15
+                })
                 .map(|(id, t)| (*id, t.result.as_ref().map(|r| r.get().len()).unwrap_or(0)))
                 .collect();
-            let max_drop = inactive_ids.len().saturating_sub(1);
-            for (id, size) in inactive_ids.into_iter().take(max_drop) {
-                if total_result_bytes <= 4 * 1024 * 1024 {
+            for (id, size) in inactive_ids {
+                if total_result_bytes <= 256 * 1024 {
                     break;
                 }
                 self.tasks.remove(&id);
@@ -589,11 +591,13 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
         }
         let mut extra = String::new();
         let mut dispatch = None;
+        let mut state_changed = false;
         let response = if req.body.is_empty() {
             if let Some(device) = &current {
                 let namespace = state.devices[device].namespace.clone();
                 state.next(device, &namespace)?.map(|rpc| {
                     dispatch = Some(rpc.undo);
+                    state_changed = true;
                     rpc.xml
                 })
             } else {
@@ -627,6 +631,7 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
                     if server.stopping.load(Ordering::Acquire) {drop(state);http::reply(&mut stream,503,"","",true)?;break;}
                     state.devices.insert(device.clone(), Device { serial:message.serial, oui:message.oui, product_class:message.product, peer:peer.clone(), namespace:message.namespace.clone(), last_inform:now(), endpoint_id:policy.endpoint_id.clone(),inform:message.data });
                     current = Some(device);
+                    state_changed = true;
                     Some(soap::envelope(&message.namespace, &message.id, "<cwmp:InformResponse><MaxEnvelopes>1</MaxEnvelopes></cwmp:InformResponse>"))
                 }
                 "GetRPCMethods" => Some(soap::envelope(&message.namespace, &message.id, "<cwmp:GetRPCMethodsResponse><MethodList soap-enc:arrayType=\"xsd:string[3]\"><string>Inform</string><string>GetRPCMethods</string><string>TransferComplete</string></MethodList></cwmp:GetRPCMethodsResponse>")),
@@ -634,6 +639,7 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
                 _ => {
                     if let Some(device) = &current {
                         if let Err(e) = state.response(device, &message) { eprintln!("[ACS] peer={peer} RPC response rejected method={} id={}: {e}", message.method, message.id); drop(state); http::reply(&mut stream, 400, "", "", true)?; break; }
+                        state_changed = true;
                         state.next(device, &message.namespace)?.map(|rpc| {
                             dispatch = Some(rpc.undo);
                             rpc.xml
@@ -642,13 +648,15 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
                 }
             }
         };
-        if server.save(&state).is_err() {
-            if let Some(undo) = dispatch {
-                undo.restore(&mut state);
+        if state_changed {
+            if server.save(&state).is_err() {
+                if let Some(undo) = dispatch {
+                    undo.restore(&mut state);
+                }
+                drop(state);
+                http::reply(&mut stream, 503, "", "", true)?;
+                break;
             }
-            drop(state);
-            http::reply(&mut stream, 503, "", "", true)?;
-            break;
         }
         drop(state);
         let close = response.is_none()

@@ -165,7 +165,7 @@ fn test_prune_bounds_inactive_tasks_and_preserves_active() {
     let mut state = State::default();
     let current_time = now();
 
-    // 50 completed tasks, half old (> 1800s)
+    // 50 completed tasks, half old (> 180s)
     for i in 1..=50 {
         let mut t = task(i);
         t.state = TaskState::Completed;
@@ -199,6 +199,31 @@ fn test_prune_bounds_inactive_tasks_and_preserves_active() {
     // Fresh inactive tasks (26..=50) remain
     let inactive_count = state.tasks.values().filter(|t| !t.state.is_active()).count();
     assert_eq!(inactive_count, 25);
+}
+
+#[test]
+fn test_prune_bounds_total_result_bytes_dropping_older_inactive_tasks() {
+    let mut state = State::default();
+    let current_time = now();
+
+    let mut t1 = task(1);
+    t1.state = TaskState::Completed;
+    t1.created = current_time - 20;
+    t1.sent = Some(t1.created);
+    t1.result = Some(RawValue::from_string(format!("\"{}\"", "a".repeat(200 * 1024))).unwrap());
+    state.tasks.insert(1, t1);
+
+    let mut t2 = task(2);
+    t2.state = TaskState::Completed;
+    t2.created = current_time - 5;
+    t2.sent = Some(t2.created);
+    t2.result = Some(RawValue::from_string(format!("\"{}\"", "b".repeat(100 * 1024))).unwrap());
+    state.tasks.insert(2, t2);
+
+    state.prune();
+
+    assert!(!state.tasks.contains_key(&1));
+    assert!(state.tasks.contains_key(&2));
 }
 
 #[test]
