@@ -1,25 +1,30 @@
 //! Per-registration workers. Cancellation precedes teardown; tokens are never reused.
 use std::{collections::BTreeMap, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, thread, time::Duration};
+use crate::model::{BusinessPhase, BusinessStatus};
 
 #[derive(Clone, Default)]
 pub(super) struct State {
     pub generation: u64,
-    pub phase: String,
+    pub phase: BusinessPhase,
     pub error: Option<String>,
     pub identity: Option<crate::model::OnuIdentity>,
     pub identity_at: Option<std::time::Instant>,
     pub mib: Option<std::sync::mpsc::SyncSender<super::inventory::MibRequest>>,
 }
 impl State {
-    pub fn business_status(&self, carrier: bool, management_ready: bool) -> String {
-        let phase = match self.phase.as_str() {
-            "WAN bootstrap pending" if management_ready && carrier => "Verified",
-            "WAN bootstrap pending" if management_ready => "Verifying",
-            "Verifying" if carrier => "Verified",
-            phase => phase,
+    pub fn business_status(&self, carrier: bool, management_ready: bool) -> BusinessStatus {
+        let phase = match self.phase {
+            BusinessPhase::WanBootstrapPending => match (management_ready, carrier) {
+                (true, true) => BusinessPhase::Verified,
+                (true, false) => BusinessPhase::Verifying,
+                (false, _) => BusinessPhase::WanBootstrapPending,
+            },
+            BusinessPhase::Verifying => if carrier { BusinessPhase::Verified } else { BusinessPhase::Verifying },
+            BusinessPhase::NotStarted | BusinessPhase::CollectingIdentity | BusinessPhase::RetryingIdentity
+            | BusinessPhase::Unsupported | BusinessPhase::Configuring | BusinessPhase::Verified
+            | BusinessPhase::Retrying | BusinessPhase::Offline => self.phase,
         };
-        format!("{} (generation {}){}", phase, self.generation,
-            self.error.as_ref().map(|error| format!(": {error}")).unwrap_or_default())
+        BusinessStatus { phase, generation: self.generation, error: self.error.clone() }
     }
 }
 pub(super) type States = Arc<Mutex<BTreeMap<u8, State>>>;
@@ -28,13 +33,13 @@ impl Services {
     pub fn new(states: States) -> Self { Self { states, tokens: BTreeMap::new() } }
     pub fn stop(&mut self, id: u8) {
         if let Some(token) = self.tokens.remove(&id) { token.store(true, Ordering::Release); }
-        if let Some(state) = self.states.lock().unwrap().get_mut(&id) { state.phase = "Offline".into(); }
+        if let Some(state) = self.states.lock().unwrap().get_mut(&id) { state.phase = BusinessPhase::Offline; }
     }
     pub fn start(&mut self, id: u8, vendor: String) {
         self.stop(id);
         let generation = self.states.lock().unwrap().get(&id).map_or(1, |state| state.generation + 1);
         let (mib, requests) = std::sync::mpsc::sync_channel(1);
-        self.states.lock().unwrap().insert(id, State { generation, phase: "Collecting identity".into(), mib: Some(mib), ..State::default() });
+        self.states.lock().unwrap().insert(id, State { generation, phase: BusinessPhase::CollectingIdentity, mib: Some(mib), ..State::default() });
         let token = Arc::new(AtomicBool::new(false));
         self.tokens.insert(id, token.clone());
         let states = self.states.clone();
@@ -50,7 +55,7 @@ impl Services {
                 if let Some(state) = states.lock().unwrap().get_mut(&id).filter(|state| state.generation == generation) {
                     state.identity = Some(identity);
                     state.identity_at = Some(std::time::Instant::now());
-                    state.phase = "Retrying identity".into();
+                    state.phase = BusinessPhase::RetryingIdentity;
                 }
                 for _ in 0..100 {
                     if token.load(Ordering::Acquire) { return; }
@@ -60,7 +65,7 @@ impl Services {
             if token.load(Ordering::Acquire) { return; }
             let adapter = crate::devices::select(&vendor, &identity);
             if let Some(state) = states.lock().unwrap().get_mut(&id).filter(|state| state.generation == generation) {
-                state.phase = adapter.status().into();
+                state.phase = adapter.status();
                 state.identity = Some(identity);
                 state.identity_at = Some(std::time::Instant::now());
             }
@@ -68,14 +73,14 @@ impl Services {
                 println!("[!] ONU {id} generation={generation} vendor={vendor}: identity collected; business profile unsupported");
                 return;
             }
-            let set = |phase: &str, error: Option<String>| {
+            let set = |phase: BusinessPhase, error: Option<String>| {
                 if token.load(Ordering::Acquire) { return; }
                 if let Some(state) = states.lock().unwrap().get_mut(&id).filter(|state| state.generation == generation) {
-                    state.phase = phase.into(); state.error = error;
+                    state.phase = phase; state.error = error;
                 }
             };
             while !token.load(Ordering::Acquire) {
-                set("Configuring", None);
+                set(BusinessPhase::Configuring, None);
                 let result = adapter.configure(id, token.clone())
                     .and_then(|()| {
                         if token.load(Ordering::Acquire) { return Ok(()); }
@@ -87,7 +92,7 @@ impl Services {
                 if token.load(Ordering::Acquire) { break; }
                 if let Err(error) = result {
                     eprintln!("[-] ONU {id} generation={generation} service retry: {error}");
-                    set("Retrying", Some(error.to_string()));
+                    set(BusinessPhase::Retrying, Some(error.to_string()));
                 }
                 for _ in 0..100 {
                     if token.load(Ordering::Acquire) { break; }
@@ -101,27 +106,28 @@ impl Services {
 pub(crate) fn operation_confirmed(id: u8) -> bool {
     crate::ipc::send_ipc_command("STATUS").ok()
         .and_then(|reply| serde_json::from_str::<crate::model::FttrSystemStatus>(&reply).ok())
-        .is_some_and(|status| status.sub_gateways.iter().any(|onu| onu.onu_id == id && onu.state == "O5Operation"))
+        .is_some_and(|status| status.sub_gateways.iter().any(|onu| onu.onu_id == id && onu.state == crate::pon_engine::ploam::OnuState::O5Operation))
 }
 
 #[cfg(test)]
 mod tests {
     use super::State;
+    use crate::model::{BusinessPhase, BusinessStatus};
 
     #[test]
     fn business_status_tracks_management_and_carrier_readiness() {
         // Given: a configured V152 waiting for management bootstrap.
-        let state = State { phase: "WAN bootstrap pending".into(), generation: 1, ..State::default() };
+        let state = State { phase: BusinessPhase::WanBootstrapPending, generation: 1, ..State::default() };
         for (carrier, management_ready, expected) in [
-            (true, true, "Verified (generation 1)"),
-            (false, true, "Verifying (generation 1)"),
-            (true, false, "WAN bootstrap pending (generation 1)"),
-            (false, false, "WAN bootstrap pending (generation 1)"),
+            (true, true, BusinessPhase::Verified),
+            (false, true, BusinessPhase::Verifying),
+            (true, false, BusinessPhase::WanBootstrapPending),
+            (false, false, BusinessPhase::WanBootstrapPending),
         ] {
             // When: status is requested with current readiness evidence.
             let status = state.business_status(carrier, management_ready);
             // Then: neither CWMP nor carrier alone certifies V152 business readiness.
-            assert_eq!(status, expected, "carrier={carrier}, management_ready={management_ready}");
+            assert_eq!(status, BusinessStatus { phase: expected, generation: 1, error: None }, "carrier={carrier}, management_ready={management_ready}");
         }
     }
 
@@ -129,17 +135,43 @@ mod tests {
     fn business_status_preserves_other_worker_phases_and_errors() {
         // Given: worker states outside the V152 bootstrap gate.
         for (phase, carrier, error, expected) in [
-            ("Verifying", true, None, "Verified (generation 2)"),
-            ("Verifying", false, None, "Verifying (generation 2)"),
-            ("Configuring", true, None, "Configuring (generation 2)"),
-            ("Retrying", true, Some("readback failed"), "Retrying (generation 2): readback failed"),
-            ("Offline", true, None, "Offline (generation 2)"),
+            (BusinessPhase::Verifying, true, None, BusinessPhase::Verified),
+            (BusinessPhase::Verifying, false, None, BusinessPhase::Verifying),
+            (BusinessPhase::Configuring, true, None, BusinessPhase::Configuring),
+            (BusinessPhase::Retrying, true, Some("readback failed"), BusinessPhase::Retrying),
+            (BusinessPhase::Offline, true, None, BusinessPhase::Offline),
+            (BusinessPhase::NotStarted, true, None, BusinessPhase::NotStarted),
+            (BusinessPhase::CollectingIdentity, true, None, BusinessPhase::CollectingIdentity),
+            (BusinessPhase::RetryingIdentity, true, None, BusinessPhase::RetryingIdentity),
+            (BusinessPhase::Unsupported, true, None, BusinessPhase::Unsupported),
+            (BusinessPhase::Verified, false, None, BusinessPhase::Verified),
         ] {
-            let state = State { phase: phase.into(), generation: 2, error: error.map(str::to_owned), ..State::default() };
+            let state = State { phase, generation: 2, error: error.map(str::to_owned), ..State::default() };
             // When: current CWMP readiness is available.
             let status = state.business_status(carrier, true);
             // Then: readiness does not hide worker transitions or errors.
-            assert_eq!(status, expected);
+            assert_eq!(status, BusinessStatus { phase: expected, generation: 2, error: error.map(str::to_owned) });
         }
+    }
+
+    #[test]
+    fn stopping_worker_preserves_generation_and_error() {
+        let states = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::from([
+            (1, State { phase: BusinessPhase::Retrying, generation: 7, error: Some("readback failed".into()), ..State::default() }),
+        ])));
+        let mut services = super::Services::new(states.clone());
+        services.stop(1);
+        let status = states.lock().unwrap()[&1].business_status(true, true);
+        assert_eq!(serde_json::to_value(status).unwrap(), serde_json::json!({
+            "phase": "offline", "generation": 7, "error": "readback failed"
+        }));
+    }
+
+    #[test]
+    fn absent_worker_serializes_as_not_started_without_error() {
+        let status = State::default().business_status(true, true);
+        assert_eq!(serde_json::to_value(status).unwrap(), serde_json::json!({
+            "phase": "not_started", "generation": 0, "error": null
+        }));
     }
 }

@@ -10,10 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::bosa;
 use crate::fpga;
 use crate::ipc::{self, SubDevice};
-use crate::model::{
-    DataPathStatus, FttrSystemStatus, IpcResponse, SubGatewayStatus,
-    SwitchPortStatus, TelemetryGatewayInfo, WifiMeshStatus,
-};
+use crate::model::{FttrSystemStatus, IpcResponse};
 use crate::mqtt::MqttClient;
 use crate::pon_engine::ploam::OnuState;
 use crate::pon_engine::PonEngine;
@@ -78,114 +75,7 @@ fn ipc_handler(
                     let provisioning = crate::provisioning::snapshot();
                     let devs = devices.lock().unwrap();
                     let engine = pon_engine.lock().unwrap();
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-
-                    let opt = bosa::get_optical_status();
-
-                    let mut switch_ports = Vec::with_capacity(16);
-                    for port in 1..=16 {
-                        let ifname = format!("fttr{port}");
-                        let onu_opt = engine.active_onus.iter().find(|o| o.onu_id == port as u8);
-                        let carrier = onu_opt.map(|o| o.state == OnuState::O5Operation).unwrap_or(false)
-                            && fs::read_to_string(format!("/sys/class/net/{ifname}/carrier"))
-                                .map(|value| value.trim() == "1").unwrap_or(false);
-                        let status_str = if carrier { "UP" } else { "DOWN" }.to_string();
-                        let (onu_id, onu_sn, link_state) = match onu_opt {
-                            Some(o) => {
-                                let st = match o.state {
-                                    OnuState::O1Initial => "Offline (identity retained)",
-                                    OnuState::O2Standby => "O2Standby",
-                                    OnuState::O3SerialNumber => "O3SerialNumber",
-                                    OnuState::O4Ranging if o.eq_delay != 0 => "EqD sent; O5 unconfirmed",
-                                    OnuState::O4Ranging => "Awaiting ranging (O4)",
-                                    OnuState::O5Operation => "O5 (protocol confirmed)",
-                                    OnuState::O6IntermittentLODS => "O6IntermittentLODS",
-                                    OnuState::O7EmergencyStop => "O7EmergencyStop",
-                                };
-                                (Some(port as u8), Some(o.full_sn_str()), st.to_string())
-                            }
-                            None => (None, None, "Offline".to_string()),
-                        };
-                        switch_ports.push(SwitchPortStatus {
-                            port: port as u8,
-                            interface: ifname,
-                            carrier,
-                            status: status_str,
-                            onu_id,
-                            onu_sn,
-                            link_state,
-                        });
-                    }
-
-                    let mut sub_gateways = Vec::new();
-                    for onu in &engine.active_onus {
-                        let service = services.lock().unwrap().get(&onu.onu_id).cloned();
-                        let identity = service.as_ref().and_then(|state| state.identity.clone());
-                        let sn_str = onu.full_sn_str();
-                        let desired = provisioning["devices"].as_array().and_then(|a| a.iter().find(|d| d["optical_sn"] == sn_str)).cloned().unwrap_or_default();
-
-                        sub_gateways.push(SubGatewayStatus {
-                            onu_id: onu.onu_id,
-                            vendor: onu.vendor_str(),
-                            model: identity.as_ref().and_then(|value| value.equipment_id.clone()).unwrap_or_else(|| onu.model.clone()),
-                            serial_number: sn_str,
-                            state: format!("{:?}", onu.state),
-                            management: desired["management"].clone(),
-                            provisioning: desired["provisioning"].clone(),
-                            services: desired["services"].as_array().cloned().unwrap_or_default(),
-                            ssids: desired["ssids"].as_array().cloned().unwrap_or_default(),
-                            wifi_sync: desired["wifi_sync"].as_str().unwrap_or("not_configured").into(),
-                            business_status: services.lock().unwrap().get(&onu.onu_id).map(|state| {
-                                let verified = fs::read_to_string(format!("/sys/class/net/fttr{}/carrier", onu.onu_id)).is_ok_and(|value| value.trim() == "1");
-                                state.business_status(verified, onu.state == OnuState::O5Operation && desired["management"]["state"] == "online")
-                            }).unwrap_or_else(|| "Not started".into()),
-                            identity: identity.clone(),
-                            identity_age_seconds: service.as_ref().and_then(|state| state.identity_at).map(|at| at.elapsed().as_secs()),
-                            identity_current: onu.state == OnuState::O5Operation && identity.is_some(),
-                            fiber_distance_m: onu.fiber_distance_m,
-                            ranging_delay_rtd_ns: (onu.fiber_distance_m / 0.102) as u32,
-                            equalization_delay_bits: (onu.eq_delay != 0).then_some(onu.eq_delay),
-                            optical_rx_power_dbm: onu.rx_power_dbm,
-                            optical_tx_power_dbm: onu.tx_power_dbm,
-                            firmware_version: identity.as_ref().filter(|value| !value.software_images.is_empty())
-                                .map(|value| value.software_images.join("; ")).unwrap_or_else(|| onu.firmware_version.clone()),
-                            hardware_version: identity.as_ref().and_then(|value| value.hardware_version.clone()).unwrap_or_else(|| onu.hardware_version.clone()),
-                            uptime_seconds: onu.uptime_seconds,
-                            data_path: DataPathStatus {
-                                interface: format!("fttr{}", onu.onu_id),
-                                gem_ports: Vec::new(), vlan_id: 0,
-                                tx_bytes: 0, rx_bytes: 0,
-                                current_tx_kbps: 0, current_rx_kbps: 0,
-                            },
-                            wifi_mesh: WifiMeshStatus {
-                                channel_2g: 0, channel_5g: 0,
-                                bandwidth_5g: "-".into(), tx_power_pct: 0,
-                            },
-                            connected_clients: Vec::new(),
-                        });
-                    }
-
-                    let telemetry_gateways = devs
-                        .iter()
-                        .map(|dev| TelemetryGatewayInfo {
-                            id: dev.id.clone(),
-                            last_seen_sec_ago: now.saturating_sub(dev.last_seen),
-                            last_payload_bytes: dev.payload_bytes,
-                        })
-                        .collect();
-
-                    let fpga_status_str = fpga::get_fpga_status().to_string();
-                    let sys_status = FttrSystemStatus {
-                        provisioning,
-                        fpga_status: fpga_status_str,
-                        optical_transceiver: opt,
-                        switch_ports,
-                        sub_gateways,
-                        telemetry_gateways,
-                    };
+                    let sys_status = super::status::snapshot(&engine, &services, (&devs, provisioning));
 
                     #[derive(serde::Serialize)]
                     struct Status<'a> {
@@ -524,7 +414,7 @@ pub fn run() {
                             if sent {
                                 *ranged = Some(Instant::now());
                                 if let Some(onu) = pon_engine_ploam.lock().unwrap().active_onus.iter_mut().find(|o| o.onu_id == *id) {
-                                    onu.eq_delay = bits;
+                                    onu.eq_delay = Some(bits);
                                 }
                                 println!("[+] Ranging_Time sent: ONU={id}, measured EqD={bits} bits, copies=3; awaiting valid O5 response");
                             }

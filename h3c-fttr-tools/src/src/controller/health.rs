@@ -275,6 +275,9 @@ fn run(
     } else { String::new() };
     let management_version = crate::provisioning::management_version(&optical_sn);
     let mut watchdog_start = start;
+    let mut telemetry = cancellation.clone().filter(|_| watch)
+        .map(|token| super::telemetry::Collector::new(id, token));
+    let mut next_telemetry = start;
     while !STOP.load(Ordering::Relaxed) && (watch || start.elapsed() < Duration::from_secs(seconds))
     {
         if watch && crate::provisioning::management_version(&optical_sn) != management_version {
@@ -305,9 +308,14 @@ fn run(
             // The upload is serialized with health GETs under the same lock.
             // Resume with fresh evidence, without rerunning business provisioning.
             // A completed, validated upload is fresh OMCI liveness evidence.
-            last_get = complete.then(Instant::now);
-            watchdog_start = Instant::now();
-            next_get = watchdog_start;
+            next_get = resume_after_omci(&mut last_get, &mut watchdog_start, complete);
+        }
+        if Instant::now() >= next_telemetry {
+            if let Some(collector) = telemetry.as_mut() {
+                let responsive = collector.refresh();
+                next_get = resume_after_omci(&mut last_get, &mut watchdog_start, responsive);
+            }
+            next_telemetry = Instant::now() + Duration::from_secs(60);
         }
         if watch && Instant::now() >= next_state {
             if !super::service::operation_confirmed(id) {
@@ -422,9 +430,31 @@ fn run(
     Ok(())
 }
 
+fn resume_after_omci(last_get: &mut Option<Instant>, watchdog_start: &mut Instant, responsive: bool) -> Instant {
+    let now = Instant::now();
+    *last_get = responsive.then_some(now);
+    *watchdog_start = now;
+    now
+}
+
 #[cfg(test)]
 mod tests {
     use super::data_gem_rx;
+    #[test]
+    fn serialized_collection_resumes_watch_without_crediting_failed_reads() {
+        // Given a collection longer than the health watchdog budget.
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        for responsive in [true, false] {
+            let mut last_get = Some(old);
+            let mut watchdog_start = old;
+            // When the serialized OMCI operation returns.
+            let next_get = super::resume_after_omci(&mut last_get, &mut watchdog_start, responsive);
+            // Then a new health GET runs immediately with only validated liveness credited.
+            assert_eq!(watchdog_start, next_get);
+            assert_eq!(last_get, responsive.then_some(next_get));
+            assert!(watchdog_start > old);
+        }
+    }
     #[test]
     fn captured_child_topology_query_is_data_but_echo_and_omci_are_not() {
         let mut frame = [0u8; 60];
