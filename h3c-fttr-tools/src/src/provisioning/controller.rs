@@ -1,5 +1,5 @@
 //! Desired-state controller. CWMP traffic runs independently of optical workers.
-use super::model::{ItemKind, OperationPhase, ParameterKind};
+use super::model::{ItemKind, ItemOutcome, OperationPhase, ParameterKind};
 use super::{config, wan, wifi};
 #[path = "parameters.rs"]
 mod parameters;
@@ -141,9 +141,9 @@ impl Operation {
     fn item(&self) -> &Item {
         &self.device.items[self.index]
     }
-    fn finish_item(&mut self, state: &str, reason: &str) {
+    fn finish_item(&mut self, state: ItemOutcome, reason: &str) {
         let i = self.item().clone();
-        if i.kind == ItemKind::Ssid && state == "verified" && self.apply {
+        if i.kind == ItemKind::Ssid && state == ItemOutcome::Verified && self.apply {
             for p in &i.parameters {
                 if let Some(n) = wifi::instance(&p.name) {
                     self.wifi.registry.owned.insert(n);
@@ -151,7 +151,7 @@ impl Operation {
             }
         }
         self.results.insert(i.id.clone(), json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":state,"reason":reason,"revision":self.revision,"operation_id":self.id,"task_id":self.task,"updated_at":now(),"changes":self.changes.iter().map(|p| json!({"name":p.name,"desired":if p.secret {"<redacted>"} else {&p.value}})).collect::<Vec<_>>()}));
-        if i.kind == ItemKind::WanActivation && state != "verified" {
+        if i.kind == ItemKind::WanActivation && state != ItemOutcome::Verified {
             if let Some(service) = i.wan_ref.clone() {
                 if let Some(result) = self.results.get_mut(&service) {
                     result["state"] = json!(state);
@@ -386,7 +386,7 @@ impl Controller {
             operation["items"]=json!(items);
             let ssids: Vec<_> = items.iter().filter(|i| i["kind"] == "ssid").cloned().collect();
             let services: Vec<_> = items.iter().filter(|i| i["kind"] != "ssid").cloned().collect();
-            let wifi_sync=if operation["wifi_lifecycle"].as_object().is_some_and(|m|m.values().any(|i|matches!(i["state"].as_str(),Some("blocked"|"failed"|"unknown")))) { "attention_required" } else if operation["wifi_stage"].is_string() && operation["wifi_stage"] != "done" { "pending" } else { aggregate(&ssids) };
+            let wifi_sync=if operation["wifi_lifecycle"].as_object().is_some_and(|m|m.values().any(|i|matches!(ItemOutcome::from_result(i),Some(ItemOutcome::Blocked|ItemOutcome::Failed|ItemOutcome::Unknown)))) { "attention_required" } else if operation["wifi_stage"].is_string() && operation["wifi_stage"] != "done" { "pending" } else { aggregate(&ssids) };
             let assignment=self.config.assignments.get(&d.id);
             json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"adapter":d.adapter,"omci_management":self.omci_management_view(d),"management":self.management.get(&d.id),"acs_bootstrap":super::bootstrap::view(&d.id,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
         }).collect();
@@ -424,7 +424,7 @@ fn discovered_identity(devices: &Value, optical_sn: &str, adapter: &str) -> Opti
 fn aggregate(items: &[Value]) -> &str {
     if items.is_empty() {
         "not_configured"
-    } else if items.iter().all(|i| i["state"] == "verified") {
+    } else if items.iter().all(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::Verified)) {
         if items.iter().any(|i| i["current_revision"] != true) {
             "stale_revision"
         } else if items.iter().any(|i| i["management_fresh"] != true) {
@@ -434,10 +434,10 @@ fn aggregate(items: &[Value]) -> &str {
         }
     } else if items
         .iter()
-        .any(|i| matches!(i["state"].as_str(), Some("failed" | "blocked" | "unknown")))
+        .any(|i| matches!(ItemOutcome::from_result(i), Some(ItemOutcome::Failed | ItemOutcome::Blocked | ItemOutcome::Unknown)))
     {
         "attention_required"
-    } else if items.iter().any(|i| i["state"] == "accepted_unverified") {
+    } else if items.iter().any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::AcceptedUnverified)) {
         "accepted_unverified"
     } else {
         "pending"
@@ -662,13 +662,13 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                     || ["wan_lifecycle", "wifi_lifecycle"].iter().any(|key| {
                         p[*key]
                             .as_object()
-                            .is_some_and(|m| m.values().any(|i| i["state"] == "unknown"))
+                            .is_some_and(|m| m.values().any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::Unknown)))
                     })
                     || p["items"].as_array().is_some_and(|a| {
                         a.iter().any(|i| {
                             matches!(
-                                i["state"].as_str(),
-                                Some("unknown" | "accepted_pending_apply" | "accepted_unverified")
+                                ItemOutcome::from_result(i),
+                                Some(ItemOutcome::Unknown | ItemOutcome::AcceptedPendingApply | ItemOutcome::AcceptedUnverified)
                             )
                         })
                     })
@@ -828,7 +828,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                                 .wan
                                 .results
                                 .get("final_inventory")
-                                .is_some_and(|r| r["state"] == "blocked")
+                                .is_some_and(|r| ItemOutcome::from_result(r) == Some(ItemOutcome::Blocked))
                         {
                             for item in op.device.items.iter().filter(|i| i.wan_ref.is_some()) {
                                 if let Some(result) = op.results.get_mut(&item.id) {
@@ -845,7 +845,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                             .all(|i| {
                                 op.results
                                     .get(&i.id)
-                                    .is_some_and(|r| r["state"] == "verified")
+                                    .is_some_and(|r| ItemOutcome::from_result(r) == Some(ItemOutcome::Verified))
                             });
                         if finish && op.wan.begin_final_verification(op.apply) {
                             op.stage = OperationPhase::WanVerifying;
@@ -871,7 +871,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                         }
                         for item in &op.device.items {
                             if op.results.get(&item.id).is_some_and(|r| {
-                                r["state"] == "verified" && r["revision"] == op.revision
+                                ItemOutcome::from_result(r) == Some(ItemOutcome::Verified) && r["revision"] == op.revision
                             }) {
                                 if let Some(owned) = op.wan.owned.get_mut(&item.id) {
                                     if let Some(p) = item.parameters.iter().find(|p| {

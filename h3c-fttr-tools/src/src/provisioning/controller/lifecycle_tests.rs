@@ -13,7 +13,7 @@ fn configured() -> Controller {
     c.omci_management.insert(device.optical_sn.clone(), json!({"state":"verified"}));
     c.optical_epochs.insert(device.optical_sn.clone(), (1, 10));
     c.owned.insert(device.cwmp_id.clone(), BTreeMap::from([("old-wan".into(), wan::Owned {
-        parent: 4, connection: 1, state: "owned".into(), service_list: "INTERNET".into(),
+        parent: 4, connection: 1, state: super::super::model::WanOwnershipState::Ready, service_list: "INTERNET".into(),
         kind: "WANIPConnection".into(), baseline: None,
     })]));
     c.wifi_owned.insert(device.cwmp_id.clone(), wifi::Registry::default());
