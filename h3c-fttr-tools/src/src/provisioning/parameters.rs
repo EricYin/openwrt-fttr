@@ -1,5 +1,6 @@
 //! Parameter discovery, diff application and readback. This is a child of the
 //! controller so execution can mutate its operation without exposing internals.
+use super::super::model::{ItemOutcome, TaskOutcome};
 use super::{acs, now, Item, ItemKind, Operation, OperationPhase, Parameter, ParameterKind};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -11,7 +12,7 @@ fn queue(op: &mut Operation, method: &str, args: Value, stage: OperationPhase) {
         op.stage = stage;
     } else {
         op.finish_item(
-            "failed",
+            ItemOutcome::Failed,
             reply["error"].as_str().unwrap_or("cannot queue RPC"),
         );
     }
@@ -40,7 +41,7 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
     if op.stage == OperationPhase::Waiting {
         if now().saturating_sub(op.started) > 900 {
             op.finish_item(
-                "failed",
+                ItemOutcome::Failed,
                 "operation deadline exceeded while waiting for management session",
             );
             return;
@@ -58,12 +59,11 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             )
         {
             if let Some(service) = &op.item().wan_ref {
-                if !op
-                    .results
-                    .get(service)
-                    .is_some_and(|r| r["state"] == "verified" && r["revision"] == op.revision)
-                {
-                    op.finish_item("blocked","verify the referenced WAN service at the current revision before applying bindings");
+                if !op.results.get(service).is_some_and(|r| {
+                    ItemOutcome::from_result(r) == Some(ItemOutcome::Verified)
+                        && r["revision"] == op.revision
+                }) {
+                    op.finish_item(ItemOutcome::Blocked,"verify the referenced WAN service at the current revision before applying bindings");
                     return;
                 }
             }
@@ -75,24 +75,25 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
                     .filter(|i| i.kind == ItemKind::PortBinding && i.wan_ref == op.item().wan_ref)
                     .any(|i| {
                         !op.results.get(&i.id).is_some_and(|r| {
-                            r["state"] == "verified" && r["revision"] == op.revision
+                            ItemOutcome::from_result(r) == Some(ItemOutcome::Verified)
+                                && r["revision"] == op.revision
                         })
                     })
             {
                 op.finish_item(
-                    "blocked",
+                    ItemOutcome::Blocked,
                     "WAN activation requires verified bindings at the current revision",
                 );
                 return;
             }
         }
         if let Some(reason) = op.item().blocked.clone() {
-            op.finish_item("blocked", &reason);
+            op.finish_item(ItemOutcome::Blocked, &reason);
             return;
         }
         if op.item().parameters.is_empty() {
             op.finish_item(
-                "verified",
+                ItemOutcome::Verified,
                 "device contract bridges all endpoints; no binding parameters required",
             );
             return;
@@ -111,23 +112,23 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
         return;
     };
     let task = acs(json!({"op":"task","id":id}));
-    let state = task["state"].as_str().unwrap_or("missing");
-    if matches!(state, "queued" | "sent") {
+    let state = TaskOutcome::from_task(&task);
+    if matches!(state, TaskOutcome::Queued | TaskOutcome::Sent) {
         return;
     }
     if op.stage == OperationPhase::Disabling {
-        if matches!(state, "completed" | "accepted_pending_apply" | "unknown") {
+        if matches!(state, TaskOutcome::Completed | TaskOutcome::AcceptedPendingApply | TaskOutcome::Unknown) {
             queue_read(op, OperationPhase::DisablingRead);
         } else {
-            op.finish_item("failed", "cannot disable WAN before configuration");
+            op.finish_item(ItemOutcome::Failed, "cannot disable WAN before configuration");
         }
         return;
     }
     if op.stage == OperationPhase::Writing {
-        if matches!(state, "completed" | "accepted_pending_apply" | "unknown") {
-            op.uncertain = state == "unknown";
-            op.pending = state == "accepted_pending_apply";
-            op.written = state != "unknown";
+        if matches!(state, TaskOutcome::Completed | TaskOutcome::AcceptedPendingApply | TaskOutcome::Unknown) {
+            op.uncertain = state == TaskOutcome::Unknown;
+            op.pending = state == TaskOutcome::AcceptedPendingApply;
+            op.written = state != TaskOutcome::Unknown;
             let delay = op.device.contract().requirements.settle_seconds;
             if delay == 0 {
                 queue_read(op, OperationPhase::Verifying);
@@ -183,17 +184,17 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             op.capabilities
                 .invalidate("parameter write fault invalidated the capability contract");
             op.finish_item(
-                "failed",
+                ItemOutcome::Failed,
                 "SetParameterValues failed; inspect ACS task for fault",
             );
         }
         return;
     }
-    if state != "completed" {
+    if state != TaskOutcome::Completed {
         op.capabilities
             .invalidate("parameter discovery/read fault invalidated the capability contract");
         op.finish_item(
-            "failed",
+            ItemOutcome::Failed,
             &format!(
                 "{}: {state}, fault {}",
                 op.stage,
@@ -237,7 +238,7 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             .collect();
         if !missing.is_empty() {
             op.finish_item(
-                "blocked",
+                ItemOutcome::Blocked,
                 &format!("parameters missing or not writable: {}", missing.join(",")),
             );
             return;
@@ -258,7 +259,7 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             });
         if !disabled {
             op.finish_item(
-                "unknown",
+                ItemOutcome::Unknown,
                 "WAN disable did not read back; further writes withheld",
             );
             return;
@@ -269,7 +270,7 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
         if let Some((root, _)) = guard.rsplit_once('.') {
             if crate::devices::cwmp::observed::protected(&values, &format!("{root}.")) {
                 op.finish_item(
-                    "blocked",
+                    ItemOutcome::Blocked,
                     "cross-contract readback identifies a management/fallback WAN",
                 );
                 return;
@@ -280,14 +281,14 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             .find(|p| p["name"] == *guard)
             .and_then(|p| p["value"].as_str());
         let Some(service) = observed else {
-            op.finish_item("blocked", "service list missing in readback");
+            op.finish_item(ItemOutcome::Blocked, "service list missing in readback");
             return;
         };
         if item.service_type != "tr069"
             && crate::provisioning::contains_service_token(service, "TR069")
         {
             op.finish_item(
-                "blocked",
+                ItemOutcome::Blocked,
                 "WAN carries TR069; dedicated business object required",
             );
             return;
@@ -314,14 +315,14 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
                 .is_some_and(|o| o.baseline.is_some());
             if enabled.is_none() || (enabled == Some(false) && !allocated) {
                 op.finish_item(
-                    "blocked",
+                    ItemOutcome::Blocked,
                     "WAN became an untagged fallback; business writes withheld",
                 );
                 return;
             }
         }
         if item.service_type == "tr069" {
-            op.finish_item("blocked", "TR069 is owned by OMCI");
+            op.finish_item(ItemOutcome::Blocked, "TR069 is owned by OMCI");
             return;
         }
     }
@@ -342,7 +343,7 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             continue;
         }
         if value.is_none() {
-            op.finish_item("failed", "incomplete parameter readback");
+            op.finish_item(ItemOutcome::Failed, "incomplete parameter readback");
             return;
         }
         if !equivalent(p, value.unwrap()) {
@@ -351,19 +352,19 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
     }
     if op.stage == OperationPhase::Verifying {
         if changes.is_empty() {
-            op.finish_item("verified","readable CWMP parameters match; credential write was accepted (password readback is write-only)");
+            op.finish_item(ItemOutcome::Verified,"readable CWMP parameters match; credential write was accepted (password readback is write-only)");
         } else if op.pending {
             op.finish_item(
-                "accepted_pending_apply",
+                ItemOutcome::AcceptedPendingApply,
                 "device returned Status=1; readback still differs",
             );
         } else if op.uncertain {
             op.finish_item(
-                "unknown",
+                ItemOutcome::Unknown,
                 "write outcome unknown; readback differs, no automatic replay",
             );
         } else {
-            op.finish_item("failed", "SetParameterValues accepted but readback differs");
+            op.finish_item(ItemOutcome::Failed, "SetParameterValues accepted but readback differs");
         }
         return;
     }
@@ -386,7 +387,7 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             .any(|p| p.name.ends_with(".ConnectionType") && p.value == "IP_Bridged")
         {
             op.finish_item(
-                "blocked",
+                ItemOutcome::Blocked,
                 "bridge NAT readback differs; independent NAT writes have not been verified",
             );
             return;
@@ -395,15 +396,15 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
     }
     op.changes = changes;
     if op.changes.is_empty() {
-        op.finish_item("verified", "already matches desired state");
+        op.finish_item(ItemOutcome::Verified, "already matches desired state");
         return;
     }
     if !op.apply {
-        op.finish_item("drift", "read-only plan: parameters differ");
+        op.finish_item(ItemOutcome::Drift, "read-only plan: parameters differ");
         return;
     }
     if item.service_type == "tr069" {
-        op.finish_item("blocked", "TR069 is owned by OMCI");
+        op.finish_item(ItemOutcome::Blocked, "TR069 is owned by OMCI");
         return;
     }
     if op.device.contract().requirements.disable_wan_before_write
