@@ -49,34 +49,160 @@ pub fn compile_wlan(
     if intent.enabled.unwrap_or(true) {
         add("RadioEnabled", "1".into(), ParameterKind::Boolean, false);
     }
-    if let Some(key) = &intent.key {
-        if !(8..=63).contains(&key.len()) {
-            return Err("WPA2 key must be 8..63 bytes".into());
+    let security = intent.security.or_else(|| {
+        intent.key.as_ref().map(|_| crate::provisioning::model::WifiSecurity::Wpa2Psk)
+    });
+    if let Some(sec) = security {
+        use crate::provisioning::model::WifiSecurity;
+        match sec {
+            WifiSecurity::None => {
+                add("BeaconType", "None".into(), ParameterKind::String, false);
+                add(
+                    "BasicEncryptionModes",
+                    "None".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "BasicAuthenticationMode",
+                    "None".into(),
+                    ParameterKind::String,
+                    false,
+                );
+            }
+            WifiSecurity::Wpa2Psk => {
+                let key = intent.key.as_deref().ok_or("WPA2 key required")?;
+                if !(8..=63).contains(&key.len()) {
+                    return Err("WPA2 key must be 8..63 bytes".into());
+                }
+                add(
+                    "BeaconType",
+                    contract.wlan.wpa2_beacon.into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "IEEE11iEncryptionModes",
+                    "AESEncryption".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "IEEE11iAuthenticationMode",
+                    "PSKAuthentication".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "PreSharedKey.1.KeyPassphrase",
+                    key.into(),
+                    ParameterKind::String,
+                    true,
+                );
+            }
+            WifiSecurity::Wpa3Sae => {
+                let key = intent.key.as_deref().ok_or("WPA3 key required")?;
+                if !(8..=63).contains(&key.len()) {
+                    return Err("WPA3 key must be 8..63 bytes".into());
+                }
+                add(
+                    "BeaconType",
+                    "WPA3".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "IEEE11iEncryptionModes",
+                    "AESEncryption".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "IEEE11iAuthenticationMode",
+                    "PSKAuthentication".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "PreSharedKey.1.KeyPassphrase",
+                    key.into(),
+                    ParameterKind::String,
+                    true,
+                );
+            }
+            WifiSecurity::Wpa2PskWpa3Sae => {
+                let key = intent.key.as_deref().ok_or("WPA2/WPA3 key required")?;
+                if !(8..=63).contains(&key.len()) {
+                    return Err("WPA2/WPA3 key must be 8..63 bytes".into());
+                }
+                add(
+                    "BeaconType",
+                    "WPA2/WPA3".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "IEEE11iEncryptionModes",
+                    "AESEncryption".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "IEEE11iAuthenticationMode",
+                    "PSKAuthentication".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "PreSharedKey.1.KeyPassphrase",
+                    key.into(),
+                    ParameterKind::String,
+                    true,
+                );
+            }
+            WifiSecurity::WpaPskWpa2Psk => {
+                let key = intent.key.as_deref().ok_or("WPA/WPA2 key required")?;
+                if !(8..=63).contains(&key.len()) {
+                    return Err("WPA/WPA2 key must be 8..63 bytes".into());
+                }
+                add(
+                    "BeaconType",
+                    contract.wlan.wpa_wpa2_beacon.into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "WPAEncryptionModes",
+                    "TKIPandAESEncryption".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "WPAAuthenticationMode",
+                    "PSKAuthentication".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "IEEE11iEncryptionModes",
+                    "TKIPandAESEncryption".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "IEEE11iAuthenticationMode",
+                    "PSKAuthentication".into(),
+                    ParameterKind::String,
+                    false,
+                );
+                add(
+                    "PreSharedKey.1.KeyPassphrase",
+                    key.into(),
+                    ParameterKind::String,
+                    true,
+                );
+            }
         }
-        add(
-            "BeaconType",
-            contract.wlan.wpa2_beacon.into(),
-            ParameterKind::String,
-            false,
-        );
-        add(
-            "IEEE11iEncryptionModes",
-            "AESEncryption".into(),
-            ParameterKind::String,
-            false,
-        );
-        add(
-            "IEEE11iAuthenticationMode",
-            "PSKAuthentication".into(),
-            ParameterKind::String,
-            false,
-        );
-        add(
-            "PreSharedKey.1.KeyPassphrase",
-            key.clone(),
-            ParameterKind::String,
-            true,
-        );
     }
     Ok(output)
 }

@@ -21,6 +21,7 @@ pub const CONTRACT: Contract = Contract {
     wlan: WlanContract {
         radio_slots: Some([[1, 2, 3, 4], [5, 6, 7, 8]]),
         wpa2_beacon: "WPA2",
+        wpa_wpa2_beacon: "WPA/WPA2",
         nat_writable_exception: true,
         passphrase_fallback: true,
     },

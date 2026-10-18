@@ -40,6 +40,7 @@ pub const K155_CONTRACT: Contract = Contract {
     wlan: crate::devices::cwmp::contract::WlanContract {
         radio_slots: Some([[1, 2, 3, 4], [5, 6, 7, 8]]),
         wpa2_beacon: "11i",
+        wpa_wpa2_beacon: "WPAand11i",
         nat_writable_exception: false,
         passphrase_fallback: false,
     },

@@ -323,9 +323,25 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
                 radio: if base == 0 { 2 } else { 5 },
                 slot: (instance - base),
             };
-            if !profile.get("security").is_empty() && profile.get("security") != "wpa2-psk" {
-                return Err("security must be wpa2-psk".into());
-            }
+            let security = match profile.get("security") {
+                "" => None,
+                "none" => Some(super::model::WifiSecurity::None),
+                "wpa2-psk" => Some(super::model::WifiSecurity::Wpa2Psk),
+                "wpa3-sae" => Some(super::model::WifiSecurity::Wpa3Sae),
+                "wpa2-psk/wpa3-sae" => Some(super::model::WifiSecurity::Wpa2PskWpa3Sae),
+                "wpa-psk/wpa2-psk" => Some(super::model::WifiSecurity::WpaPskWpa2Psk),
+                _ => return Err("invalid Wi-Fi security".into()),
+            };
+            let key = match security {
+                Some(super::model::WifiSecurity::None) | None => None,
+                Some(_) => {
+                    let k = profile.get("key");
+                    if !(8..=63).contains(&k.len()) {
+                        return Err("Wi-Fi key must be 8..63 bytes".into());
+                    }
+                    Some(k.to_owned())
+                }
+            };
             let intent = super::model::WlanIntent {
                 endpoint,
                 ssid: profile.get("ssid").into(),
@@ -335,15 +351,9 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
                 broadcast: (!profile.get("broadcast").is_empty())
                     .then(|| boolean(profile.get("broadcast"), true))
                     .transpose()?,
-                key: (!profile.get("security").is_empty()).then(|| profile.get("key").to_owned()),
+                security,
+                key,
             };
-            if intent
-                .key
-                .as_ref()
-                .is_some_and(|key| !(8..=63).contains(&key.len()))
-            {
-                return Err("WPA2 key must be 8..63 bytes".into());
-            }
             item.wlan_intent = Some(intent);
             if !s.get("device_service").is_empty() {
                 let ds = reference(&sections, s.get("device_service"), "device_service")?;

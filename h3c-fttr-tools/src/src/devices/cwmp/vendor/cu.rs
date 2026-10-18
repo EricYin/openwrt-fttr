@@ -24,6 +24,7 @@ pub const BASE: Contract = Contract {
     wlan: WlanContract {
         radio_slots: None,
         wpa2_beacon: "11i",
+        wpa_wpa2_beacon: "WPAand11i",
         nat_writable_exception: false,
         passphrase_fallback: false,
     },

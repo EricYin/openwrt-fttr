@@ -109,6 +109,7 @@ impl WanContract {
 pub struct WlanContract {
     pub radio_slots: Option<[[u32; 4]; 2]>,
     pub wpa2_beacon: &'static str,
+    pub wpa_wpa2_beacon: &'static str,
     pub nat_writable_exception: bool,
     pub passphrase_fallback: bool,
 }

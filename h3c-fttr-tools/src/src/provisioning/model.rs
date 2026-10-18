@@ -134,6 +134,14 @@ wire_enum!(ParameterKind {
     UnsignedInt => "unsignedInt",
 });
 
+wire_enum!(WifiSecurity {
+    None => "none",
+    Wpa2Psk => "wpa2-psk",
+    Wpa3Sae => "wpa3-sae",
+    Wpa2PskWpa3Sae => "wpa2-psk/wpa3-sae",
+    WpaPskWpa2Psk => "wpa-psk/wpa2-psk",
+});
+
 /// Values retain their CWMP lexical representation (including 0/1 booleans).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Parameter {
@@ -164,6 +172,7 @@ pub struct WlanIntent {
     pub ssid: String,
     pub enabled: Option<bool>,
     pub broadcast: Option<bool>,
+    pub security: Option<WifiSecurity>,
     pub key: Option<String>,
 }
 #[derive(Clone, Debug)]
