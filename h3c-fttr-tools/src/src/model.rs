@@ -2,6 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
+mod business;
+pub use business::{BusinessPhase, BusinessStatus};
+
+mod measurement;
+pub use measurement::{MeasurementEvidence, Measurements};
+
+mod inventory;
+pub use inventory::{OnuGemPort, OnuOmciInventory, OnuVlanFilter, OnuVlanOperation};
+
 /// Physical and optical telemetry for the downstream GPON BOSA transceiver.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpticalTransceiverStatus {
@@ -15,6 +24,7 @@ pub struct OpticalTransceiverStatus {
     pub temperature_celsius: Option<f32>,
     pub vcc_voltage: Option<f32>,
     pub cdr_locked: Option<bool>,
+    pub measurements: Measurements,
 }
 
 /// Downstream FTTR DSA switch port link and carrier status.
@@ -42,30 +52,33 @@ pub struct MeshClientStatus {
     pub mac: String,
     pub ip: String,
     pub band: String,
-    pub rssi_dbm: i32,
-    pub rx_rate_mbps: u32,
-    pub tx_rate_mbps: u32,
+    pub rssi_dbm: Option<i32>,
+    pub rx_rate_mbps: Option<u32>,
+    pub tx_rate_mbps: Option<u32>,
 }
 
 /// Data path statistics and provisioning parameters for an ONU.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataPathStatus {
     pub interface: String,
-    pub gem_ports: Vec<u16>,
-    pub vlan_id: u16,
-    pub tx_bytes: u64,
-    pub rx_bytes: u64,
-    pub current_tx_kbps: u32,
-    pub current_rx_kbps: u32,
+    pub gem_ports: Option<Vec<u16>>,
+    pub vlan_id: Option<u16>,
+    pub onu_inventory: Option<OnuOmciInventory>,
+    pub tx_bytes: Option<u64>,
+    pub rx_bytes: Option<u64>,
+    pub current_tx_kbps: Option<f64>,
+    pub current_rx_kbps: Option<f64>,
+    pub measurements: Measurements,
 }
 
 /// Wi-Fi Mesh radio parameters reported by sub-gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WifiMeshStatus {
-    pub channel_2g: u8,
-    pub channel_5g: u8,
-    pub bandwidth_5g: String,
-    pub tx_power_pct: u8,
+    pub channel_2g: Option<u8>,
+    pub channel_5g: Option<u8>,
+    pub bandwidth_5g: Option<String>,
+    pub tx_power_pct: Option<u8>,
+    pub measurements: Measurements,
 }
 
 /// Comprehensive telemetry and configuration state of a sub-gateway (HL202-DU).
@@ -84,9 +97,9 @@ pub struct SubGatewayStatus {
     pub vendor: String,
     pub model: String,
     pub serial_number: String,
-    pub state: String,
+    pub state: crate::pon_engine::ploam::OnuState,
     #[serde(default)]
-    pub business_status: String,
+    pub business_status: BusinessStatus,
     #[serde(default)]
     pub management: serde_json::Value,
     #[serde(default)]
@@ -103,18 +116,19 @@ pub struct SubGatewayStatus {
     pub identity_age_seconds: Option<u64>,
     #[serde(default)]
     pub identity_current: bool,
-    pub fiber_distance_m: f32,
-    pub ranging_delay_rtd_ns: u32,
+    pub fiber_distance_m: Option<f32>,
+    pub ranging_delay_rtd_ns: Option<u32>,
     #[serde(default)]
     pub equalization_delay_bits: Option<u32>,
-    pub optical_rx_power_dbm: f32,
-    pub optical_tx_power_dbm: f32,
+    pub optical_rx_power_dbm: Option<f64>,
+    pub optical_tx_power_dbm: Option<f64>,
     pub firmware_version: String,
     pub hardware_version: String,
-    pub uptime_seconds: u64,
+    pub uptime_seconds: Option<f64>,
     pub data_path: DataPathStatus,
     pub wifi_mesh: WifiMeshStatus,
-    pub connected_clients: Vec<MeshClientStatus>,
+    pub connected_clients: Option<Vec<MeshClientStatus>>,
+    pub measurements: Measurements,
 }
 
 /// Lightweight telemetry record for sub-gateways reporting via MQTT.
