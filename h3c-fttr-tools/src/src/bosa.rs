@@ -304,6 +304,12 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         temperature_celsius: None,
         vcc_voltage: None,
         cdr_locked: None,
+        measurements: [
+            ("tx_power_dbm", "dBm"), ("laser_bias_current_ma", "mA"),
+            ("temperature_celsius", "C"), ("vcc_voltage", "V"), ("cdr_locked", "boolean"),
+        ].into_iter().map(|(field, unit)| (field.into(),
+            crate::model::MeasurementEvidence::unavailable("UX3326/FMCS", unit,
+                "diagnostic_register_and_scaling_unverified"))).collect(),
     };
 
     if let Ok(mut guard) = OPTICAL_CACHE.lock() {
