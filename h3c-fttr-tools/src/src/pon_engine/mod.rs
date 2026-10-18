@@ -27,7 +27,7 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].message_id, ploam::PLOAM_ASSIGN_ONU_ID);
         assert_eq!(engine.active_onus[0].state, OnuState::O4Ranging);
-        assert_eq!(engine.active_onus[0].eq_delay, 0);
+        assert_eq!(engine.active_onus[0].eq_delay, None);
         assert_eq!(engine.active_onus[0].firmware_version, "Unknown");
     }
 
@@ -63,10 +63,10 @@ mod tests {
     fn retry_discards_previous_eqd_and_operation_state() {
         let mut engine = PonEngine::new();
         let onu = engine.register_onu(*b"TEST", [1, 2, 3, 4]);
-        engine.active_onus[0].eq_delay = 248248;
+        engine.active_onus[0].eq_delay = Some(248248);
         engine.active_onus[0].state = OnuState::O5Operation;
         engine.activate_onu(onu.onu_id);
-        assert_eq!(engine.active_onus[0].eq_delay, 0);
+        assert_eq!(engine.active_onus[0].eq_delay, None);
         assert_eq!(engine.active_onus[0].state, OnuState::O4Ranging);
     }
 
@@ -75,16 +75,16 @@ mod tests {
         let mut engine = PonEngine::new();
         let old = engine.register_onu(*b"TEST", [1,2,3,4]);
         engine.active_onus[0].state = OnuState::O5Operation;
-        engine.active_onus[0].eq_delay = 248248;
+        engine.active_onus[0].eq_delay = Some(248248);
         engine.mark_offline(old.onu_id);
         assert_eq!(engine.active_onus[0].state, OnuState::O1Initial);
-        assert_eq!(engine.active_onus[0].eq_delay, 0);
+        assert_eq!(engine.active_onus[0].eq_delay, None);
         let again = engine.register_onu(old.vendor_id, old.serial_number);
         assert_eq!(again.onu_id, old.onu_id);
         assert_eq!(engine.active_onus.len(), 1);
         engine.activate_onu(again.onu_id);
         assert_eq!(engine.active_onus[0].state, OnuState::O4Ranging);
-        assert_eq!(engine.active_onus[0].eq_delay, 0);
+        assert_eq!(engine.active_onus[0].eq_delay, None);
     }
 }
 
@@ -134,7 +134,7 @@ impl PonEngine {
         if let Some(onu) = self.active_onus.iter_mut().find(|o| o.onu_id == onu_id) {
             // Retain identity/slot only, never evidence from the previous activation.
             onu.state = OnuState::O1Initial;
-            onu.eq_delay = 0;
+            onu.eq_delay = None;
         }
     }
 
@@ -143,7 +143,7 @@ impl PonEngine {
         if let Some(onu) = self.active_onus.iter_mut().find(|o| o.onu_id == onu_id) {
             println!("[*] PLOAM: Assigning ONU {}; awaiting measured ranging response", onu_id);
             onu.state = OnuState::O4Ranging;
-            onu.eq_delay = 0; // A new attempt must not inherit an old measurement.
+            onu.eq_delay = None; // A new attempt must not inherit an old measurement.
             vec![
                 PloamFrame::assign_onu_id(onu_id, onu.vendor_id, onu.serial_number),
             ]

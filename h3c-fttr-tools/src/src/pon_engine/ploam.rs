@@ -3,15 +3,39 @@
 //! Handles ONU discovery, activation state machine (O1 -> O5), ranging,
 //! and equalization delay calculation for all downstream ONUs.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OnuState {
     O1Initial,
     O2Standby,
     O3SerialNumber,
     O4Ranging,
     O5Operation,
+    #[serde(rename = "o6_intermittent_lods")]
     O6IntermittentLODS,
     O7EmergencyStop,
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::OnuState;
+
+    #[test]
+    fn onu_state_wire_round_trip_uses_protocol_phase_names() {
+        for (state, wire) in [
+            (OnuState::O1Initial, "o1_initial"),
+            (OnuState::O2Standby, "o2_standby"),
+            (OnuState::O3SerialNumber, "o3_serial_number"),
+            (OnuState::O4Ranging, "o4_ranging"),
+            (OnuState::O5Operation, "o5_operation"),
+            (OnuState::O6IntermittentLODS, "o6_intermittent_lods"),
+            (OnuState::O7EmergencyStop, "o7_emergency_stop"),
+        ] {
+            let json = serde_json::to_value(state).unwrap();
+            assert_eq!(json, wire);
+            assert_eq!(serde_json::from_value::<OnuState>(json).unwrap(), state);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,14 +44,10 @@ pub struct GponOnu {
     pub vendor_id: [u8; 4],
     pub serial_number: [u8; 4],
     pub state: OnuState,
-    pub eq_delay: u32,
-    pub fiber_distance_m: f32,
-    pub rx_power_dbm: f32,
-    pub tx_power_dbm: f32,
+    pub eq_delay: Option<u32>,
     pub model: String,
     pub firmware_version: String,
     pub hardware_version: String,
-    pub uptime_seconds: u64,
 }
 
 impl GponOnu {
@@ -42,14 +62,10 @@ impl GponOnu {
             vendor_id,
             serial_number,
             state: OnuState::O1Initial,
-            eq_delay: 0,
-            fiber_distance_m: 0.0,
-            rx_power_dbm: 0.0,
-            tx_power_dbm: 0.0,
+            eq_delay: None,
             model,
             firmware_version,
             hardware_version,
-            uptime_seconds: 0,
         }
     }
 
