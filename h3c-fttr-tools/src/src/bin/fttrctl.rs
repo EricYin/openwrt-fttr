@@ -205,7 +205,7 @@ fn print_status_table(status: &FttrSystemStatus) {
     let mut in_prog_count = 0;
     for p in &status.switch_ports {
         let is_up = p.carrier;
-        let speed = if is_up { "2.5 Gbps" } else { "-" };
+        let speed = "Unavailable";
         let onu_id_str = p.onu_id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string());
         let onu_sn_str = p.onu_sn.as_deref().unwrap_or("-");
         let link_state = if !p.link_state.is_empty() {
@@ -240,10 +240,8 @@ fn print_status_table(status: &FttrSystemStatus) {
         println!("------------------------------------------------------------------------------------------");
         for sg in &status.sub_gateways {
             println!("[+] Sub-Gateway #{} [{}] - {} {}", sg.onu_id, sg.serial_number, sg.vendor, sg.model);
-            println!("    Switch Port:    fttr{} (VLAN Tag: {}, State: {})", sg.onu_id, sg.onu_id, sg.state);
-            if !sg.business_status.is_empty() {
-                println!("    Business:       {}", sg.business_status);
-            }
+            println!("    Switch Port:    fttr{} (VLAN Tag: {}, State: {:?})", sg.onu_id, sg.onu_id, sg.state);
+            println!("    Business:       {}", sg.business_status);
             if !sg.provisioning.is_null() {
                 println!("    CWMP:           {} | Sync: {} | Wi-Fi: {}", sg.management["state"].as_str().unwrap_or("unknown"), sg.provisioning["state"].as_str().unwrap_or("not_started"), sg.wifi_sync);
                 for item in sg.services.iter().chain(sg.ssids.iter()) {
@@ -261,22 +259,23 @@ fn print_status_table(status: &FttrSystemStatus) {
             if let Some(bits) = sg.equalization_delay_bits {
                 println!("    Measured EqD:   {bits} bits (Ranging_Time sent; see protocol state above)");
             }
-            if sg.fiber_distance_m == 0.0 && sg.optical_rx_power_dbm == 0.0 && sg.optical_tx_power_dbm == 0.0 {
-                println!("    Fiber/ONU optics: unavailable (no verified readings)");
-            } else {
-                println!("    Fiber Distance: {:.1} m | Optical RX: {:.1} dBm | Optical TX: {:.1} dBm", sg.fiber_distance_m, sg.optical_rx_power_dbm, sg.optical_tx_power_dbm);
-            }
-            if sg.wifi_mesh.channel_2g == 0 && sg.wifi_mesh.channel_5g == 0 {
-                println!("    Wi-Fi Mesh:     unavailable (not collected)");
-            } else {
-                println!("    Wi-Fi Mesh:     2.4G Ch {} / 5G Ch {} ({})", sg.wifi_mesh.channel_2g, sg.wifi_mesh.channel_5g, sg.wifi_mesh.bandwidth_5g);
-            }
+            println!("    Fiber Distance: {} | Optical RX: {} | Optical TX: {}",
+                sg.fiber_distance_m.map(|v| format!("{v:.1} m")).unwrap_or_else(|| "Unavailable".into()),
+                sg.optical_rx_power_dbm.map(|v| format!("{v:.3} dBm")).unwrap_or_else(|| "Unavailable".into()),
+                sg.optical_tx_power_dbm.map(|v| format!("{v:.3} dBm")).unwrap_or_else(|| "Unavailable".into()));
+            println!("    Wi-Fi Mesh:     2.4G Ch {} / 5G Ch {} ({})",
+                sg.wifi_mesh.channel_2g.map(|v| v.to_string()).unwrap_or_else(|| "Unavailable".into()),
+                sg.wifi_mesh.channel_5g.map(|v| v.to_string()).unwrap_or_else(|| "Unavailable".into()),
+                sg.wifi_mesh.bandwidth_5g.as_deref().unwrap_or("Unavailable"));
 
-            if !sg.connected_clients.is_empty() {
+            if let Some(clients) = &sg.connected_clients {
                 println!("    Connected Mesh Clients:");
-                for c in &sg.connected_clients {
+                for c in clients {
                     println!("      - {} | {} | {} ({} dBm) | {}/{} Mbps",
-                             c.mac, c.ip, c.band, c.rssi_dbm, c.rx_rate_mbps, c.tx_rate_mbps);
+                             c.mac, c.ip, c.band,
+                             c.rssi_dbm.map(|v| v.to_string()).unwrap_or_else(|| "Unavailable".into()),
+                             c.rx_rate_mbps.map(|v| v.to_string()).unwrap_or_else(|| "Unavailable".into()),
+                             c.tx_rate_mbps.map(|v| v.to_string()).unwrap_or_else(|| "Unavailable".into()));
                 }
             }
             println!();
