@@ -6,6 +6,10 @@ use std::{collections::BTreeMap, io::Read, net::Ipv4Addr, process::{Command, Std
 
 const JOURNAL: &str = "/etc/fttr/management-applied.json";
 type Sections = BTreeMap<String, Section>;
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Phase { Discovering, Comparing, Planning, Applying, Verifying, ConfiguringListener,
+    CleaningPrevious, WaitingDevices, Ready, AwaitingApply, Verified, Blocked, RetryWait }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Desired {
@@ -80,12 +84,12 @@ fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default
 #[derive(Clone,Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Journal { authorized: Option<Desired>, applied: Option<Desired>, previous:Option<Desired>, cleanup_pending:bool,pending: bool, epoch: u64,applied_epoch:u64 }
-struct Coordinator { journal: Journal, requires_apply: bool, busy: bool, state: String, error: Option<String>, plan: Value, next_retry: u64, attempts: u32, ready: bool, last_discovery: u64 }
+struct Coordinator { journal: Journal, requires_apply: bool, busy: bool, state: Phase, error: Option<String>, plan: Value, next_retry: u64, attempts: u32, ready: bool, last_discovery: u64 }
 static COORDINATOR: OnceLock<Mutex<Coordinator>> = OnceLock::new();
 fn coordinator() -> &'static Mutex<Coordinator> {
     COORDINATOR.get_or_init(|| {
         let (journal, error) = match std::fs::read(JOURNAL) { Ok(bytes) => match serde_json::from_slice(&bytes) { Ok(j) => (j, None), Err(_) => (Journal::default(), Some("management journal is invalid or uses the old scalar VLAN format; explicitly apply the VLAN list configuration".into())) }, Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Journal::default(), None), Err(_) => (Journal::default(), Some("management journal cannot be read".into())) };
-        Mutex::new(Coordinator { journal, requires_apply:error.is_some(), busy:false, state:"discovering".into(), error, plan:json!([]), next_retry:0, attempts:0, ready:false, last_discovery:0 })
+        Mutex::new(Coordinator { journal, requires_apply:error.is_some(), busy:false, state:Phase::Discovering, error, plan:json!([]), next_retry:0, attempts:0, ready:false, last_discovery:0 })
     })
 }
 fn persist(c: &Coordinator) -> Result<(), String> { storage::write_atomic(JOURNAL, &serde_json::to_vec(&c.journal).map_err(|_| "cannot encode management journal")?, true).map_err(|_| "cannot persist management authorization".into()) }
@@ -122,7 +126,7 @@ fn start(desired: Desired, apply: bool, fresh_grant: bool) -> Result<Value, Stri
         if fresh_grant||changed {c.ready=false;}
         c.requires_apply=false;
     }
-    c.busy = true; c.state = "discovering".into(); if !c.requires_apply {c.error = None;}
+    c.busy = true; c.state = Phase::Discovering; if !c.requires_apply {c.error = None;}
     drop(c);
     std::thread::spawn(move || execute(desired, apply));
     Ok(json!({"started":true,"mode":if apply {"apply"} else {"plan"}}))
@@ -137,7 +141,7 @@ pub(super) fn tick(desired: Option<&Desired>) {
     if c.busy || time < c.next_retry || time.saturating_sub(c.last_discovery) < 15 { return; }
     c.last_discovery = time;
     if c.journal.cleanup_pending || (c.ready&&c.journal.previous.is_some()&&c.journal.applied.as_ref().is_some_and(|a|!a.enabled||!a.acs_enabled||a.devices.iter().all(|(id,sn)|super::bootstrap::is_ready_for_management(id,sn,&a.management.acs_url,c.journal.applied_epoch)))) {
-        if let Some(applied)=c.journal.applied.clone() {c.journal.cleanup_pending=true;if let Err(e)=persist(&c) {c.error=Some(e);return;}c.busy=true;c.state="cleaning_previous".into();drop(c);std::thread::spawn(move||cleanup_previous(applied));return;}
+        if let Some(applied)=c.journal.applied.clone() {c.journal.cleanup_pending=true;if let Err(e)=persist(&c) {c.error=Some(e);return;}c.busy=true;c.state=Phase::CleaningPrevious;drop(c);std::thread::spawn(move||cleanup_previous(applied));return;}
     }
     let apply = !c.requires_apply && application_authorized(&c.journal,desired);
     if !apply && !c.ready {
@@ -152,13 +156,13 @@ fn restore(d:Desired) {
     let previous=coordinator().lock().unwrap().journal.previous.clone();
     let result=verify_network(&d,previous.as_ref()).and_then(|_|configure_listener(&d,previous.as_ref()));
     let mut c=coordinator().lock().unwrap();c.busy=false;
-    match result.and_then(|_|persist(&c)) {Ok(())=>{c.ready=true;c.state=if c.journal.previous.is_some(){"waiting_devices"}else{"ready"}.into();c.error=None;},Err(e)=>{c.ready=false;c.state="awaiting_apply".into();c.error=Some(e);c.next_retry=now()+15;}}
+    match result.and_then(|_|persist(&c)) {Ok(())=>{c.ready=true;c.state=if c.journal.previous.is_some(){Phase::WaitingDevices}else{Phase::Ready};c.error=None;},Err(e)=>{c.ready=false;c.state=Phase::AwaitingApply;c.error=Some(e);c.next_retry=now()+15;}}
 }
 fn application_authorized(j:&Journal,d:&Desired)->bool {d.automatic||(j.pending&&j.authorized.as_ref().is_some_and(|a|a.version()==d.version()))}
 fn resource_version(d:&Desired)->String {let mut d=d.clone();d.devices.clear();d.automatic=false;d.version()}
 fn endpoint_changed(a:&Desired,b:&Desired)->bool {a.address!=b.address||a.prefix!=b.prefix||a.port!=b.port||a.path!=b.path||a.username!=b.username||a.password!=b.password}
 fn subnets_overlap(a:&Desired,b:&Desired)->bool {let mask=u32::MAX << (32-a.prefix.min(b.prefix));u32::from(a.address.parse::<Ipv4Addr>().unwrap())&mask==u32::from(b.address.parse::<Ipv4Addr>().unwrap())&mask}
-fn phase(state: &str) { coordinator().lock().unwrap().state = state.into(); }
+fn phase(state: Phase) { coordinator().lock().unwrap().state = state; }
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
     let mut child = Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|_| format!("cannot start {program}"))?;
     let stdout = child.stdout.take().ok_or("missing process output")?;
@@ -354,20 +358,20 @@ fn configure_listener(d:&Desired,previous:Option<&Desired>) -> Result<(),String>
 fn execute(d:Desired, apply_authorized:bool) {
     let previous=coordinator().lock().unwrap().journal.previous.clone();
     let result=(|| -> Result<bool,String> {
-        let actual=discover()?; phase("comparing"); let mut actions=if !d.enabled {if let Some(p)=&previous {cleanup_actions(&d,p,&actual)?}else{plan(&d,&actual)?}}else{plan_resources(&d,previous.as_ref(),&actual)?};runtime_plan(&d,previous.as_ref(),&mut actions);
-        {let mut c=coordinator().lock().unwrap();c.state="planning".into();c.plan=serde_json::to_value(&actions).unwrap_or_default();}
+        let actual=discover()?; phase(Phase::Comparing); let mut actions=if !d.enabled {if let Some(p)=&previous {cleanup_actions(&d,p,&actual)?}else{plan(&d,&actual)?}}else{plan_resources(&d,previous.as_ref(),&actual)?};runtime_plan(&d,previous.as_ref(),&mut actions);
+        {let mut c=coordinator().lock().unwrap();c.state=Phase::Planning;c.plan=serde_json::to_value(&actions).unwrap_or_default();}
         if !apply_authorized {return Ok(false);}
-        phase("applying"); let actions:Vec<_>=actions.into_iter().filter(|a|a.operation!="configure_listener").collect();if !actions.is_empty() {let mut c=coordinator().lock().unwrap();c.ready=false;c.journal.pending=true;persist(&c)?;drop(c);apply(&actions)?;}
+        phase(Phase::Applying); let actions:Vec<_>=actions.into_iter().filter(|a|a.operation!="configure_listener").collect();if !actions.is_empty() {let mut c=coordinator().lock().unwrap();c.ready=false;c.journal.pending=true;persist(&c)?;drop(c);apply(&actions)?;}
         let retained=if d.enabled {previous.as_ref()}else{None};
-        phase("verifying"); verify_network(&d,retained)?;
-        phase("configuring_listener"); configure_listener(&d,retained)?;
+        phase(Phase::Verifying); verify_network(&d,retained)?;
+        phase(Phase::ConfiguringListener); configure_listener(&d,retained)?;
         Ok(true)
     })();
     let mut c=coordinator().lock().unwrap(); c.busy=false;
     match result {
-        Ok(true) => {let save=c.journal.pending||c.journal.applied.as_ref().is_none_or(|a|a.version()!=d.version());if !d.enabled {c.journal.previous=None;c.journal.cleanup_pending=false;}c.journal.applied=Some(d);c.journal.applied_epoch=c.journal.epoch;c.journal.pending=false; match if save {persist(&c)}else{Ok(())} {Ok(())=>{c.ready=true;c.state=if c.journal.previous.is_some(){"waiting_devices"}else{"ready"}.into();c.error=None;c.next_retry=0;c.attempts=0;},Err(e)=>{c.ready=false;c.state="blocked".into();c.error=Some(e);}}},
-        Ok(false) => {c.state=if c.plan.as_array().is_some_and(|a|a.is_empty())&&c.journal.applied.as_ref().is_some_and(|a|a.version()==d.version()) {"verified"}else{"awaiting_apply"}.into();},
-        Err(e) => {if apply_authorized {c.ready=false;}c.attempts=c.attempts.saturating_add(1);c.next_retry=now()+5u64.saturating_mul(1u64<<c.attempts.min(6)).min(300);c.state=if apply_authorized {"retry_wait"}else{"blocked"}.into();c.error=Some(e);},
+        Ok(true) => {let save=c.journal.pending||c.journal.applied.as_ref().is_none_or(|a|a.version()!=d.version());if !d.enabled {c.journal.previous=None;c.journal.cleanup_pending=false;}c.journal.applied=Some(d);c.journal.applied_epoch=c.journal.epoch;c.journal.pending=false; match if save {persist(&c)}else{Ok(())} {Ok(())=>{c.ready=true;c.state=if c.journal.previous.is_some(){Phase::WaitingDevices}else{Phase::Ready};c.error=None;c.next_retry=0;c.attempts=0;},Err(e)=>{c.ready=false;c.state=Phase::Blocked;c.error=Some(e);}}},
+        Ok(false) => {c.state=if c.plan.as_array().is_some_and(|a|a.is_empty())&&c.journal.applied.as_ref().is_some_and(|a|a.version()==d.version()) {Phase::Verified}else{Phase::AwaitingApply};},
+        Err(e) => {if apply_authorized {c.ready=false;}c.attempts=c.attempts.saturating_add(1);c.next_retry=now()+5u64.saturating_mul(1u64<<c.attempts.min(6)).min(300);c.state=if apply_authorized {Phase::RetryWait}else{Phase::Blocked};c.error=Some(e);},
     }
 }
 fn cleanup_actions(d:&Desired,previous:&Desired,actual:&Sections)->Result<Vec<Action>,String> {
@@ -389,7 +393,7 @@ fn cleanup_previous(d:Desired) {
         Ok(())
     })();
     let mut c=coordinator().lock().unwrap();c.busy=false;
-    match result {Ok(())=>{c.journal.previous=None;c.journal.cleanup_pending=false;if let Err(e)=persist(&c){c.ready=false;c.state="blocked".into();c.error=Some(e);}else{c.ready=true;c.state="ready".into();c.error=None;c.next_retry=0;}},Err(e)=>{c.state="retry_wait".into();c.error=Some(e);c.next_retry=now()+15;}}
+    match result {Ok(())=>{c.journal.previous=None;c.journal.cleanup_pending=false;if let Err(e)=persist(&c){c.ready=false;c.state=Phase::Blocked;c.error=Some(e);}else{c.ready=true;c.state=Phase::Ready;c.error=None;c.next_retry=0;}},Err(e)=>{c.state=Phase::RetryWait;c.error=Some(e);c.next_retry=now()+15;}}
 }
 
 #[cfg(test)] mod tests {
