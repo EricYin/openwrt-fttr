@@ -6,10 +6,23 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStatus { Error, Executed, Dispatched, Timeout }
+
+impl std::fmt::Display for CommandStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Error => "error", Self::Executed => "executed",
+            Self::Dispatched => "dispatched", Self::Timeout => "timeout",
+        })
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct CommandResult {
     pub target: String,
-    pub status: String,
+    pub status: CommandStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -23,14 +36,14 @@ pub struct CommandResult {
 
 impl CommandResult {
     pub fn failed(target: &str, error: impl ToString) -> Self {
-        Self { target: target.into(), status: "error".into(), request_id: None,
+        Self { target: target.into(), status: CommandStatus::Error, request_id: None,
                exit_code: None, output: None, output_truncated: false, error: Some(error.to_string()) }
     }
     pub fn success(&self) -> bool {
-        self.error.is_none() && match self.status.as_str() {
-            "executed" => self.exit_code == Some(0),
-            "dispatched" => self.exit_code.is_none(),
-            _ => false,
+        self.error.is_none() && match self.status {
+            CommandStatus::Executed => self.exit_code == Some(0),
+            CommandStatus::Dispatched => self.exit_code.is_none(),
+            CommandStatus::Error | CommandStatus::Timeout => false,
         }
     }
 }
@@ -104,17 +117,17 @@ mod tests {
     #[test]
     fn mqtt_command_success_requires_a_confirmed_outcome() {
         // Given a result without a transport error but without execution proof.
-        let mut result = CommandResult { target: "1A2B3C4DA111".into(), status: "unknown".into(),
+        let mut result = CommandResult { target: "1A2B3C4DA111".into(), status: CommandStatus::Timeout,
             request_id: None, exit_code: None, output: None, output_truncated: false, error: None };
         // When classifying each externally observable result; then unknown is not success.
         assert!(!result.success());
-        result.status = "executed".into();
+        result.status = CommandStatus::Executed;
         assert!(!result.success());
         result.exit_code = Some(0);
         assert!(result.success());
         result.exit_code = Some(7);
         assert!(!result.success());
-        result.status = "dispatched".into();
+        result.status = CommandStatus::Dispatched;
         result.exit_code = None;
         assert!(result.success());
     }
@@ -189,7 +202,7 @@ pub fn dispatch(target: &str, command: &str) -> io::Result<CommandResult> {
     let _lock = lock_target(&target)?;
     let mut mqtt = MqttClient::connect("127.0.0.1:1883", &format!("fttr-cmd-{}", request_id()))?;
     mqtt.publish(&format!("/fttr/subdev/cmd/{target}"), command.as_bytes())?;
-    Ok(CommandResult { target, status: "dispatched".into(), request_id: None,
+    Ok(CommandResult { target, status: CommandStatus::Dispatched, request_id: None,
         exit_code: None, output: None, output_truncated: false, error: None })
 }
 

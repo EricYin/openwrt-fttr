@@ -13,7 +13,7 @@ fn wait_for_operation(id: u8) {
         let ready = ipc::send_ipc_command("STATUS").ok()
             .and_then(|reply| serde_json::from_str::<FttrSystemStatus>(&reply).ok())
             .is_some_and(|status| status.sub_gateways.iter()
-                .any(|onu| onu.onu_id == id && onu.vendor == "H3CT" && onu.state == "O5Operation"));
+                .any(|onu| onu.onu_id == id && onu.vendor == "H3CT" && onu.state == crate::pon_engine::ploam::OnuState::O5Operation));
         if ready {
             println!("ONU_OPERATION_CONFIRMED id={id}; starting OMCI service");
             return;

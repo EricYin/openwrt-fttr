@@ -1,5 +1,6 @@
 //! Whole-device compile-time registry. Core activation/inventory never depend on adapters.
 pub mod cwmp;
+use crate::model::BusinessPhase;
 
 pub fn observe_mqtt_report(source: &str, payload: Vec<u8>, received: u64) -> bool {
     #[cfg(feature = "device-hl202")]
@@ -52,20 +53,24 @@ impl Adapter {
             _ => Capabilities { business: false, shell_commands: false },
         }
     }
-    pub fn status(self) -> &'static str {
+    pub fn status(self) -> BusinessPhase {
         match self {
             #[cfg(feature = "device-hl202")]
-            Self::Hl202 => "Configuring",
+            Self::Hl202 => BusinessPhase::Configuring,
             #[cfg(feature = "device-hwtc")]
-            Self::Hwtc(_) => "Configuring",
-            Self::Unavailable => "Adapter not compiled or unsupported device",
+            Self::Hwtc(_) => BusinessPhase::Configuring,
+            Self::Unavailable => BusinessPhase::Unsupported,
         }
     }
-    pub fn verification_status(self) -> &'static str {
+    pub fn verification_status(self) -> BusinessPhase {
         match self {
             #[cfg(feature = "device-hwtc")]
-            Self::Hwtc(hwtc::Profile::V152) => "WAN bootstrap pending",
-            _ => "Verifying",
+            Self::Hwtc(hwtc::Profile::V152) => BusinessPhase::WanBootstrapPending,
+            #[cfg(feature = "device-hwtc")]
+            Self::Hwtc(hwtc::Profile::K155 | hwtc::Profile::Standard) => BusinessPhase::Verifying,
+            #[cfg(feature = "device-hl202")]
+            Self::Hl202 => BusinessPhase::Verifying,
+            Self::Unavailable => BusinessPhase::Verifying,
         }
     }
     pub fn configure(self, id: u8, token: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::io::Result<()> {
@@ -80,7 +85,7 @@ impl Adapter {
             },
             _ => {
                 let _ = (id, token);
-                Err(std::io::Error::new(std::io::ErrorKind::Unsupported, self.status()))
+                Err(std::io::Error::new(std::io::ErrorKind::Unsupported, self.status().to_string()))
             }
         }
     }
@@ -126,12 +131,12 @@ mod tests {
         assert_eq!(select("HWTC", &identity), Adapter::Hwtc(hwtc::Profile::K155));
         identity.equipment_id = Some("V152".into());
         assert_eq!(select("HWTC", &identity).capabilities().business, cfg!(feature = "device-hwtc") );
-        assert_eq!(select("HWTC", &identity).status(), if cfg!(feature = "device-hwtc") { "Configuring" } else { "Adapter not compiled or unsupported device" });
+        assert_eq!(select("HWTC", &identity).status(), if cfg!(feature = "device-hwtc") { BusinessPhase::Configuring } else { BusinessPhase::Unsupported });
         assert!(!select("HWTC", &identity).capabilities().shell_commands);
         #[cfg(feature = "device-hwtc")]
         {
             assert_eq!(select("HWTC", &identity), Adapter::Hwtc(hwtc::Profile::V152));
-            assert_eq!(select("HWTC", &identity).verification_status(), "WAN bootstrap pending");
+            assert_eq!(select("HWTC", &identity).verification_status(), BusinessPhase::WanBootstrapPending);
             identity.equipment_id = Some("OTHER-HWTC".into());
             assert_eq!(select("HWTC", &identity), Adapter::Hwtc(hwtc::Profile::Standard));
         }

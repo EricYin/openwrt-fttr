@@ -1,4 +1,4 @@
-use super::command::{framed_script, parse_reply, CommandResult};
+use super::command::{framed_script, parse_reply, CommandResult, CommandStatus};
 use crate::mqtt::{MqttClient, MqttEvent};
 use std::io;
 use std::time::{Duration, Instant};
@@ -47,14 +47,14 @@ pub(super) fn run(transport: &mut impl Transport, request: Request<'_>) -> io::R
             transport.receive(deadline.saturating_duration_since(Instant::now()))? {
             if topic == reply_topic {
                 if let Some((output, code, output_truncated)) = parse_reply(&payload, &request.id) {
-                    return Ok(CommandResult { target: request.target, status: "executed".into(),
+                    return Ok(CommandResult { target: request.target, status: CommandStatus::Executed,
                         request_id: Some(request.id), exit_code: Some(code), output: Some(output),
                         output_truncated, error: None });
                 }
             }
         }
     }
-    Ok(CommandResult { target: request.target, status: "timeout".into(),
+    Ok(CommandResult { target: request.target, status: CommandStatus::Timeout,
         request_id: Some(request.id), exit_code: None, output: None, output_truncated: false,
         error: Some("no matching device response before timeout; execution outcome is unknown".into()) })
 }
@@ -121,7 +121,7 @@ mod tests {
     fn mqtt_command_transport_timeout_does_not_republish() {
         let mut broker = Broker::default();
         let result = run(&mut broker, request(Duration::ZERO)).unwrap();
-        assert_eq!(result.status, "timeout");
+        assert_eq!(result.status, CommandStatus::Timeout);
         assert!(!result.success());
         assert_eq!(broker.publications.len(), 1);
         assert!(result.error.unwrap().contains("outcome is unknown"));
