@@ -1,6 +1,6 @@
 //! WLAN lifecycle is separate from parameter diffs. Inventory, actual returned
 //! instances and readback are authoritative; an acknowledged Delete is not proof.
-use super::model::{ItemKind, WifiPhase};
+use super::model::{ItemKind, ItemOutcome, TaskOutcome, WifiPhase, WifiPendingAction};
 use super::{acs, config::Device};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -9,7 +9,7 @@ pub const ROOT: &str = "InternetGatewayDevice.LANDevice.1.WLANConfiguration.";
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Registry {
     pub owned: BTreeSet<u32>,
-    pub pending: Option<String>,
+    pub pending: Option<WifiPendingAction>,
     pub pending_instance: Option<u32>,
 }
 fn path(id: &str) -> String {
@@ -113,7 +113,7 @@ mod tests {
             r.tick(&d, true, true, true, true);
         }
         assert_eq!(r.results["2"]["state"], "unknown");
-        assert_eq!(r.registry.pending.as_deref(), Some("deleting"));
+        assert_eq!(r.registry.pending, Some(WifiPendingAction::Deleting));
     }
     #[test]
     fn returned_slot_is_verified_before_further_allocation_and_unknown_is_not_replayed() {
@@ -310,7 +310,7 @@ impl Reconciler {
                 .map_err(|e| format!("persist Wi-Fi ownership: {e}"))
         }
     }
-    fn fail(&mut self, state: &str, reason: &str) {
+    fn fail(&mut self, state: ItemOutcome, reason: &str) {
         self.results.insert(
             self.current
                 .map(|n| n.to_string())
@@ -337,7 +337,7 @@ impl Reconciler {
     }
     fn queue(&mut self, d: &Device, method: &str, args: Value, stage: WifiPhase) {
         if self.save(&d.cwmp_id).is_err() {
-            self.fail("blocked", "cannot persist Wi-Fi lifecycle intent");
+            self.fail(ItemOutcome::Blocked, "cannot persist Wi-Fi lifecycle intent");
             return;
         }
         let v = acs(json!({"op":"queue","device":d.cwmp_id,"method":method,"args":args}));
@@ -347,7 +347,7 @@ impl Reconciler {
         } else {
             self.registry.pending = None;
             self.registry.pending_instance = None;
-            self.fail("failed", "cannot queue Wi-Fi RPC");
+            self.fail(ItemOutcome::Failed, "cannot queue Wi-Fi RPC");
         }
     }
     pub fn tick(
@@ -381,20 +381,20 @@ impl Reconciler {
         }
         if let Some(task) = self.task {
             let v = acs(json!({"op":"task","id":task}));
-            let state = v["state"].as_str().unwrap_or("missing");
-            if matches!(state, "queued" | "sent") {
+            let state = TaskOutcome::from_task(&v);
+            if matches!(state, TaskOutcome::Queued | TaskOutcome::Sent) {
                 return false;
             }
-            if !matches!(state, "completed" | "accepted_pending_apply") {
-                if matches!(state, "fault" | "expired") {
+            if !matches!(state, TaskOutcome::Completed | TaskOutcome::AcceptedPendingApply) {
+                if matches!(state, TaskOutcome::Fault | TaskOutcome::Expired) {
                     self.registry.pending = None;
                     self.registry.pending_instance = None;
                 }
                 self.fail(
-                    if state == "unknown" {
-                        "unknown"
+                    if state == TaskOutcome::Unknown {
+                        ItemOutcome::Unknown
                     } else {
-                        "failed"
+                        ItemOutcome::Failed
                     },
                     "Wi-Fi RPC failed/unknown; no automatic write replay",
                 );
@@ -406,7 +406,7 @@ impl Reconciler {
                     self.existing = inventory(&v);
                     self.registry.owned.retain(|n| self.existing.contains(n));
                     if self.registry.pending.is_some() {
-                        if self.registry.pending.as_deref() == Some("deleting")
+                        if self.registry.pending == Some(WifiPendingAction::Deleting)
                             && self
                                 .registry
                                 .pending_instance
@@ -415,7 +415,7 @@ impl Reconciler {
                             self.registry.pending = None;
                             self.registry.pending_instance = None;
                         } else {
-                            self.fail("unknown","interrupted Wi-Fi lifecycle; inspect registry and inventory before retry");
+                            self.fail(ItemOutcome::Unknown,"interrupted Wi-Fi lifecycle; inspect registry and inventory before retry");
                             return true;
                         }
                     }
@@ -426,7 +426,7 @@ impl Reconciler {
                         .and_then(|n| n.parse::<u32>().ok())
                         .filter(|n| *n > 0);
                     let Some(n) = n else {
-                        self.fail("unknown", "AddObject did not return a WLAN instance");
+                        self.fail(ItemOutcome::Unknown, "AddObject did not return a WLAN instance");
                         return true;
                     };
                     self.reused = self.existing.contains(&n);
@@ -448,16 +448,16 @@ impl Reconciler {
                     self.existing = inventory(&v);
                     let n = self.current.unwrap();
                     if !self.existing.contains(&n) {
-                        self.fail("unknown", "AddObject acknowledged but WLAN is absent");
+                        self.fail(ItemOutcome::Unknown, "AddObject acknowledged but WLAN is absent");
                         return true;
                     }
                     if self.reused {
                         if before == self.existing {
                             self.registry.pending = None;
                             self.registry.pending_instance = None;
-                            self.fail("blocked","firmware reused existing WLAN instance; requested slot cannot be allocated with this contract");
+                            self.fail(ItemOutcome::Blocked,"firmware reused existing WLAN instance; requested slot cannot be allocated with this contract");
                         } else {
-                            self.fail("unknown","AddObject returned existing instance but inventory changed; inspect before retry");
+                            self.fail(ItemOutcome::Unknown,"AddObject returned existing instance but inventory changed; inspect before retry");
                         }
                         return true;
                     }
@@ -478,7 +478,7 @@ impl Reconciler {
                     self.existing = inventory(&v);
                     let n = self.current.unwrap();
                     if self.existing.contains(&n) {
-                        self.fail("unknown", "DeleteObject acknowledged but WLAN still exists");
+                        self.fail(ItemOutcome::Unknown, "DeleteObject acknowledged but WLAN still exists");
                         return true;
                     }
                     self.registry.owned.remove(&n);
@@ -495,7 +495,7 @@ impl Reconciler {
                         .find(|p| p["name"] == name)
                         .and_then(|p| p["value"].as_str());
                     let Some(value) = disabled else {
-                        self.fail("failed", "missing WLAN Enable readback");
+                        self.fail(ItemOutcome::Failed, "missing WLAN Enable readback");
                         return true;
                     };
                     if matches!(value, "0" | "false") {
@@ -505,14 +505,14 @@ impl Reconciler {
                         self.registry.pending_instance = None;
                     } else if self.stage == WifiPhase::VerifyingDisable {
                         self.fail(
-                            "unknown",
+                            ItemOutcome::Unknown,
                             "disable accepted/unknown but Enable still true; no replay",
                         );
                         return true;
                     } else if !apply {
                         self.results.insert(self.current.unwrap().to_string(),json!({"state":"drift","reason":"unconfigured WLAN enabled; apply will disable"}));
                     } else {
-                        self.registry.pending = Some("disabling".into());
+                        self.registry.pending = Some(WifiPendingAction::Disabling);
                         self.registry.pending_instance = self.current;
                         self.queue(
                             d,
@@ -544,7 +544,7 @@ impl Reconciler {
                     self.prepared = true;
                 } else if n > 8 || self.additions >= 8 {
                     self.fail(
-                        "blocked",
+                        ItemOutcome::Blocked,
                         "cannot allocate requested instance within verified adapter slots 1..8",
                     );
                     return true;
@@ -552,7 +552,7 @@ impl Reconciler {
                     // Only use actual returned slots. Some firmware reuses an existing
                     // slot; verification above blocks that contract instead of looping.
                     self.additions += 1;
-                    self.registry.pending = Some("adding".into());
+                    self.registry.pending = Some(WifiPendingAction::Adding);
                     self.registry.pending_instance = None;
                     self.queue(d, "AddObject", json!({"object":ROOT}), WifiPhase::Adding);
                     return false;
@@ -566,7 +566,7 @@ impl Reconciler {
         }
         if !verified && apply {
             self.fail(
-                "blocked",
+                ItemOutcome::Blocked,
                 "desired SSIDs must verify before removing other WLANs",
             );
             return true;
@@ -577,7 +577,7 @@ impl Reconciler {
                     && !self.preserve.contains(n)
                     && (self.policy != "preserve" || self.registry.owned.contains(n))
                     && !self.results.get(&n.to_string()).is_some_and(|r| {
-                        matches!(r["state"].as_str(), Some("deleted" | "disabled" | "drift"))
+                        matches!(ItemOutcome::from_result(r), Some(ItemOutcome::Deleted | ItemOutcome::Disabled | ItemOutcome::Drift))
                     })
             });
             if let Some(n) = candidate {
@@ -595,7 +595,7 @@ impl Reconciler {
                     self.results.insert(n.to_string(),json!({"state":"drift","reason":"unconfigured WLAN present; apply will delete"}));
                     return false;
                 }
-                self.registry.pending = Some("deleting".into());
+                self.registry.pending = Some(WifiPendingAction::Deleting);
                 self.registry.pending_instance = Some(n);
                 self.queue(
                     d,
