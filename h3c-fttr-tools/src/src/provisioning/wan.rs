@@ -1,5 +1,5 @@
 //! Discover every connection, protect fallback services, then reconcile in order.
-use super::model::{ItemKind, WanPhase};
+use super::model::{ItemKind, ItemOutcome, TaskOutcome, WanPhase, WanOwnershipState};
 use super::policy::protected;
 use super::{acs, config::Device};
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ pub fn parent_protected(id: &str, parent: u32) -> bool {
 pub struct Owned {
     pub parent: u32,
     pub connection: u32,
-    pub state: String,
+    pub state: WanOwnershipState,
     pub service_list: String,
     #[serde(default = "ip_kind")]
     pub kind: String,
@@ -117,7 +117,7 @@ impl Reconciler {
         if self.save(&device.cwmp_id).is_err() {
             self.fail(
                 device,
-                "blocked",
+                ItemOutcome::Blocked,
                 "cannot persist WAN ownership before lifecycle RPC",
             );
             return;
@@ -127,10 +127,10 @@ impl Reconciler {
             self.task = Some(id);
             self.stage = stage;
         } else {
-            self.fail(device, "failed", "cannot queue WAN lifecycle RPC");
+            self.fail(device, ItemOutcome::Failed, "cannot queue WAN lifecycle RPC");
         }
     }
-    fn fail(&mut self, device: &Device, state: &str, reason: &str) {
+    fn fail(&mut self, device: &Device, state: ItemOutcome, reason: &str) {
         let id = self
             .current
             .as_ref()
@@ -199,22 +199,22 @@ impl Reconciler {
         }
         if let Some(task) = self.task {
             let v = acs(json!({"op":"task","id":task}));
-            let state = v["state"].as_str().unwrap_or("missing");
-            if matches!(state, "queued" | "sent") {
+            let state = TaskOutcome::from_task(&v);
+            if matches!(state, TaskOutcome::Queued | TaskOutcome::Sent) {
                 return false;
             }
-            if !matches!(state, "completed" | "accepted_pending_apply") {
-                if matches!(state, "fault" | "expired") && self.stage == WanPhase::AddingParent {
+            if !matches!(state, TaskOutcome::Completed | TaskOutcome::AcceptedPendingApply) {
+                if matches!(state, TaskOutcome::Fault | TaskOutcome::Expired) && self.stage == WanPhase::AddingParent {
                     if let Some((id, _)) = &self.current {
                         self.owned.remove(id);
                     }
                 }
                 self.fail(
                     device,
-                    if state == "unknown" {
-                        "unknown"
+                    if state == TaskOutcome::Unknown {
+                        ItemOutcome::Unknown
                     } else {
-                        "failed"
+                        ItemOutcome::Failed
                     },
                     "WAN lifecycle RPC failed/unknown; no write replay",
                 );
@@ -242,7 +242,7 @@ impl Reconciler {
             {
                 self.fail(
                     device,
-                    "blocked",
+                    ItemOutcome::Blocked,
                     "incomplete WAN RPC inventory/readback; no mutation allowed",
                 );
                 self.actions.clear();
@@ -300,7 +300,7 @@ impl Reconciler {
                     else {
                         self.fail(
                             device,
-                            "blocked",
+                            ItemOutcome::Blocked,
                             "incomplete WAN classification; no changes allowed",
                         );
                         self.actions.clear();
@@ -314,7 +314,7 @@ impl Reconciler {
                         let Some(priority) =
                             value(contract.priority.name).and_then(|v| v.parse::<u32>().ok())
                         else {
-                            self.fail(device, "blocked", "incomplete parent priority readback");
+                            self.fail(device, ItemOutcome::Blocked, "incomplete parent priority readback");
                             self.stage = WanPhase::Done;
                             return true;
                         };
@@ -329,11 +329,10 @@ impl Reconciler {
                                 parameters.map(Vec::as_slice).unwrap_or_default(),
                                 &format!("{ROOT}{parent}.{kind}.{connection}."),
                             ) {
-                            "protected"
+                            WanOwnershipState::Protected
                         } else {
-                            "ready"
-                        }
-                        .into(),
+                            WanOwnershipState::Ready
+                        },
                         service_list: service.into(),
                         baseline: None,
                     });
@@ -346,14 +345,14 @@ impl Reconciler {
                         .and_then(|n| n.parse::<u32>().ok())
                         .filter(|n| *n > 0);
                     let Some(n) = n else {
-                        self.fail(device, "unknown", "AddObject did not return an instance");
+                        self.fail(device, ItemOutcome::Unknown, "AddObject did not return an instance");
                         return false;
                     };
                     self.parents.insert(n);
                     let id = self.current.as_ref().unwrap().0.clone();
                     let o = self.owned.get_mut(&id).unwrap();
                     o.parent = n;
-                    o.state = "discovering_child".into();
+                    o.state = WanOwnershipState::DiscoveringChild;
                     self.queue(
                         device,
                         "GetParameterNames",
@@ -383,7 +382,7 @@ impl Reconciler {
                     if children.len() > 1 {
                         self.fail(
                             device,
-                            "blocked",
+                            ItemOutcome::Blocked,
                             "new WAN unexpectedly has multiple IP connections",
                         );
                         return false;
@@ -391,12 +390,12 @@ impl Reconciler {
                     if let Some(n) = children.first() {
                         let o = self.owned.get_mut(&id).unwrap();
                         o.connection = *n;
-                        o.state = "ready".into();
+                        o.state = WanOwnershipState::Ready;
                         self.remap(device, &id);
                         self.current = None;
                         self.stage = WanPhase::Next;
                     } else {
-                        self.owned.get_mut(&id).unwrap().state = "adding_child".into();
+                        self.owned.get_mut(&id).unwrap().state = WanOwnershipState::AddingChild;
                         self.queue(
                             device,
                             "AddObject",
@@ -414,7 +413,7 @@ impl Reconciler {
                     let Some(n) = n else {
                         self.fail(
                             device,
-                            "unknown",
+                            ItemOutcome::Unknown,
                             "child AddObject did not return an instance",
                         );
                         return false;
@@ -422,7 +421,7 @@ impl Reconciler {
                     let id = self.current.as_ref().unwrap().0.clone();
                     let o = self.owned.get_mut(&id).unwrap();
                     o.connection = n;
-                    o.state = "ready".into();
+                    o.state = WanOwnershipState::Ready;
                     self.remap(device, &id);
                     self.current = None;
                     self.stage = WanPhase::Next;
@@ -436,7 +435,7 @@ impl Reconciler {
                     {
                         self.fail(
                             device,
-                            "blocked",
+                            ItemOutcome::Blocked,
                             "cross-contract discovery protects this management/fallback WAN",
                         );
                         return false;
@@ -456,7 +455,7 @@ impl Reconciler {
                     let Some(observed) = observed else {
                         self.fail(
                             device,
-                            "blocked",
+                            ItemOutcome::Blocked,
                             "missing service list before deleting owned WAN",
                         );
                         return false;
@@ -467,14 +466,14 @@ impl Reconciler {
                     ) || super::contains_service_token(observed, "TR069")
                         || (!observed.is_empty() && observed != o.service_list)
                     {
-                        self.fail(device,"blocked","owned WAN now carries protected or reassigned service; manual review required");
+                        self.fail(device,ItemOutcome::Blocked,"owned WAN now carries protected or reassigned service; manual review required");
                         return false;
                     }
                     let enabled = contract.tagged(|name| value(name).map(str::to_owned));
                     if enabled.is_none_or(|enabled| protected(observed, enabled)) {
                         self.fail(
                             device,
-                            "blocked",
+                            ItemOutcome::Blocked,
                             "WAN became a protected fallback before deletion",
                         );
                         return false;
@@ -482,13 +481,13 @@ impl Reconciler {
                     if !apply {
                         self.fail(
                             device,
-                            "drift",
+                            ItemOutcome::Drift,
                             "owned WAN removed from desired configuration; apply will delete",
                         );
                         return false;
                     }
                     let object = format!("{ROOT}{}.{}.{}.", o.parent, o.kind, o.connection);
-                    self.owned.get_mut(&id).unwrap().state = "deleting".into();
+                    self.owned.get_mut(&id).unwrap().state = WanOwnershipState::Deleting;
                     self.queue(
                         device,
                         "DeleteObject",
@@ -519,7 +518,7 @@ impl Reconciler {
                     if exists {
                         self.fail(
                             device,
-                            "unknown",
+                            ItemOutcome::Unknown,
                             "DeleteObject accepted but WAN still exists; no replay",
                         );
                         return false;
@@ -529,7 +528,7 @@ impl Reconciler {
                         let o = self.owned.get_mut(&id).unwrap();
                         o.kind = ip_kind();
                         o.connection = 0;
-                        o.state = "adding_child".into();
+                        o.state = WanOwnershipState::AddingChild;
                         o.baseline = Some(baseline);
                         let prefix = format!("{ROOT}{}.WANIPConnection.", o.parent);
                         self.queue(
@@ -605,7 +604,7 @@ impl Reconciler {
                     {
                         self.fail(
                             device,
-                            "unknown",
+                            ItemOutcome::Unknown,
                             "parent deletion not confirmed; no replay",
                         );
                         return false;
@@ -633,10 +632,10 @@ impl Reconciler {
                     self.current = None;
                     return false;
                 };
-                if o.state != "ready" {
+                if o.state != WanOwnershipState::Ready {
                     self.fail(
                         device,
-                        "unknown",
+                        ItemOutcome::Unknown,
                         "owned WAN lifecycle interrupted; automatic deletion withheld",
                     );
                     return false;
@@ -657,7 +656,7 @@ impl Reconciler {
                 return false;
             }
             if let Some(o) = self.owned.get(&id) {
-                if o.state == "ready" {
+                if o.state == WanOwnershipState::Ready {
                     self.remap(device, &id);
                     self.current = None;
                     return false;
@@ -674,20 +673,20 @@ impl Reconciler {
                 }
                 self.fail(
                     device,
-                    "unknown",
+                    ItemOutcome::Unknown,
                     "WAN creation interrupted; automatic AddObject replay withheld",
                 );
                 return false;
             }
             let item = device.items.iter().find(|i| i.id == id).unwrap();
             if item.service_type == "tr069" {
-                self.fail(device, "blocked", "TR069 is owned by OMCI");
+                self.fail(device, ItemOutcome::Blocked, "TR069 is owned by OMCI");
                 return false;
             }
             if !apply {
                 self.fail(
                     device,
-                    "drift",
+                    ItemOutcome::Drift,
                     "WAN missing; apply will allocate parent and IP connection",
                 );
                 return false;
@@ -703,7 +702,7 @@ impl Reconciler {
                 Owned {
                     parent: 0,
                     connection: 0,
-                    state: "adding_parent".into(),
+                    state: WanOwnershipState::AddingParent,
                     service_list,
                     kind: ip_kind(),
                     baseline: Some(self.parents.clone()),
@@ -730,7 +729,7 @@ impl Reconciler {
                 parent: *parent,
                 connection: *child,
                 kind: kind.clone(),
-                state: "protected".into(),
+                state: WanOwnershipState::Protected,
                 service_list: String::new(),
                 baseline: None,
             });
@@ -749,7 +748,7 @@ impl Reconciler {
         let editable: Vec<_> = self
             .discovered
             .iter()
-            .filter(|o| o.state != "protected")
+            .filter(|o| o.state != WanOwnershipState::Protected)
             .cloned()
             .collect();
         if self.final_started {
@@ -794,7 +793,7 @@ impl Reconciler {
                 self.results.insert(id.clone(),json!({"state":"blocked","reason":"untagged INTERNET is reserved for the fallback network"}));
                 continue;
             }
-            if let Some(old) = previous.get(id).filter(|o| o.state != "ready") {
+            if let Some(old) = previous.get(id).filter(|o| o.state != WanOwnershipState::Ready) {
                 let mut old = old.clone();
                 if old.parent == 0 {
                     let candidates: Vec<_> = old
@@ -951,7 +950,7 @@ impl Reconciler {
             .filter_map(|id| self.owned.get(id).cloned())
             .collect();
         if rows.len() != ids.len()
-            || rows.iter().any(|o| o.state != "ready")
+            || rows.iter().any(|o| o.state != WanOwnershipState::Ready)
             || ids.iter().any(|id| self.results.contains_key(id))
         {
             return;
@@ -1000,7 +999,7 @@ impl Reconciler {
             let protected_parents: BTreeSet<_> = self
                 .discovered
                 .iter()
-                .filter(|o| o.state == "protected")
+                .filter(|o| o.state == WanOwnershipState::Protected)
                 .map(|o| o.parent)
                 .chain(self.protected_roots.iter().filter_map(|root| {
                     root.strip_prefix(ROOT)?
@@ -1144,7 +1143,7 @@ mod tests {
             Owned {
                 parent: 7,
                 connection: 3,
-                state: "ready".into(),
+                state: WanOwnershipState::Ready,
                 service_list: "INTERNET".into(),
                 kind: ip_kind(),
                 baseline: None,
@@ -1213,7 +1212,7 @@ mod tests {
         r.discovery.push_back((1, 1, ip_kind()));
         responses(vec![]);
         r.discover_next(&mut d);
-        assert_eq!(r.discovered[0].state, "protected");
+        assert_eq!(r.discovered[0].state, WanOwnershipState::Protected);
         assert!(r.actions.is_empty());
         assert!(r.owned.is_empty());
     }
@@ -1235,7 +1234,7 @@ mod tests {
             r.tick(&mut d, true, false, true);
         }
         assert!(r.owned.is_empty());
-        assert_eq!(r.discovered[0].state, "protected");
+        assert_eq!(r.discovered[0].state, WanOwnershipState::Protected);
         RPC.with(|r| assert!(r.borrow().1.iter().all(|v| v["method"] != "DeleteObject")));
     }
     #[test]
@@ -1254,7 +1253,7 @@ mod tests {
             Owned {
                 parent: 7,
                 connection: 3,
-                state: "protected".into(),
+                state: WanOwnershipState::Protected,
                 service_list: "INTERNET".into(),
                 kind: ip_kind(),
                 baseline: None,
@@ -1262,7 +1261,7 @@ mod tests {
             Owned {
                 parent: 12,
                 connection: 2,
-                state: "ready".into(),
+                state: WanOwnershipState::Ready,
                 service_list: "OTHER".into(),
                 kind: ip_kind(),
                 baseline: None,
@@ -1285,7 +1284,7 @@ mod tests {
             Owned {
                 parent: 4,
                 connection: 1,
-                state: "protected".into(),
+                state: WanOwnershipState::Protected,
                 service_list: "TR069".into(),
                 kind: ip_kind(),
                 baseline: None,
@@ -1293,7 +1292,7 @@ mod tests {
             Owned {
                 parent: 4,
                 connection: 2,
-                state: "ready".into(),
+                state: WanOwnershipState::Ready,
                 service_list: "OTHER".into(),
                 kind: ip_kind(),
                 baseline: None,
@@ -1310,7 +1309,7 @@ mod tests {
         let old = Owned {
             parent: 0,
             connection: 0,
-            state: "adding_parent".into(),
+            state: WanOwnershipState::AddingParent,
             service_list: "INTERNET".into(),
             kind: ip_kind(),
             baseline: Some([1, 2, 3].into()),
@@ -1334,7 +1333,7 @@ mod tests {
         r.discovered = vec![Owned {
             parent: 4,
             connection: 2,
-            state: "ready".into(),
+            state: WanOwnershipState::Ready,
             service_list: "OTHER".into(),
             kind: ip_kind(),
             baseline: None,
@@ -1384,7 +1383,7 @@ mod tests {
         let o = Owned {
             parent: 4,
             connection: 2,
-            state: "ready".into(),
+            state: WanOwnershipState::Ready,
             service_list: "OTHER".into(),
             kind: ip_kind(),
             baseline: None,
@@ -1410,7 +1409,7 @@ mod tests {
         let row = Owned {
             parent: 7,
             connection: 3,
-            state: "ready".into(),
+            state: WanOwnershipState::Ready,
             service_list: "OTHER".into(),
             kind: ip_kind(),
             baseline: None,
