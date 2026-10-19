@@ -126,7 +126,13 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 "dhcp_limit",
                 "dhcp_leasetime",
             ],
-            "provisioning" => &["enabled", "mode", "trigger", "interval", "freshness"],
+            "provisioning" => &[
+                "enabled",
+                "mode",
+                "trigger",
+                "interval_minutes",
+                "freshness",
+            ],
             "acs" => &[
                 "enabled",
                 "port",

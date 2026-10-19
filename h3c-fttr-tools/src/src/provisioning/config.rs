@@ -171,10 +171,10 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
         if !matches!(s.get("method"), "" | "diff") {
             return Err("only diff synchronization is supported".into());
         }
-        cfg.interval = if s.get("interval").is_empty() {
+        cfg.interval = if s.get("interval_minutes").is_empty() {
             0
         } else {
-            s.number("interval", 86400)? as u64
+            u64::from(s.number("interval_minutes", 1440)?) * 60
         };
         cfg.freshness = if s.get("freshness").is_empty() {
             180
