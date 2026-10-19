@@ -28,6 +28,7 @@ Commands:\n  \
   mib ONU_ID [--summary|--json] [--tables]  Read structured OMCI inventory (default: JSON)\n  \
   fpga-read <addr>     Directly read 32-bit FPGA hardware register\n  \
   fpga-write <a> <v>   Directly write 32-bit FPGA hardware register\n  \
+  bosa-diag [--json]   Read calibrated UX3326 optical diagnostics (Temp, Vcc, Bias, TX)\n  \
   bosa-read <addr>     Directly read 8-bit BOSA UX3326 optical register\n  \
   bosa-write <a> <v>   Directly write 8-bit BOSA UX3326 optical register\n  \
   discover             Trigger PLOAM discovery sequence on optical link\n  \
@@ -190,7 +191,15 @@ fn print_status_table(status: &FttrSystemStatus) {
 
     println!("[*] Optical Transceiver (BOSA {}):", opt.model);
     println!("    Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G  |  CDR: {}", opt.wavelength_tx_nm, opt.wavelength_rx_nm, cdr_str);
-    println!("    Optical diagnostics: unavailable (no verified hardware readings)");
+    if opt.temperature_celsius.is_some() || opt.vcc_voltage.is_some() || opt.laser_bias_current_ma.is_some() || opt.tx_power_dbm.is_some() {
+        let temp_str = opt.temperature_celsius.map(|t| format!("{t:.2} °C")).unwrap_or_else(|| "N/A".into());
+        let volt_str = opt.vcc_voltage.map(|v| format!("{v:.2} V")).unwrap_or_else(|| "N/A".into());
+        let bias_str = opt.laser_bias_current_ma.map(|b| format!("{b:.2} mA")).unwrap_or_else(|| "N/A".into());
+        let tx_str = opt.tx_power_dbm.map(|p| format!("{p:.2} dBm")).unwrap_or_else(|| "N/A".into());
+        println!("    Diagnostics: Temp: {}  |  Voltage: {}  |  Bias: {}  |  TX: {}", temp_str, volt_str, bias_str, tx_str);
+    } else {
+        println!("    Optical diagnostics: unavailable (no verified hardware readings)");
+    }
     println!();
 
     // 2. Switch Ports Table
@@ -363,6 +372,28 @@ fn main() {
                 Err(e) => {
                     eprintln!("[-] Error writing FPGA reg 0x{:08X}: {e}", addr);
                     exit(1);
+                }
+            }
+        }
+        "bosa-diag" => {
+            let is_json = args.iter().any(|a| a == "--json" || a == "-j");
+            let opt = bosa::get_optical_status();
+            if is_json {
+                println!("{}", serde_json::to_string_pretty(&opt).unwrap_or_default());
+            } else {
+                let cdr_str = match opt.cdr_locked { Some(true) => "LOCKED (OK)", Some(false) => "UNLOCKED", None => "UNKNOWN" };
+                println!("[*] Optical Transceiver (BOSA {}):", opt.model);
+                println!("    Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G  |  CDR: {}", opt.wavelength_tx_nm, opt.wavelength_rx_nm, cdr_str);
+                let temp_str = opt.temperature_celsius.map(|t| format!("{t:.2} °C")).unwrap_or_else(|| "N/A".into());
+                let volt_str = opt.vcc_voltage.map(|v| format!("{v:.2} V")).unwrap_or_else(|| "N/A".into());
+                let bias_str = opt.laser_bias_current_ma.map(|b| format!("{b:.2} mA")).unwrap_or_else(|| "N/A".into());
+                let tx_str = opt.tx_power_dbm.map(|p| format!("{p:.2} dBm")).unwrap_or_else(|| "N/A".into());
+                println!("    Diagnostics: Temp: {}  |  Voltage: {}  |  Bias: {}  |  TX: {}", temp_str, volt_str, bias_str, tx_str);
+                println!("    Measurements Evidence:");
+                for (name, ev) in &opt.measurements {
+                    let raw_val = ev.raw.as_deref().unwrap_or("-");
+                    let reason_val = ev.reason.as_deref().unwrap_or("none");
+                    println!("      - {name:<22}: raw={raw_val:<6} unit={:<5} source=\"{}\" (reason: {reason_val})", ev.unit, ev.source);
                 }
             }
         }

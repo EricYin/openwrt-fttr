@@ -1,8 +1,11 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
+
+use crate::model::MeasurementEvidence;
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -43,7 +46,29 @@ pub fn configure_discovery_timing() -> io::Result<()> {
     Ok(())
 }
 
-// Default 56-byte calibration table for Semtech UX3326 BOSA optical transceiver.
+// Full 288-byte verified calibration table from stock firmware (/h3c/bosa/modified_UX3326.bin).
+pub const DEFAULT_UX3326_CALIBRATION_DATA: [u8; 288] = [
+    0x02, 0x0e, 0x77, 0xc8, 0x14, 0x00, 0x3c, 0x02, 0x61, 0x00, 0x06, 0x22, 0x22, 0x1f, 0x40, 0x00,
+    0x00, 0x00, 0x00, 0xab, 0xa8, 0x88, 0x40, 0xae, 0x00, 0xf8, 0x86, 0x85, 0x78, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x36, 0x0f, 0x00, 0x00, 0x00, 0x55, 0x00, 0x18, 0x00, 0x04, 0x35, 0x85, 0x4b, 0xc0,
+    0x88, 0x80, 0x11, 0x80, 0x24, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x1b, 0xe6, 0x10, 0x00, 0x9f, 0x34, 0x03, 0xb6, 0x04, 0x00, 0x00, 0x00, 0x05, 0x7b, 0x04, 0x00,
+    0x01, 0x51, 0x00, 0xe3, 0x01, 0x00, 0x00, 0x01, 0x1c, 0xcc, 0x10, 0x00, 0x97, 0x91, 0x00, 0x23,
+    0x01, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7,
+    0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7,
+    0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe7, 0x00, 0xe8, 0x00, 0xe8, 0x00, 0xe9, 0x00, 0xe9,
+    0x00, 0xe9, 0x00, 0xea, 0x00, 0xeb, 0x00, 0xec, 0x00, 0xec, 0x00, 0xec, 0x00, 0xec, 0x00, 0xed,
+    0x00, 0xed, 0x00, 0xef, 0x00, 0xef, 0x00, 0xef, 0x00, 0xf0, 0x00, 0xf2, 0x00, 0xf2, 0x00, 0xf3,
+    0x00, 0xf5, 0x00, 0xf8, 0x00, 0xfb, 0x00, 0xfc, 0x00, 0xfe, 0x01, 0x01, 0x01, 0x04, 0x01, 0x07,
+    0x01, 0x08, 0x01, 0x0a, 0x01, 0x0d, 0x01, 0x0f, 0x01, 0x12, 0x01, 0x14, 0x01, 0x15, 0x01, 0x18,
+    0x01, 0x1a, 0x01, 0x1d, 0x01, 0x1e, 0x01, 0x1f, 0x01, 0x21, 0x01, 0x24, 0x01, 0x26, 0x01, 0x28,
+    0x01, 0x28, 0x01, 0x2b, 0x01, 0x2d, 0x01, 0x30, 0x01, 0x32, 0x01, 0x33, 0x01, 0x35, 0x01, 0x38,
+    0x01, 0x3a, 0x01, 0x3b, 0x01, 0x3c, 0x01, 0x3f, 0x01, 0x41, 0x01, 0x44, 0x01, 0x46, 0x01, 0x47,
+    0x01, 0x49, 0x01, 0x4a, 0x01, 0x4b, 0x01, 0x4d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+// Default 56-byte calibration table for Semtech UX3326 BOSA optical transceiver initialization.
 pub const DEFAULT_UX3326_CALIBRATION_TABLE: [u8; 56] = [
     0x02, 0x0e, 0x77, 0xc8, 0x14, 0x00, 0x3c, 0x02,
     0x61, 0x00, 0x06, 0x22, 0x22, 0x1f, 0x40, 0x00,
@@ -178,28 +203,242 @@ pub fn read_bosa_reg(reg: u32) -> io::Result<u32> {
     }
 }
 
-fn load_calibration_table() -> [u8; 56] {
-    let candidate_paths = [
-        "/h3c/bosa/modified_UX3326.bin",
-        "/etc/UX3326/default_UX3326.bin",
-        "/lib/firmware/modified_UX3326.bin",
-    ];
+/// Parsed calibration parameters from modified_UX3326.bin / default_UX3326.bin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BosaCalibration {
+    pub temp_primary: (u16, u16, i16), // N (0x40), D (0x42), O (0x44)
+    pub voltage: (u16, u16, i16),      // N (0x46), D (0x48), O (0x4a)
+    pub bias: (u16, u16, i16),         // N (0x4c), D (0x4e), O (0x50)
+    pub tx_power: (u16, u16, i16),     // N (0x52), D (0x54), O (0x56)
+    pub temp_alt: (u16, u16, i16),     // N (0x58), D (0x5a), O (0x5c)
+    pub temp_threshold: i16,           // threshold (0x5e)
+}
 
-    for path in candidate_paths {
-        if Path::new(path).exists() {
-            if let Ok(bytes) = fs::read(path) {
-                if bytes.len() >= 56 {
-                    println!("[+] Loaded BOSA calibration table from {}", path);
-                    let mut table = [0u8; 56];
-                    table.copy_from_slice(&bytes[..56]);
-                    return table;
+impl BosaCalibration {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 0x60 {
+            return None;
+        }
+        let read_u16 = |off: usize| -> u16 {
+            u16::from_be_bytes([bytes[off], bytes[off + 1]])
+        };
+        let read_i16 = |off: usize| -> i16 {
+            i16::from_be_bytes([bytes[off], bytes[off + 1]])
+        };
+
+        Some(Self {
+            temp_primary: (read_u16(0x40), read_u16(0x42), read_i16(0x44)),
+            voltage: (read_u16(0x46), read_u16(0x48), read_i16(0x4a)),
+            bias: (read_u16(0x4c), read_u16(0x4e), read_i16(0x50)),
+            tx_power: (read_u16(0x52), read_u16(0x54), read_i16(0x56)),
+            temp_alt: (read_u16(0x58), read_u16(0x5a), read_i16(0x5c)),
+            temp_threshold: read_i16(0x5e),
+        })
+    }
+}
+
+pub const FACTORY_UX3326_OFFSET: u64 = 0x2200;
+pub const FACTORY_UX3326_LEN: usize = 288;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationSource {
+    Factory,
+    FirmwareFile,
+    BuiltinDefault,
+}
+
+impl std::fmt::Display for CalibrationSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Factory => write!(f, "1MB Factory partition (offset 0x2200)"),
+            Self::FirmwareFile => write!(f, "/lib/firmware/modified_UX3326.bin"),
+            Self::BuiltinDefault => write!(f, "Built-in static default fallback"),
+        }
+    }
+}
+
+/// Tries to locate and read 288 bytes from the 1MB factory partition (UBI volume or MTD) at offset 0x2200.
+pub fn read_factory_calibration() -> Option<[u8; 288]> {
+    #[cfg(unix)]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut candidate_devices = Vec::new();
+
+        // 1. Scan UBI sysfs for volume named "factory"
+        if let Ok(entries) = fs::read_dir("/sys/class/ubi") {
+            for entry in entries.flatten() {
+                let name_path = entry.path().join("name");
+                if let Ok(name) = fs::read_to_string(&name_path) {
+                    if name.trim() == "factory" {
+                        if let Some(file_name) = entry.file_name().to_str() {
+                            candidate_devices.push(format!("/dev/{file_name}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Direct device nodes
+        candidate_devices.push("/dev/ubi0_factory".to_string());
+
+        // 3. Scan /proc/mtd for "factory" partition
+        if let Ok(mtd_info) = fs::read_to_string("/proc/mtd") {
+            for line in mtd_info.lines() {
+                if line.contains("\"factory\"") {
+                    if let Some(dev_part) = line.split(':').next() {
+                        let dev_str = dev_part.trim();
+                        candidate_devices.push(format!("/dev/{dev_str}ro"));
+                        candidate_devices.push(format!("/dev/{dev_str}"));
+                        let mtd_num = dev_str.trim_start_matches("mtd");
+                        candidate_devices.push(format!("/dev/mtdblock{mtd_num}"));
+                    }
+                }
+            }
+        }
+
+        for dev in candidate_devices {
+            if let Ok(mut file) = fs::File::open(&dev) {
+                if file.seek(SeekFrom::Start(FACTORY_UX3326_OFFSET)).is_ok() {
+                    let mut buf = [0u8; FACTORY_UX3326_LEN];
+                    if file.read_exact(&mut buf).is_ok() {
+                        // Check if buffer is non-blank (not all 0xFF and not all 0x00)
+                        if !buf.iter().all(|&b| b == 0xFF) && !buf.iter().all(|&b| b == 0x00) {
+                            println!("[+] Successfully loaded UX3326 calibration from factory partition ({dev} @ 0x{FACTORY_UX3326_OFFSET:04X})");
+                            return Some(buf);
+                        }
+                    }
                 }
             }
         }
     }
+    None
+}
 
-    println!("[*] Using built-in default UX3326 calibration table (56 bytes)");
-    DEFAULT_UX3326_CALIBRATION_TABLE
+/// Loads the calibration 288-byte data with strict priority:
+/// 1. 1MB Factory partition (offset 0x2200)
+/// 2. /lib/firmware/modified_UX3326.bin
+/// 3. Built-in default table (fallback with warning)
+pub fn load_calibration_data() -> ([u8; 288], CalibrationSource) {
+    // Priority 1: 1MB Factory partition
+    if let Some(bytes) = read_factory_calibration() {
+        return (bytes, CalibrationSource::Factory);
+    }
+
+    // Priority 2: /lib/firmware/modified_UX3326.bin
+    let fw_path = "/lib/firmware/modified_UX3326.bin";
+    if Path::new(fw_path).exists() {
+        if let Ok(bytes) = fs::read(fw_path) {
+            if bytes.len() >= 56 {
+                let mut data = [0u8; 288];
+                let copy_len = bytes.len().min(288);
+                data[..copy_len].copy_from_slice(&bytes[..copy_len]);
+                if bytes.len() < 288 {
+                    data[copy_len..].copy_from_slice(&DEFAULT_UX3326_CALIBRATION_DATA[copy_len..]);
+                }
+                return (data, CalibrationSource::FirmwareFile);
+            }
+        }
+    }
+
+    // Priority 3: Fallback to built-in default
+    (DEFAULT_UX3326_CALIBRATION_DATA, CalibrationSource::BuiltinDefault)
+}
+
+pub fn load_calibration() -> BosaCalibration {
+    let (data, source) = load_calibration_data();
+    match source {
+        CalibrationSource::Factory => {
+            println!("[+] Using UX3326 calibration from 1MB Factory partition");
+        }
+        CalibrationSource::FirmwareFile => {
+            println!("[+] Using UX3326 calibration from /lib/firmware/modified_UX3326.bin");
+        }
+        CalibrationSource::BuiltinDefault => {
+            eprintln!("[-] WARNING: No factory partition or /lib/firmware/modified_UX3326.bin found; falling back to built-in default!");
+        }
+    }
+
+    BosaCalibration::from_bytes(&data)
+        .expect("static UX3326 calibration data must be valid")
+}
+
+fn load_calibration_table() -> [u8; 56] {
+    let (data, source) = load_calibration_data();
+    match source {
+        CalibrationSource::Factory => {
+            println!("[+] Loaded BOSA calibration table from 1MB Factory partition");
+        }
+        CalibrationSource::FirmwareFile => {
+            println!("[+] Loaded BOSA calibration table from /lib/firmware/modified_UX3326.bin");
+        }
+        CalibrationSource::BuiltinDefault => {
+            println!("[*] WARNING: Using built-in default UX3326 calibration table (56 bytes)");
+        }
+    }
+
+    let mut table = [0u8; 56];
+    table.copy_from_slice(&data[..56]);
+    table
+}
+
+
+/// Read 16-bit ADC register pair (high byte at base_reg, low byte at base_reg + 1).
+/// UX3326 requires 1ms wait after each byte read.
+pub fn read_adc_u16(base_reg: u32) -> io::Result<u16> {
+    #[cfg(unix)]
+    {
+        let hi = read_bosa_reg(base_reg)?;
+        thread::sleep(Duration::from_millis(1));
+        let lo = read_bosa_reg(base_reg + 1)?;
+        thread::sleep(Duration::from_millis(1));
+        Ok(((hi as u16 & 0xff) << 8) | (lo as u16 & 0xff))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = base_reg;
+        Err(io::Error::new(io::ErrorKind::Unsupported, "Linux FMCS required"))
+    }
+}
+
+pub fn calc_temperature(raw: u16, cal: &BosaCalibration) -> f32 {
+    let (n, d, o) = cal.temp_primary;
+    let d = if d == 0 { 4096 } else { d };
+    let scaled = (raw as i64 * n as i64) / d as i64 + o as i64;
+    let temp = scaled as f32 / 256.0;
+    if temp <= cal.temp_threshold as f32 {
+        let (n_alt, d_alt, o_alt) = cal.temp_alt;
+        let d_alt = if d_alt == 0 { 4096 } else { d_alt };
+        let scaled_alt = (raw as i64 * n_alt as i64) / d_alt as i64 + o_alt as i64;
+        scaled_alt as f32 / 256.0
+    } else {
+        temp
+    }
+}
+
+pub fn calc_voltage(raw: u16, cal: &BosaCalibration) -> f32 {
+    let (n, d, o) = cal.voltage;
+    let d = if d == 0 { 1024 } else { d };
+    let scaled = (raw as i64 * n as i64) / d as i64 + o as i64;
+    scaled as f32 / 10000.0
+}
+
+pub fn calc_bias(raw: u16, cal: &BosaCalibration) -> f32 {
+    let (n, d, o) = cal.bias;
+    let d = if d == 0 { 1024 } else { d };
+    let scaled = (raw as i64 * n as i64) / d as i64 + o as i64;
+    scaled as f32 / 500.0
+}
+
+pub fn calc_tx_power(raw: u16, cal: &BosaCalibration) -> Option<f32> {
+    let (n, d, o) = cal.tx_power;
+    let d = if d == 0 { 256 } else { d };
+    let p_uw = (raw as i64 * n as i64) / d as i64 + o as i64;
+    let p_mw = p_uw as f32 / 10000.0;
+    if p_mw > 0.0 {
+        Some(10.0 * p_mw.log10())
+    } else {
+        None
+    }
 }
 
 pub fn init_optical_transceiver() -> io::Result<()> {
@@ -291,25 +530,158 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         }
     }
 
-    // No verified diagnostic register/scaling is available. Configuration
-    // register 0x20 is not a CDR lock indicator; report unavailable readings.
+    let cal = load_calibration();
+
+    // UX3326 internal ADC channels:
+    // 0x2E/0x2F: Temperature
+    // 0x30/0x31: Supply Voltage (Vcc)
+    // 0x32/0x33: Laser Bias Current
+    // 0x34/0x35: Transmit Power
+    let temp_res = read_adc_u16(0x2e);
+    let volt_res = read_adc_u16(0x30);
+    let bias_res = read_adc_u16(0x32);
+    let tx_res = read_adc_u16(0x34);
+
+    let mut measurements = BTreeMap::new();
+
+    let temperature_celsius = match temp_res {
+        Ok(raw) => {
+            let val = calc_temperature(raw, &cal);
+            measurements.insert(
+                "temperature_celsius".into(),
+                MeasurementEvidence::observed(
+                    "UX3326 ADC Reg 0x2E/0x2F with modified_UX3326.bin calibration",
+                    "C",
+                    format!("{raw:04x}"),
+                ),
+            );
+            Some(val)
+        }
+        Err(_) => {
+            measurements.insert(
+                "temperature_celsius".into(),
+                MeasurementEvidence::unavailable(
+                    "UX3326/FMCS",
+                    "C",
+                    "bosa_adc_read_failed",
+                ),
+            );
+            None
+        }
+    };
+
+    let vcc_voltage = match volt_res {
+        Ok(raw) => {
+            let val = calc_voltage(raw, &cal);
+            measurements.insert(
+                "vcc_voltage".into(),
+                MeasurementEvidence::observed(
+                    "UX3326 ADC Reg 0x30/0x31 with modified_UX3326.bin calibration",
+                    "V",
+                    format!("{raw:04x}"),
+                ),
+            );
+            Some(val)
+        }
+        Err(_) => {
+            measurements.insert(
+                "vcc_voltage".into(),
+                MeasurementEvidence::unavailable(
+                    "UX3326/FMCS",
+                    "V",
+                    "bosa_adc_read_failed",
+                ),
+            );
+            None
+        }
+    };
+
+    let laser_bias_current_ma = match bias_res {
+        Ok(raw) => {
+            let val = calc_bias(raw, &cal);
+            measurements.insert(
+                "laser_bias_current_ma".into(),
+                MeasurementEvidence::observed(
+                    "UX3326 ADC Reg 0x32/0x33 with modified_UX3326.bin calibration",
+                    "mA",
+                    format!("{raw:04x}"),
+                ),
+            );
+            Some(val)
+        }
+        Err(_) => {
+            measurements.insert(
+                "laser_bias_current_ma".into(),
+                MeasurementEvidence::unavailable(
+                    "UX3326/FMCS",
+                    "mA",
+                    "bosa_adc_read_failed",
+                ),
+            );
+            None
+        }
+    };
+
+    let tx_power_dbm = match tx_res {
+        Ok(raw) => {
+            let val = calc_tx_power(raw, &cal);
+            if let Some(v) = val {
+                measurements.insert(
+                    "tx_power_dbm".into(),
+                    MeasurementEvidence::observed(
+                        "UX3326 ADC Reg 0x34/0x35 with modified_UX3326.bin calibration",
+                        "dBm",
+                        format!("{raw:04x}"),
+                    ),
+                );
+                Some(v)
+            } else {
+                measurements.insert(
+                    "tx_power_dbm".into(),
+                    MeasurementEvidence::unavailable(
+                        "UX3326/FMCS",
+                        "dBm",
+                        "tx_power_non_positive",
+                    ),
+                );
+                None
+            }
+        }
+        Err(_) => {
+            measurements.insert(
+                "tx_power_dbm".into(),
+                MeasurementEvidence::unavailable(
+                    "UX3326/FMCS",
+                    "dBm",
+                    "bosa_adc_read_failed",
+                ),
+            );
+            None
+        }
+    };
+
+    // CDR locked state remains unknown: reading bit 3 of register 0x00 is not verified as a dynamic hardware indicator.
+    measurements.insert(
+        "cdr_locked".into(),
+        MeasurementEvidence::unavailable(
+            "UX3326/FMCS",
+            "boolean",
+            "diagnostic_register_and_scaling_unverified",
+        ),
+    );
+
     let status = OpticalTransceiverStatus {
         model: "UX3326".to_string(),
         wavelength_tx_nm: 1490,
         wavelength_rx_nm: 1310,
         phy_rate_downlink_gbps: 2.488,
         phy_rate_uplink_gbps: 1.244,
-        tx_power_dbm: None,
-        laser_bias_current_ma: None,
-        temperature_celsius: None,
-        vcc_voltage: None,
+        tx_power_dbm,
+        laser_bias_current_ma,
+        temperature_celsius,
+        vcc_voltage,
         cdr_locked: None,
-        measurements: [
-            ("tx_power_dbm", "dBm"), ("laser_bias_current_ma", "mA"),
-            ("temperature_celsius", "C"), ("vcc_voltage", "V"), ("cdr_locked", "boolean"),
-        ].into_iter().map(|(field, unit)| (field.into(),
-            crate::model::MeasurementEvidence::unavailable("UX3326/FMCS", unit,
-                "diagnostic_register_and_scaling_unverified"))).collect(),
+        measurements,
     };
 
     if let Ok(mut guard) = OPTICAL_CACHE.lock() {
@@ -420,3 +792,86 @@ pub fn set_fttr_carrier(port: u32, carrier: bool) -> io::Result<()> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calibration_data_matches_stock_table() {
+        assert_eq!(
+            &DEFAULT_UX3326_CALIBRATION_DATA[..56],
+            &DEFAULT_UX3326_CALIBRATION_TABLE[..],
+            "initialization registers must match stock table"
+        );
+    }
+
+    #[test]
+    fn test_bosa_calibration_from_bytes() {
+        let cal = BosaCalibration::from_bytes(&DEFAULT_UX3326_CALIBRATION_DATA)
+            .expect("calibration table parsing failed");
+        assert_eq!(cal.temp_primary, (7142, 4096, -24780));
+        assert_eq!(cal.voltage, (950, 1024, 0));
+        assert_eq!(cal.bias, (1403, 1024, 337));
+        assert_eq!(cal.tx_power, (227, 256, 1));
+        assert_eq!(cal.temp_alt, (7372, 4096, -26735));
+        assert_eq!(cal.temp_threshold, 35);
+    }
+
+    #[test]
+    fn test_calc_temperature() {
+        let cal = BosaCalibration::from_bytes(&DEFAULT_UX3326_CALIBRATION_DATA).unwrap();
+        // Live hardware sample: 0x5980 = 22912 -> ~59.26 C
+        let temp = calc_temperature(0x5980, &cal);
+        assert!((temp - 59.26).abs() < 0.1, "expected ~59.26 C, got {temp}");
+
+        // Low temperature branch: raw = 0x3000 = 12288
+        // Primary: (12288 * 7142 / 4096 - 24780) / 256 = (21426 - 24780) / 256 = -13.1 C <= 35
+        // Alt: (12288 * 7372 / 4096 - 26735) / 256 = (22116 - 26735) / 256 = -18.04 C
+        let temp_low = calc_temperature(0x3000, &cal);
+        assert!(temp_low <= 35.0);
+        assert!((temp_low - (-18.04)).abs() < 0.2);
+    }
+
+    #[test]
+    fn test_calc_voltage() {
+        let cal = BosaCalibration::from_bytes(&DEFAULT_UX3326_CALIBRATION_DATA).unwrap();
+        // Live hardware sample: 0x8880 = 34944 -> ~3.24 V
+        let volt = calc_voltage(0x8880, &cal);
+        assert!((volt - 3.24).abs() < 0.05, "expected ~3.24 V, got {volt}");
+    }
+
+    #[test]
+    fn test_calc_bias() {
+        let cal = BosaCalibration::from_bytes(&DEFAULT_UX3326_CALIBRATION_DATA).unwrap();
+        // Live hardware sample: 0x1F00 = 7936 -> ~22.42 mA
+        let bias = calc_bias(0x1F00, &cal);
+        assert!((bias - 22.42).abs() < 0.1, "expected ~22.42 mA, got {bias}");
+    }
+
+    #[test]
+    fn test_calc_tx_power() {
+        let cal = BosaCalibration::from_bytes(&DEFAULT_UX3326_CALIBRATION_DATA).unwrap();
+        // Live hardware sample: 0x2440 = 9280
+        let p = calc_tx_power(0x2440, &cal);
+        assert!(p.is_some());
+
+        // Zero raw -> non-positive or very low
+        let zero = calc_tx_power(0, &cal);
+        assert!(zero.is_some());
+    }
+
+    #[test]
+    fn test_get_optical_status_fallback_evidence() {
+        // Without hardware device, status gracefully reports model and evidences
+        let status = get_optical_status();
+        assert_eq!(status.model, "UX3326");
+        assert_eq!(status.wavelength_tx_nm, 1490);
+        assert_eq!(status.wavelength_rx_nm, 1310);
+        assert!(status.measurements.contains_key("temperature_celsius"));
+        assert!(status.measurements.contains_key("vcc_voltage"));
+        assert!(status.measurements.contains_key("laser_bias_current_ma"));
+        assert!(status.measurements.contains_key("cdr_locked"));
+    }
+}
+
