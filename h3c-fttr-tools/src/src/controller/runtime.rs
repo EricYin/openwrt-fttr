@@ -7,28 +7,38 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::activation::{clear_offline_hardware, RangingSession};
 use crate::bosa;
 use crate::fpga;
 use crate::ipc::{self, SubDevice};
 use crate::model::{FttrSystemStatus, IpcResponse};
 use crate::mqtt::MqttClient;
 use crate::pon_engine::ploam::OnuState;
-use crate::pon_engine::PonEngine;
-use super::activation::{RangingSession, clear_offline_hardware};
 use crate::pon_engine::ploam::PloamFrame;
+use crate::pon_engine::PonEngine;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod ipc_server;
 
 fn setup_bridge() {
     println!("[*] Initializing downstream FTTR DSA switch ports (fttr1 ~ fttr16)...");
-    let _ = Command::new("ip").args(["link", "set", "molt_ploam", "up"]).status();
-    let _ = Command::new("ip").args(["link", "set", "molt_omci", "up"]).status();
-    let _ = Command::new("ip").args(["link", "set", "fttr0", "up"]).status();
+    let _ = Command::new("ip")
+        .args(["link", "set", "molt_ploam", "up"])
+        .status();
+    let _ = Command::new("ip")
+        .args(["link", "set", "molt_omci", "up"])
+        .status();
+    let _ = Command::new("ip")
+        .args(["link", "set", "fttr0", "up"])
+        .status();
     for id in 1..=16 {
         let ifname = format!("fttr{id}");
-        let _ = Command::new("ip").args(["link", "set", &ifname, "up"]).status();
-        let _ = Command::new("ip").args(["link", "set", &ifname, "master", "br-lan"]).status();
+        let _ = Command::new("ip")
+            .args(["link", "set", &ifname, "up"])
+            .status();
+        let _ = Command::new("ip")
+            .args(["link", "set", &ifname, "master", "br-lan"])
+            .status();
     }
     println!("[+] Downstream FTTR switch ports fttr1 ~ fttr16 bridged to br-lan.");
 }
@@ -48,69 +58,114 @@ fn ipc_handler(
     services: super::service::States,
 ) -> impl Fn(std::os::unix::net::UnixStream, &str) + Send + Sync + 'static {
     move |mut stream, line| {
-                if let Some(request) = line.strip_prefix("HL202 ") {
-                    #[cfg(feature = "device-hl202")]
-                    super::hl202::start(stream, request.to_string(), pon_engine.clone(), services.clone());
-                    #[cfg(not(feature = "device-hl202"))]
-                    { let _ = request; let _ = stream.write_all(b"{\"schema_version\":1,\"error\":{\"code\":\"adapter_disabled\",\"message\":\"HL202 adapter not compiled\"}}"); }
-                } else if let Some(request) = line.strip_prefix("MIB ") {
-                    let request = request.to_string();
-                        let result = serde_json::from_str::<super::inventory::MibCommand>(&request)
-                            .map_err(std::io::Error::other)
-                            .and_then(|command| super::inventory::control(command.onu_id, command.tables, &services));
-                        let response = match result {
-                            Ok(report) => serde_json::to_value(report).expect("serializable MIB report"),
-                            Err(error) => serde_json::json!({"schema_version": 1, "error": {"code": format!("{:?}", error.kind()), "message": error.to_string()}}),
-                        };
-                        let _ = stream.write_all(response.to_string().as_bytes());
-                } else if let Some(request) = line.strip_prefix("PROVISIONING ") {
-                    let _ = stream.write_all(crate::provisioning::control(request).as_bytes());
-                } else if let Some(_request) = line.strip_prefix("ACS ") {
-                    #[cfg(feature = "acs")]
-                    let response = crate::acs::control(_request);
-                    #[cfg(not(feature = "acs"))]
-                    let response = "{\"error\":\"ACS adapter not compiled (enable Cargo feature acs)\"}".to_string();
-                    let _ = stream.write_all(response.as_bytes());
-                } else if line == "STATUS" {
-                    let provisioning = crate::provisioning::snapshot();
-                    let devs = devices.lock().unwrap();
-                    let engine = pon_engine.lock().unwrap();
-                    let sys_status = super::status::snapshot(&engine, &services, (&devs, provisioning));
-
-                    #[derive(serde::Serialize)]
-                    struct Status<'a> {
-                        #[serde(flatten)]
-                        system: &'a FttrSystemStatus,
-                        ipc: ipc_server::metrics::Snapshot,
-                    }
-                    let status = Status { system: &sys_status, ipc: ipc_server::metrics::snapshot() };
-                    if let Ok(json_str) = serde_json::to_string_pretty(&status) {
-                        let _ = stream.write_all(json_str.as_bytes());
-                        let _ = stream.write_all(b"\n");
-                    }
-                } else if line == "DISCOVER" {
-                    let engine = pon_engine.lock().unwrap();
-                    let frames = engine.build_discovery_frames();
-                    for frame in &frames {
-                        let bytes = frame.to_bytes();
-                        let _ = bosa::send_ploam_msg(&bytes);
-                    }
-                    let _ = stream.write_all(
-                        format!("{{\"status\": \"discovery_dispatched\", \"frames\": {}}}\n", frames.len()).as_bytes(),
-                    );
-                } else if line.starts_with("REGISTER ") {
-                    let _ = stream.write_all(IpcResponse::err("manual registration disabled; serial must arrive over upstream PLOAM").to_json_line().as_bytes());
-                } else if line.starts_with("PROVISION ") {
-                    let _ = stream.write_all(IpcResponse::err("provisioning is managed automatically by the per-ONU controller; use STATUS for readback").to_json_line().as_bytes());
-                } else if line.starts_with("AUTH ") {
-                    let _ = stream.write_all(IpcResponse::err("authentication is owned by the verified vendor profile; use fttrctl mib ONU_ID --summary to inspect capabilities").to_json_line().as_bytes());
-                } else if line == "SYNC_WIFI" {
-                    let _ = stream.write_all(IpcResponse::err("automatic Wi-Fi synchronization has no verified payload contract").to_json_line().as_bytes());
-                } else if line.starts_with("EXEC ") {
-                    let _ = stream.write_all(crate::devices::legacy_command(line).to_json_line().as_bytes());
-                } else if line.starts_with("SUBDEV ") {
-                    let _ = stream.write_all(crate::devices::legacy_command(line).to_json_line().as_bytes());
+        if let Some(request) = line.strip_prefix("HL202 ") {
+            #[cfg(feature = "device-hl202")]
+            super::hl202::start(
+                stream,
+                request.to_string(),
+                pon_engine.clone(),
+                services.clone(),
+            );
+            #[cfg(not(feature = "device-hl202"))]
+            {
+                let _ = request;
+                let _ = stream.write_all(b"{\"schema_version\":1,\"error\":{\"code\":\"adapter_disabled\",\"message\":\"HL202 adapter not compiled\"}}");
+            }
+        } else if let Some(request) = line.strip_prefix("MIB ") {
+            let request = request.to_string();
+            let result = serde_json::from_str::<super::inventory::MibCommand>(&request)
+                .map_err(std::io::Error::other)
+                .and_then(|command| {
+                    let progress = command
+                        .progress_id
+                        .as_deref()
+                        .map(super::inventory::MibProgressReporter::new)
+                        .transpose()?;
+                    super::inventory::control(command.onu_id, command.tables, progress, &services)
+                });
+            let response = match result {
+                Ok(report) => serde_json::to_value(report).expect("serializable MIB report"),
+                Err(error) => {
+                    serde_json::json!({"schema_version": 1, "error": {"code": format!("{:?}", error.kind()), "message": error.to_string()}})
                 }
+            };
+            let _ = stream.write_all(response.to_string().as_bytes());
+        } else if let Some(request) = line.strip_prefix("PROVISIONING ") {
+            let _ = stream.write_all(crate::provisioning::control(request).as_bytes());
+        } else if let Some(_request) = line.strip_prefix("ACS ") {
+            #[cfg(feature = "acs")]
+            let response = crate::acs::control(_request);
+            #[cfg(not(feature = "acs"))]
+            let response =
+                "{\"error\":\"ACS adapter not compiled (enable Cargo feature acs)\"}".to_string();
+            let _ = stream.write_all(response.as_bytes());
+        } else if line == "STATUS" {
+            let provisioning = crate::provisioning::snapshot();
+            let devs = devices.lock().unwrap();
+            let engine = pon_engine.lock().unwrap();
+            let sys_status = super::status::snapshot(&engine, &services, (&devs, provisioning));
+
+            #[derive(serde::Serialize)]
+            struct Status<'a> {
+                #[serde(flatten)]
+                system: &'a FttrSystemStatus,
+                ipc: ipc_server::metrics::Snapshot,
+            }
+            let status = Status {
+                system: &sys_status,
+                ipc: ipc_server::metrics::snapshot(),
+            };
+            if let Ok(json_str) = serde_json::to_string_pretty(&status) {
+                let _ = stream.write_all(json_str.as_bytes());
+                let _ = stream.write_all(b"\n");
+            }
+        } else if line == "DISCOVER" {
+            let engine = pon_engine.lock().unwrap();
+            let frames = engine.build_discovery_frames();
+            for frame in &frames {
+                let bytes = frame.to_bytes();
+                let _ = bosa::send_ploam_msg(&bytes);
+            }
+            let _ = stream.write_all(
+                format!(
+                    "{{\"status\": \"discovery_dispatched\", \"frames\": {}}}\n",
+                    frames.len()
+                )
+                .as_bytes(),
+            );
+        } else if line.starts_with("REGISTER ") {
+            let _ = stream.write_all(
+                IpcResponse::err(
+                    "manual registration disabled; serial must arrive over upstream PLOAM",
+                )
+                .to_json_line()
+                .as_bytes(),
+            );
+        } else if line.starts_with("PROVISION ") {
+            let _ = stream.write_all(IpcResponse::err("provisioning is managed automatically by the per-ONU controller; use STATUS for readback").to_json_line().as_bytes());
+        } else if line.starts_with("AUTH ") {
+            let _ = stream.write_all(IpcResponse::err("authentication is owned by the verified vendor profile; use fttrctl mib ONU_ID --summary to inspect capabilities").to_json_line().as_bytes());
+        } else if line == "SYNC_WIFI" {
+            let _ = stream.write_all(
+                IpcResponse::err(
+                    "automatic Wi-Fi synchronization has no verified payload contract",
+                )
+                .to_json_line()
+                .as_bytes(),
+            );
+        } else if line.starts_with("EXEC ") {
+            let _ = stream.write_all(
+                crate::devices::legacy_command(line)
+                    .to_json_line()
+                    .as_bytes(),
+            );
+        } else if line.starts_with("SUBDEV ") {
+            let _ = stream.write_all(
+                crate::devices::legacy_command(line)
+                    .to_json_line()
+                    .as_bytes(),
+            );
+        }
     }
 }
 
@@ -154,7 +209,9 @@ pub fn run() {
             loop {
                 match fpga::get_fpga_status() {
                     fpga::FpgaStatus::Ready => {
-                        println!("[+] FPGA bitstream is ready! Proceeding with BOSA & switch init.");
+                        println!(
+                            "[+] FPGA bitstream is ready! Proceeding with BOSA & switch init."
+                        );
                         break;
                     }
                     fpga::FpgaStatus::Failed => {
@@ -236,7 +293,9 @@ pub fn run() {
                                 last_grant = Instant::now() - Duration::from_secs(1);
                                 println!("[+] ONU {id} offline cleanup complete; fresh discovery enabled");
                             }
-                            Err(e) => eprintln!("[-] ONU {id} offline cleanup failed; discovery held: {e}"),
+                            Err(e) => eprintln!(
+                                "[-] ONU {id} offline cleanup failed; discovery held: {e}"
+                            ),
                         }
                     }
                 }
@@ -260,44 +319,77 @@ pub fn run() {
                 if last_grant.elapsed() >= Duration::from_millis(50) {
                     // One directed activation window, then round-robin live ONU
                     // windows. With no activation the first window discovers new SNs.
-                    let target = super::activation::grant_target(ranging.as_ref().map(|session| session.id), online.keys().copied(), grant_cycle);
+                    let target = super::activation::grant_target(
+                        ranging.as_ref().map(|session| session.id),
+                        online.keys().copied(),
+                        grant_cycle,
+                    );
                     grant_cycle = grant_cycle.wrapping_add(1);
-                    let grant = (u32::from(target) << 18) | if target == 0xfe { bosa::SERIAL_NUMBER_GRANT } else { (202 * 19440 + 124) / 125 };
+                    let grant = (u32::from(target) << 18)
+                        | if target == 0xfe {
+                            bosa::SERIAL_NUMBER_GRANT
+                        } else {
+                            (202 * 19440 + 124) / 125
+                        };
                     match bosa::write_fpga_reg(bosa::FPGA_SERIAL_NUMBER_GRANT, grant) {
                         Ok(()) => grants += 1,
                         Err(e) => {
                             grant_errors += 1;
-                            if grant_errors == 1 || last_report.elapsed() >= Duration::from_secs(30) {
+                            if grant_errors == 1 || last_report.elapsed() >= Duration::from_secs(30)
+                            {
                                 eprintln!("[-] Discovery grant failed: {e}");
                             }
                         }
                     }
                     last_grant = Instant::now();
-                    if let Some(RangingSession { id, ranged: Some(at), allocated, confirmed, .. }) = ranging.as_mut() {
+                    if let Some(RangingSession {
+                        id,
+                        ranged: Some(at),
+                        allocated,
+                        confirmed,
+                        ..
+                    }) = ranging.as_mut()
+                    {
                         if !*allocated && at.elapsed() >= Duration::from_millis(40) {
                             let frame = PloamFrame::assign_alloc_id(*id);
                             let mut sent = true;
                             for _ in 0..3 {
-                                if bosa::send_ploam_msg(&frame.to_bytes()).is_ok() { tx_ok += 1; }
-                                else { tx_errors += 1; sent = false; }
+                                if bosa::send_ploam_msg(&frame.to_bytes()).is_ok() {
+                                    tx_ok += 1;
+                                } else {
+                                    tx_errors += 1;
+                                    sent = false;
+                                }
                             }
                             *allocated = sent;
                         }
                         if *allocated && !*confirmed {
-                        // Request_Password is downstream ID 09 (upstream
-                        // Password is 02). Keep strict validation on replies.
-                         let frame = PloamFrame::new(*id, 9, [0; 10]);
-                        if bosa::send_ploam_msg(&frame.to_bytes()).is_ok() { tx_ok += 1; }
-                        else { tx_errors += 1; }
+                            // Request_Password is downstream ID 09 (upstream
+                            // Password is 02). Keep strict validation on replies.
+                            let frame = PloamFrame::new(*id, 9, [0; 10]);
+                            if bosa::send_ploam_msg(&frame.to_bytes()).is_ok() {
+                                tx_ok += 1;
+                            } else {
+                                tx_errors += 1;
+                            }
                         }
                     }
                 }
 
-                if let Some(RangingSession { id, armed, measured, ranged, .. }) = ranging.as_mut() {
+                if let Some(RangingSession {
+                    id,
+                    armed,
+                    measured,
+                    ranged,
+                    ..
+                }) = ranging.as_mut()
+                {
                     if ranged.is_none() {
                         if let Ok(events) = bosa::read_fpga_reg(0xb4) {
                             let mask = 1u32 << (16 + *id);
-                            if events & mask == 0 { *armed = true; }
+                            if events & mask == 0 {
+                                *armed = true;
+                            }
                             if *armed && events & mask != 0 {
                                 let address = 0x01010020 + 4 * u32::from(*id);
                                 if let Ok(bits) = bosa::read_fpga_reg(address) {
@@ -316,15 +408,23 @@ pub fn run() {
                     if !rx_data.is_empty() {
                         rx_frames += 1;
                         // Upstream 04 is No message, not a ranging/error frame.
-                        if rx_data.get(1) != Some(&4) || last_idle_sample.elapsed() >= Duration::from_secs(30) {
+                        if rx_data.get(1) != Some(&4)
+                            || last_idle_sample.elapsed() >= Duration::from_secs(30)
+                        {
                             println!("[*] Upstream PLOAM raw: {:02X?}", rx_data);
-                            if rx_data.get(1) == Some(&4) { last_idle_sample = Instant::now(); }
+                            if rx_data.get(1) == Some(&4) {
+                                last_idle_sample = Instant::now();
+                            }
                         }
                     }
                     if PloamFrame::from_bytes(&rx_data).is_some() {
                         rx_valid += 1;
-                        if let Some(session) = ranging.as_mut() { session.observe(&rx_data, Instant::now()); }
-                        if let Some(session) = online.get_mut(&rx_data[0]) { session.observe(&rx_data, Instant::now()); }
+                        if let Some(session) = ranging.as_mut() {
+                            session.observe(&rx_data, Instant::now());
+                        }
+                        if let Some(session) = online.get_mut(&rx_data[0]) {
+                            session.observe(&rx_data, Instant::now());
+                        }
                         let msg_id = rx_data[1];
                         if msg_id == 0x01 && rx_data[0] == 0xff && ranging.is_none() {
                             let mut vendor = [0u8; 4];
@@ -338,14 +438,23 @@ pub fn run() {
                             );
 
                             let mut engine = pon_engine_ploam.lock().unwrap();
-                            if engine.active_onus.len() >= 15 && !engine.active_onus.iter()
-                                .any(|onu| onu.vendor_id == vendor && onu.serial_number == sn) {
-                                eprintln!("[-] No free verified ONU slot; preserving existing identities");
+                            if engine.active_onus.len() >= 15
+                                && !engine
+                                    .active_onus
+                                    .iter()
+                                    .any(|onu| onu.vendor_id == vendor && onu.serial_number == sn)
+                            {
+                                eprintln!(
+                                    "[-] No free verified ONU slot; preserving existing identities"
+                                );
                                 continue;
                             }
                             let onu = engine.register_onu(vendor, sn);
                             let onu_id = onu.onu_id;
-                            if online.contains_key(&onu_id) || pending_cleanup.contains(&onu_id) { drop(engine); continue; }
+                            if online.contains_key(&onu_id) || pending_cleanup.contains(&onu_id) {
+                                drop(engine);
+                                continue;
+                            }
                             if onu_id > 15 {
                                 eprintln!("[-] ONU-ID {onu_id} has no verified FPGA ranging slot");
                                 drop(engine);
@@ -362,7 +471,9 @@ pub fn run() {
                                             assigned = false;
                                             tx_errors += 1;
                                             eprintln!("[-] Assign ONU-ID {onu_id} failed: {e}");
-                                        } else { tx_ok += 1; }
+                                        } else {
+                                            tx_ok += 1;
+                                        }
                                     }
                                 }
                             }
@@ -371,25 +482,52 @@ pub fn run() {
                                 serial[..4].copy_from_slice(&vendor);
                                 serial[4..].copy_from_slice(&sn);
                                 ranging = Some(RangingSession {
-                                    id: onu_id, serial, started: Instant::now(),
+                                    id: onu_id,
+                                    serial,
+                                    started: Instant::now(),
                                     armed: baseline.unwrap() & (1u32 << (16 + onu_id)) == 0,
-                                    matched: false, measured: None, ranged: None,
-                                    allocated: false, confirmed: false,
+                                    matched: false,
+                                    measured: None,
+                                    ranged: None,
+                                    allocated: false,
+                                    confirmed: false,
                                     last_valid_rx: Instant::now(),
                                 });
                                 last_grant = Instant::now() - Duration::from_secs(1);
                                 println!("[*] ONU {onu_id} assigned; requesting directed ranging");
                             }
-                        } else if let Some(RangingSession { id, serial, matched, ranged, allocated, confirmed, .. }) = ranging.as_mut() {
+                        } else if let Some(RangingSession {
+                            id,
+                            serial,
+                            matched,
+                            ranged,
+                            allocated,
+                            confirmed,
+                            ..
+                        }) = ranging.as_mut()
+                        {
                             if msg_id == 1 && rx_data[0] == *id && rx_data[2..10] == serial[..] {
                                 *matched = true;
                                 println!("[+] Ranging matched unicast serial for ONU {id}");
-                            } else if !*confirmed && rx_data[0] == *id && ranged.is_some()
-                                && (msg_id == 2 || (*allocated && msg_id == 9 && rx_data[2] == 0x0e
-                                    && rx_data[3..12] == PloamFrame::assign_alloc_id(*id).to_bytes()[..9])) {
+                            } else if !*confirmed
+                                && rx_data[0] == *id
+                                && ranged.is_some()
+                                && (msg_id == 2
+                                    || (*allocated
+                                        && msg_id == 9
+                                        && rx_data[2] == 0x0e
+                                        && rx_data[3..12]
+                                            == PloamFrame::assign_alloc_id(*id).to_bytes()[..9]))
+                            {
                                 *confirmed = true;
                                 println!("[+] ONU {id} CRC-valid post-ranging response msg=0x{msg_id:02X}: O5 protocol confirmed");
-                                if let Some(onu) = pon_engine_ploam.lock().unwrap().active_onus.iter_mut().find(|o| o.onu_id == *id) {
+                                if let Some(onu) = pon_engine_ploam
+                                    .lock()
+                                    .unwrap()
+                                    .active_onus
+                                    .iter_mut()
+                                    .find(|o| o.onu_id == *id)
+                                {
                                     onu.state = OnuState::O5Operation;
                                 }
                                 // Data-plane carrier still requires separate hardware evidence.
@@ -402,18 +540,35 @@ pub fn run() {
                     rx_errors += 1;
                 }
 
-                if let Some(RangingSession { id, matched, measured, ranged, .. }) = ranging.as_mut() {
+                if let Some(RangingSession {
+                    id,
+                    matched,
+                    measured,
+                    ranged,
+                    ..
+                }) = ranging.as_mut()
+                {
                     if *matched && ranged.is_none() {
                         if let Some(bits) = *measured {
                             let frame = PloamFrame::assign_delay(*id, bits);
                             let mut sent = true;
                             for _ in 0..3 {
-                                if bosa::send_ploam_msg(&frame.to_bytes()).is_ok() { tx_ok += 1; }
-                                else { tx_errors += 1; sent = false; }
+                                if bosa::send_ploam_msg(&frame.to_bytes()).is_ok() {
+                                    tx_ok += 1;
+                                } else {
+                                    tx_errors += 1;
+                                    sent = false;
+                                }
                             }
                             if sent {
                                 *ranged = Some(Instant::now());
-                                if let Some(onu) = pon_engine_ploam.lock().unwrap().active_onus.iter_mut().find(|o| o.onu_id == *id) {
+                                if let Some(onu) = pon_engine_ploam
+                                    .lock()
+                                    .unwrap()
+                                    .active_onus
+                                    .iter_mut()
+                                    .find(|o| o.onu_id == *id)
+                                {
                                     onu.eq_delay = Some(bits);
                                 }
                                 println!("[+] Ranging_Time sent: ONU={id}, measured EqD={bits} bits, copies=3; awaiting valid O5 response");
@@ -425,12 +580,23 @@ pub fn run() {
                 if ranging.as_ref().is_some_and(|session| session.confirmed) {
                     let session = ranging.take().unwrap();
                     let id = session.id;
-                    let vendor = pon_engine_ploam.lock().unwrap().active_onus.iter().find(|onu| onu.onu_id == id).unwrap().vendor_str();
+                    let vendor = pon_engine_ploam
+                        .lock()
+                        .unwrap()
+                        .active_onus
+                        .iter()
+                        .find(|onu| onu.onu_id == id)
+                        .unwrap()
+                        .vendor_str();
                     online.insert(id, session);
                     services.start(id, vendor);
                     println!("[+] ONU {id} moved to independent online set; discovery remains enabled (online={})", online.len());
                 }
-                let expired: Vec<_> = online.iter().filter(|(_, session)| session.expired(Instant::now())).map(|(&id, _)| id).collect();
+                let expired: Vec<_> = online
+                    .iter()
+                    .filter(|(_, session)| session.expired(Instant::now()))
+                    .map(|(&id, _)| id)
+                    .collect();
                 for id in expired {
                     online.remove(&id);
                     services.stop(id);
@@ -443,7 +609,9 @@ pub fn run() {
                     let id = session.id;
                     println!("[-] ONU {id} activation expired (confirmed={}); revoke O5/EqD and re-register", session.confirmed);
                     pon_engine_ploam.lock().unwrap().mark_offline(id);
-                    if let Err(e) = bosa::set_fttr_carrier(id as u32, false) { eprintln!("[-] ONU {id} carrier disable: {e}"); }
+                    if let Err(e) = bosa::set_fttr_carrier(id as u32, false) {
+                        eprintln!("[-] ONU {id} carrier disable: {e}");
+                    }
                     ranging = None;
                     pending_cleanup.insert(id);
                 }
@@ -491,7 +659,9 @@ pub fn run() {
             match client.read_packet() {
                 Ok(Some((topic, payload))) => {
                     if let Some(dev_id) = topic.strip_prefix(prefix) {
-                        let Some(mac) = crate::mqtt_identity::normalize_target(dev_id) else { continue; };
+                        let Some(mac) = crate::mqtt_identity::normalize_target(dev_id) else {
+                            continue;
+                        };
                         let dev_id = mac.as_str();
                         let payload_bytes = payload.len();
                         println!(
@@ -499,7 +669,6 @@ pub fn run() {
                             dev_id,
                             payload.len()
                         );
-
 
                         // Telemetry is observation only: it must not enable
                         // carrier or publish unverified configuration payloads.
@@ -510,14 +679,27 @@ pub fn run() {
                             .unwrap_or_default()
                             .as_secs();
 
-                        let protected = crate::mqtt_identity::shared().lock()
-                            .map(|state| state.snapshots(now).into_iter()
-                                .filter(|source| source.reason == "ready")
-                                .map(|source| source.mqtt_mac).collect()).unwrap_or_default();
+                        let protected = crate::mqtt_identity::shared()
+                            .lock()
+                            .map(|state| {
+                                state
+                                    .snapshots(now)
+                                    .into_iter()
+                                    .filter(|source| source.reason == "ready")
+                                    .map(|source| source.mqtt_mac)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         let mut devs = devices.lock().unwrap();
-                        crate::telemetry_sources::observe(&mut devs, SubDevice {
-                            id: dev_id.to_string(), last_seen: now, payload_bytes,
-                        }, &protected);
+                        crate::telemetry_sources::observe(
+                            &mut devs,
+                            SubDevice {
+                                id: dev_id.to_string(),
+                                last_seen: now,
+                                payload_bytes,
+                            },
+                            &protected,
+                        );
 
                         let _ = ipc::update_status_file(&devs);
                         drop(devs);
@@ -557,17 +739,26 @@ mod lifecycle_tests {
     #[test]
     fn only_valid_directed_rx_keeps_operation_alive_and_activation_is_bounded() {
         let start = Instant::now();
-        let mut session = RangingSession { id: 1, serial: [0;8], started: start, armed: true,
-            matched: true, measured: Some(248248), ranged: Some(start), allocated: true,
-            confirmed: true, last_valid_rx: start };
+        let mut session = RangingSession {
+            id: 1,
+            serial: [0; 8],
+            started: start,
+            armed: true,
+            matched: true,
+            measured: Some(248248),
+            ranged: Some(start),
+            allocated: true,
+            confirmed: true,
+            last_valid_rx: start,
+        };
         let later = start + Duration::from_secs(14);
-        session.observe(&PloamFrame::new(2, 4, [0;10]).to_bytes(), later);
-        let mut bad = PloamFrame::new(1, 4, [0;10]).to_bytes();
+        session.observe(&PloamFrame::new(2, 4, [0; 10]).to_bytes(), later);
+        let mut bad = PloamFrame::new(1, 4, [0; 10]).to_bytes();
         bad[3] ^= 1;
         session.observe(&bad, later);
         session.observe(&bad[..12], later);
         assert!(session.expired(start + Duration::from_secs(15)));
-        session.observe(&PloamFrame::new(1, 4, [0;10]).to_bytes(), later);
+        session.observe(&PloamFrame::new(1, 4, [0; 10]).to_bytes(), later);
         assert!(!session.expired(start + Duration::from_secs(15)));
         assert!(session.expired(later + Duration::from_secs(15)));
         // A measured but never confirmed activation must not remain O4 forever.

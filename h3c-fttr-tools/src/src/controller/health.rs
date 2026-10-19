@@ -268,14 +268,22 @@ fn run(
     let mut next_state = start;
     let optical_sn = if watch {
         let reply = crate::ipc::send_ipc_command("STATUS")?;
-        let status: crate::model::FttrSystemStatus = serde_json::from_str(&reply).map_err(io::Error::other)?;
-        status.sub_gateways.into_iter().find(|onu| onu.onu_id == id)
+        let status: crate::model::FttrSystemStatus =
+            serde_json::from_str(&reply).map_err(io::Error::other)?;
+        status
+            .sub_gateways
+            .into_iter()
+            .find(|onu| onu.onu_id == id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "ONU identity unavailable"))?
             .serial_number
-    } else { String::new() };
+    } else {
+        String::new()
+    };
     let management_version = crate::provisioning::management_version(&optical_sn);
     let mut watchdog_start = start;
-    let mut telemetry = cancellation.clone().filter(|_| watch)
+    let mut telemetry = cancellation
+        .clone()
+        .filter(|_| watch)
         .map(|token| super::telemetry::Collector::new(id, token));
     let mut next_telemetry = start;
     while !STOP.load(Ordering::Relaxed) && (watch || start.elapsed() < Duration::from_secs(seconds))
@@ -301,6 +309,7 @@ fn run(
                     request.tables,
                     cancellation.clone(),
                     request.deadline,
+                    request.progress,
                 )
             };
             let complete = result.is_ok();
@@ -430,7 +439,11 @@ fn run(
     Ok(())
 }
 
-fn resume_after_omci(last_get: &mut Option<Instant>, watchdog_start: &mut Instant, responsive: bool) -> Instant {
+fn resume_after_omci(
+    last_get: &mut Option<Instant>,
+    watchdog_start: &mut Instant,
+    responsive: bool,
+) -> Instant {
     let now = Instant::now();
     *last_get = responsive.then_some(now);
     *watchdog_start = now;

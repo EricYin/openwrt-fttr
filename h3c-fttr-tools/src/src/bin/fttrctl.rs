@@ -7,11 +7,11 @@ use h3c_fttr_tools::fpga;
 use h3c_fttr_tools::ipc;
 use h3c_fttr_tools::model::{FttrSystemStatus, IpcResponse};
 #[cfg(feature = "device-hl202")]
-#[path = "fttrctl/mqtt_command.rs"]
-mod mqtt_command;
-#[cfg(feature = "device-hl202")]
 #[path = "fttrctl/hl202.rs"]
 mod hl202;
+#[cfg(feature = "device-hl202")]
+#[path = "fttrctl/mqtt_command.rs"]
+mod mqtt_command;
 #[cfg(feature = "device-hl202")]
 use mqtt_command::handle as handle_mqtt_command;
 
@@ -155,20 +155,25 @@ fn handle_subdev_command(args: &[String]) {
     }
 }
 
-
 fn setup_bridge() {
     println!("[*] Configuring downstream FTTR DSA switch ports (fttr1 ~ fttr16) to br-lan...");
     for id in 1..=16 {
         let ifname = format!("fttr{id}");
-        let _ = Command::new("ip").args(["link", "set", &ifname, "up"]).status();
-        let _ = Command::new("ip").args(["link", "set", &ifname, "master", "br-lan"]).status();
+        let _ = Command::new("ip")
+            .args(["link", "set", &ifname, "up"])
+            .status();
+        let _ = Command::new("ip")
+            .args(["link", "set", &ifname, "master", "br-lan"])
+            .status();
     }
     println!("[+] Downstream switch ports fttr1 ~ fttr16 configured and bridged to br-lan.");
 }
 
 fn print_status_table(status: &FttrSystemStatus) {
     println!("==========================================================================================");
-    println!("                   H3C HM2004-DU FTTR Micro-OLT Subsystem Status                         ");
+    println!(
+        "                   H3C HM2004-DU FTTR Micro-OLT Subsystem Status                         "
+    );
     println!("==========================================================================================");
 
     // 0. FPGA Core Status
@@ -178,25 +183,63 @@ fn print_status_table(status: &FttrSystemStatus) {
         "failed" => "[FAILED / ERROR]",
         _ => "[UNKNOWN / NOT STARTED]",
     };
-    println!("[*] FPGA Micro-OLT Core:    {} (Status: {})", fpga_badge, status.fpga_status);
+    println!(
+        "[*] FPGA Micro-OLT Core:    {} (Status: {})",
+        fpga_badge, status.fpga_status
+    );
     if !status.provisioning.is_null() {
-        println!("[*] Provisioning: {} / {} / revision {}", status.provisioning["enabled"], status.provisioning["mode"].as_str().unwrap_or("unknown"), status.provisioning["revision"].as_str().unwrap_or("unknown"));
-        if let Some(error)=status.provisioning["error"].as_str() { println!("    Config error: {error}"); }
+        println!(
+            "[*] Provisioning: {} / {} / revision {}",
+            status.provisioning["enabled"],
+            status.provisioning["mode"].as_str().unwrap_or("unknown"),
+            status.provisioning["revision"]
+                .as_str()
+                .unwrap_or("unknown")
+        );
+        if let Some(error) = status.provisioning["error"].as_str() {
+            println!("    Config error: {error}");
+        }
     }
     println!();
 
     // 1. Optical Link
     let opt = &status.optical_transceiver;
-    let cdr_str = match opt.cdr_locked { Some(true) => "LOCKED (OK)", Some(false) => "UNLOCKED", None => "UNKNOWN" };
+    let cdr_str = match opt.cdr_locked {
+        Some(true) => "LOCKED (OK)",
+        Some(false) => "UNLOCKED",
+        None => "UNKNOWN",
+    };
 
     println!("[*] Optical Transceiver (BOSA {}):", opt.model);
-    println!("    Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G  |  CDR: {}", opt.wavelength_tx_nm, opt.wavelength_rx_nm, cdr_str);
-    if opt.temperature_celsius.is_some() || opt.vcc_voltage.is_some() || opt.laser_bias_current_ma.is_some() || opt.tx_power_dbm.is_some() {
-        let temp_str = opt.temperature_celsius.map(|t| format!("{t:.2} °C")).unwrap_or_else(|| "N/A".into());
-        let volt_str = opt.vcc_voltage.map(|v| format!("{v:.2} V")).unwrap_or_else(|| "N/A".into());
-        let bias_str = opt.laser_bias_current_ma.map(|b| format!("{b:.2} mA")).unwrap_or_else(|| "N/A".into());
-        let tx_str = opt.tx_power_dbm.map(|p| format!("{p:.2} dBm")).unwrap_or_else(|| "N/A".into());
-        println!("    Diagnostics: Temp: {}  |  Voltage: {}  |  Bias: {}  |  TX: {}", temp_str, volt_str, bias_str, tx_str);
+    println!(
+        "    Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G  |  CDR: {}",
+        opt.wavelength_tx_nm, opt.wavelength_rx_nm, cdr_str
+    );
+    if opt.temperature_celsius.is_some()
+        || opt.vcc_voltage.is_some()
+        || opt.laser_bias_current_ma.is_some()
+        || opt.tx_power_dbm.is_some()
+    {
+        let temp_str = opt
+            .temperature_celsius
+            .map(|t| format!("{t:.2} °C"))
+            .unwrap_or_else(|| "N/A".into());
+        let volt_str = opt
+            .vcc_voltage
+            .map(|v| format!("{v:.2} V"))
+            .unwrap_or_else(|| "N/A".into());
+        let bias_str = opt
+            .laser_bias_current_ma
+            .map(|b| format!("{b:.2} mA"))
+            .unwrap_or_else(|| "N/A".into());
+        let tx_str = opt
+            .tx_power_dbm
+            .map(|p| format!("{p:.2} dBm"))
+            .unwrap_or_else(|| "N/A".into());
+        println!(
+            "    Diagnostics: Temp: {}  |  Voltage: {}  |  Bias: {}  |  TX: {}",
+            temp_str, volt_str, bias_str, tx_str
+        );
     } else {
         println!("    Optical diagnostics: unavailable (no verified hardware readings)");
     }
@@ -206,8 +249,10 @@ fn print_status_table(status: &FttrSystemStatus) {
     println!("------------------------------------------------------------------------------------------");
     println!(" Downstream DSA Switch Ports (fttr1 ~ fttr16)");
     println!("----------------------------------------------------------------------------------------------------");
-    println!(" {:<6} {:<10} {:<10} {:<12} {:<8} {:<16} {:<24}",
-             "Port", "Interface", "Carrier", "Link Speed", "ONU-ID", "ONU Serial", "Link State");
+    println!(
+        " {:<6} {:<10} {:<10} {:<12} {:<8} {:<16} {:<24}",
+        "Port", "Interface", "Carrier", "Link Speed", "ONU-ID", "ONU Serial", "Link State"
+    );
     println!("----------------------------------------------------------------------------------------------------");
 
     let mut active_count = 0;
@@ -215,7 +260,10 @@ fn print_status_table(status: &FttrSystemStatus) {
     for p in &status.switch_ports {
         let is_up = p.carrier;
         let speed = "Unavailable";
-        let onu_id_str = p.onu_id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string());
+        let onu_id_str = p
+            .onu_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string());
         let onu_sn_str = p.onu_sn.as_deref().unwrap_or("-");
         let link_state = if !p.link_state.is_empty() {
             p.link_state.as_str()
@@ -231,12 +279,17 @@ fn print_status_table(status: &FttrSystemStatus) {
             in_prog_count += 1;
         }
 
-        println!(" {:<6} {:<10} {:<10} {:<12} {:<8} {:<16} {:<24}",
-                 p.port, p.interface, p.status, speed, onu_id_str, onu_sn_str, link_state);
+        println!(
+            " {:<6} {:<10} {:<10} {:<12} {:<8} {:<16} {:<24}",
+            p.port, p.interface, p.status, speed, onu_id_str, onu_sn_str, link_state
+        );
     }
     println!("----------------------------------------------------------------------------------------------------");
     if in_prog_count > 0 {
-        println!(" Downlink Ports: {} Carrier Up, {} Assigned Without Carrier / 16 Total", active_count, in_prog_count);
+        println!(
+            " Downlink Ports: {} Carrier Up, {} Assigned Without Carrier / 16 Total",
+            active_count, in_prog_count
+        );
     } else {
         println!(" Active Downlink Ports: {} / 16", active_count);
     }
@@ -248,43 +301,111 @@ fn print_status_table(status: &FttrSystemStatus) {
         println!(" Active Sub-Gateway Telemetry & Mesh Details");
         println!("------------------------------------------------------------------------------------------");
         for sg in &status.sub_gateways {
-            println!("[+] Sub-Gateway #{} [{}] - {} {}", sg.onu_id, sg.serial_number, sg.vendor, sg.model);
-            println!("    Switch Port:    fttr{} (VLAN Tag: {}, State: {:?})", sg.onu_id, sg.onu_id, sg.state);
+            println!(
+                "[+] Sub-Gateway #{} [{}] - {} {}",
+                sg.onu_id, sg.serial_number, sg.vendor, sg.model
+            );
+            println!(
+                "    Switch Port:    fttr{} (VLAN Tag: {}, State: {:?})",
+                sg.onu_id, sg.onu_id, sg.state
+            );
             println!("    Business:       {}", sg.business_status);
             if !sg.provisioning.is_null() {
-                println!("    CWMP:           {} | Sync: {} | Wi-Fi: {}", sg.management["state"].as_str().unwrap_or("unknown"), sg.provisioning["state"].as_str().unwrap_or("not_started"), sg.wifi_sync);
+                println!(
+                    "    CWMP:           {} | Sync: {} | Wi-Fi: {}",
+                    sg.management["state"].as_str().unwrap_or("unknown"),
+                    sg.provisioning["state"].as_str().unwrap_or("not_started"),
+                    sg.wifi_sync
+                );
                 for item in sg.services.iter().chain(sg.ssids.iter()) {
-                    println!("      {} [{}]: {} {}", item["id"].as_str().unwrap_or("?"), item["service_type"].as_str().unwrap_or("?"), item["state"].as_str().unwrap_or("?"), item["reason"].as_str().unwrap_or(""));
+                    println!(
+                        "      {} [{}]: {} {}",
+                        item["id"].as_str().unwrap_or("?"),
+                        item["service_type"].as_str().unwrap_or("?"),
+                        item["state"].as_str().unwrap_or("?"),
+                        item["reason"].as_str().unwrap_or("")
+                    );
                 }
             }
             println!("    Hardware:       {}", sg.hardware_version);
             println!("    Software:       {}", sg.firmware_version);
             if let Some(identity) = &sg.identity {
-                let age = sg.identity_age_seconds.map(|seconds| format!("{seconds}s ago")).unwrap_or_else(|| "unknown age".into());
-                println!("    Identity:       OMCI cache, {}, {age}", if sg.identity_current { "current registration" } else { "offline / cached" });
-                println!("    OMCC version:   {}", identity.omcc_version.map(|value| format!("0x{value:02x}")).unwrap_or_else(|| "Unavailable".into()));
-                for error in &identity.errors { println!("    Identity read:  {error}"); }
-            } else { println!("    Identity:       not collected yet"); }
-            if let Some(bits) = sg.equalization_delay_bits {
-                println!("    Measured EqD:   {bits} bits (Ranging_Time sent; see protocol state above)");
+                let age = sg
+                    .identity_age_seconds
+                    .map(|seconds| format!("{seconds}s ago"))
+                    .unwrap_or_else(|| "unknown age".into());
+                println!(
+                    "    Identity:       OMCI cache, {}, {age}",
+                    if sg.identity_current {
+                        "current registration"
+                    } else {
+                        "offline / cached"
+                    }
+                );
+                println!(
+                    "    OMCC version:   {}",
+                    identity
+                        .omcc_version
+                        .map(|value| format!("0x{value:02x}"))
+                        .unwrap_or_else(|| "Unavailable".into())
+                );
+                for error in &identity.errors {
+                    println!("    Identity read:  {error}");
+                }
+            } else {
+                println!("    Identity:       not collected yet");
             }
-            println!("    Fiber Distance: {} | Optical RX: {} | Optical TX: {}",
-                sg.fiber_distance_m.map(|v| format!("{v:.1} m")).unwrap_or_else(|| "Unavailable".into()),
-                sg.optical_rx_power_dbm.map(|v| format!("{v:.3} dBm")).unwrap_or_else(|| "Unavailable".into()),
-                sg.optical_tx_power_dbm.map(|v| format!("{v:.3} dBm")).unwrap_or_else(|| "Unavailable".into()));
-            println!("    Wi-Fi Mesh:     2.4G Ch {} / 5G Ch {} ({})",
-                sg.wifi_mesh.channel_2g.map(|v| v.to_string()).unwrap_or_else(|| "Unavailable".into()),
-                sg.wifi_mesh.channel_5g.map(|v| v.to_string()).unwrap_or_else(|| "Unavailable".into()),
-                sg.wifi_mesh.bandwidth_5g.as_deref().unwrap_or("Unavailable"));
+            if let Some(bits) = sg.equalization_delay_bits {
+                println!(
+                    "    Measured EqD:   {bits} bits (Ranging_Time sent; see protocol state above)"
+                );
+            }
+            println!(
+                "    Fiber Distance: {} | Optical RX: {} | Optical TX: {}",
+                sg.fiber_distance_m
+                    .map(|v| format!("{v:.1} m"))
+                    .unwrap_or_else(|| "Unavailable".into()),
+                sg.optical_rx_power_dbm
+                    .map(|v| format!("{v:.3} dBm"))
+                    .unwrap_or_else(|| "Unavailable".into()),
+                sg.optical_tx_power_dbm
+                    .map(|v| format!("{v:.3} dBm"))
+                    .unwrap_or_else(|| "Unavailable".into())
+            );
+            println!(
+                "    Wi-Fi Mesh:     2.4G Ch {} / 5G Ch {} ({})",
+                sg.wifi_mesh
+                    .channel_2g
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "Unavailable".into()),
+                sg.wifi_mesh
+                    .channel_5g
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "Unavailable".into()),
+                sg.wifi_mesh
+                    .bandwidth_5g
+                    .as_deref()
+                    .unwrap_or("Unavailable")
+            );
 
             if let Some(clients) = &sg.connected_clients {
                 println!("    Connected Mesh Clients:");
                 for c in clients {
-                    println!("      - {} | {} | {} ({} dBm) | {}/{} Mbps",
-                             c.mac, c.ip, c.band,
-                             c.rssi_dbm.map(|v| v.to_string()).unwrap_or_else(|| "Unavailable".into()),
-                             c.rx_rate_mbps.map(|v| v.to_string()).unwrap_or_else(|| "Unavailable".into()),
-                             c.tx_rate_mbps.map(|v| v.to_string()).unwrap_or_else(|| "Unavailable".into()));
+                    println!(
+                        "      - {} | {} | {} ({} dBm) | {}/{} Mbps",
+                        c.mac,
+                        c.ip,
+                        c.band,
+                        c.rssi_dbm
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "Unavailable".into()),
+                        c.rx_rate_mbps
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "Unavailable".into()),
+                        c.tx_rate_mbps
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "Unavailable".into())
+                    );
                 }
             }
             println!();
@@ -301,18 +422,20 @@ fn main() {
     }
 
     match args[1].as_str() {
-        "acs" => {
-            match h3c_fttr_tools::acs_cli::run(&args[2..]) {
-                Ok(code) => std::process::exit(code),
-                Err(e) => { eprintln!("ACS: {e}"); std::process::exit(1); }
+        "acs" => match h3c_fttr_tools::acs_cli::run(&args[2..]) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("ACS: {e}");
+                std::process::exit(1);
             }
-        }
-        "config" | "sync" => {
-            match h3c_fttr_tools::provisioning_cli::run(&args[1], &args[2..]) {
-                Ok(code) => exit(code),
-                Err(e) => { eprintln!("Provisioning: {e}"); exit(1); }
+        },
+        "config" | "sync" => match h3c_fttr_tools::provisioning_cli::run(&args[1], &args[2..]) {
+            Ok(code) => exit(code),
+            Err(e) => {
+                eprintln!("Provisioning: {e}");
+                exit(1);
             }
-        }
+        },
         "load-fpga" => {
             let path_str = args
                 .get(2)
@@ -368,7 +491,10 @@ fn main() {
                 args[3].parse::<u32>().unwrap_or(0)
             };
             match bosa::write_fpga_reg(addr, val) {
-                Ok(()) => println!("[+] Successfully wrote FPGA reg 0x{:08X} = 0x{:08X}", addr, val),
+                Ok(()) => println!(
+                    "[+] Successfully wrote FPGA reg 0x{:08X} = 0x{:08X}",
+                    addr, val
+                ),
                 Err(e) => {
                     eprintln!("[-] Error writing FPGA reg 0x{:08X}: {e}", addr);
                     exit(1);
@@ -381,14 +507,36 @@ fn main() {
             if is_json {
                 println!("{}", serde_json::to_string_pretty(&opt).unwrap_or_default());
             } else {
-                let cdr_str = match opt.cdr_locked { Some(true) => "LOCKED (OK)", Some(false) => "UNLOCKED", None => "UNKNOWN" };
+                let cdr_str = match opt.cdr_locked {
+                    Some(true) => "LOCKED (OK)",
+                    Some(false) => "UNLOCKED",
+                    None => "UNKNOWN",
+                };
                 println!("[*] Optical Transceiver (BOSA {}):", opt.model);
-                println!("    Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G  |  CDR: {}", opt.wavelength_tx_nm, opt.wavelength_rx_nm, cdr_str);
-                let temp_str = opt.temperature_celsius.map(|t| format!("{t:.2} °C")).unwrap_or_else(|| "N/A".into());
-                let volt_str = opt.vcc_voltage.map(|v| format!("{v:.2} V")).unwrap_or_else(|| "N/A".into());
-                let bias_str = opt.laser_bias_current_ma.map(|b| format!("{b:.2} mA")).unwrap_or_else(|| "N/A".into());
-                let tx_str = opt.tx_power_dbm.map(|p| format!("{p:.2} dBm")).unwrap_or_else(|| "N/A".into());
-                println!("    Diagnostics: Temp: {}  |  Voltage: {}  |  Bias: {}  |  TX: {}", temp_str, volt_str, bias_str, tx_str);
+                println!(
+                    "    Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G  |  CDR: {}",
+                    opt.wavelength_tx_nm, opt.wavelength_rx_nm, cdr_str
+                );
+                let temp_str = opt
+                    .temperature_celsius
+                    .map(|t| format!("{t:.2} °C"))
+                    .unwrap_or_else(|| "N/A".into());
+                let volt_str = opt
+                    .vcc_voltage
+                    .map(|v| format!("{v:.2} V"))
+                    .unwrap_or_else(|| "N/A".into());
+                let bias_str = opt
+                    .laser_bias_current_ma
+                    .map(|b| format!("{b:.2} mA"))
+                    .unwrap_or_else(|| "N/A".into());
+                let tx_str = opt
+                    .tx_power_dbm
+                    .map(|p| format!("{p:.2} dBm"))
+                    .unwrap_or_else(|| "N/A".into());
+                println!(
+                    "    Diagnostics: Temp: {}  |  Voltage: {}  |  Bias: {}  |  TX: {}",
+                    temp_str, volt_str, bias_str, tx_str
+                );
                 println!("    Measurements Evidence:");
                 for (name, ev) in &opt.measurements {
                     let raw_val = ev.raw.as_deref().unwrap_or("-");
@@ -431,7 +579,10 @@ fn main() {
                 args[3].parse::<u32>().unwrap_or(0)
             };
             match bosa::write_bosa_reg(addr, val) {
-                Ok(()) => println!("[+] Successfully wrote BOSA reg 0x{:02X} = 0x{:02X}", addr, val),
+                Ok(()) => println!(
+                    "[+] Successfully wrote BOSA reg 0x{:02X} = 0x{:02X}",
+                    addr, val
+                ),
                 Err(e) => {
                     eprintln!("[-] Error writing BOSA reg 0x{:02X}: {e}", addr);
                     exit(1);
@@ -466,7 +617,9 @@ fn main() {
                         if is_json {
                             println!("{{\"fpga_status\": \"failed\", \"error\": \"FPGA bitstream programming failed in kernel\"}}");
                         } else {
-                            eprintln!("[!] 错误：内核 FPGA 位流烧录失败！请检查系统日志（dmesg）。");
+                            eprintln!(
+                                "[!] 错误：内核 FPGA 位流烧录失败！请检查系统日志（dmesg）。"
+                            );
                         }
                         return;
                     }
@@ -481,14 +634,47 @@ fn main() {
             }
         }
         "mib" => {
-            let id = args.get(2).and_then(|value| value.parse::<u8>().ok()).filter(|id| (1..=15).contains(id));
+            let id = args
+                .get(2)
+                .and_then(|value| value.parse::<u8>().ok())
+                .filter(|id| (1..=15).contains(id));
             let summary = args.iter().any(|arg| arg == "--summary");
-            let Some(id) = id else { eprintln!("Usage: fttrctl mib ONU_ID [--summary|--json] [--tables]"); exit(1); };
-            if args[3..].iter().any(|arg| !matches!(arg.as_str(), "--summary" | "--json" | "--tables")) || (summary && args.iter().any(|arg| arg == "--json")) {
-                eprintln!("Usage: fttrctl mib ONU_ID [--summary|--json] [--tables]"); exit(1);
+            let mut progress_id = None;
+            let Some(id) = id else {
+                eprintln!("Usage: fttrctl mib ONU_ID [--summary|--json] [--tables]");
+                exit(1);
+            };
+            let mut options = args[3..].iter();
+            while let Some(option) = options.next() {
+                match option.as_str() {
+                    "--summary" | "--json" | "--tables" => {}
+                    "--progress-id" if progress_id.is_none() => {
+                        progress_id = options.next().filter(|value| !value.is_empty()).cloned();
+                        if progress_id.is_none() {
+                            eprintln!("Usage: fttrctl mib ONU_ID [--summary|--json] [--tables] [--progress-id ID]");
+                            exit(1);
+                        }
+                    }
+                    _ => {
+                        eprintln!("Usage: fttrctl mib ONU_ID [--summary|--json] [--tables] [--progress-id ID]");
+                        exit(1);
+                    }
+                }
             }
-            if let Err(error) = h3c_fttr_tools::controller::inventory::read(id, summary, args.iter().any(|arg| arg == "--tables")) {
-                eprintln!("[-] MIB read failed: {error}"); exit(1);
+            if summary && args.iter().any(|arg| arg == "--json") {
+                eprintln!(
+                    "Usage: fttrctl mib ONU_ID [--summary|--json] [--tables] [--progress-id ID]"
+                );
+                exit(1);
+            }
+            if let Err(error) = h3c_fttr_tools::controller::inventory::read_with_progress(
+                id,
+                summary,
+                args.iter().any(|arg| arg == "--tables"),
+                progress_id,
+            ) {
+                eprintln!("[-] MIB read failed: {error}");
+                exit(1);
             }
         }
         "discover" => match ipc::send_ipc_command("DISCOVER") {
@@ -515,12 +701,10 @@ fn main() {
                 Err(e) => eprintln!("[-] Failed to communicate with fttrd: {e}"),
             }
         }
-        "sync-wifi" => {
-            match ipc::send_ipc_command("SYNC_WIFI") {
-                Ok(resp) => println!("{resp}"),
-                Err(e) => eprintln!("[-] Failed to communicate with fttrd: {e}"),
-            }
-        }
+        "sync-wifi" => match ipc::send_ipc_command("SYNC_WIFI") {
+            Ok(resp) => println!("{resp}"),
+            Err(e) => eprintln!("[-] Failed to communicate with fttrd: {e}"),
+        },
         "provision" => {
             if args.len() < 3 {
                 eprintln!("Usage: fttrctl provision <onu_id>");
@@ -533,20 +717,27 @@ fn main() {
                 Err(e) => eprintln!("[-] Failed to communicate with fttrd: {e}"),
             }
         }
-        "exec" | "cmd" | "broadcast" => {
-            match handle_mqtt_command(&args[1..]) {
-                Ok(code) => exit(code),
-                Err(error) => { eprintln!("[-] {error}"); exit(1); }
+        "exec" | "cmd" | "broadcast" => match handle_mqtt_command(&args[1..]) {
+            Ok(code) => exit(code),
+            Err(error) => {
+                eprintln!("[-] {error}");
+                exit(1);
             }
-        }
+        },
         "hl202" => {
             #[cfg(feature = "device-hl202")]
             match hl202::handle(&args[2..]) {
                 Ok(code) => exit(code),
-                Err(error) => { eprintln!("[-] {error}"); exit(1); }
+                Err(error) => {
+                    eprintln!("[-] {error}");
+                    exit(1);
+                }
             }
             #[cfg(not(feature = "device-hl202"))]
-            { eprintln!("HL202 adapter not compiled"); exit(1); }
+            {
+                eprintln!("HL202 adapter not compiled");
+                exit(1);
+            }
         }
         "subdev" => {
             handle_subdev_command(&args[1..]);
@@ -557,8 +748,11 @@ fn main() {
                 exit(1);
             }
             let addr_str = &args[2];
-            let addr = u32::from_str_radix(addr_str.trim_start_matches("0x").trim_start_matches("0X"), 16)
-                .expect("Invalid hex address");
+            let addr = u32::from_str_radix(
+                addr_str.trim_start_matches("0x").trim_start_matches("0X"),
+                16,
+            )
+            .expect("Invalid hex address");
             match bosa::read_fpga_reg(addr) {
                 Ok(val) => println!("FPGA [0x{:08X}] = 0x{:08X}", addr, val),
                 Err(e) => eprintln!("[-] Error reading FPGA register: {e}"),
@@ -569,10 +763,16 @@ fn main() {
                 eprintln!("Usage: fttrctl write-reg <addr> <val>");
                 exit(1);
             }
-            let addr = u32::from_str_radix(args[2].trim_start_matches("0x").trim_start_matches("0X"), 16)
-                .expect("Invalid hex address");
-            let val = u32::from_str_radix(args[3].trim_start_matches("0x").trim_start_matches("0X"), 16)
-                .expect("Invalid hex value");
+            let addr = u32::from_str_radix(
+                args[2].trim_start_matches("0x").trim_start_matches("0X"),
+                16,
+            )
+            .expect("Invalid hex address");
+            let val = u32::from_str_radix(
+                args[3].trim_start_matches("0x").trim_start_matches("0X"),
+                16,
+            )
+            .expect("Invalid hex value");
             match bosa::write_fpga_reg(addr, val) {
                 Ok(_) => println!("FPGA [0x{:08X}] <= 0x{:08X}", addr, val),
                 Err(e) => eprintln!("[-] Error writing FPGA register: {e}"),
@@ -583,8 +783,11 @@ fn main() {
                 eprintln!("Usage: fttrctl read-bosa <reg>");
                 exit(1);
             }
-            let reg = u32::from_str_radix(args[2].trim_start_matches("0x").trim_start_matches("0X"), 16)
-                .expect("Invalid hex register");
+            let reg = u32::from_str_radix(
+                args[2].trim_start_matches("0x").trim_start_matches("0X"),
+                16,
+            )
+            .expect("Invalid hex register");
             match bosa::read_bosa_reg(reg) {
                 Ok(val) => println!("BOSA [0x{:02X}] = 0x{:02X}", reg, val),
                 Err(e) => eprintln!("[-] Error reading BOSA register: {e}"),
@@ -595,10 +798,16 @@ fn main() {
                 eprintln!("Usage: fttrctl write-bosa <reg> <val>");
                 exit(1);
             }
-            let reg = u32::from_str_radix(args[2].trim_start_matches("0x").trim_start_matches("0X"), 16)
-                .expect("Invalid hex register");
-            let val = u32::from_str_radix(args[3].trim_start_matches("0x").trim_start_matches("0X"), 16)
-                .expect("Invalid hex value");
+            let reg = u32::from_str_radix(
+                args[2].trim_start_matches("0x").trim_start_matches("0X"),
+                16,
+            )
+            .expect("Invalid hex register");
+            let val = u32::from_str_radix(
+                args[3].trim_start_matches("0x").trim_start_matches("0X"),
+                16,
+            )
+            .expect("Invalid hex value");
             match bosa::write_bosa_reg(reg, val) {
                 Ok(_) => println!("BOSA [0x{:02X}] <= 0x{:02X}", reg, val),
                 Err(e) => eprintln!("[-] Error writing BOSA register: {e}"),
