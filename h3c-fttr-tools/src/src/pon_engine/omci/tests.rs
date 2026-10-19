@@ -279,7 +279,14 @@ fn session_ignores_echo_and_wrong_entity_and_uploads_via_transport() {
     let mut session = OmciSession::new(Script {
         responses: VecDeque::new(),
     });
-    let report = session.upload_mib().unwrap();
+    let mut progress = Vec::new();
+    let report = session
+        .upload_mib_with_progress(|received, expected| {
+            progress.push((received, expected));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(progress, [(0, 1), (1, 1)]);
     assert!(report.uploaded_complete);
     assert_eq!(report.entities[0].class_id, 262);
     assert_eq!(

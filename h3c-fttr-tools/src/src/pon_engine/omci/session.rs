@@ -191,12 +191,19 @@ impl OmciSession {
         table.finish()
     }
     pub fn upload_mib(&mut self) -> io::Result<MibReport> {
+        self.upload_mib_with_progress(|_, _| Ok(()))
+    }
+    pub fn upload_mib_with_progress(
+        &mut self,
+        mut progress: impl FnMut(usize, usize) -> io::Result<()>,
+    ) -> io::Result<MibReport> {
         let frame = self.request(Action::MibUpload, 2, 0, RequestBody::Empty)?;
         let count = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
         if count == 0 || count > 2048 {
             return Err(invalid("invalid/beyond supported MIB upload count"));
         }
         let mut mib = MibAssembler::new(count);
+        progress(0, usize::from(count))?;
         for sequence in 0..count {
             let frame = self.request(
                 Action::MibUploadNext,
@@ -205,6 +212,7 @@ impl OmciSession {
                 RequestBody::UploadNext { sequence },
             )?;
             mib.push(MibRecord::decode(sequence, &frame.payload)?);
+            progress(usize::from(sequence) + 1, usize::from(count))?;
         }
         Ok(mib.finish())
     }
