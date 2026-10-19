@@ -243,7 +243,7 @@ pub struct Config {
     pub enabled: bool,
     pub automatic: bool,
     pub triggers: BTreeSet<String>,
-    pub interval: u64,
+    pub interval_seconds: u64,
     pub freshness: u64,
     pub devices: Vec<Device>,
     pub assignments: BTreeMap<String, (String, String)>,

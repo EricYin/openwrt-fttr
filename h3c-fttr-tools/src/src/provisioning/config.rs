@@ -171,7 +171,7 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
         if !matches!(s.get("method"), "" | "diff") {
             return Err("only diff synchronization is supported".into());
         }
-        cfg.interval = if s.get("interval_minutes").is_empty() {
+        cfg.interval_seconds = if s.get("interval_minutes").is_empty() {
             0
         } else {
             u64::from(s.number("interval_minutes", 1440)?) * 60
@@ -181,8 +181,8 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
         } else {
             s.number("freshness", 86400)? as u64
         };
-        if cfg.freshness == 0 || (cfg.interval != 0 && cfg.interval < 30) {
-            return Err("freshness must be positive; interval must be 0 or >=30".into());
+        if cfg.freshness == 0 {
+            return Err("freshness must be positive".into());
         }
         cfg.triggers = s
             .options
@@ -200,7 +200,7 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
         if cfg.triggers.iter().any(|t| {
             !matches!(
                 t.as_str(),
-                "config_change" | "device_online" | "cwmp_boot" | "periodic"
+                "config_change" | "device_online" | "cwmp_boot" | "periodic" | "program_start"
             )
         }) {
             return Err("unknown synchronization trigger".into());
@@ -566,6 +566,22 @@ mod tests {
     #[test]
     fn rejects_invalid_policy() {
         assert!(parse("config provisioning 'global'\n option mode 'invalid'").is_err());
+    }
+    #[test]
+    fn accepts_program_start_trigger_and_rejects_unknown_triggers() {
+        let config = parse(
+            "config provisioning 'global'\n option mode 'auto'\n list trigger 'program_start'",
+        )
+        .unwrap();
+        assert!(config.triggers.contains("program_start"));
+        assert!(parse("config provisioning 'global'\n list trigger 'unknown_trigger'").is_err());
+    }
+    #[test]
+    fn parses_periodic_interval_minutes_and_rejects_old_interval_option() {
+        let config =
+            parse("config provisioning 'global'\n option interval_minutes '30'").unwrap();
+        assert_eq!(config.interval_seconds, 1800);
+        assert!(parse("config provisioning 'global'\n option interval '3600'").is_err());
     }
     #[test]
     fn revision_excludes_acs_credentials() {

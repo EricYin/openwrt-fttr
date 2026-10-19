@@ -190,6 +190,7 @@ struct Controller {
     operations: BTreeMap<String, Operation>,
     management: BTreeMap<String, Value>,
     last_online: BTreeSet<String>,
+    startup_pending: BTreeSet<String>,
     last_boot: BTreeMap<String, u64>,
     optical_epochs: BTreeMap<String, (u16, u64)>,
     last_periodic: u64,
@@ -262,6 +263,9 @@ impl Controller {
         self.recovered.retain(|id, op| Some(id) != device_id && op["optical_sn"] != serial);
         self.owned.remove(cwmp_id);
         self.wifi_owned.remove(cwmp_id);
+    }
+    fn startup_trigger_pending(&self, device: &str) -> bool {
+        self.config.triggers.contains("program_start") && self.startup_pending.contains(device)
     }
     fn start(&mut self, target: &str, apply: bool, management: bool) -> Result<Vec<u64>, String> {
         self.start_selected(target, apply, management, None)
@@ -416,7 +420,7 @@ impl Controller {
             let assignment=self.config.assignments.get(&d.id);
             json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"adapter":d.adapter,"omci_management":self.omci_management_view(d),"management":self.management.get(&d.id),"acs_bootstrap":super::bootstrap::view(&d.id,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
         }).collect();
-        json!({"enabled":self.config.enabled,"mode":if self.config.automatic {"auto"} else {"manual"},"method":"diff","revision":self.config.revision,"triggers":self.config.triggers,"interval":self.config.interval,"omci_management":{"desired":self.config.management,"state":"not_verified"},"management_network":super::management_network::view(self.config.management_network.as_ref()),"groups":self.config.groups.iter().map(|(id,t)|json!({"id":id,"name":self.config.labels.get(id),"template":t})).collect::<Vec<_>>(),"error":self.failure,"devices":devices,"pending_devices":devices.iter().filter(|d| d["provisioning"]["state"] != "completed").map(|d| d["device"].clone()).collect::<Vec<_>>()})
+        json!({"enabled":self.config.enabled,"mode":if self.config.automatic {"auto"} else {"manual"},"method":"diff","revision":self.config.revision,"triggers":self.config.triggers,"interval_minutes":self.config.interval_seconds / 60,"omci_management":{"desired":self.config.management,"state":"not_verified"},"management_network":super::management_network::view(self.config.management_network.as_ref()),"groups":self.config.groups.iter().map(|(id,t)|json!({"id":id,"name":self.config.labels.get(id),"template":t})).collect::<Vec<_>>(),"error":self.failure,"devices":devices,"pending_devices":devices.iter().filter(|d| d["provisioning"]["state"] != "completed").map(|d| d["device"].clone()).collect::<Vec<_>>()})
     }
 }
 fn discovered_identity(devices: &Value, optical_sn: &str, adapter: &str) -> Option<String> {
@@ -567,6 +571,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
         }
         c.retain_configured_state();
         c.resume_resets();
+        c.startup_pending = c.config.devices.iter().map(|device| device.id.clone()).collect();
         let identities: Vec<_> = c.config.devices.iter().filter(|d| !c.resets.blocks(&d.optical_sn)).map(|d| d.cwmp_id.clone()).collect();
         for id in identities {
             match wan::load(&id) {
@@ -632,8 +637,8 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                 c.optical_epochs.insert(serial.clone(), (*id, epoch));
             }
         }
-        let periodic = config.interval > 0
-            && time.saturating_sub(c.last_periodic) >= config.interval
+        let periodic = config.interval_seconds > 0
+            && time.saturating_sub(c.last_periodic) >= config.interval_seconds
             && config.triggers.contains("periodic");
         if periodic {
             c.last_periodic = time;
@@ -737,16 +742,20 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                 .operations
                 .get(&d.id)
                 .is_some_and(|o| o.stage != OperationPhase::Completed && o.stage != OperationPhase::Interrupted);
+            let startup_trigger = c.startup_trigger_pending(&d.id);
             if !active_op && reachable && config.enabled && config.automatic {
                 if needs_reconcile {
                     let _ = c.start_selected(&d.id, false, false, None);
                 } else if !needs_manual
-                    && (periodic
+                    && (startup_trigger
+                        || periodic
                         || (config.triggers.contains("device_online")
                             && !c.last_online.contains(&d.id))
                         || (new_boot && config.triggers.contains("cwmp_boot")))
                 {
-                    let _ = c.start(&d.id, true, false);
+                    if c.start(&d.id, true, false).is_ok() && startup_trigger {
+                        c.startup_pending.remove(&d.id);
+                    }
                 } else if !needs_manual && previous.as_ref().is_some_and(|p| {
                     p["items"].as_array().is_some_and(|a| a.iter().any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::Drift)))
                 }) {

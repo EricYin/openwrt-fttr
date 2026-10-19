@@ -174,6 +174,19 @@ fn full_start_releases_recovered_shadow() {
     assert_eq!(history["operations"][0]["mode"], "plan");
 }
 
+#[test]
+fn program_start_trigger_is_pending_only_for_configured_devices() {
+    let mut c = configured();
+    c.config.triggers.insert("program_start".into());
+    c.startup_pending.insert("child".into());
+
+    assert!(c.startup_trigger_pending("child"));
+    assert!(!c.startup_trigger_pending("other"));
+
+    c.config.triggers.remove("program_start");
+    assert!(!c.startup_trigger_pending("child"));
+}
+
 fn template_config() -> Config {
     crate::provisioning::templates::compile(
         "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'child'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\n",
