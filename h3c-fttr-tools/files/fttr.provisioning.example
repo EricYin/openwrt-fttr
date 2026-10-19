@@ -7,10 +7,12 @@ config provisioning 'provisioning'
 	option enabled '1'
 	option mode 'manual'
 	option freshness '180'
-	option interval '0'
+	option interval_minutes '30'
 	list trigger 'config_change'
 	list trigger 'device_online'
 	list trigger 'cwmp_boot'
+	# Optional: automatically sync eligible devices after fttrd starts.
+	# list trigger 'program_start'
 
 config management 'management'
 	list vlan '46'
