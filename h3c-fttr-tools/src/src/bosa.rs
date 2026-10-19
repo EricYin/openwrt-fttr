@@ -345,21 +345,24 @@ pub fn load_calibration_data() -> ([u8; 288], CalibrationSource) {
 }
 
 pub fn load_calibration() -> BosaCalibration {
-    let (data, source) = load_calibration_data();
-    match source {
-        CalibrationSource::Factory => {
-            println!("[+] Using UX3326 calibration from 1MB Factory partition");
+    static CACHED: std::sync::OnceLock<BosaCalibration> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let (data, source) = load_calibration_data();
+        match source {
+            CalibrationSource::Factory => {
+                println!("[+] Using UX3326 calibration from 1MB Factory partition");
+            }
+            CalibrationSource::FirmwareFile => {
+                println!("[+] Using UX3326 calibration from /lib/firmware/modified_UX3326.bin");
+            }
+            CalibrationSource::BuiltinDefault => {
+                eprintln!("[-] WARNING: No factory partition or /lib/firmware/modified_UX3326.bin found; falling back to built-in default!");
+            }
         }
-        CalibrationSource::FirmwareFile => {
-            println!("[+] Using UX3326 calibration from /lib/firmware/modified_UX3326.bin");
-        }
-        CalibrationSource::BuiltinDefault => {
-            eprintln!("[-] WARNING: No factory partition or /lib/firmware/modified_UX3326.bin found; falling back to built-in default!");
-        }
-    }
 
-    BosaCalibration::from_bytes(&data)
-        .expect("static UX3326 calibration data must be valid")
+        BosaCalibration::from_bytes(&data)
+            .expect("static UX3326 calibration data must be valid")
+    })
 }
 
 fn load_calibration_table() -> [u8; 56] {

@@ -40,7 +40,7 @@ fn management_tag(vlan:u32,priority:u32)->io::Result<[u8;2]> {
     }
 }
 pub fn bootstrap(session:&mut OmciSession,onu:u8,instance:u16) {
-    let serial=crate::ipc::send_ipc_command("STATUS").ok().and_then(|v|serde_json::from_str::<crate::model::FttrSystemStatus>(&v).ok()).and_then(|s|s.sub_gateways.into_iter().find(|d|d.onu_id==onu).map(|d|d.serial_number));
+    let serial = super::service::onu_serial(onu);
     let Some(serial)=serial else {return;};
     let Some((desired,revision))=crate::provisioning::management_desired(&serial) else {return;};
     let result=configure(session,instance,&desired.acs_url,desired.vlan,desired.priority);

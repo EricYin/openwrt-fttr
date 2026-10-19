@@ -182,6 +182,7 @@ pub fn run() {
     // 1. Data Structures & IPC Socket Server (Start immediately so fttrctl can query)
     let devices: Arc<Mutex<Vec<SubDevice>>> = Arc::new(Mutex::new(Vec::new()));
     let pon_engine = Arc::new(Mutex::new(PonEngine::new()));
+    super::service::init_pon_engine(pon_engine.clone());
     crate::provisioning::start(pon_engine.clone());
     let mqtt_client_arc: Arc<Mutex<Option<MqttClient>>> = Arc::new(Mutex::new(None));
     let hardware_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));

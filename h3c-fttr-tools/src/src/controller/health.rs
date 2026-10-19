@@ -267,15 +267,8 @@ fn run(
     let mut next_get = start + Duration::from_secs(5);
     let mut next_state = start;
     let optical_sn = if watch {
-        let reply = crate::ipc::send_ipc_command("STATUS")?;
-        let status: crate::model::FttrSystemStatus =
-            serde_json::from_str(&reply).map_err(io::Error::other)?;
-        status
-            .sub_gateways
-            .into_iter()
-            .find(|onu| onu.onu_id == id)
+        super::service::onu_serial(id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "ONU identity unavailable"))?
-            .serial_number
     } else {
         String::new()
     };

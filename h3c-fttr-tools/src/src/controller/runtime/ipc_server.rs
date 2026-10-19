@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 pub(super) mod metrics;
 
-const INTAKE_WORKERS: usize = 4;
-const HANDLER_WORKERS: usize = 8;
-const STATUS_WORKERS: usize = 2;
+const INTAKE_WORKERS: usize = 2;
+const HANDLER_WORKERS: usize = 2;
+const STATUS_WORKERS: usize = 1;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BYTES: usize = 524296;
 const BUSY: &[u8] =
@@ -31,6 +31,7 @@ pub(super) fn start(
 ) {
     if let Err(error) = thread::Builder::new()
         .name("ipc-accept".into())
+        .stack_size(256 * 1024)
         .spawn(move || {
             serve(listener.incoming(), handler);
         })
@@ -129,6 +130,7 @@ fn pool<Job: Send + 'static>(
         let handle = Arc::clone(&handle);
         thread::Builder::new()
             .name("ipc-worker".into())
+            .stack_size(256 * 1024)
             .spawn(move || loop {
                 let job = match receiver.lock() {
                     Ok(receiver) => receiver.recv(),

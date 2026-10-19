@@ -103,11 +103,38 @@ impl Services {
         });
     }
 }
-pub(crate) fn operation_confirmed(id: u8) -> bool {
-    crate::ipc::send_ipc_command("STATUS").ok()
-        .and_then(|reply| serde_json::from_str::<crate::model::FttrSystemStatus>(&reply).ok())
-        .is_some_and(|status| status.sub_gateways.iter().any(|onu| onu.onu_id == id && onu.state == crate::pon_engine::ploam::OnuState::O5Operation))
+static PON_ENGINE: std::sync::OnceLock<Arc<Mutex<crate::pon_engine::PonEngine>>> =
+    std::sync::OnceLock::new();
+
+pub(super) fn init_pon_engine(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
+    let _ = PON_ENGINE.set(engine);
 }
+
+pub(crate) fn operation_confirmed(id: u8) -> bool {
+    if let Some(engine) = PON_ENGINE.get() {
+        if let Ok(guard) = engine.lock() {
+            return guard
+                .active_onus
+                .iter()
+                .any(|onu| onu.onu_id == id && onu.state == crate::pon_engine::ploam::OnuState::O5Operation);
+        }
+    }
+    false
+}
+
+pub(crate) fn onu_serial(id: u8) -> Option<String> {
+    if let Some(engine) = PON_ENGINE.get() {
+        if let Ok(guard) = engine.lock() {
+            return guard
+                .active_onus
+                .iter()
+                .find(|onu| onu.onu_id == id)
+                .map(|onu| onu.full_sn_str());
+        }
+    }
+    None
+}
+
 
 #[cfg(test)]
 mod tests {
