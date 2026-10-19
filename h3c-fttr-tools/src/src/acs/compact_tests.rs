@@ -222,8 +222,8 @@ fn test_prune_bounds_total_result_bytes_dropping_older_inactive_tasks() {
 
     state.prune();
 
-    assert!(!state.tasks.contains_key(&1));
-    assert!(state.tasks.contains_key(&2));
+    assert!(state.tasks[&1].result.is_none());
+    assert!(state.tasks[&2].result.is_some());
 }
 
 #[test]

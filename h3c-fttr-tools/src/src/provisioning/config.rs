@@ -288,7 +288,10 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
             binding_intent: None,
             id: id.clone(),
             kind,
-            service_type: String::new(),
+            service_type: match kind {
+                ItemKind::Ssid => "wifi".into(),
+                _ => String::new(),
+            },
             parameters: Vec::new(),
             guard: None,
             blocked: None,

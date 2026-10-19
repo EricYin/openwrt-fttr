@@ -68,6 +68,10 @@ pub struct DataPathStatus {
     pub rx_bytes: Option<u64>,
     pub current_tx_kbps: Option<f64>,
     pub current_rx_kbps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub olt_channel_gem: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarding_verified: Option<bool>,
     pub measurements: Measurements,
 }
 

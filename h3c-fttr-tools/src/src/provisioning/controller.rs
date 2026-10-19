@@ -199,6 +199,8 @@ struct Controller {
     wifi_owned: BTreeMap<String, wifi::Registry>,
     omci_management: BTreeMap<String, Value>,
     acs_status: Value,
+    attempts: BTreeMap<String, u32>,
+    next_retry_at: BTreeMap<String, u64>,
 }
 static CONTROLLER: OnceLock<Mutex<Controller>> = OnceLock::new();
 fn controller() -> &'static Mutex<Controller> {
@@ -323,7 +325,7 @@ impl Controller {
         if devices.iter().any(|d| {
             self.operations
                 .get(&d.id)
-                .is_some_and(|o| o.stage != OperationPhase::Completed)
+                .is_some_and(|o| o.stage != OperationPhase::Completed && o.stage != OperationPhase::Interrupted)
         }) {
             return Err("device already has an active operation".into());
         }
@@ -373,7 +375,17 @@ impl Controller {
             if self.resets.blocks(&d.optical_sn) {
                 operation = json!({"state":"reset_pending","items":[],"reason":self.resets.reason(&d.optical_sn)});
             }
-            operation["management_fresh"] = json!(self.management.get(&d.id).is_some_and(|m| m["state"] == "online"));
+            let management_fresh = self.management.get(&d.id).is_some_and(|m| m["state"] == "online");
+            operation["management_fresh"] = json!(management_fresh);
+            if let Some(attempts) = self.attempts.get(&d.id) {
+                operation["attempts"] = json!(attempts);
+            }
+            if let Some(next_retry) = self.next_retry_at.get(&d.id) {
+                operation["next_retry_at"] = json!(next_retry);
+            }
+            if !management_fresh && matches!(operation["state"].as_str(), Some("waiting" | "recovering")) {
+                operation["state"] = json!("waiting_management");
+            }
             if let Some(owned)=self.owned.get(&d.cwmp_id) { operation["wan_objects"]=json!(owned); }
             if let Some(owned)=self.wifi_owned.get(&d.cwmp_id) { operation["wifi_objects"]=json!(owned); }
             let previous=operation["items"].as_array().cloned().unwrap_or_default();
@@ -381,12 +393,26 @@ impl Controller {
                 let mut item=previous.iter().find(|i| i["id"] == desired.id).cloned().unwrap_or_else(|| json!({"id":desired.id,"kind":desired.kind,"service_type":desired.service_type,"state":"not_started"}));
                 item["name"]=json!(self.config.labels.get(desired.id.rsplit("__").next().unwrap_or(&desired.id)));
                 item["current_revision"]=json!(item["revision"] == self.config.revision);
-                item["management_fresh"]=operation["management_fresh"].clone(); item
+                item["management_fresh"]=operation["management_fresh"].clone();
+                if item.get("service_type").is_none() {
+                    item["service_type"] = json!(desired.service_type);
+                }
+                item
             }).collect();
             operation["items"]=json!(items);
             let ssids: Vec<_> = items.iter().filter(|i| i["kind"] == "ssid").cloned().collect();
             let services: Vec<_> = items.iter().filter(|i| i["kind"] != "ssid").cloned().collect();
-            let wifi_sync=if operation["wifi_lifecycle"].as_object().is_some_and(|m|m.values().any(|i|matches!(ItemOutcome::from_result(i),Some(ItemOutcome::Blocked|ItemOutcome::Failed|ItemOutcome::Unknown)))) { "attention_required" } else if operation["wifi_stage"].is_string() && operation["wifi_stage"] != "done" { "pending" } else { aggregate(&ssids) };
+            let wifi_sync=if operation["wifi_lifecycle"].as_object().is_some_and(|m|m.values().any(|i|matches!(ItemOutcome::from_result(i),Some(ItemOutcome::Blocked|ItemOutcome::Failed|ItemOutcome::Unknown)))) {
+                "attention_required"
+            } else if operation["state"] == "recovering" {
+                "recovering"
+            } else if operation["state"] == "waiting_management" || (!management_fresh && operation["state"] != "completed") {
+                "waiting_management"
+            } else if operation["wifi_stage"].is_string() && operation["wifi_stage"] != "done" {
+                "pending"
+            } else {
+                aggregate(&ssids)
+            };
             let assignment=self.config.assignments.get(&d.id);
             json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"adapter":d.adapter,"omci_management":self.omci_management_view(d),"management":self.management.get(&d.id),"acs_bootstrap":super::bootstrap::view(&d.id,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
         }).collect();
@@ -437,6 +463,8 @@ fn aggregate(items: &[Value]) -> &str {
         .any(|i| matches!(ItemOutcome::from_result(i), Some(ItemOutcome::Failed | ItemOutcome::Blocked | ItemOutcome::Unknown)))
     {
         "attention_required"
+    } else if items.iter().any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::ReconcileRequired)) {
+        "recovering"
     } else if items.iter().any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::AcceptedUnverified)) {
         "accepted_unverified"
     } else {
@@ -498,6 +526,22 @@ pub fn control(request: &str) -> String {
                     v["item"].as_str(),
                 )?;
                 Ok(json!({"operation_ids":ids,"revision":c.config.revision}))
+            }
+            "reconcile" => {
+                let target = v["target"].as_str().unwrap_or("all");
+                let mut c = controller().lock().unwrap();
+                c.attempts.remove(target);
+                c.next_retry_at.remove(target);
+                let ids = c.start_selected(target, false, false, None)?;
+                Ok(json!({"operation_ids":ids,"mode":"plan","reconcile":true}))
+            }
+            "retry" => {
+                let target = v["target"].as_str().unwrap_or("all");
+                let mut c = controller().lock().unwrap();
+                c.attempts.remove(target);
+                c.next_retry_at.remove(target);
+                let ids = c.start(target, true, false)?;
+                Ok(json!({"operation_ids":ids,"mode":"apply","retry":true}))
             }
             _ => Err("unknown provisioning operation".into()),
         }
@@ -657,8 +701,14 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                 .get(&d.id)
                 .map(Operation::view)
                 .or_else(|| c.recovered.get(&d.id).cloned());
+            let needs_reconcile = previous.as_ref().is_some_and(|p| {
+                p["reconcile_required"] == true
+                    || p["items"].as_array().is_some_and(|a| {
+                        a.iter().any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::ReconcileRequired))
+                    })
+            });
             let needs_manual = previous.as_ref().is_some_and(|p| {
-                p["state"] == "interrupted"
+                (p["state"] == "interrupted" && p["reconcile_required"] != true)
                     || ["wan_lifecycle", "wifi_lifecycle"].iter().any(|key| {
                         p[*key]
                             .as_object()
@@ -668,21 +718,48 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                         a.iter().any(|i| {
                             matches!(
                                 ItemOutcome::from_result(i),
-                                Some(ItemOutcome::Unknown | ItemOutcome::AcceptedPendingApply | ItemOutcome::AcceptedUnverified)
+                                Some(ItemOutcome::Unknown | ItemOutcome::AcceptedPendingApply)
                             )
                         })
                     })
             });
-            if !needs_manual
-                && reachable
-                && config.enabled
-                && config.automatic
-                && (periodic
-                    || (config.triggers.contains("device_online")
-                        && !c.last_online.contains(&d.id))
-                    || (new_boot && config.triggers.contains("cwmp_boot")))
-            {
-                let _ = c.start(&d.id, true, false);
+            let all_verified = previous.as_ref().is_some_and(|p| {
+                p["state"] == "completed"
+                    && p["items"].as_array().is_some_and(|a| {
+                        !a.is_empty() && a.iter().all(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::Verified))
+                    })
+            });
+            if all_verified {
+                c.attempts.remove(&d.id);
+                c.next_retry_at.remove(&d.id);
+            }
+            let active_op = c
+                .operations
+                .get(&d.id)
+                .is_some_and(|o| o.stage != OperationPhase::Completed && o.stage != OperationPhase::Interrupted);
+            if !active_op && reachable && config.enabled && config.automatic {
+                if needs_reconcile {
+                    let _ = c.start_selected(&d.id, false, false, None);
+                } else if !needs_manual
+                    && (periodic
+                        || (config.triggers.contains("device_online")
+                            && !c.last_online.contains(&d.id))
+                        || (new_boot && config.triggers.contains("cwmp_boot")))
+                {
+                    let _ = c.start(&d.id, true, false);
+                } else if !needs_manual && previous.as_ref().is_some_and(|p| {
+                    p["items"].as_array().is_some_and(|a| a.iter().any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::Drift)))
+                }) {
+                    let attempts = c.attempts.get(&d.id).copied().unwrap_or(0);
+                    let next = c.next_retry_at.get(&d.id).copied().unwrap_or(0);
+                    if attempts < 5 && now() >= next {
+                        let next_attempts = attempts + 1;
+                        c.attempts.insert(d.id.clone(), next_attempts);
+                        let delay = (15 * (1 << (next_attempts - 1))).min(300);
+                        c.next_retry_at.insert(d.id.clone(), now() + delay);
+                        let _ = c.start(&d.id, true, false);
+                    }
+                }
             }
             use std::hash::{Hash, Hasher};
             let mut epoch_hash = std::collections::hash_map::DefaultHasher::new();
@@ -765,7 +842,16 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                             .unwrap_or("capability contract unresolved")
                             .to_owned();
                         for item in &op.device.items {
-                            op.results.entry(item.id.clone()).or_insert_with(||json!({"id":item.id,"kind":item.kind,"state":"blocked","reason":reason,"revision":op.revision}));
+                            op.results.entry(item.id.clone()).or_insert_with(|| {
+                                json!({
+                                    "id": item.id,
+                                    "kind": item.kind,
+                                    "service_type": item.service_type,
+                                    "state": "blocked",
+                                    "reason": reason,
+                                    "revision": op.revision,
+                                })
+                            });
                         }
                         op.stage = OperationPhase::Completed;
                         continue;
@@ -1294,5 +1380,104 @@ mod tests {
                 .iter()
                 .all(|v| v["method"] != "SetParameterValues"))
         });
+    }
+
+    #[test]
+    fn blocked_capabilities_populate_service_type_on_all_items() {
+        let mut op = operation(OperationPhase::Discovering, false);
+        op.device.items[0].service_type = "wifi".into();
+        op.capabilities.invalidate("test contract fault");
+        assert!(op.capabilities.blocked());
+        let reason = op.capabilities.view()["reason"]
+            .as_str()
+            .unwrap_or("capability contract unresolved")
+            .to_owned();
+        for item in &op.device.items {
+            op.results.entry(item.id.clone()).or_insert_with(|| {
+                json!({
+                    "id": item.id,
+                    "kind": item.kind,
+                    "service_type": item.service_type,
+                    "state": "blocked",
+                    "reason": reason,
+                    "revision": op.revision,
+                })
+            });
+        }
+        let result = &op.results["wifi"];
+        assert_eq!(result["state"], "blocked");
+        assert_eq!(result["service_type"], "wifi");
+
+        let mut c = Controller::default();
+        c.config.devices = vec![op.device.clone()];
+        c.operations.insert("child".into(), op);
+        let snapshot = c.snapshot();
+        let items = snapshot["devices"][0]["provisioning"]["items"].as_array().unwrap();
+        assert_eq!(items[0]["service_type"], "wifi");
+        assert_eq!(items[0]["state"], "blocked");
+    }
+
+    #[test]
+    fn plan_mode_marks_secret_only_difference_as_accepted_unverified() {
+        let mut o = operation(OperationPhase::Reading, false);
+        let secret = Parameter {
+            name: "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.KeyPassphrase".into(),
+            value: "secret12".into(),
+            kind: ParameterKind::String,
+            secret: true,
+        };
+        o.device.items[0].parameters = vec![secret];
+        let readback = json!({
+            "state": "completed",
+            "result": {
+                "parameters": [{
+                    "name": "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.KeyPassphrase",
+                    "value": ""
+                }]
+            }
+        });
+        responses(vec![readback]);
+        advance(&mut o, true);
+        assert_eq!(o.results["wifi"]["state"], "accepted_unverified");
+        assert!(o.results["wifi"]["reason"].as_str().unwrap().contains("write-only credentials"));
+    }
+
+    #[test]
+    fn snapshot_reports_self_healing_attempts_and_waiting_management() {
+        let mut c = Controller::default();
+        let op = operation(OperationPhase::Waiting, false);
+        c.config.devices = vec![op.device.clone()];
+        c.operations.insert("child".into(), op);
+        c.attempts.insert("child".into(), 2);
+        c.next_retry_at.insert("child".into(), 12345678);
+        c.management.insert("child".into(), json!({"state":"offline_or_stale"}));
+
+        let snap = c.snapshot();
+        let dev = &snap["devices"][0];
+        assert_eq!(dev["provisioning"]["state"], "waiting_management");
+        assert_eq!(dev["provisioning"]["attempts"], 2);
+        assert_eq!(dev["provisioning"]["next_retry_at"], 12345678);
+        assert_eq!(dev["wifi_sync"], "waiting_management");
+    }
+
+    #[test]
+    fn snapshot_reports_recovering_when_reconcile_required() {
+        let mut c = Controller::default();
+        let mut op = operation(OperationPhase::Completed, false);
+        op.results.insert("wifi".into(), json!({
+            "id": "wifi",
+            "kind": "ssid",
+            "service_type": "wifi",
+            "state": "reconcile_required",
+            "reason": "service_restarted",
+            "revision": op.revision,
+        }));
+        c.config.devices = vec![op.device.clone()];
+        c.operations.insert("child".into(), op);
+        c.management.insert("child".into(), json!({"state":"online"}));
+
+        let snap = c.snapshot();
+        let dev = &snap["devices"][0];
+        assert_eq!(dev["wifi_sync"], "recovering");
     }
 }

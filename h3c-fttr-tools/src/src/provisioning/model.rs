@@ -48,6 +48,7 @@ wire_enum!(ItemOutcome {
     Unknown => "unknown",
     AcceptedPendingApply => "accepted_pending_apply",
     AcceptedUnverified => "accepted_unverified",
+    ReconcileRequired => "reconcile_required",
     Drift => "drift",
     Created => "created",
     Deleted => "deleted",
@@ -87,6 +88,10 @@ wire_enum!(OperationPhase {
     Writing => "writing",
     Verifying => "verifying",
     Settling => "settling",
+    Recovering => "recovering",
+    WaitingManagement => "waiting_management",
+    WaitingTask => "waiting_task",
+    Interrupted => "interrupted",
     Completed => "completed",
 });
 

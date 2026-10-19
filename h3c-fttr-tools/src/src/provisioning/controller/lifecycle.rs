@@ -74,6 +74,16 @@ impl Controller {
                 }
                 if operation["state"] != "completed" {
                     operation["state"] = json!("interrupted");
+                    operation["reconcile_required"] = json!(true);
+                    operation["reconcile_reason"] = json!("service_restarted");
+                    if let Some(items) = operation["items"].as_array_mut() {
+                        for item in items {
+                            if item["state"] != "verified" {
+                                item["state"] = json!("reconcile_required");
+                                item["reason"] = json!("reconcile after service restart");
+                            }
+                        }
+                    }
                 }
                 if let Some(id) = operation["device"].as_str().map(str::to_owned) {
                     self.recovered.insert(id, operation);
@@ -163,6 +173,10 @@ impl Controller {
             .retain(|serial, _| devices.iter().any(|d| &d.optical_sn == serial));
         self.optical_epochs
             .retain(|serial, _| devices.iter().any(|d| &d.optical_sn == serial));
+        self.attempts
+            .retain(|id, _| devices.iter().any(|d| &d.id == id));
+        self.next_retry_at
+            .retain(|id, _| devices.iter().any(|d| &d.id == id));
         let retained_binding = |id: &String| {
             devices.iter().any(|d| &d.cwmp_id == id)
                 || self

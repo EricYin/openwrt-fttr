@@ -245,7 +245,7 @@ fn print_status_table(status: &FttrSystemStatus) {
             if !sg.provisioning.is_null() {
                 println!("    CWMP:           {} | Sync: {} | Wi-Fi: {}", sg.management["state"].as_str().unwrap_or("unknown"), sg.provisioning["state"].as_str().unwrap_or("not_started"), sg.wifi_sync);
                 for item in sg.services.iter().chain(sg.ssids.iter()) {
-                    println!("      {} [{}]: {} {}", item["id"].as_str().unwrap_or("?"), item["service_type"].as_str().filter(|s| !s.is_empty()).unwrap_or_else(|| item["kind"].as_str().unwrap_or("?")), item["state"].as_str().unwrap_or("?"), item["reason"].as_str().unwrap_or(""));
+                    println!("      {} [{}]: {} {}", item["id"].as_str().unwrap_or("?"), item["service_type"].as_str().unwrap_or("?"), item["state"].as_str().unwrap_or("?"), item["reason"].as_str().unwrap_or(""));
                 }
             }
             println!("    Hardware:       {}", sg.hardware_version);

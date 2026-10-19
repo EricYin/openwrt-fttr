@@ -400,7 +400,14 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
         return;
     }
     if !op.apply {
-        op.finish_item(ItemOutcome::Drift, "read-only plan: parameters differ");
+        if !op.changes.is_empty() && op.changes.iter().all(|p| p.secret) {
+            op.finish_item(
+                ItemOutcome::AcceptedUnverified,
+                "readable CWMP parameters match; write-only credentials cannot be verified by readback",
+            );
+        } else {
+            op.finish_item(ItemOutcome::Drift, "read-only plan: parameters differ");
+        }
         return;
     }
     if item.service_type == "tr069" {

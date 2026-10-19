@@ -303,6 +303,11 @@ impl State {
         self.tasks.retain(|_, task| {
             task.state.is_active() || time.saturating_sub(task.sent.unwrap_or(task.created)) < 180
         });
+        for task in self.tasks.values_mut() {
+            if !task.state.is_active() && time.saturating_sub(task.sent.unwrap_or(task.created)) >= 15 {
+                task.result = None;
+            }
+        }
         let mut total_result_bytes: usize = self
             .tasks
             .values()
@@ -310,21 +315,22 @@ impl State {
             .map(|r| r.get().len())
             .sum();
         if total_result_bytes > 256 * 1024 {
-            let inactive_ids: Vec<(u64, usize)> = self
+            let inactive_ids: Vec<u64> = self
                 .tasks
                 .iter()
-                .filter(|(_, t)| {
-                    !t.state.is_active()
-                        && time.saturating_sub(t.sent.unwrap_or(t.created)) >= 15
-                })
-                .map(|(id, t)| (*id, t.result.as_ref().map(|r| r.get().len()).unwrap_or(0)))
+                .filter(|(_, t)| !t.state.is_active() && t.result.is_some())
+                .map(|(id, _)| *id)
                 .collect();
-            for (id, size) in inactive_ids {
+            let max_drop = inactive_ids.len().saturating_sub(1);
+            for id in inactive_ids.into_iter().take(max_drop) {
                 if total_result_bytes <= 256 * 1024 {
                     break;
                 }
-                self.tasks.remove(&id);
-                total_result_bytes = total_result_bytes.saturating_sub(size);
+                if let Some(task) = self.tasks.get_mut(&id) {
+                    if let Some(res) = task.result.take() {
+                        total_result_bytes = total_result_bytes.saturating_sub(res.get().len());
+                    }
+                }
             }
         }
     }
