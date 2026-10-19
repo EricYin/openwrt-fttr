@@ -63,7 +63,8 @@ impl Services {
                 }
             };
             if token.load(Ordering::Acquire) { return; }
-            let adapter = crate::devices::select(&vendor, &identity);
+            let serial = super::service::onu_serial(id);
+            let adapter = crate::devices::select_with_serial(&vendor, &identity, serial.as_deref());
             if let Some(state) = states.lock().unwrap().get_mut(&id).filter(|state| state.generation == generation) {
                 state.phase = adapter.status();
                 state.identity = Some(identity);

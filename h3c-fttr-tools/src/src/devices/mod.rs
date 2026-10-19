@@ -12,6 +12,7 @@ pub fn observe_mqtt_report(source: &str, payload: Vec<u8>, received: u64) -> boo
 pub mod hl202;
 #[cfg(feature = "device-hwtc")]
 pub mod hwtc;
+pub mod generic;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Adapter {
@@ -19,6 +20,7 @@ pub enum Adapter {
     Hl202,
     #[cfg(feature = "device-hwtc")]
     Hwtc(hwtc::Profile),
+    GenericBridge,
     Unavailable,
 }
 
@@ -50,6 +52,7 @@ impl Adapter {
             Self::Hl202 => Capabilities { business: true, shell_commands: true },
             #[cfg(feature = "device-hwtc")]
             Self::Hwtc(_) => Capabilities { business: true, shell_commands: false },
+            Self::GenericBridge => Capabilities { business: true, shell_commands: false },
             _ => Capabilities { business: false, shell_commands: false },
         }
     }
@@ -59,6 +62,7 @@ impl Adapter {
             Self::Hl202 => BusinessPhase::Configuring,
             #[cfg(feature = "device-hwtc")]
             Self::Hwtc(_) => BusinessPhase::Configuring,
+            Self::GenericBridge => BusinessPhase::Configuring,
             Self::Unavailable => BusinessPhase::Unsupported,
         }
     }
@@ -70,6 +74,7 @@ impl Adapter {
             Self::Hwtc(hwtc::Profile::K155 | hwtc::Profile::Standard) => BusinessPhase::Verifying,
             #[cfg(feature = "device-hl202")]
             Self::Hl202 => BusinessPhase::Verifying,
+            Self::GenericBridge => BusinessPhase::Verifying,
             Self::Unavailable => BusinessPhase::Verifying,
         }
     }
@@ -83,6 +88,7 @@ impl Adapter {
                 hwtc::Profile::V152 => hwtc::v152::service::configure(id, Some(token)),
                 hwtc::Profile::Standard => hwtc::service::configure(id, Some(token)),
             },
+            Self::GenericBridge => generic::service::configure(id, Some(token)),
             _ => {
                 let _ = (id, token);
                 Err(std::io::Error::new(std::io::ErrorKind::Unsupported, self.status().to_string()))
@@ -91,12 +97,26 @@ impl Adapter {
     }
 }
 pub fn select(vendor: &str, identity: &crate::model::OnuIdentity) -> Adapter {
+    select_with_serial(vendor, identity, None)
+}
+
+pub fn select_with_serial(vendor: &str, identity: &crate::model::OnuIdentity, serial: Option<&str>) -> Adapter {
     let equipment = identity.equipment_id.as_deref();
+    if let Some(sn) = serial {
+        if crate::provisioning::is_device_adapter(sn, "generic") {
+            return Adapter::GenericBridge;
+        }
+    }
     #[cfg(feature = "device-hl202")]
     if hl202::matches(vendor, equipment) { return Adapter::Hl202; }
     #[cfg(feature = "device-hwtc")]
     if vendor == "HWTC" { return Adapter::Hwtc(hwtc::profile(equipment)); }
     let _ = (vendor, equipment);
+    if serial.is_some_and(crate::provisioning::allows_generic_bridge)
+        || std::env::var("FTTR_ALLOW_UNSUPPORTED_AS_BRIDGE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        return Adapter::GenericBridge;
+    }
     Adapter::Unavailable
 }
 
@@ -149,5 +169,21 @@ mod tests {
         assert!(configure_authenticated_cwmp_settings("HWTC3C6DE5B3/fttr_data.tar.gz", "http://acs",&CwmpCredentials::default())
             .is_err());
         assert!(configure_authenticated_cwmp_settings("H3CT12345678", "http://acs",&CwmpCredentials::default()).is_err());
+    }
+
+    #[test]
+    fn generic_bridge_adapter_capabilities_and_selection() {
+        let adapter = Adapter::GenericBridge;
+        assert!(adapter.capabilities().business);
+        assert!(!adapter.capabilities().shell_commands);
+        assert_eq!(adapter.status(), BusinessPhase::Configuring);
+        assert_eq!(adapter.verification_status(), BusinessPhase::Verifying);
+
+        let identity = crate::model::OnuIdentity::default();
+        assert_eq!(select_with_serial("ZTEG", &identity, None), Adapter::Unavailable);
+
+        std::env::set_var("FTTR_ALLOW_UNSUPPORTED_AS_BRIDGE", "1");
+        assert_eq!(select_with_serial("ZTEG", &identity, None), Adapter::GenericBridge);
+        std::env::remove_var("FTTR_ALLOW_UNSUPPORTED_AS_BRIDGE");
     }
 }

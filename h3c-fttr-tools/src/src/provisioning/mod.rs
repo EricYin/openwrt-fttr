@@ -21,7 +21,10 @@ use controller::acs;
 use controller::RPC;
 pub(crate) use bootstrap::observe_mqtt;
 pub use controller::{control, snapshot, start};
-pub(crate) use controller::{management_desired, management_result, management_version};
+pub(crate) use controller::{
+    allows_generic_bridge, is_device_adapter, management_desired, management_result,
+    management_version,
+};
 pub(crate) use policy::contains_service_token;
 #[cfg(feature = "acs")]
 pub(crate) use policy::{owns_business_wan, protected_wan_parent};

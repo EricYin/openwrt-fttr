@@ -163,6 +163,7 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
     };
     if let Some(s) = globals.first() {
         cfg.enabled = boolean(s.get("enabled"), false)?;
+        cfg.allow_unsupported_as_bridge = boolean(s.get("allow_unsupported_as_bridge"), false)?;
         cfg.automatic = match s.get("mode") {
             "" | "manual" => false,
             "auto" => true,
@@ -226,6 +227,7 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
         let adapter = match s.get("adapter") {
             "hl202" if cfg!(feature = "device-hl202") => "hl202",
             "hwtc" | "k155" if cfg!(feature = "device-hwtc") => "hwtc",
+            "generic" => "generic",
             _ => return Err(format!("{id}: adapter unknown or not compiled")),
         };
         let wifi_cleanup = match s.get("wifi_cleanup") {
@@ -613,5 +615,16 @@ mod tests {
                 "hwtc"
             );
         }
+    }
+    #[test]
+    fn parses_allow_unsupported_as_bridge_and_generic_adapter() {
+        let text = "config provisioning 'global'\n option allow_unsupported_as_bridge '1'\nconfig device 'child'\n option optical_sn 'ZTEG12345678'\n option cwmp_id 'child-id'\n option adapter 'generic'\n";
+        let config = parse_expanded(text).unwrap();
+        assert!(config.allow_unsupported_as_bridge);
+        assert_eq!(config.devices[0].adapter, "generic");
+
+        let text_disabled = "config provisioning 'global'\n option allow_unsupported_as_bridge '0'\n";
+        let config_disabled = parse_expanded(text_disabled).unwrap();
+        assert!(!config_disabled.allow_unsupported_as_bridge);
     }
 }
