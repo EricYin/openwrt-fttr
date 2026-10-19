@@ -5,14 +5,70 @@ use crate::pon_engine::omci::{
     FmcsTransport, OmciSession,
 };
 mod tables;
+use std::sync::atomic::AtomicU64;
 use std::{
+    fs::{self, OpenOptions},
     io,
+    io::Write,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
+
+static NEXT_PROGRESS_FILE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(serde::Serialize)]
+pub(super) struct MibProgress {
+    pub phase: &'static str,
+    pub received: usize,
+    pub expected: Option<usize>,
+}
+
+#[derive(Clone)]
+pub(super) struct MibProgressReporter {
+    path: PathBuf,
+}
+
+impl MibProgressReporter {
+    pub fn new(id: &str) -> io::Result<Self> {
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid MIB progress identifier",
+            ));
+        }
+        Ok(Self {
+            path: PathBuf::from(format!("/tmp/fttr-mib.{id}/progress")),
+        })
+    }
+
+    pub fn update(&self, progress: &MibProgress) -> io::Result<()> {
+        let directory = self.path.parent().expect("MIB progress path has a parent");
+        if !fs::symlink_metadata(directory)?.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid MIB job directory",
+            ));
+        }
+        let sequence = NEXT_PROGRESS_FILE.fetch_add(1, Ordering::Relaxed);
+        let temporary = directory.join(format!("progress.{}.{}.tmp", std::process::id(), sequence));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        serde_json::to_writer(&mut file, progress).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+        fs::rename(temporary, &self.path)
+    }
+}
 
 pub(super) fn collect(
     id: u8,
@@ -90,23 +146,39 @@ pub(super) fn collect(
 pub(super) struct MibCommand {
     pub onu_id: u8,
     pub tables: bool,
+    #[serde(default)]
+    pub progress_id: Option<String>,
 }
 pub(super) struct MibRequest {
     pub tables: bool,
     pub deadline: Instant,
+    pub progress: Option<MibProgressReporter>,
     pub reply: std::sync::mpsc::Sender<io::Result<MibReport>>,
 }
 
 /// Default output is one JSON document; human-readable summary is a client view.
 pub fn read(id: u8, summary: bool, tables: bool) -> io::Result<()> {
+    read_with_progress(id, summary, tables, None)
+}
+
+pub fn read_with_progress(
+    id: u8,
+    summary: bool,
+    tables: bool,
+    progress_id: Option<String>,
+) -> io::Result<()> {
     if !(1..=15).contains(&id) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "ONU_ID must be 1..15",
         ));
     }
-    let command =
-        serde_json::to_string(&MibCommand { onu_id: id, tables }).map_err(io::Error::other)?;
+    let command = serde_json::to_string(&MibCommand {
+        onu_id: id,
+        tables,
+        progress_id,
+    })
+    .map_err(io::Error::other)?;
     let response = crate::ipc::send_ipc_command(&format!("MIB {command}"))?;
     let value: serde_json::Value = serde_json::from_str(&response).map_err(io::Error::other)?;
     if let Some(error) = value.get("error") {
@@ -180,6 +252,7 @@ pub(super) fn read_owned(
     tables: bool,
     cancellation: Option<Arc<AtomicBool>>,
     deadline: Instant,
+    progress: Option<MibProgressReporter>,
 ) -> io::Result<MibReport> {
     if !super::service::operation_confirmed(id) {
         return Err(io::Error::new(
@@ -193,17 +266,55 @@ pub(super) fn read_owned(
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let mut report = session.upload_mib()?;
+    if let Some(reporter) = &progress {
+        reporter.update(&MibProgress {
+            phase: "upload",
+            received: 0,
+            expected: None,
+        })?;
+    }
+    let mut report = session.upload_mib_with_progress(|received, expected| {
+        if let Some(reporter) = &progress {
+            reporter.update(&MibProgress {
+                phase: "upload",
+                received,
+                expected: Some(expected),
+            })?;
+        }
+        Ok(())
+    })?;
     report.onu_id = Some(id);
     report.tables_requested = tables;
     if tables {
-        self::tables::collect(&mut session, &mut report)?;
+        let expected = report
+            .entities
+            .iter()
+            .filter(|entity| entity.class_id == 171)
+            .count();
+        if let Some(reporter) = &progress {
+            reporter.update(&MibProgress {
+                phase: "tables",
+                received: 0,
+                expected: Some(expected),
+            })?;
+        }
+        self::tables::collect(&mut session, &mut report, |received, expected| {
+            if let Some(reporter) = &progress {
+                reporter.update(&MibProgress {
+                    phase: "tables",
+                    received,
+                    expected: Some(expected),
+                })?;
+            }
+            Ok(())
+        })?;
     }
     Ok(report)
 }
 pub(super) fn control(
     id: u8,
     tables: bool,
+    progress: Option<MibProgressReporter>,
     states: &super::service::States,
 ) -> io::Result<MibReport> {
     if !(1..=15).contains(&id) {
@@ -229,7 +340,7 @@ pub(super) fn control(
             }
             let _lease = StockOmccLease::open(id)?;
             let _channel = ChannelLease::open(id, 0)?;
-            read_owned(id, tables, None, deadline)
+            read_owned(id, tables, None, deadline, progress)
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
             let sender = states
@@ -245,6 +356,7 @@ pub(super) fn control(
                 .try_send(MibRequest {
                     tables,
                     deadline,
+                    progress,
                     reply,
                 })
                 .map_err(|_| {
