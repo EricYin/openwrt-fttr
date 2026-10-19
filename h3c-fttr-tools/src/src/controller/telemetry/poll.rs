@@ -1,6 +1,13 @@
 use super::Collector;
 use crate::pon_engine::omci::platform::leases::{lock_onu, ChannelLease, StockOmccLease};
-use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread, time::{Duration, Instant}};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 pub(in crate::controller) fn start(id: u8, token: Arc<AtomicBool>) {
     thread::spawn(move || {

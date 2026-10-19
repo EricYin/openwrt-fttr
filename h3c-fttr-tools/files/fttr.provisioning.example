@@ -29,12 +29,12 @@ config group 'home_group'
 	option template 'home'
 
 config device 'hl202'
-	option optical_sn 'H3CT685DF998'
+	option optical_sn 'H3CT00088888'
 	option adapter 'hl202'
 	option group 'home_group'
 
 config device 'k155'
-	option optical_sn 'HWTC3C6DE5B3'
+	option optical_sn 'HWTC00088888'
 	option adapter 'hwtc'
 	option group 'home_group'
 

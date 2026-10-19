@@ -83,13 +83,16 @@ fn ipc_handler(
                         .transpose()?;
                     super::inventory::control(command.onu_id, command.tables, progress, &services)
                 });
-            let response = match result {
-                Ok(report) => serde_json::to_value(report).expect("serializable MIB report"),
-                Err(error) => {
-                    serde_json::json!({"schema_version": 1, "error": {"code": format!("{:?}", error.kind()), "message": error.to_string()}})
+            match result {
+                Ok(report) => {
+                    let _ = serde_json::to_writer(&mut stream, &report);
                 }
-            };
-            let _ = stream.write_all(response.to_string().as_bytes());
+                Err(error) => {
+                    let response = serde_json::json!({"schema_version": 1, "error": {"code": format!("{:?}", error.kind()), "message": error.to_string()}});
+                    let _ = serde_json::to_writer(&mut stream, &response);
+                }
+            }
+            let _ = stream.write_all(b"\n");
         } else if let Some(request) = line.strip_prefix("PROVISIONING ") {
             let _ = stream.write_all(crate::provisioning::control(request).as_bytes());
         } else if let Some(_request) = line.strip_prefix("ACS ") {

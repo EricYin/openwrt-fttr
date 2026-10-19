@@ -1,5 +1,10 @@
-use crate::{model::{OnuGemPort, OnuOmciInventory, OnuVlanFilter, OnuVlanOperation},
-    pon_engine::omci::{attributes::AttributeValue, mib::{DecodedEntity, MibReport}}};
+use crate::{
+    model::{OnuGemPort, OnuOmciInventory, OnuVlanFilter, OnuVlanOperation},
+    pon_engine::omci::{
+        attributes::AttributeValue,
+        mib::{DecodedEntity, MibReport},
+    },
+};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -10,32 +15,56 @@ pub(in crate::controller) struct InventorySample {
 
 impl InventorySample {
     pub fn from_report(report: &MibReport, started: Instant) -> Option<Self> {
-        if !report.uploaded_complete { return None; }
-        let mut inventory = OnuOmciInventory { age_seconds: 0, gem_ports: Vec::new(),
-            vlan_filters: Vec::new(), vlan_operations: Vec::new() };
+        if !report.uploaded_complete {
+            return None;
+        }
+        let mut inventory = OnuOmciInventory {
+            age_seconds: 0,
+            gem_ports: Vec::new(),
+            vlan_filters: Vec::new(),
+            vlan_operations: Vec::new(),
+        };
         for entity in &report.entities {
             match entity.class_id {
-                268 => inventory.gem_ports.push(OnuGemPort { entity_id: entity.entity_id,
-                    port_id: unsigned(entity, 1).and_then(|v| u16::try_from(v).ok()).filter(|v| *v <= 4095) }),
-                84 => inventory.vlan_filters.push(OnuVlanFilter { entity_id: entity.entity_id,
+                268 => inventory.gem_ports.push(OnuGemPort {
+                    entity_id: entity.entity_id,
+                    port_id: unsigned(entity, 1)
+                        .and_then(|v| u16::try_from(v).ok())
+                        .filter(|v| *v <= 4095),
+                }),
+                84 => inventory.vlan_filters.push(OnuVlanFilter {
+                    entity_id: entity.entity_id,
                     filter_list_hex: match attribute(entity, 1) {
                         Some(AttributeValue::Octets { hex }) => Some(hex.clone()),
                         _ => None,
-                    }, forward_operation: unsigned(entity, 2), number_of_entries: unsigned(entity, 3) }),
+                    },
+                    forward_operation: unsigned(entity, 2),
+                    number_of_entries: unsigned(entity, 3),
+                }),
                 171 => {
-                    let table = report.tables.iter().find(|t| t.class_id == 171
-                        && t.entity_id == entity.entity_id && t.attribute.index == 6);
-                    inventory.vlan_operations.push(OnuVlanOperation { entity_id: entity.entity_id,
-                        received_frame_rules_hex: table.filter(|t| t.collected).map(|t| t.rows.clone()),
+                    let table = report.tables.iter().find(|t| {
+                        t.class_id == 171
+                            && t.entity_id == entity.entity_id
+                            && t.attribute.index == 6
+                    });
+                    inventory.vlan_operations.push(OnuVlanOperation {
+                        entity_id: entity.entity_id,
+                        received_frame_rules_hex: table
+                            .filter(|t| t.collected)
+                            .map(|t| t.rows.clone()),
                         error: match table {
                             Some(t) => t.error.clone(),
                             None => Some("vlan_table_not_collected".into()),
-                        } });
+                        },
+                    });
                 }
                 _ => {}
             }
         }
-        Some(Self { inventory, at: started })
+        Some(Self {
+            inventory,
+            at: started,
+        })
     }
 
     pub fn current(&self) -> Option<OnuOmciInventory> {
@@ -46,11 +75,18 @@ impl InventorySample {
         })
     }
 
-    pub fn refresh_due(&self) -> bool { self.at.elapsed() >= Duration::from_secs(60) }
+    pub fn refresh_due(&self) -> bool {
+        self.at.elapsed() >= Duration::from_secs(60)
+    }
 }
 
 fn attribute(entity: &DecodedEntity, index: u8) -> Option<&AttributeValue> {
-    entity.attributes.iter().find(|a| a.definition.index == index)?.value.as_ref()
+    entity
+        .attributes
+        .iter()
+        .find(|a| a.definition.index == index)?
+        .value
+        .as_ref()
 }
 
 fn unsigned(entity: &DecodedEntity, index: u8) -> Option<u32> {
@@ -71,8 +107,13 @@ mod tests {
         let mut assembler = MibAssembler::new(1);
         let mut data = [0; 26];
         data[..2].copy_from_slice(&[1, 3]);
-        assembler.push(MibRecord { sequence: 0, class_id: 268, entity_id: 512,
-            attribute_mask: 0x8000, data });
+        assembler.push(MibRecord {
+            sequence: 0,
+            class_id: 268,
+            entity_id: 512,
+            attribute_mask: 0x8000,
+            data,
+        });
         // When a complete report becomes a telemetry inventory.
         let sample = InventorySample::from_report(&assembler.finish(), Instant::now()).unwrap();
         // Then the independently reported GEM ID survives.

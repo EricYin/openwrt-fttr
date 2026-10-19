@@ -1,5 +1,11 @@
 use crate::model::{DataPathStatus, MeasurementEvidence, Measurements, OnuOmciInventory};
-use std::{collections::BTreeMap, fs, path::Path, sync::{Mutex, OnceLock}, time::{Duration, Instant}};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::Path,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 struct Counters {
     at: Instant,
@@ -7,21 +13,41 @@ struct Counters {
     rx: Option<u64>,
 }
 
-pub(in crate::controller) fn data_path(id: u8, registration: &str, inventory: Option<OnuOmciInventory>) -> DataPathStatus {
+pub(in crate::controller) fn data_path(
+    id: u8,
+    registration: &str,
+    inventory: Option<OnuOmciInventory>,
+) -> DataPathStatus {
     data_path_from(Path::new("/sys/class/net"), id, registration, inventory)
 }
 
-pub(in crate::controller) fn data_path_from(root: &Path, id: u8, registration: &str, inventory: Option<OnuOmciInventory>) -> DataPathStatus {
+pub(in crate::controller) fn data_path_from(
+    root: &Path,
+    id: u8,
+    registration: &str,
+    inventory: Option<OnuOmciInventory>,
+) -> DataPathStatus {
     let mut status = collect(root, id, registration);
     let expected_gem = 0x100u16 + u16::from(id);
     status.olt_channel_gem = Some(expected_gem);
 
     if let Some(inventory) = inventory {
-        status.gem_ports = inventory.gem_ports.iter().map(|port| port.port_id).collect();
+        status.gem_ports = inventory
+            .gem_ports
+            .iter()
+            .map(|port| port.port_id)
+            .collect();
         for field in ["gem_ports", "onu_inventory"] {
-            let mut evidence = MeasurementEvidence::observed("fresh ONU OMCI MIB upload; not OLT forwarding proof",
-                "ONU configuration", format!("{} GEM CTPs; {} VLAN filters; {} VLAN operation tables",
-                    inventory.gem_ports.len(), inventory.vlan_filters.len(), inventory.vlan_operations.len()));
+            let mut evidence = MeasurementEvidence::observed(
+                "fresh ONU OMCI MIB upload; not OLT forwarding proof",
+                "ONU configuration",
+                format!(
+                    "{} GEM CTPs; {} VLAN filters; {} VLAN operation tables",
+                    inventory.gem_ports.len(),
+                    inventory.vlan_filters.len(),
+                    inventory.vlan_operations.len()
+                ),
+            );
             evidence.age_seconds = Some(inventory.age_seconds);
             if field == "gem_ports" && status.gem_ports.is_none() {
                 evidence.reason = Some("gem_port_attribute_missing_or_invalid".into());
@@ -29,7 +55,10 @@ pub(in crate::controller) fn data_path_from(root: &Path, id: u8, registration: &
             status.measurements.insert(field.into(), evidence);
         }
 
-        let gem_matched = status.gem_ports.as_ref().map_or(false, |ports| ports.iter().any(|p| *p == expected_gem));
+        let gem_matched = status
+            .gem_ports
+            .as_ref()
+            .map_or(false, |ports| ports.iter().any(|p| *p == expected_gem));
         let rx_traffic = status.rx_bytes.unwrap_or(0) > 0;
 
         let (verified, fwd_evidence) = if !gem_matched {
@@ -67,7 +96,9 @@ pub(in crate::controller) fn data_path_from(root: &Path, id: u8, registration: &
         };
 
         status.forwarding_verified = Some(verified);
-        status.measurements.insert("forwarding_proof".into(), fwd_evidence);
+        status
+            .measurements
+            .insert("forwarding_proof".into(), fwd_evidence);
         status.onu_inventory = Some(inventory);
     } else {
         status.forwarding_verified = Some(false);
@@ -85,22 +116,37 @@ pub(in crate::controller) fn data_path_from(root: &Path, id: u8, registration: &
 
 fn counter(path: &Path) -> (Option<u64>, MeasurementEvidence) {
     let source = path.display().to_string();
-    let unit = if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with("packets")) {
+    let unit = if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with("packets"))
+    {
         "packets"
     } else {
         "bytes"
     };
     match fs::read_to_string(path) {
         Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(value) => (Some(value), MeasurementEvidence::observed(source, unit, raw.trim())),
-            Err(error) => (None, MeasurementEvidence::unavailable(source, unit, format!("invalid_counter: {error}"))),
+            Ok(value) => (
+                Some(value),
+                MeasurementEvidence::observed(source, unit, raw.trim()),
+            ),
+            Err(error) => (
+                None,
+                MeasurementEvidence::unavailable(source, unit, format!("invalid_counter: {error}")),
+            ),
         },
-        Err(error) => (None, MeasurementEvidence::unavailable(source, unit, format!("read_failed: {error}"))),
+        Err(error) => (
+            None,
+            MeasurementEvidence::unavailable(source, unit, format!("read_failed: {error}")),
+        ),
     }
 }
 
 fn rate(current: Option<u64>, previous: Option<u64>, elapsed: Duration) -> Option<f64> {
-    if elapsed < Duration::from_secs(1) { return None; }
+    if elapsed < Duration::from_secs(1) {
+        return None;
+    }
     let delta = current?.checked_sub(previous?)?;
     Some(delta.to_string().parse::<f64>().ok()? * 8.0 / elapsed.as_secs_f64() / 1000.0)
 }
@@ -128,23 +174,65 @@ fn collect(root: &Path, id: u8, registration: &str) -> DataPathStatus {
             current_rx_kbps = rate(rx_bytes, previous.rx, previous.at.elapsed());
         }
         if previous.is_none_or(|sample| sample.at.elapsed() >= Duration::from_secs(1)) {
-            samples.insert(key, Counters { at: Instant::now(), tx: tx_bytes, rx: rx_bytes });
+            samples.insert(
+                key,
+                Counters {
+                    at: Instant::now(),
+                    tx: tx_bytes,
+                    rx: rx_bytes,
+                },
+            );
         }
     }
-    for (name, value) in [("current_tx_kbps", current_tx_kbps), ("current_rx_kbps", current_rx_kbps)] {
+    for (name, value) in [
+        ("current_tx_kbps", current_tx_kbps),
+        ("current_rx_kbps", current_rx_kbps),
+    ] {
         let evidence = match value {
-            Some(value) => MeasurementEvidence::observed(format!("{}/counter_delta", base.display()), "kbit/s", value.to_string()),
-            None => MeasurementEvidence::unavailable(format!("{}/counter_delta", base.display()), "kbit/s", "requires_two_valid_monotonic_samples_at_least_one_second_apart"),
+            Some(value) => MeasurementEvidence::observed(
+                format!("{}/counter_delta", base.display()),
+                "kbit/s",
+                value.to_string(),
+            ),
+            None => MeasurementEvidence::unavailable(
+                format!("{}/counter_delta", base.display()),
+                "kbit/s",
+                "requires_two_valid_monotonic_samples_at_least_one_second_apart",
+            ),
         };
         measurements.insert(name.into(), evidence);
     }
     for field in ["gem_ports", "onu_inventory"] {
-        measurements.insert(field.into(), MeasurementEvidence::unavailable("verified data-path inventory", "identifier", "verified_inventory_unavailable"));
+        measurements.insert(
+            field.into(),
+            MeasurementEvidence::unavailable(
+                "verified data-path inventory",
+                "identifier",
+                "verified_inventory_unavailable",
+            ),
+        );
     }
-    measurements.insert("vlan_id".into(), MeasurementEvidence::unavailable("ONU VLAN rule tables", "VID",
-        "vlan_rules_are_not_a_single_business_vlan; see onu_inventory"));
-    DataPathStatus { interface, gem_ports: None, vlan_id: None, onu_inventory: None, tx_bytes, rx_bytes,
-        current_tx_kbps, current_rx_kbps, olt_channel_gem: None, forwarding_verified: None, measurements }
+    measurements.insert(
+        "vlan_id".into(),
+        MeasurementEvidence::unavailable(
+            "ONU VLAN rule tables",
+            "VID",
+            "vlan_rules_are_not_a_single_business_vlan; see onu_inventory",
+        ),
+    );
+    DataPathStatus {
+        interface,
+        gem_ports: None,
+        vlan_id: None,
+        onu_inventory: None,
+        tx_bytes,
+        rx_bytes,
+        current_tx_kbps,
+        current_rx_kbps,
+        olt_channel_gem: None,
+        forwarding_verified: None,
+        measurements,
+    }
 }
 
 #[cfg(test)]
@@ -184,7 +272,10 @@ mod tests {
 
         let inventory = OnuOmciInventory {
             age_seconds: 5,
-            gem_ports: vec![crate::model::OnuGemPort { entity_id: 257, port_id: Some(257) }],
+            gem_ports: vec![crate::model::OnuGemPort {
+                entity_id: 257,
+                port_id: Some(257),
+            }],
             vlan_filters: Vec::new(),
             vlan_operations: Vec::new(),
         };
@@ -196,7 +287,11 @@ mod tests {
         assert!(proof.raw.is_some());
         assert!(proof.reason.is_none());
         assert_eq!(proof.unit, "forwarding_proof");
-        assert!(proof.raw.as_ref().unwrap().contains("hardware_forwarding_verified"));
+        assert!(proof
+            .raw
+            .as_ref()
+            .unwrap()
+            .contains("hardware_forwarding_verified"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -210,7 +305,10 @@ mod tests {
 
         let inventory = OnuOmciInventory {
             age_seconds: 5,
-            gem_ports: vec![crate::model::OnuGemPort { entity_id: 257, port_id: Some(257) }],
+            gem_ports: vec![crate::model::OnuGemPort {
+                entity_id: 257,
+                port_id: Some(257),
+            }],
             vlan_filters: Vec::new(),
             vlan_operations: Vec::new(),
         };
@@ -220,13 +318,17 @@ mod tests {
         assert_eq!(status.forwarding_verified, Some(false));
         let proof = status.measurements.get("forwarding_proof").unwrap();
         assert!(proof.raw.is_none());
-        assert_eq!(proof.reason.as_deref(), Some("waiting_for_first_rx_frame_from_gem"));
+        assert_eq!(
+            proof.reason.as_deref(),
+            Some("waiting_for_first_rx_frame_from_gem")
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn data_path_rejects_verification_when_gem_mismatches_olt_channel() {
-        let root = std::env::temp_dir().join(format!("network-test-mismatch-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("network-test-mismatch-{}", std::process::id()));
         let stat_dir = root.join("fttr1").join("statistics");
         fs::create_dir_all(&stat_dir).unwrap();
         fs::write(stat_dir.join("tx_bytes"), "1000\n").unwrap();
@@ -235,7 +337,10 @@ mod tests {
         // ONU reports GEM 300, but OLT channel for ONU 1 is 257 (0x101)
         let inventory = OnuOmciInventory {
             age_seconds: 5,
-            gem_ports: vec![crate::model::OnuGemPort { entity_id: 257, port_id: Some(300) }],
+            gem_ports: vec![crate::model::OnuGemPort {
+                entity_id: 257,
+                port_id: Some(300),
+            }],
             vlan_filters: Vec::new(),
             vlan_operations: Vec::new(),
         };
@@ -245,7 +350,11 @@ mod tests {
         assert_eq!(status.forwarding_verified, Some(false));
         let proof = status.measurements.get("forwarding_proof").unwrap();
         assert!(proof.raw.is_none());
-        assert!(proof.reason.as_ref().unwrap().contains("gem_port_mismatch_with_olt_hardware_envelope"));
+        assert!(proof
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("gem_port_mismatch_with_olt_hardware_envelope"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -257,6 +366,9 @@ mod tests {
         assert_eq!(status.forwarding_verified, Some(false));
         let proof = status.measurements.get("forwarding_proof").unwrap();
         assert!(proof.raw.is_none());
-        assert_eq!(proof.reason.as_deref(), Some("verified_inventory_unavailable"));
+        assert_eq!(
+            proof.reason.as_deref(),
+            Some("verified_inventory_unavailable")
+        );
     }
 }
