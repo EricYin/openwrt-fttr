@@ -11,14 +11,6 @@ start_service() {
 	config_get acs_username acs username ""
 	config_get acs_password acs password ""
 
-	# Rotate oversized ACS state file (> 256 KiB) if present to prevent daemon lockup
-	if [ -f "$acs_state" ]; then
-		size=$(wc -c < "$acs_state" 2>/dev/null || echo 0)
-		if [ "$size" -gt 262144 ]; then
-			echo "[*] ACS state file exceeds 256 KiB ($size bytes), rotating to ${acs_state}.oversized.bak"
-			mv "$acs_state" "${acs_state}.oversized.bak"
-		fi
-	fi
 	# Only start on H3C HM2004-DU
 	board=$(cat /tmp/sysinfo/board_name 2>/dev/null)
 	if [ "$board" != "h3c,hm2004-du" ]; then

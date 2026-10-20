@@ -52,6 +52,7 @@ struct Record {
     last_error: Option<String>,
     transport_epoch: u64,
     completed_authorization: u64,
+    connection_request_enabled: Option<bool>,
     #[serde(skip)]
     worker: Option<u64>,
     #[serde(skip)]
@@ -112,6 +113,7 @@ fn version(device: &Device, management: Option<&Management>, target: Option<&str
         device.optical_sn.as_str(),
         device.cwmp_id.as_str(),
         device.adapter.as_str(),
+        device.connection_request.enabled,
         management,
         target,
     ))
@@ -277,6 +279,10 @@ impl Coordinator {
         r.last_observed_time = time;
         let desired = format!("{}-{}",version(device, management, target),authorization.map(|(epoch,_)|epoch).unwrap_or_default());
         let initialized = !r.desired_version.is_empty();
+        if r.connection_request_enabled.is_some_and(|enabled| enabled != device.connection_request.enabled) {
+            r.completed_authorization = 0;
+        }
+        r.connection_request_enabled = Some(device.connection_request.enabled);
         if r.initial_inform.is_none() {
             r.initial_inform = Some(at);
         }
@@ -329,7 +335,7 @@ impl Coordinator {
             || r.settings_verified_at.is_some_and(|verified| at.is_some_and(|at| at >= verified));
         let fresh = acs_available
             && settings_verified
-            && r.fresh_inform(at, time, freshness, online);
+            && r.fresh_inform(at, time, device.connection_request.effective_freshness(freshness), online);
         if r.state == Phase::Ready && !fresh {
             r.invalidate(
                 time,
@@ -543,6 +549,10 @@ pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Va
 }
 
 #[cfg(test)]
+#[path = "bootstrap_interval_tests.rs"]
+mod interval_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::mqtt_identity::normalize_target;
@@ -584,6 +594,7 @@ mod tests {
             adapter: adapter.into(),
             cwmp_contract: "auto".into(),
             omci_management: false,
+            connection_request: Default::default(),
             items: Vec::new(),
             wifi_cleanup: "preserve".into(),
             wifi_preserve: Default::default(),

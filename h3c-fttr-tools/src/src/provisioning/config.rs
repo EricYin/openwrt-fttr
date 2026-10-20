@@ -268,6 +268,22 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
             cwmp_contract: cwmp_contract.into(),
             omci_management: boolean(s.get("omci_management"), false)
                 .map_err(|error| format!("{id}: omci_management: {error}"))?,
+            connection_request: super::model::ConnectionRequest {
+                enabled: boolean(s.get("connection_request"), true)
+                    .map_err(|error| format!("{id}: connection_request: {error}"))?,
+                defaults: boolean(s.get("connection_request_defaults"),
+                    s.get("connection_request_username").is_empty() || s.get("connection_request_password").is_empty())
+                    .map_err(|error| format!("{id}: connection_request_defaults: {error}"))?,
+                username: s.get("connection_request_username").into(),
+                password: s.get("connection_request_password").into(),
+                port: if s.get("connection_request_port").is_empty() {
+                    super::model::ConnectionRequest::default().port
+                } else {
+                    s.get("connection_request_port").parse::<std::num::NonZeroU16>()
+                        .map_err(|_| format!("{id}: connection_request_port must be 1..65535"))?
+                },
+                ..Default::default()
+            },
             items: Vec::new(),
             wifi_cleanup: wifi_cleanup.into(),
             wifi_preserve,
@@ -544,6 +560,9 @@ fn boolean(value: &str, default: bool) -> Result<bool, String> {
     }
 }
 
+#[cfg(test)]
+#[path = "connection_request_config_tests.rs"]
+mod connection_request_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

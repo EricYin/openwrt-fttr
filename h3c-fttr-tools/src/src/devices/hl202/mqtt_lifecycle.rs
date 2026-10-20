@@ -70,10 +70,7 @@ fn authenticated_script(acs_url:Option<&str>,credentials:&crate::devices::CwmpCr
         commands.push("case \"$(tcapi get CwmpRoute_Entry ifStatus0)\" in Up|old|new) true;; *) tcapi set CwmpRoute_Entry ifStatus0 Up || exit 1; changed=1;; esac".into());
         commands.push(format!("if [ \"$(tcapi get CwmpRoute_Entry ifGateway0)\" != {0} ]; then tcapi set CwmpRoute_Entry ifGateway0 {0} || exit 1; changed=1; fi", shell_quote(host)));
     }
-    commands.push(
-        "if [ \"$(tcapi get Cwmp_Entry periodInterval)\" != 5 ]; then tcapi set Cwmp_Entry periodInterval 5 || exit 1; changed=1; fi".into(),
-    );
-    for (key, value) in [("Active", "Yes"), ("periodActive", "Yes")] {
+    for (key, value) in [("Active", "Yes")] {
         commands.push(format!("if [ \"$(tcapi get Cwmp_Entry {key})\" != {value} ]; then tcapi set Cwmp_Entry {key} {value} || exit 1; changed=1; fi"));
     }
     // Also persist matching runtime values after a previous command with an unknown outcome.
@@ -113,9 +110,7 @@ fn settings_tests(acs_url: Option<&str>) -> Vec<String> {
         commands.push("case \"$(tcapi get CwmpRoute_Entry ifStatus0)\" in Up|old|new) true;; *) false;; esac".into());
         commands.push(format!("test \"$(tcapi get CwmpRoute_Entry ifGateway0)\" = {}", shell_quote(host)));
     }
-    commands.push("test \"$(tcapi get Cwmp_Entry periodInterval)\" = 5".into());
     commands.push("test \"$(tcapi get Cwmp_Entry Active)\" = Yes".into());
-    commands.push("test \"$(tcapi get Cwmp_Entry periodActive)\" = Yes".into());
     commands
 }
 
@@ -146,12 +141,13 @@ mod tests {
     }
 
     #[test]
-    fn config_script_sets_both_acs_url_fields_and_five_second_interval() {
+    fn config_script_sets_acs_url_without_owning_periodic_policy() {
         let script = config_script(Some("http://192.168.1.1:7547/cwmp"));
         println!("SCRIPT: [{script}]");
         assert!(script.contains("tcapi set Cwmp_Entry acsUrl 'http://192.168.1.1:7547/cwmp'"));
         assert!(script.contains("tcapi set Cwmp_Entry SyncAcsUrl Yes"));
-        assert!(script.contains("tcapi set Cwmp_Entry periodInterval 5"));
+        assert!(!script.contains("periodInterval"));
+        assert!(!script.contains("periodActive"));
         assert!(script.contains("tcapi set DeviceInfo_DevParaDynamic mainGatewayOUI 000FE2"));
         assert!(script.contains("tcapi set DeviceInfo_DevParaDynamic mainGatewaySN 1C94685AF429"));
         assert!(script.contains("case \"$(tcapi get CwmpRoute_Entry ifStatus0)\" in Up|old|new) true;; *) tcapi set CwmpRoute_Entry ifStatus0 Up"));
@@ -160,14 +156,13 @@ mod tests {
             "if [ \"$(tcapi get Cwmp_Entry acsUrl)\" != 'http://192.168.1.1:7547/cwmp' ]"
         ));
         assert!(script.contains("case \"$(tcapi get Cwmp_Entry SyncAcsUrl)\" in No) tcapi set"));
-        assert!(script.contains("if [ \"$(tcapi get Cwmp_Entry periodInterval)\" != 5 ]"));
         assert!(script.contains("tcapi commit Cwmp && tcapi commit CwmpRoute && tcapi commit DeviceInfo && tcapi save"));
         assert!(script.contains("printf 'HL202_CWMP_SETTINGS_VERIFIED\\n'"));
 
         let tests = settings_tests(Some("http://192.168.1.1:7547/cwmp")).join(" && ");
         assert!(tests.contains("tcapi get Cwmp_Entry acsUrl"));
         assert!(tests.contains("tcapi get Cwmp_Entry SyncAcsUrl)\" in No) false"));
-        assert!(tests.contains("tcapi get Cwmp_Entry periodInterval"));
+        assert!(!tests.contains("periodInterval"));
     }
 
     #[test]
@@ -219,7 +214,7 @@ tcapi() {
 }
 "#;
         let script = format!(
-            "{mock}\n{}",
+            "{mock}\n{} && test \"$interval:$periodic\" = '43200:No'",
             config_script(Some("http://192.0.2.1:7547/cwmp"))
         );
         let output = std::process::Command::new("sh")

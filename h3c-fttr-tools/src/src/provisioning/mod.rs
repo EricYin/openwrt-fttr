@@ -28,3 +28,5 @@ pub(crate) use controller::{
 pub(crate) use policy::contains_service_token;
 #[cfg(feature = "acs")]
 pub(crate) use policy::{owns_business_wan, protected_wan_parent};
+#[cfg(feature = "acs")]
+pub(crate) use controller::connection_request_devices;

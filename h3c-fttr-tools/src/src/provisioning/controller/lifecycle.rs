@@ -167,6 +167,9 @@ impl Controller {
                 self.last_online.remove(&previous.id);
             }
         }
+        for previous in &self.config.devices {
+            previous.connection_request.authorization.store(false, std::sync::atomic::Ordering::Release);
+        }
         self.config = config;
         self.load_reset_intents();
         self.retain_configured_state();

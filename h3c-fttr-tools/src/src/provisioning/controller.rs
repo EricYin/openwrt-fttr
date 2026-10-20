@@ -502,6 +502,14 @@ fn aggregate(items: &[Value]) -> &str {
 pub fn snapshot() -> Value {
     controller().lock().unwrap().snapshot()
 }
+#[cfg(feature = "acs")]
+pub(crate) fn connection_request_devices() -> BTreeMap<String, super::model::ConnectionRequest> {
+    let c = controller().lock().unwrap();
+    c.config.devices.iter()
+        .filter(|d| !c.resets.blocks(&d.optical_sn))
+        .map(|d| (d.cwmp_id.clone(), d.connection_request.clone()))
+        .collect()
+}
 pub fn control(request: &str) -> String {
     let reply = (|| -> Result<Value, String> {
         let v: Value = serde_json::from_str(request).map_err(|_| "invalid provisioning request")?;
@@ -685,7 +693,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
             .then(|| observed["last_inform"].as_u64())
             .flatten();
             let reachable = online.contains(&d.optical_sn)
-                && at.is_some_and(|at| time.saturating_sub(at) <= config.freshness);
+                && at.is_some_and(|at| time.saturating_sub(at) <= d.connection_request.effective_freshness(config.freshness));
             c.management.insert(d.id.clone(), json!({"cwmp_id":d.cwmp_id,"state":if reachable {"online"} else if at.is_none() {"waiting_inform"} else {"offline_or_stale"},"optical_online":online.contains(&d.optical_sn),"last_inform":at,"age_seconds":at.map(|at| time.saturating_sub(at))}));
             if reachable {
                 fresh.insert(d.id.clone());
@@ -706,7 +714,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                 last_inform: at,
                 online: online.contains(&d.optical_sn),
                 new_boot,
-                freshness: config.freshness,
+                freshness: d.connection_request.effective_freshness(config.freshness),
                 time,
                 acs_available: active_management.is_some()
                     && c.acs_status["enabled"] == true
@@ -1163,6 +1171,7 @@ mod tests {
                 adapter: "hl202".into(),
                 cwmp_contract: "hl202-cu".into(),
                 omci_management: false,
+                connection_request: Default::default(),
                 items: vec![item],
                 wifi_cleanup: "preserve".into(),
                 wifi_preserve: BTreeSet::new(),

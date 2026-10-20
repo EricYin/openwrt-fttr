@@ -5,6 +5,15 @@ mod task;
 mod persistence;
 mod readback;
 mod transaction;
+mod connection_request;
+mod connection_request_http;
+mod periodic_policy;
+mod periodic_task;
+mod connection_request_proof;
+#[cfg(test)]
+mod periodic_policy_tests;
+#[cfg(test)]
+mod connection_request_tests;
 #[cfg(test)]
 mod compact_tests;
 #[cfg(test)]
@@ -54,6 +63,14 @@ struct State {
     sessions: BTreeMap<String, (String, String, u64)>,
     #[serde(skip)]
     load_failure: Option<String>,
+    #[serde(skip)]
+    connection_requests: BTreeMap<String, connection_request::Status>,
+    #[serde(skip)]
+    periodic_inform: BTreeMap<String, periodic_policy::Policy>,
+    #[serde(skip)]
+    interval_authorizations: BTreeMap<u64, periodic_task::Authorization>,
+    #[serde(skip)]
+    connection_request_proofs: BTreeMap<String, connection_request_proof::Proof>,
 }
 struct Server {
     state: Arc<Mutex<State>>,
@@ -128,7 +145,7 @@ impl Server {
             "status" => {
                 json!({"compiled":true, "enabled":self.enabled && !self.stopped.load(Ordering::Acquire), "listen":self.listen, "path":self.path, "endpoint_id":self.endpoint_id,"auth":self.auth.is_some(), "devices":state.devices.len(), "tasks":state.tasks.len(), "http_requests":self.requests.load(Ordering::Relaxed), "error":self.failure.lock().unwrap().clone()})
             }
-            "devices" => json!({"devices":state.devices}),
+            "devices" => json!({"devices":state.devices,"connection_requests":state.connection_requests,"periodic_inform":state.periodic_inform}),
             "reset_device_tasks" => {
                 let Some(device) = request["device"].as_str().filter(|id| !id.is_empty()) else {
                     return error("device required");
@@ -204,6 +221,7 @@ fn protect_management(
             .any(|p| {
                 p["name"].as_str().is_some_and(|n| {
                     n.starts_with("InternetGatewayDevice.ManagementServer.")
+                        || n.starts_with("Device.ManagementServer.")
                         || ((n.ends_with("ServiceList") || n.ends_with("SERVICELIST"))
                             && crate::provisioning::contains_service_token(
                                 p["value"].as_str().unwrap_or(""),
@@ -368,7 +386,8 @@ impl State {
             .values()
             .find(|t| t.device == device && t.state == TaskState::Queued)
         {
-            if let Err(reason) = protect_management(self, device, &task.method, &task.args) {
+            let internal_interval = self.interval_authorizations.get(&task.id).is_some_and(|grant|grant.permits(task, self));
+            if let Err(reason) = if internal_interval { Ok(()) } else { protect_management(self, device, &task.method, &task.args) } {
                 let id = task.id;
                 let task = self.tasks.get_mut(&id).unwrap();
                 task.state = TaskState::Fault;
@@ -462,6 +481,7 @@ pub fn control(request: &str) -> String {
 }
 pub fn start_from_env() {
     let _ = init();
+    connection_request::start();
     println!("[ACS] waiting for authorized management network");
 }
 
@@ -572,6 +592,7 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut current: Option<String> = None;
+    let mut current_session: Option<String> = None;
     for _ in 0..64 {
         if let Some(deadline)=*server.drain_deadline.lock().unwrap() {
             let Some(remaining)=deadline.checked_duration_since(std::time::Instant::now()) else {break;};
@@ -635,6 +656,7 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
                     *at = now();
                     device.clone()
                 });
+            if current.is_some() { current_session = cookie.map(str::to_owned); }
         }
         let mut extra = String::new();
         let mut dispatch = None;
@@ -677,6 +699,11 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
                     extra = format!("Set-Cookie: fttr_session={key}; Path={}; HttpOnly; SameSite=Strict\r\n", policy.path);
                     if server.stopping.load(Ordering::Acquire) {drop(state);http::reply(&mut stream,503,"","",true)?;break;}
                     state.devices.insert(device.clone(), Device { serial:message.serial, oui:message.oui, product_class:message.product, peer:peer.clone(), namespace:message.namespace.clone(), last_inform:now(), endpoint_id:policy.endpoint_id.clone(),inform:message.data });
+                    if let Some(mut proof) = state.connection_request_proofs.remove(&device) {
+                        proof.inform(&state.devices[&device], &key);
+                        if proof.current(&state.devices[&device], &proof.config()) { state.connection_request_proofs.insert(device.clone(), proof); }
+                    }
+                    current_session = Some(key);
                     current = Some(device);
                     state_changed = true;
                     Some(soap::envelope(&message.namespace, &message.id, "<cwmp:InformResponse><MaxEnvelopes>1</MaxEnvelopes></cwmp:InformResponse>"))
@@ -686,6 +713,7 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
                 _ => {
                     if let Some(device) = &current {
                         if let Err(e) = state.response(device, &message) { eprintln!("[ACS] peer={peer} RPC response rejected method={} id={}: {e}", message.method, message.id); drop(state); http::reply(&mut stream, 400, "", "", true)?; break; }
+                        if let Some(session) = &current_session { connection_request_proof::completed(&mut state, device, session); }
                         state_changed = true;
                         state.next(device, &message.namespace)?.map(|rpc| {
                             dispatch = Some(rpc.undo);
@@ -704,6 +732,9 @@ fn serve(server: &Server, mut stream: TcpStream) -> io::Result<()> {
                 http::reply(&mut stream, 503, "", "", true)?;
                 break;
             }
+        }
+        if let (Some(device), Some(session), Some(undo)) = (&current, &current_session, &dispatch) {
+            connection_request_proof::dispatched(&mut state, device, session, undo.id);
         }
         drop(state);
         let close = response.is_none()

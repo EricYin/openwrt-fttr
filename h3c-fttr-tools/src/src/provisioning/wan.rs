@@ -1070,6 +1070,7 @@ mod tests {
             adapter: "hwtc".into(),
             cwmp_contract: "hwtc-hw".into(),
             omci_management: false,
+            connection_request: Default::default(),
             items: vec![Item {
                 wlan_intent: None,
                 binding_intent: None,

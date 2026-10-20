@@ -222,9 +222,51 @@ pub struct Device {
     pub adapter: String,
     pub cwmp_contract: String,
     pub omci_management: bool,
+    pub connection_request: ConnectionRequest,
     pub items: Vec<Item>,
     pub wifi_cleanup: String,
     pub wifi_preserve: BTreeSet<u32>,
+}
+
+#[derive(Clone)]
+pub struct ConnectionRequest {
+    pub enabled: bool,
+    pub defaults: bool,
+    pub username: String,
+    pub password: String,
+    pub port: std::num::NonZeroU16,
+    pub(crate) authorization: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for ConnectionRequest {
+    fn default() -> Self {
+        Self {
+            enabled: true, defaults: true, username: String::new(), password: String::new(),
+            port: const { match std::num::NonZeroU16::new(7547) { Some(port) => port, None => panic!("invalid CR port") } },
+            authorization: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+}
+
+impl ConnectionRequest {
+    pub fn credentials_available(&self) -> bool {
+        !self.defaults && !self.username.is_empty() && !self.password.is_empty()
+            && !self.username.contains(':')
+            && [&self.username, &self.password].iter()
+                .all(|value| value.len() <= 1024 && !value.chars().any(char::is_control))
+    }
+
+    pub fn effective_freshness(&self, configured: u64) -> u64 {
+        if self.enabled { configured.max(2 * 43200) } else { configured }
+    }
+
+    #[cfg(feature = "acs")]
+    pub(crate) fn same_policy(&self, other: &Self) -> bool {
+        self.enabled == other.enabled && self.defaults == other.defaults
+            && self.username == other.username && self.password == other.password
+            && self.port == other.port
+            && std::sync::Arc::ptr_eq(&self.authorization, &other.authorization)
+    }
 }
 
 impl Device {

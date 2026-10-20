@@ -1,7 +1,7 @@
 use super::*;
 use std::io::BufRead;
 
-const DEVICE: &str = "ABCDEF:test:durability";
+pub(super) const DEVICE: &str = "ABCDEF:test:durability";
 const NS: &str = "urn:dslforum-org:cwmp-1-0";
 
 fn record(id: u64) -> Task {
@@ -17,10 +17,10 @@ fn record(id: u64) -> Task {
     }
 }
 
-struct Fixture(Arc<Server>);
+pub(super) struct Fixture(pub(super) Arc<Server>);
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let mut server = tests::listener_test_server();
         Arc::get_mut(&mut server).unwrap().enabled = true;
         {
@@ -46,22 +46,26 @@ impl Fixture {
         Self(server)
     }
 
-    fn fail_save(&self) {
+    pub(super) fn fail_save(&self) {
         fs::create_dir(format!("{}.tmp", self.0.state_file)).unwrap();
     }
 
-    fn repair_save(&self) {
+    pub(super) fn repair_save(&self) {
         fs::remove_dir(format!("{}.tmp", self.0.state_file)).unwrap();
     }
 
-    fn queue(&self) -> Value {
+    pub(super) fn queue(&self) -> Value {
         let task = record(0);
         self.0.execute_small(
             json!({"op":"queue","device":DEVICE,"method":task.method,"args":task.args}),
         )
     }
 
-    fn exchange(&self, body: &str) -> (String, String) {
+    pub(super) fn exchange(&self, body: &str) -> (String, String) {
+        self.exchange_session(body, "cookie")
+    }
+
+    pub(super) fn exchange_session(&self, body: &str, cookie: &str) -> (String, String) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         client
@@ -72,7 +76,7 @@ impl Fixture {
             let (stream, _) = listener.accept().unwrap();
             serve(&server, stream).unwrap();
         });
-        write!(client, "POST /cwmp HTTP/1.1\r\nHost: localhost\r\nCookie: fttr_session=cookie\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        write!(client, "POST /cwmp HTTP/1.1\r\nHost: localhost\r\nCookie: fttr_session={cookie}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
         client.flush().unwrap();
         let mut reader = BufReader::new(client);
         let mut headers = String::new();

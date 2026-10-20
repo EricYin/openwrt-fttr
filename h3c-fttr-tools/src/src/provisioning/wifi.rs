@@ -32,6 +32,7 @@ mod tests {
             adapter: "hl202".into(),
             cwmp_contract: "hl202-cu".into(),
             omci_management: false,
+            connection_request: Default::default(),
             wifi_cleanup: "delete".into(),
             wifi_preserve: BTreeSet::new(),
             items: vec![Item {
