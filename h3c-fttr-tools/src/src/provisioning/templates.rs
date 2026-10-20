@@ -128,6 +128,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
             ],
             "provisioning" => &[
                 "enabled",
+                "allow_unsupported_as_bridge",
                 "mode",
                 "trigger",
                 "interval_minutes",
@@ -504,6 +505,16 @@ mod tests {
             .as_ref()
             .is_some_and(|b| b.endpoints == [super::super::model::EndpointRef::Lan(2)])));
     }
+
+    #[test]
+    fn global_bridge_fallback_policy_is_preserved() {
+        let config =
+            super::compile("config provisioning 'global'\n option allow_unsupported_as_bridge '1'")
+                .unwrap();
+
+        assert!(config.allow_unsupported_as_bridge);
+    }
+
     use crate::provisioning::model::ItemKind;
     #[test]
     fn omci_management_is_opt_in_per_device_and_changes_revision() {
