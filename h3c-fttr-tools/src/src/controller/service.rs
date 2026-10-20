@@ -43,7 +43,10 @@ impl Services {
         let token = Arc::new(AtomicBool::new(false));
         self.tokens.insert(id, token.clone());
         let states = self.states.clone();
-        thread::spawn(move || {
+        let _ = thread::Builder::new()
+            .name(format!("onu-{id}-svc"))
+            .stack_size(256 * 1024)
+            .spawn(move || {
             // A transient equipment-ID GET failure must not permanently classify
             // an otherwise supported device as unsupported for this generation.
             let identity = loop {

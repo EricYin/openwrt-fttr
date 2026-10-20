@@ -128,25 +128,47 @@ fn start(desired: Desired, apply: bool, fresh_grant: bool) -> Result<Value, Stri
     }
     c.busy = true; c.state = Phase::Discovering; if !c.requires_apply {c.error = None;}
     drop(c);
-    std::thread::spawn(move || execute(desired, apply));
+    let _ = std::thread::Builder::new()
+        .name("mgmt-exec".into())
+        .stack_size(128 * 1024)
+        .spawn(move || execute(desired, apply));
     Ok(json!({"started":true,"mode":if apply {"apply"} else {"plan"}}))
 }
 pub(super) fn tick(desired: Option<&Desired>) {
     let Some(desired) = desired else {
         let mut c=coordinator().lock().unwrap();if c.busy||now()<c.next_retry||now().saturating_sub(c.last_discovery)<15 {return;}
-        if let Some(applied)=c.journal.applied.clone(){c.busy=true;c.last_discovery=now();drop(c);std::thread::spawn(move||restore(applied));}return;
+        if let Some(applied)=c.journal.applied.clone(){
+            c.busy=true;c.last_discovery=now();drop(c);
+            let _ = std::thread::Builder::new()
+                .name("mgmt-restore".into())
+                .stack_size(128 * 1024)
+                .spawn(move||restore(applied));
+        }
+        return;
     };
     let time = now();
     let mut c = coordinator().lock().unwrap();
     if c.busy || time < c.next_retry || time.saturating_sub(c.last_discovery) < 15 { return; }
     c.last_discovery = time;
     if c.journal.cleanup_pending || (c.ready&&c.journal.previous.is_some()&&c.journal.applied.as_ref().is_some_and(|a|!a.enabled||!a.acs_enabled||a.devices.iter().all(|(id,sn)|super::bootstrap::is_ready_for_management(id,sn,&a.management.acs_url,c.journal.applied_epoch)))) {
-        if let Some(applied)=c.journal.applied.clone() {c.journal.cleanup_pending=true;if let Err(e)=persist(&c) {c.error=Some(e);return;}c.busy=true;c.state=Phase::CleaningPrevious;drop(c);std::thread::spawn(move||cleanup_previous(applied));return;}
+        if let Some(applied)=c.journal.applied.clone() {
+            c.journal.cleanup_pending=true;if let Err(e)=persist(&c) {c.error=Some(e);return;}c.busy=true;c.state=Phase::CleaningPrevious;drop(c);
+            let _ = std::thread::Builder::new()
+                .name("mgmt-cleanup".into())
+                .stack_size(128 * 1024)
+                .spawn(move||cleanup_previous(applied));
+            return;
+        }
     }
     let apply = !c.requires_apply && application_authorized(&c.journal,desired);
     if !apply && !c.ready {
         if let Some(applied)=c.journal.applied.clone() {
-            c.busy=true;drop(c);std::thread::spawn(move||restore(applied));return;
+            c.busy=true;drop(c);
+            let _ = std::thread::Builder::new()
+                .name("mgmt-restore".into())
+                .stack_size(128 * 1024)
+                .spawn(move||restore(applied));
+            return;
         }
     }
     drop(c);
@@ -166,7 +188,14 @@ fn phase(state: Phase) { coordinator().lock().unwrap().state = state; }
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
     let mut child = Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|_| format!("cannot start {program}"))?;
     let stdout = child.stdout.take().ok_or("missing process output")?;
-    let reader = std::thread::spawn(move || { let mut bytes=Vec::new(); stdout.take(1024*1024+1).read_to_end(&mut bytes).map(|_| bytes) });
+    let reader = std::thread::Builder::new()
+        .name("cmd-reader".into())
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.take(1024 * 1024 + 1).read_to_end(&mut bytes).map(|_| bytes)
+        })
+        .map_err(|_| "cannot spawn command reader")?;
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop { if let Some(status) = child.try_wait().map_err(|_| "cannot inspect command")? { break status; } if Instant::now() >= deadline { let _=child.kill(); let _=child.wait(); return Err(format!("{program} timed out; rediscovery required")); } std::thread::sleep(Duration::from_millis(20)); };
     let bytes = reader.join().map_err(|_| "command reader failed")?.map_err(|_| "command output failed")?;

@@ -117,8 +117,10 @@ impl PacketSocket {
             bytes.len(),
         )
     }
-    pub fn receive(&self) -> io::Result<Option<(Vec<u8>, u8, Option<u16>)>> {
-        let mut buffer = [0; 2048];
+    pub fn receive_into<'a>(
+        &self,
+        buffer: &'a mut [u8; 2048],
+    ) -> io::Result<Option<(&'a [u8], u8, Option<u16>)>> {
         let mut address: Address = unsafe { std::mem::zeroed() };
         let mut control = [0usize; 16];
         let mut iov = IoVec {
@@ -145,6 +147,13 @@ impl PacketSocket {
             }
             return Err(error);
         }
+        if message.flags & 0x20 != 0 || count as usize > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packet socket frame truncated by buffer limit",
+            ));
+        }
+        let valid_len = count as usize;
         let raw = unsafe {
             std::slice::from_raw_parts(
                 control.as_ptr() as *const u8,
@@ -167,11 +176,15 @@ impl PacketSocket {
         } else {
             None
         };
-        Ok(Some((
-            buffer[..count as usize].to_vec(),
-            address.kind,
-            vlan,
-        )))
+        Ok(Some((&buffer[..valid_len], address.kind, vlan)))
+    }
+
+    pub fn receive(&self) -> io::Result<Option<(Vec<u8>, u8, Option<u16>)>> {
+        let mut buffer = [0; 2048];
+        match self.receive_into(&mut buffer)? {
+            Some((bytes, kind, vlan)) => Ok(Some((bytes.to_vec(), kind, vlan))),
+            None => Ok(None),
+        }
     }
 }
 fn check_send(count: isize, expected: usize) -> io::Result<()> {

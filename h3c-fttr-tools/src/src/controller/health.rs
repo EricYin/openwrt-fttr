@@ -338,10 +338,11 @@ fn run(
             Some(("fttr0", &physical)),
             data.as_ref().map(|d| ("data", d)),
         ];
+        let mut rx_buf = [0u8; 2048];
         for (name, capture) in captures.into_iter().flatten() {
             // Bound each drain pass even on a busy physical interface.
             for _ in 0..32 {
-                let Some((bytes, kind, vlan)) = capture.receive()? else {
+                let Some((bytes, kind, vlan)) = capture.receive_into(&mut rx_buf)? else {
                     break;
                 };
                 if !watch {

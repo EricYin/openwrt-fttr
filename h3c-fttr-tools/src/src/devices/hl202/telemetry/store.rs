@@ -86,7 +86,10 @@ impl Store {
 
 fn shared() -> &'static (Mutex<Store>, Condvar) {
     SHARED.get_or_init(|| {
-        std::thread::spawn(super::worker::run);
+        let _ = std::thread::Builder::new()
+            .name("hl202-worker".into())
+            .stack_size(512 * 1024)
+            .spawn(super::worker::run);
         (Mutex::new(Store::default()), Condvar::new())
     })
 }

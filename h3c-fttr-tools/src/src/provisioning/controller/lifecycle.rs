@@ -97,6 +97,7 @@ impl Controller {
                         .iter()
                         .any(|d| &d.cwmp_id == id && self.resets.blocks(&d.optical_sn))
             });
+            self.dirty = true;
         }
     }
 

@@ -182,6 +182,7 @@ impl Operation {
 }
 #[derive(Default)]
 struct Controller {
+    pub(super) dirty: bool,
     resets: reset::Resets,
     config: Config,
     failure: Option<String>,
@@ -281,6 +282,7 @@ impl Controller {
         self.recovered.retain(|id, op| Some(id) != device_id && op["optical_sn"] != serial);
         self.owned.remove(cwmp_id);
         self.wifi_owned.remove(cwmp_id);
+        self.dirty = true;
     }
     fn startup_trigger_pending(&self, device: &str) -> bool {
         self.config.triggers.contains("program_start") && self.startup_pending.contains(device)
@@ -387,6 +389,7 @@ impl Controller {
             }
             self.recovered.remove(&d.id);
             self.operations.insert(d.id.clone(), op);
+            self.dirty = true;
         }
         Ok(ids)
     }
@@ -607,7 +610,10 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
             }
         }
     }
-    std::thread::spawn(move || loop {
+    let _ = std::thread::Builder::new()
+        .name("prov-ctrl".into())
+        .stack_size(256 * 1024)
+        .spawn(move || loop {
         // Copy optical preconditions, release the PON lock before any ACS access.
         let online_onus: BTreeMap<_, _> = engine
             .lock()
@@ -1028,16 +1034,30 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
             }
         }
         c.last_online = fresh;
-        let saved = c.history();
-        if saved != c.saved {
-            let result = super::storage::write_atomic(
-                "/var/lib/fttr/provisioning-state.json",
-                saved.as_bytes(),
-                false,
-            );
-            match result {
-                Ok(()) => c.saved = saved,
-                Err(e) => c.failure = Some(format!("provisioning state persistence: {e}")),
+        let any_active = c.operations.values().any(|o| {
+            o.stage != OperationPhase::Completed && o.stage != OperationPhase::Interrupted
+        });
+        if c.dirty || any_active || c.saved.is_empty() {
+            let saved = c.history();
+            if saved != c.saved {
+                let result = super::storage::write_atomic(
+                    "/var/lib/fttr/provisioning-state.json",
+                    saved.as_bytes(),
+                    false,
+                );
+                match result {
+                    Ok(()) => {
+                        c.saved = saved;
+                        c.dirty = false;
+                        c.failure = None;
+                    }
+                    Err(e) => {
+                        c.failure = Some(format!("provisioning state persistence: {e}"));
+                        c.dirty = true;
+                    }
+                }
+            } else {
+                c.dirty = false;
             }
         }
         drop(c);

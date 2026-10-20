@@ -168,6 +168,7 @@ impl Controller {
         storage::write_atomic(&self.resets.history, saved.as_bytes(), true)
             .map_err(|e| format!("persist reset history: {e}"))?;
         self.saved = saved;
+        self.dirty = false;
         #[cfg(not(test))]
         {
             wan::reset(&intent.cwmp_id)?;

@@ -90,13 +90,21 @@ extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
 }
 
+#[cfg(unix)]
+fn mci_file() -> io::Result<&'static std::fs::File> {
+    static MCI_DEV: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+    if let Some(f) = MCI_DEV.get() {
+        return Ok(f);
+    }
+    let f = OpenOptions::new().read(true).write(true).open(FMCS_MCI_DEV)?;
+    let _ = MCI_DEV.set(f);
+    Ok(MCI_DEV.get().unwrap())
+}
+
 pub fn write_fpga_reg(addr: u32, val: u32) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(FMCS_MCI_DEV)?;
+        let file = mci_file()?;
 
         let mut op = RegOp { addr, val };
         let ret = unsafe { ioctl(file.as_raw_fd(), IOC_WRITE_FPGA_REG, &mut op as *mut _) };
@@ -121,7 +129,7 @@ pub fn exchange_omci_channel(id: u8, channel: u16) -> io::Result<u16> {
     }
     #[cfg(unix)]
     {
-        let file = OpenOptions::new().read(true).write(true).open(FMCS_MCI_DEV)?;
+        let file = mci_file()?;
         let mut op = RegOp { addr: id as u32, val: channel as u32 };
         if unsafe { ioctl(file.as_raw_fd(), 0xC008A509u64, &mut op as *mut _) } < 0 {
             return Err(io::Error::last_os_error());
@@ -135,10 +143,7 @@ pub fn exchange_omci_channel(id: u8, channel: u16) -> io::Result<u16> {
 pub fn read_fpga_reg(addr: u32) -> io::Result<u32> {
     #[cfg(unix)]
     {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(FMCS_MCI_DEV)?;
+        let file = mci_file()?;
 
         let mut op = RegOp { addr, val: 0 };
         let ret = unsafe { ioctl(file.as_raw_fd(), IOC_READ_FPGA_REG, &mut op as *mut _) };
@@ -158,10 +163,7 @@ pub fn read_fpga_reg(addr: u32) -> io::Result<u32> {
 pub fn write_bosa_reg(reg: u32, val: u32) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(FMCS_MCI_DEV)?;
+        let file = mci_file()?;
 
         let addr = if reg < 0x10000 { BOSA_REG_BASE | reg } else { reg };
         let mut op = RegOp { addr, val };
@@ -182,10 +184,7 @@ pub fn write_bosa_reg(reg: u32, val: u32) -> io::Result<()> {
 pub fn read_bosa_reg(reg: u32) -> io::Result<u32> {
     #[cfg(unix)]
     {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(FMCS_MCI_DEV)?;
+        let file = mci_file()?;
 
         let addr = if reg < 0x10000 { BOSA_REG_BASE | reg } else { reg };
         let mut op = RegOp { addr, val: 0 };
@@ -709,10 +708,7 @@ pub fn send_ploam_msg(data: &[u8]) -> io::Result<()> {
     }
     #[cfg(unix)]
     {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(FMCS_MCI_DEV)?;
+        let file = mci_file()?;
 
         let mut msg = PloamMsg {
             data: [0u8; 16],
@@ -734,13 +730,71 @@ pub fn send_ploam_msg(data: &[u8]) -> io::Result<()> {
     }
 }
 
-pub fn recv_ploam_msg() -> io::Result<Vec<u8>> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RawPloamMsg {
+    data: [u8; 16],
+    len: usize,
+}
+
+impl RawPloamMsg {
+    pub fn new(data: [u8; 16], len: usize) -> io::Result<Self> {
+        if len > 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid PLOAM ioctl length",
+            ));
+        }
+        Ok(Self { data, len })
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl std::ops::Deref for RawPloamMsg {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for RawPloamMsg {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for RawPloamMsg {
+    #[inline]
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::fmt::Debug for RawPloamMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_slice(), f)
+    }
+}
+
+pub fn recv_ploam_msg() -> io::Result<RawPloamMsg> {
     #[cfg(unix)]
     {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(FMCS_MCI_DEV)?;
+        let file = mci_file()?;
 
         let mut msg = PloamMsg {
             data: [0u8; 16],
@@ -751,14 +805,14 @@ pub fn recv_ploam_msg() -> io::Result<Vec<u8>> {
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
-        if msg.len as usize > msg.data.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid PLOAM ioctl length"));
-        }
-        Ok(msg.data[..msg.len as usize].to_vec())
+        RawPloamMsg::new(msg.data, msg.len as usize)
     }
     #[cfg(not(unix))]
     {
-        Ok(Vec::new())
+        Ok(RawPloamMsg {
+            data: [0u8; 16],
+            len: 0,
+        })
     }
 }
 
@@ -773,10 +827,7 @@ const IOC_SET_CARRIER: u64 = 0x4008A507;
 pub fn set_fttr_carrier(port: u32, carrier: bool) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(FMCS_MCI_DEV)?;
+        let file = mci_file()?;
 
         let mut req = CarrierReq {
             port,
@@ -799,6 +850,40 @@ pub fn set_fttr_carrier(port: u32, carrier: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_raw_ploam_msg_exact_length_and_deref() {
+        let mut data = [0u8; 16];
+        data[0..13].copy_from_slice(&[4, 9, 10, 4, 10, 16, 64, 1, 0, 0, 0, 0, 151]);
+        data[13..16].copy_from_slice(&[0xff, 0xff, 0xff]); // trailing junk that must not leak
+        let msg = RawPloamMsg::new(data, 13).expect("valid 13-byte PLOAM length");
+        assert_eq!(msg.len(), 13);
+        assert!(!msg.is_empty());
+        assert_eq!(msg.as_slice().len(), 13);
+        assert_eq!(&msg[..], &data[..13]);
+        assert_eq!(msg[0], 4);
+        assert_eq!(msg[1], 9);
+        assert_eq!(msg[12], 151);
+        assert_eq!(format!("{:02X?}", msg), format!("{:02X?}", &data[..13]));
+    }
+
+    #[test]
+    fn test_raw_ploam_msg_empty() {
+        let msg = RawPloamMsg::new([0; 16], 0).expect("empty PLOAM length 0 is valid");
+        assert_eq!(msg.len(), 0);
+        assert!(msg.is_empty());
+        assert_eq!(msg.as_slice(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_raw_ploam_msg_overflow_rejected() {
+        let err = RawPloamMsg::new([0; 16], 17).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "invalid PLOAM ioctl length");
+
+        let err2 = RawPloamMsg::new([0; 16], 255).unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn test_calibration_data_matches_stock_table() {

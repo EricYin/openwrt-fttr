@@ -10,7 +10,10 @@ use std::{
 };
 
 pub(in crate::controller) fn start(id: u8, token: Arc<AtomicBool>) {
-    thread::spawn(move || {
+    let _ = thread::Builder::new()
+        .name(format!("onu-{id}-poll"))
+        .stack_size(256 * 1024)
+        .spawn(move || {
         let mut collector = Collector::new(id, token.clone());
         let mut next = Instant::now();
         while !token.load(Ordering::Acquire) {

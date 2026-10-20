@@ -201,7 +201,10 @@ pub fn run() {
     // 2. Background Hardware Initialization (Async resilient)
     {
         let hardware_ready = hardware_ready.clone();
-        thread::spawn(move || {
+        let _ = thread::Builder::new()
+            .name("hw-init".into())
+            .stack_size(256 * 1024)
+            .spawn(move || {
             let fw_path = Path::new("/lib/firmware/FTTR_TOP.sbit");
             if fw_path.exists() {
                 let _ = fpga::load_bitstream(fw_path);
@@ -267,7 +270,10 @@ pub fn run() {
     // 3. Background PLOAM discovery broadcast & reception thread
     {
         let pon_engine_ploam = pon_engine.clone();
-        thread::spawn(move || {
+        let _ = thread::Builder::new()
+            .name("ploam-loop".into())
+            .stack_size(256 * 1024)
+            .spawn(move || {
             println!("[+] Started background PLOAM discovery & reception loop.");
             let mut last_disc = Instant::now() - Duration::from_secs(5);
             let mut last_grant = Instant::now() - Duration::from_secs(5);
