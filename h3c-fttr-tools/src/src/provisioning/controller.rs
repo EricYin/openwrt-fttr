@@ -10,6 +10,9 @@ mod reset;
 #[cfg(test)]
 #[path = "controller/lifecycle_tests.rs"]
 mod lifecycle_tests;
+#[cfg(test)]
+#[path = "controller/persistence_tests.rs"]
+mod persistence_tests;
 use config::{Config, Device, Item, Parameter};
 use parameters::advance;
 #[cfg(test)]
@@ -668,6 +671,8 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
             c.last_periodic = time;
         }
         let mut fresh = BTreeSet::new();
+        c.begin_history_tick();
+        let mut history_changed = false;
         for d in &config.devices {
             if c.resets.blocks(&d.optical_sn) {
                 continue;
@@ -832,8 +837,10 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                             .observation_changed(&capability_identity, capability_epoch))
                 {
                     op.capabilities.invalidate("identity, firmware, optical registration or BOOTSTRAP changed; evidence is stale");
+                    history_changed = true;
                 }
                 if op.device.cwmp_id.starts_with("pending:") && !d.cwmp_id.starts_with("pending:") {
+                    history_changed = true;
                     op.device.cwmp_id = d.cwmp_id.clone();
                     match (wan::load(&d.cwmp_id), wifi::load(&d.cwmp_id)) {
                         (Ok(owned), Ok(registry)) => {
@@ -1014,12 +1021,14 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                     }
                 }
                 if let Err(error) = op.wan.save(&op.device.cwmp_id) {
+                    history_changed = true;
                     op.wan.results.insert(
                         "persistence".into(),
                         json!({"state":"blocked","reason":error}),
                     );
                 }
                 if let Err(error) = op.wifi.save(&op.device.cwmp_id) {
+                    history_changed = true;
                     op.wifi.results.insert(
                         "persistence".into(),
                         json!({"state":"blocked","reason":error}),
@@ -1034,32 +1043,10 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
             }
         }
         c.last_online = fresh;
-        let any_active = c.operations.values().any(|o| {
-            o.stage != OperationPhase::Completed && o.stage != OperationPhase::Interrupted
-        });
-        if c.dirty || any_active || c.saved.is_empty() {
-            let saved = c.history();
-            if saved != c.saved {
-                let result = super::storage::write_atomic(
-                    "/var/lib/fttr/provisioning-state.json",
-                    saved.as_bytes(),
-                    false,
-                );
-                match result {
-                    Ok(()) => {
-                        c.saved = saved;
-                        c.dirty = false;
-                        c.failure = None;
-                    }
-                    Err(e) => {
-                        c.failure = Some(format!("provisioning state persistence: {e}"));
-                        c.dirty = true;
-                    }
-                }
-            } else {
-                c.dirty = false;
-            }
-        }
+        c.dirty |= history_changed;
+        c.persist_history(|data| super::storage::write_atomic(
+            "/var/lib/fttr/provisioning-state.json", data, false,
+        ));
         drop(c);
         std::thread::sleep(Duration::from_secs(1));
     });

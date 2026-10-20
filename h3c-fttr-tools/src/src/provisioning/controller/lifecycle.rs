@@ -27,6 +27,34 @@ impl Serialize for Operations<'_> {
 }
 
 impl Controller {
+    pub(super) fn begin_history_tick(&mut self) {
+        self.dirty |= self.operations.values().any(|op| {
+            op.stage != OperationPhase::Completed && op.stage != OperationPhase::Interrupted
+        });
+    }
+
+    pub(super) fn persist_history(&mut self, write: impl FnOnce(&[u8]) -> std::io::Result<()>) {
+        if !self.dirty && !self.saved.is_empty() {
+            return;
+        }
+        let saved = self.history();
+        if saved == self.saved {
+            self.dirty = false;
+            return;
+        }
+        match write(saved.as_bytes()) {
+            Ok(()) => {
+                self.saved = saved;
+                self.dirty = false;
+                self.failure = None;
+            }
+            Err(error) => {
+                self.failure = Some(format!("provisioning state persistence: {error}"));
+                self.dirty = true;
+            }
+        }
+    }
+
     pub(super) fn resolve_pending_identities(&mut self, devices: &Value) {
         let mut resolved = false;
         for d in &mut self.config.devices {
@@ -146,6 +174,11 @@ impl Controller {
     }
 
     pub(super) fn retain_configured_state(&mut self) {
+        let previous = (
+            self.operations.len(),
+            self.recovered.len(),
+            self.owned.len(),
+        );
         let devices = &self.config.devices;
         self.operations.retain(|id, op| {
             devices.iter().any(|d| {
@@ -188,5 +221,11 @@ impl Controller {
         };
         self.owned.retain(|id, _| retained_binding(id));
         self.wifi_owned.retain(|id, _| retained_binding(id));
+        self.dirty |= previous
+            != (
+                self.operations.len(),
+                self.recovered.len(),
+                self.owned.len(),
+            );
     }
 }
