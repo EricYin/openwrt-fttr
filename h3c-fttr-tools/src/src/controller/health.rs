@@ -1,5 +1,7 @@
 //! Bounded OMCI GET diagnostic. The optional OMCC trial restores register settings on exit.
 use crate::bosa;
+#[path = "health_policy.rs"]
+mod policy;
 use crate::pon_engine::omci::{
     platform::{
         fmcs::{decode_envelope, PacketSocket},
@@ -116,6 +118,7 @@ fn run(
         ));
     }
     let watch = args.iter().any(|arg| arg == "--watch");
+    let mut observations = policy::Observations::new(watch);
     if watch
         && (id == 0
             || args
@@ -183,7 +186,7 @@ fn run(
         "GET ONU={id} TCI={tci:04x} class=256 instance=0 mask=8000 bytes={:02X?}",
         request.to_bytes()
     );
-    if args[3..]
+    let accepted = if args[3..]
         .iter()
         .any(|arg| arg == "--stock-padding" || arg == "--mapped-omcc")
     {
@@ -202,10 +205,13 @@ fn run(
         wire[16..64].copy_from_slice(&request.to_bytes());
         physical.transmit(&wire)?;
         println!("STOCK_PADDING physical envelope length=68");
+        true
     } else {
-        omci.send_fmcs(id, &request)?;
+        observations.send(omci.send_fmcs(id, &request))?
+    };
+    if accepted {
+        println!("TX accepted by socket; awaiting response (not proof of delivery)");
     }
-    println!("TX accepted by socket; awaiting response (not proof of delivery)");
     if data.is_some() {
         let mac = std::fs::read_to_string(format!("/sys/class/net/fttr{id}/address"))?;
         let mac: Vec<u8> = mac
@@ -252,6 +258,8 @@ fn run(
             wire[29..35].copy_from_slice(&mac);
             wire[35..38].copy_from_slice(&[2, 0, 6]);
             wire[38..44].copy_from_slice(&mac);
+            // Unlike periodic GETs, this one-shot probe has no in-watch retry.
+            // Preserve supervisor retry if it could not be transmitted.
             physical.transmit(&wire)?;
             println!("IEEE1905 topology discovery transmitted; awaiting actual child traffic");
         }
@@ -329,8 +337,10 @@ fn run(
             next_state = Instant::now() + Duration::from_secs(1);
         }
         if watch && Instant::now() >= next_get {
-            tci = (tci.wrapping_add(1) & 0x7fff).max(1);
-            omci.send_fmcs(id, &BaselineFrame::new(tci, 0x49, 256, 0, payload))?;
+            let next_tci = (tci.wrapping_add(1) & 0x7fff).max(1);
+            if observations.send(omci.send_fmcs(id, &BaselineFrame::new(next_tci, 0x49, 256, 0, payload)))? {
+                tci = next_tci;
+            }
             next_get = Instant::now() + Duration::from_secs(5);
         }
         let captures = [
@@ -342,7 +352,7 @@ fn run(
         for (name, capture) in captures.into_iter().flatten() {
             // Bound each drain pass even on a busy physical interface.
             for _ in 0..32 {
-                let Some((bytes, kind, vlan)) = capture.receive_into(&mut rx_buf)? else {
+                let Some((bytes, kind, vlan)) = observations.receive(capture.receive_into(&mut rx_buf))? else {
                     break;
                 };
                 if !watch {
@@ -400,8 +410,7 @@ fn run(
                     }
                 }
                 if (activate || watch)
-                    && last_get.is_some_and(|t: Instant| t.elapsed() < Duration::from_secs(15))
-                    && last_data.is_some_and(|t: Instant| t.elapsed() < Duration::from_secs(180))
+                    && policy::link_ready(last_get, last_data, Instant::now())
                     && carrier_lease.is_none()
                 {
                     let previous = !watch
@@ -416,12 +425,12 @@ fn run(
         }
         if watch
             && carrier_lease.is_some()
-            && (last_get.is_none_or(|t| t.elapsed() >= Duration::from_secs(15))
-                || last_data.is_none_or(|t| t.elapsed() >= Duration::from_secs(180)))
+            && !policy::link_ready(last_get, last_data, Instant::now())
         {
             drop(carrier_lease.take());
-            println!("VERIFIED_LINK_DISABLED stale OMCI or data evidence");
+            println!("VERIFIED_LINK_DISABLED stale OMCI evidence");
         }
+        observations.report(id, Instant::now());
         if watch && last_get.unwrap_or(watchdog_start).elapsed() >= Duration::from_secs(30) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
