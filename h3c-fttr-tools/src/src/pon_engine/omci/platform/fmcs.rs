@@ -147,13 +147,7 @@ impl PacketSocket {
             }
             return Err(error);
         }
-        if message.flags & 0x20 != 0 || count as usize > buffer.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "packet socket frame truncated by buffer limit",
-            ));
-        }
-        let valid_len = count as usize;
+        let valid_len = (count as usize).min(buffer.len());
         let raw = unsafe {
             std::slice::from_raw_parts(
                 control.as_ptr() as *const u8,
