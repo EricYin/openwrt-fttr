@@ -2,7 +2,10 @@
 use super::{config::Section, model::Management, storage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, io::Read, net::Ipv4Addr, process::{Command, Stdio}, sync::{Mutex, OnceLock}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{collections::BTreeMap, net::Ipv4Addr, sync::{Mutex, OnceLock}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+#[path = "management_command.rs"]
+mod command;
+use command::run;
 
 const JOURNAL: &str = "/etc/fttr/management-applied.json";
 type Sections = BTreeMap<String, Section>;
@@ -126,23 +129,32 @@ fn start(desired: Desired, apply: bool, fresh_grant: bool) -> Result<Value, Stri
         if fresh_grant||changed {c.ready=false;}
         c.requires_apply=false;
     }
-    c.busy = true; c.state = Phase::Discovering; if !c.requires_apply {c.error = None;}
-    drop(c);
-    let _ = std::thread::Builder::new()
+    c.state = Phase::Discovering; if !c.requires_apply {c.error = None;}
+    finish_spawn(&mut c, std::thread::Builder::new()
         .name("mgmt-exec".into())
         .stack_size(128 * 1024)
-        .spawn(move || execute(desired, apply));
+        .spawn(move || execute(desired, apply)))?;
     Ok(json!({"started":true,"mode":if apply {"apply"} else {"plan"}}))
+}
+fn finish_spawn(c: &mut Coordinator, result: std::io::Result<std::thread::JoinHandle<()>>) -> Result<(), String> {
+    match result {
+        Ok(_) => {c.busy=true;Ok(())},
+        Err(error) => {
+            let error=format!("cannot start management worker: {error}");
+            c.busy=false;c.state=Phase::RetryWait;c.error=Some(error.clone());c.next_retry=now()+15;
+            Err(error)
+        }
+    }
 }
 pub(super) fn tick(desired: Option<&Desired>) {
     let Some(desired) = desired else {
         let mut c=coordinator().lock().unwrap();if c.busy||now()<c.next_retry||now().saturating_sub(c.last_discovery)<15 {return;}
         if let Some(applied)=c.journal.applied.clone(){
-            c.busy=true;c.last_discovery=now();drop(c);
-            let _ = std::thread::Builder::new()
+            c.last_discovery=now();
+            let _ = finish_spawn(&mut c, std::thread::Builder::new()
                 .name("mgmt-restore".into())
                 .stack_size(128 * 1024)
-                .spawn(move||restore(applied));
+                .spawn(move||restore(applied)));
         }
         return;
     };
@@ -152,22 +164,21 @@ pub(super) fn tick(desired: Option<&Desired>) {
     c.last_discovery = time;
     if c.journal.cleanup_pending || (c.ready&&c.journal.previous.is_some()&&c.journal.applied.as_ref().is_some_and(|a|!a.enabled||!a.acs_enabled||a.devices.iter().all(|(id,sn)|super::bootstrap::is_ready_for_management(id,sn,&a.management.acs_url,c.journal.applied_epoch)))) {
         if let Some(applied)=c.journal.applied.clone() {
-            c.journal.cleanup_pending=true;if let Err(e)=persist(&c) {c.error=Some(e);return;}c.busy=true;c.state=Phase::CleaningPrevious;drop(c);
-            let _ = std::thread::Builder::new()
+            c.journal.cleanup_pending=true;if let Err(e)=persist(&c) {c.error=Some(e);return;}c.state=Phase::CleaningPrevious;
+            let _ = finish_spawn(&mut c, std::thread::Builder::new()
                 .name("mgmt-cleanup".into())
                 .stack_size(128 * 1024)
-                .spawn(move||cleanup_previous(applied));
+                .spawn(move||cleanup_previous(applied)));
             return;
         }
     }
     let apply = !c.requires_apply && application_authorized(&c.journal,desired);
     if !apply && !c.ready {
         if let Some(applied)=c.journal.applied.clone() {
-            c.busy=true;drop(c);
-            let _ = std::thread::Builder::new()
+            let _ = finish_spawn(&mut c, std::thread::Builder::new()
                 .name("mgmt-restore".into())
                 .stack_size(128 * 1024)
-                .spawn(move||restore(applied));
+                .spawn(move||restore(applied)));
             return;
         }
     }
@@ -185,23 +196,6 @@ fn resource_version(d:&Desired)->String {let mut d=d.clone();d.devices.clear();d
 fn endpoint_changed(a:&Desired,b:&Desired)->bool {a.address!=b.address||a.prefix!=b.prefix||a.port!=b.port||a.path!=b.path||a.username!=b.username||a.password!=b.password}
 fn subnets_overlap(a:&Desired,b:&Desired)->bool {let mask=u32::MAX << (32-a.prefix.min(b.prefix));u32::from(a.address.parse::<Ipv4Addr>().unwrap())&mask==u32::from(b.address.parse::<Ipv4Addr>().unwrap())&mask}
 fn phase(state: Phase) { coordinator().lock().unwrap().state = state; }
-fn run(program: &str, args: &[&str]) -> Result<String, String> {
-    let mut child = Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|_| format!("cannot start {program}"))?;
-    let stdout = child.stdout.take().ok_or("missing process output")?;
-    let reader = std::thread::Builder::new()
-        .name("cmd-reader".into())
-        .stack_size(64 * 1024)
-        .spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.take(1024 * 1024 + 1).read_to_end(&mut bytes).map(|_| bytes)
-        })
-        .map_err(|_| "cannot spawn command reader")?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop { if let Some(status) = child.try_wait().map_err(|_| "cannot inspect command")? { break status; } if Instant::now() >= deadline { let _=child.kill(); let _=child.wait(); return Err(format!("{program} timed out; rediscovery required")); } std::thread::sleep(Duration::from_millis(20)); };
-    let bytes = reader.join().map_err(|_| "command reader failed")?.map_err(|_| "command output failed")?;
-    if !status.success() || bytes.len() > 1024*1024 { return Err(format!("{program} failed; rediscovery required")); }
-    String::from_utf8(bytes).map_err(|_| "invalid command output".into())
-}
 fn parse_export(text: &str, package: &str) -> Result<Sections, String> {
     let mut sections = Sections::new(); let mut id = None; let mut counts = BTreeMap::<String, usize>::new();
     for line in text.lines() { let w = super::config::words(line)?; if w.is_empty() {continue;}
@@ -429,6 +423,15 @@ fn cleanup_previous(d:Desired) {
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn failed_worker_spawn_is_reported_and_allows_a_later_launch() {
+        let mut c=Coordinator {journal:Journal {pending:true,..Default::default()},requires_apply:false,busy:false,state:Phase::Discovering,error:None,plan:json!([]),next_retry:0,attempts:0,ready:true,last_discovery:0};
+        let error=finish_spawn(&mut c,Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))).unwrap_err();
+        assert!(!c.busy);assert!(matches!(c.state,Phase::RetryWait));assert_eq!(c.error.as_deref(),Some(error.as_str()));assert!(c.next_retry>=now());
+        assert!(c.ready);assert!(c.journal.pending);
+        let (tx,rx)=std::sync::mpsc::channel();
+        finish_spawn(&mut c,std::thread::Builder::new().spawn(move||{tx.send(()).unwrap();})).unwrap();
+        assert!(c.busy);rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
     #[test] fn vlan_membership_changes_share_resources_and_remove_only_owned_devices() {
         let old=desired();let mut next=old.clone();next.management.vlans=vec![46,47];
         assert!(!endpoint_changed(&old,&next));
