@@ -30,8 +30,7 @@ fn error(s: &str) -> Value {
 }
 #[cfg(all(feature = "acs", not(test)))]
 pub(super) fn acs(v: Value) -> Value {
-    serde_json::from_str(&crate::acs::control(&v.to_string()))
-        .unwrap_or_else(|_| error("invalid ACS reply"))
+    crate::acs::control_value(v)
 }
 #[cfg(all(not(feature = "acs"), not(test)))]
 pub(super) fn acs(_: Value) -> Value {

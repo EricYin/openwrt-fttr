@@ -333,11 +333,12 @@ fn run(
             omci.send_fmcs(id, &BaselineFrame::new(tci, 0x49, 256, 0, payload))?;
             next_get = Instant::now() + Duration::from_secs(5);
         }
-        let mut captures = vec![("molt_omci", &omci), ("fttr0", &physical)];
-        if let Some(data) = &data {
-            captures.push(("data", data));
-        }
-        for (name, capture) in captures {
+        let captures = [
+            Some(("molt_omci", &omci)),
+            Some(("fttr0", &physical)),
+            data.as_ref().map(|d| ("data", d)),
+        ];
+        for (name, capture) in captures.into_iter().flatten() {
             // Bound each drain pass even on a busy physical interface.
             for _ in 0..32 {
                 let Some((bytes, kind, vlan)) = capture.receive()? else {

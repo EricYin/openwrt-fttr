@@ -19,7 +19,7 @@ use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex, OnceLock,
+    mpsc, Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use task::{error_result, Task, TaskState};
@@ -88,20 +88,24 @@ fn init() -> Arc<Server> {
     }).lock().unwrap().clone()
 }
 impl Server {
-    fn execute(&self, request: Value) -> String {
+    fn execute_value(&self, request: Value) -> Value {
         if request["op"] == "task" {
             let mut state = self.state.lock().unwrap();
             if let Some(reason) = &state.load_failure {
-                return error(reason).to_string();
+                return error(reason);
             }
             state.expire();
             return match request["id"].as_u64().and_then(|id| state.tasks.get(&id)) {
-                Some(task) => serde_json::to_string(task)
-                    .unwrap_or_else(|err| error(&format!("task serialization: {err}")).to_string()),
-                None => error("unknown task").to_string(),
+                Some(task) => serde_json::to_value(task)
+                    .unwrap_or_else(|err| error(&format!("task serialization: {err}"))),
+                None => error("unknown task"),
             };
         }
-        self.execute_small(request).to_string()
+        self.execute_small(request)
+    }
+    #[allow(dead_code)]
+    fn execute(&self, request: Value) -> String {
+        self.execute_value(request).to_string()
     }
     fn execute_small(&self, request: Value) -> Value {
         let mut state = self.state.lock().unwrap();
@@ -444,12 +448,15 @@ impl State {
         Ok(())
     }
 }
+pub fn control_value(request: Value) -> Value {
+    init().execute_value(request)
+}
 pub fn control(request: &str) -> String {
     if request.len() > 64 * 1024 {
         error("ACS request too large").to_string()
     } else {
         serde_json::from_str(request)
-            .map(|v| init().execute(v))
+            .map(|v| init().execute_value(v).to_string())
             .unwrap_or_else(|_| error("invalid ACS JSON").to_string())
     }
 }
@@ -499,26 +506,60 @@ fn transition(old:Arc<Server>,enabled:bool,listen:&str,path:&str,username:&str,p
 }
 fn start_listener(server: Arc<Server>, listener: TcpListener) {
     println!("[ACS] listening on {}{}", server.listen, server.path);
-    let connections = Arc::new(AtomicUsize::new(0));
-    std::thread::spawn(move || {
-        while !server.stopping.load(Ordering::Acquire) {
-            let stream = match listener.accept() {Ok((stream,_))=>stream,Err(e) if e.kind()==io::ErrorKind::WouldBlock=>{std::thread::sleep(Duration::from_millis(50));continue;},Err(e)=>{*server.failure.lock().unwrap()=Some(format!("listener accept: {e}"));break;}};
-            if connections.fetch_add(1, Ordering::AcqRel) >= 16 {
-                connections.fetch_sub(1, Ordering::AcqRel);
-                continue;
-            }
-            let server = server.clone();
-            let connections = connections.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = serve(&server, stream) {
-                    eprintln!("[ACS] HTTP connection ended: {}", e.kind());
+    let (tx, rx) = mpsc::sync_channel::<TcpStream>(16);
+    let rx = Arc::new(Mutex::new(rx));
+    const WORKERS: usize = 3;
+    for idx in 0..WORKERS {
+        let server = server.clone();
+        let rx = rx.clone();
+        let _ = std::thread::Builder::new()
+            .name(format!("acs-worker-{idx}"))
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                loop {
+                    let stream = {
+                        let Ok(rx_guard) = rx.lock() else { break; };
+                        match rx_guard.recv_timeout(Duration::from_millis(200)) {
+                            Ok(s) => s,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                if server.stopping.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    };
+                    if let Err(e) = serve(&server, stream) {
+                        eprintln!("[ACS] HTTP connection ended: {}", e.kind());
+                    }
                 }
-                connections.fetch_sub(1, Ordering::AcqRel);
             });
-        }
-        drop(listener);
-        server.stopped.store(true, Ordering::Release);
-    });
+    }
+    let _ = std::thread::Builder::new()
+        .name("acs-listener".into())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            while !server.stopping.load(Ordering::Acquire) {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                    Err(e) => {
+                        *server.failure.lock().unwrap() = Some(format!("listener accept: {e}"));
+                        break;
+                    }
+                };
+                if let Err(mpsc::TrySendError::Full(_)) = tx.try_send(stream) {
+                    eprintln!("[ACS] worker queue full; dropping incoming connection");
+                }
+            }
+            drop(tx);
+            drop(listener);
+            server.stopped.store(true, Ordering::Release);
+        });
 }
 fn token() -> io::Result<String> {
     let mut bytes = [0u8; 16];
