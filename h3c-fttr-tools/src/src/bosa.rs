@@ -16,11 +16,11 @@ const FMCS_MCI_DEV: &str = "/dev/fmcs_mci";
 // _IOW(0xA5, 0, struct RegOp)  -> 0x4008A500
 const IOC_WRITE_FPGA_REG: u64 = 0x4008A500;
 // _IOWR(0xA5, 1, struct RegOp) -> 0xC008A501
-const IOC_READ_FPGA_REG: u64  = 0xC008A501;
+const IOC_READ_FPGA_REG: u64 = 0xC008A501;
 // _IOW(0xA5, 2, struct RegOp)  -> 0x4008A502
 const IOC_WRITE_BOSA_REG: u64 = 0x4008A502;
 // _IOWR(0xA5, 3, struct RegOp) -> 0xC008A503
-const IOC_READ_BOSA_REG: u64  = 0xC008A503;
+const IOC_READ_BOSA_REG: u64 = 0xC008A503;
 
 // BOSA controller (Semtech UX3326) sub-address base in FPGA register space
 const BOSA_REG_BASE: u32 = 0x06006300;
@@ -32,8 +32,7 @@ const STOCK_DISCOVERY_PARAMETER: u32 = 20;
 // The timing and serial-grant table entries map to the FPGA register addresses below.
 const FPGA_PON_MAC_TIMING: u32 = 0x01000000;
 pub const FPGA_SERIAL_NUMBER_GRANT: u32 = 0x04000000;
-pub const SERIAL_NUMBER_GRANT: u32 =
-    ((STOCK_DISCOVERY_PARAMETER * 10 + 50) * 19440 + 124) / 125;
+pub const SERIAL_NUMBER_GRANT: u32 = ((STOCK_DISCOVERY_PARAMETER * 10 + 50) * 19440 + 124) / 125;
 
 pub fn configure_discovery_timing() -> io::Result<()> {
     // Encode whole 125us frames in bits 16+ and byte periods for the remainder
@@ -70,12 +69,9 @@ pub const DEFAULT_UX3326_CALIBRATION_DATA: [u8; 288] = [
 
 // Default 56-byte calibration table for Semtech UX3326 BOSA optical transceiver initialization.
 pub const DEFAULT_UX3326_CALIBRATION_TABLE: [u8; 56] = [
-    0x02, 0x0e, 0x77, 0xc8, 0x14, 0x00, 0x3c, 0x02,
-    0x61, 0x00, 0x06, 0x22, 0x22, 0x1f, 0x40, 0x00,
-    0x00, 0x00, 0x00, 0xab, 0xa8, 0x88, 0x40, 0xae,
-    0x00, 0xf8, 0x86, 0x85, 0x78, 0x00, 0x00, 0x00,
-    0x00, 0x01, 0x36, 0x0f, 0x00, 0x00, 0x00, 0x55,
-    0x00, 0x18, 0x00, 0x04, 0x35, 0x85, 0x4b, 0xc0,
+    0x02, 0x0e, 0x77, 0xc8, 0x14, 0x00, 0x3c, 0x02, 0x61, 0x00, 0x06, 0x22, 0x22, 0x1f, 0x40, 0x00,
+    0x00, 0x00, 0x00, 0xab, 0xa8, 0x88, 0x40, 0xae, 0x00, 0xf8, 0x86, 0x85, 0x78, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x36, 0x0f, 0x00, 0x00, 0x00, 0x55, 0x00, 0x18, 0x00, 0x04, 0x35, 0x85, 0x4b, 0xc0,
     0x88, 0x80, 0x11, 0x80, 0x24, 0x80, 0x00, 0x00,
 ];
 
@@ -96,7 +92,10 @@ fn mci_file() -> io::Result<&'static std::fs::File> {
     if let Some(f) = MCI_DEV.get() {
         return Ok(f);
     }
-    let f = OpenOptions::new().read(true).write(true).open(FMCS_MCI_DEV)?;
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(FMCS_MCI_DEV)?;
     let _ = MCI_DEV.set(f);
     Ok(MCI_DEV.get().unwrap())
 }
@@ -130,14 +129,22 @@ pub fn exchange_omci_channel(id: u8, channel: u16) -> io::Result<u16> {
     #[cfg(unix)]
     {
         let file = mci_file()?;
-        let mut op = RegOp { addr: id as u32, val: channel as u32 };
+        let mut op = RegOp {
+            addr: id as u32,
+            val: channel as u32,
+        };
         if unsafe { ioctl(file.as_raw_fd(), 0xC008A509u64, &mut op as *mut _) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(op.val as u16)
     }
     #[cfg(not(unix))]
-    { Err(io::Error::new(io::ErrorKind::Unsupported, "Linux FMCS required")) }
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Linux FMCS required",
+        ))
+    }
 }
 
 pub fn read_fpga_reg(addr: u32) -> io::Result<u32> {
@@ -165,7 +172,11 @@ pub fn write_bosa_reg(reg: u32, val: u32) -> io::Result<()> {
     {
         let file = mci_file()?;
 
-        let addr = if reg < 0x10000 { BOSA_REG_BASE | reg } else { reg };
+        let addr = if reg < 0x10000 {
+            BOSA_REG_BASE | reg
+        } else {
+            reg
+        };
         let mut op = RegOp { addr, val };
         let ret = unsafe { ioctl(file.as_raw_fd(), IOC_WRITE_BOSA_REG, &mut op as *mut _) };
 
@@ -186,7 +197,11 @@ pub fn read_bosa_reg(reg: u32) -> io::Result<u32> {
     {
         let file = mci_file()?;
 
-        let addr = if reg < 0x10000 { BOSA_REG_BASE | reg } else { reg };
+        let addr = if reg < 0x10000 {
+            BOSA_REG_BASE | reg
+        } else {
+            reg
+        };
         let mut op = RegOp { addr, val: 0 };
         let ret = unsafe { ioctl(file.as_raw_fd(), IOC_READ_BOSA_REG, &mut op as *mut _) };
 
@@ -218,12 +233,8 @@ impl BosaCalibration {
         if bytes.len() < 0x60 {
             return None;
         }
-        let read_u16 = |off: usize| -> u16 {
-            u16::from_be_bytes([bytes[off], bytes[off + 1]])
-        };
-        let read_i16 = |off: usize| -> i16 {
-            i16::from_be_bytes([bytes[off], bytes[off + 1]])
-        };
+        let read_u16 = |off: usize| -> u16 { u16::from_be_bytes([bytes[off], bytes[off + 1]]) };
+        let read_i16 = |off: usize| -> i16 { i16::from_be_bytes([bytes[off], bytes[off + 1]]) };
 
         Some(Self {
             temp_primary: (read_u16(0x40), read_u16(0x42), read_i16(0x44)),
@@ -340,7 +351,10 @@ pub fn load_calibration_data() -> ([u8; 288], CalibrationSource) {
     }
 
     // Priority 3: Fallback to built-in default
-    (DEFAULT_UX3326_CALIBRATION_DATA, CalibrationSource::BuiltinDefault)
+    (
+        DEFAULT_UX3326_CALIBRATION_DATA,
+        CalibrationSource::BuiltinDefault,
+    )
 }
 
 pub fn load_calibration() -> BosaCalibration {
@@ -383,7 +397,6 @@ fn load_calibration_table() -> [u8; 56] {
     table
 }
 
-
 /// Read 16-bit ADC register pair (high byte at base_reg, low byte at base_reg + 1).
 /// UX3326 requires 1ms wait after each byte read.
 pub fn read_adc_u16(base_reg: u32) -> io::Result<u16> {
@@ -398,7 +411,10 @@ pub fn read_adc_u16(base_reg: u32) -> io::Result<u16> {
     #[cfg(not(unix))]
     {
         let _ = base_reg;
-        Err(io::Error::new(io::ErrorKind::Unsupported, "Linux FMCS required"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Linux FMCS required",
+        ))
     }
 }
 
@@ -460,22 +476,30 @@ pub fn init_optical_transceiver() -> io::Result<()> {
     let reset_status = read_fpga_reg(0x84)?;
     println!("[+] FPGA reset line state: 0x{:08X}", reset_status);
     if reset_status != 1 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData,
-            "FPGA reset readback differs from 1; SPI alignment must be corrected"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FPGA reset readback differs from 1; SPI alignment must be corrected",
+        ));
     }
 
     // Readiness is determined by transport success, not register 0x27's value.
     let mut ready = false;
     for attempt in 1..=10 {
         if read_bosa_reg(0x27).is_ok() {
-            println!("[+] UX3326 register access succeeded on attempt {}", attempt);
+            println!(
+                "[+] UX3326 register access succeeded on attempt {}",
+                attempt
+            );
             ready = true;
             break;
         }
         thread::sleep(Duration::from_millis(1));
     }
     if !ready {
-        return Err(io::Error::new(io::ErrorKind::TimedOut, "UX3326 register access failed"));
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "UX3326 register access failed",
+        ));
     }
 
     // Step 3: Load calibration table
@@ -517,11 +541,59 @@ pub fn init_optical_transceiver() -> io::Result<()> {
 
 pub use crate::model::OpticalTransceiverStatus;
 
-
 use std::sync::Mutex;
 use std::time::Instant;
 
 static OPTICAL_CACHE: Mutex<Option<(Instant, OpticalTransceiverStatus)>> = Mutex::new(None);
+
+pub fn invalidate_optical_cache() {
+    if let Ok(mut guard) = OPTICAL_CACHE.lock() {
+        *guard = None;
+    }
+}
+
+pub(crate) fn update_tx_dis_byte(current: u8, enable: bool) -> u8 {
+    if enable {
+        current & !0x02
+    } else {
+        current | 0x02
+    }
+}
+
+pub(crate) fn is_tx_enabled(reg_val: u8) -> bool {
+    (reg_val & 0x02) == 0
+}
+
+/// Controls the downstream PON TX_DIS bit using the stock UX3326 I2C register path.
+///
+/// This verifies the register bit, not emitted optical power.
+pub(crate) fn set_optical_tx_enable(enable: bool) -> io::Result<()> {
+    let current = crate::i2c::read_register(crate::i2c::Register::TxDis)?;
+    let new_val = update_tx_dis_byte(current, enable);
+    crate::i2c::write_register(crate::i2c::Register::TxDis, new_val)?;
+    thread::sleep(Duration::from_millis(1));
+    let verify = crate::i2c::read_register(crate::i2c::Register::TxDis)?;
+    if (verify & 0x02) != (new_val & 0x02) {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "Optical TX verification failed: expected bit1={}, readback 0x{:02X}",
+                (new_val & 0x02) >> 1,
+                verify
+            ),
+        ));
+    }
+    invalidate_optical_cache();
+    Ok(())
+}
+
+/// Reads the UX3326 TX_DIS register bit over the stock I2C path.
+///
+/// The result is register readback, not an independent optical-power measurement.
+pub(crate) fn get_optical_tx_enable() -> io::Result<bool> {
+    let val = crate::i2c::read_register(crate::i2c::Register::TxDis)?;
+    Ok(is_tx_enabled(val))
+}
 
 pub fn get_optical_status() -> OpticalTransceiverStatus {
     if let Ok(guard) = OPTICAL_CACHE.lock() {
@@ -533,6 +605,7 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
     }
 
     let cal = load_calibration();
+    let tx_enabled = get_optical_tx_enable().ok();
 
     // UX3326 internal ADC channels:
     // 0x2E/0x2F: Temperature
@@ -562,11 +635,7 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         Err(_) => {
             measurements.insert(
                 "temperature_celsius".into(),
-                MeasurementEvidence::unavailable(
-                    "UX3326/FMCS",
-                    "C",
-                    "bosa_adc_read_failed",
-                ),
+                MeasurementEvidence::unavailable("UX3326/FMCS", "C", "bosa_adc_read_failed"),
             );
             None
         }
@@ -588,11 +657,7 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         Err(_) => {
             measurements.insert(
                 "vcc_voltage".into(),
-                MeasurementEvidence::unavailable(
-                    "UX3326/FMCS",
-                    "V",
-                    "bosa_adc_read_failed",
-                ),
+                MeasurementEvidence::unavailable("UX3326/FMCS", "V", "bosa_adc_read_failed"),
             );
             None
         }
@@ -614,11 +679,7 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         Err(_) => {
             measurements.insert(
                 "laser_bias_current_ma".into(),
-                MeasurementEvidence::unavailable(
-                    "UX3326/FMCS",
-                    "mA",
-                    "bosa_adc_read_failed",
-                ),
+                MeasurementEvidence::unavailable("UX3326/FMCS", "mA", "bosa_adc_read_failed"),
             );
             None
         }
@@ -640,11 +701,7 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
             } else {
                 measurements.insert(
                     "tx_power_dbm".into(),
-                    MeasurementEvidence::unavailable(
-                        "UX3326/FMCS",
-                        "dBm",
-                        "tx_power_non_positive",
-                    ),
+                    MeasurementEvidence::unavailable("UX3326/FMCS", "dBm", "tx_power_non_positive"),
                 );
                 None
             }
@@ -652,11 +709,7 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         Err(_) => {
             measurements.insert(
                 "tx_power_dbm".into(),
-                MeasurementEvidence::unavailable(
-                    "UX3326/FMCS",
-                    "dBm",
-                    "bosa_adc_read_failed",
-                ),
+                MeasurementEvidence::unavailable("UX3326/FMCS", "dBm", "bosa_adc_read_failed"),
             );
             None
         }
@@ -672,6 +725,21 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         ),
     );
 
+    if let Some(enabled) = tx_enabled {
+        measurements.insert(
+            "tx_enabled".into(),
+            MeasurementEvidence::observed(
+                "UX3326 Reg 0x14 bit 1 (TX_DIS)",
+                "boolean",
+                if enabled {
+                    "true (TX_DIS=0)"
+                } else {
+                    "false (TX_DIS=1)"
+                },
+            ),
+        );
+    }
+
     let status = OpticalTransceiverStatus {
         model: "UX3326".to_string(),
         wavelength_tx_nm: 1490,
@@ -683,6 +751,7 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         temperature_celsius,
         vcc_voltage,
         cdr_locked: None,
+        tx_enabled,
         measurements,
     };
 
@@ -704,7 +773,10 @@ const IOC_SEND_PACKET: u64 = 0x4014A506;
 
 pub fn send_ploam_msg(data: &[u8]) -> io::Result<()> {
     if data.len() != 13 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "PLOAM requires 13 bytes"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PLOAM requires 13 bytes",
+        ));
     }
     #[cfg(unix)]
     {
@@ -961,5 +1033,31 @@ mod tests {
         assert!(status.measurements.contains_key("laser_bias_current_ma"));
         assert!(status.measurements.contains_key("cdr_locked"));
     }
-}
 
+    #[test]
+    fn test_optical_tx_bit_semantics() {
+        let initial = 0xa9u8;
+        assert!(is_tx_enabled(initial), "bit 1 == 0 means TX is enabled");
+
+        // Turning OFF sets bit 1 (TX_DIS = 1) while preserving other bits
+        let reg_off = update_tx_dis_byte(initial, false);
+        assert_eq!(reg_off, 0xab);
+        assert!(!is_tx_enabled(reg_off), "bit 1 == 1 means TX is disabled");
+
+        // Turning ON clears bit 1 (TX_DIS = 0) while preserving other bits
+        let reg_on = update_tx_dis_byte(reg_off, true);
+        assert_eq!(reg_on, initial);
+        assert!(is_tx_enabled(reg_on), "bit 1 == 0 means TX is enabled");
+
+        // Verify preservation of other arbitrary bits
+        for base in [0x00u8, 0x01, 0x55, 0xAA, 0xFF] {
+            let disabled = update_tx_dis_byte(base, false);
+            assert_eq!(disabled, base | 0x02);
+            assert!(!is_tx_enabled(disabled));
+
+            let enabled = update_tx_dis_byte(disabled, true);
+            assert_eq!(enabled, base & !0x02);
+            assert!(is_tx_enabled(enabled));
+        }
+    }
+}

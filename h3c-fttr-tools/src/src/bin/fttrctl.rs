@@ -24,6 +24,7 @@ Commands:\n  \
   load-fpga [path]     Program FPGA bitstream (default: /lib/firmware/FTTR_TOP.sbit)\n  \
   bosa-init            Initialize BOSA optical transceiver registers\n  \
   bridge-setup         Ensure downstream FTTR switch ports (fttr1~16) are bridged to br-lan\n  \
+  optical on|off|status [--json]  Control downstream PON TX enable through fttrd\n  \
   status [--json|-j]   Display active FTTR optical link and DSA switch ports (table or JSON)\n  \
   mib ONU_ID [--summary|--json] [--tables]  Read structured OMCI inventory (default: JSON)\n  \
   fpga-read <addr>     Directly read 32-bit FPGA hardware register\n  \
@@ -210,10 +211,16 @@ fn print_status_table(status: &FttrSystemStatus) {
         None => "UNKNOWN",
     };
 
+    let tx_enable_str = match opt.tx_enabled {
+        Some(true) => "ENABLED",
+        Some(false) => "DISABLED",
+        None => "UNKNOWN",
+    };
+
     println!("[*] Optical Transceiver (BOSA {}):", opt.model);
     println!(
-        "    Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G  |  CDR: {}",
-        opt.wavelength_tx_nm, opt.wavelength_rx_nm, cdr_str
+        "    TX enable/readback: {}  |  Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G  |  CDR: {}",
+        tx_enable_str, opt.wavelength_tx_nm, opt.wavelength_rx_nm, cdr_str
     );
     if opt.temperature_celsius.is_some()
         || opt.vcc_voltage.is_some()
@@ -414,6 +421,52 @@ fn print_status_table(status: &FttrSystemStatus) {
     println!("==========================================================================================");
 }
 
+fn parse_optical_args(args: &[String]) -> Result<(&'static str, bool), String> {
+    if args.len() < 3 {
+        return Err("Usage: fttrctl optical <on|off|status> [--json|-j]".into());
+    }
+    let sub = args[2].to_lowercase();
+    let is_json = args.iter().any(|a| a == "--json" || a == "-j");
+    match sub.as_str() {
+        "on" => Ok(("OPTICAL ON", is_json)),
+        "off" => Ok(("OPTICAL OFF", is_json)),
+        "status" => Ok(("OPTICAL STATUS", is_json)),
+        unknown => Err(format!("Unknown optical subcommand: {unknown}")),
+    }
+}
+
+fn handle_optical_command(cmd: &str, is_json: bool) {
+    let action = match cmd {
+        "OPTICAL ON" => "on",
+        "OPTICAL OFF" => "off",
+        "OPTICAL STATUS" => "status",
+        _ => return,
+    };
+
+    match ipc::send_ipc_command(cmd) {
+        Ok(response) => {
+            let daemon_error = match serde_json::from_str::<serde_json::Value>(&response) {
+                Ok(value) => {
+                    value.get("status").and_then(serde_json::Value::as_str) == Some("error")
+                }
+                Err(_) => false,
+            };
+            if is_json {
+                println!("{response}");
+            } else {
+                println!("Optical {action}: {response}");
+            }
+            if daemon_error {
+                exit(1);
+            }
+        }
+        Err(error) => {
+            eprintln!("[-] Optical IPC failed: {error}");
+            exit(1);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -456,6 +509,14 @@ fn main() {
         "bridge-setup" => {
             setup_bridge();
         }
+        "optical" => match parse_optical_args(&args) {
+            Ok((cmd, is_json)) => handle_optical_command(cmd, is_json),
+            Err(err) => {
+                eprintln!("[-] {err}");
+                eprintln!("Usage: fttrctl optical <on|off|status> [--json|-j]");
+                exit(1);
+            }
+        },
         "fpga-read" => {
             if args.len() < 3 {
                 eprintln!("Usage: fttrctl fpga-read <hex_or_dec_addr>");
@@ -826,7 +887,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::status_ipc_error;
+    use super::{parse_optical_args, status_ipc_error};
 
     #[test]
     fn ipc_failure_is_an_explicit_unavailable_result_not_device_status() {
@@ -836,5 +897,30 @@ mod tests {
         assert_eq!(response["detail"], "Connection refused");
         assert!(response.get("devices").is_none());
         assert!(response.get("sub_gateways").is_none());
+    }
+
+    #[test]
+    fn parse_optical_args_valid_and_invalid() {
+        let to_args = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Insufficient arguments
+        assert!(parse_optical_args(&to_args(&["fttrctl", "optical"])).is_err());
+
+        // Valid commands
+        assert_eq!(
+            parse_optical_args(&to_args(&["fttrctl", "optical", "on"])).unwrap(),
+            ("OPTICAL ON", false)
+        );
+        assert_eq!(
+            parse_optical_args(&to_args(&["fttrctl", "optical", "off", "--json"])).unwrap(),
+            ("OPTICAL OFF", true)
+        );
+        assert_eq!(
+            parse_optical_args(&to_args(&["fttrctl", "optical", "status", "-j"])).unwrap(),
+            ("OPTICAL STATUS", true)
+        );
+
+        // Invalid subcommand
+        assert!(parse_optical_args(&to_args(&["fttrctl", "optical", "reboot"])).is_err());
     }
 }

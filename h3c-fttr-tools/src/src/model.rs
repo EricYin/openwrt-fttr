@@ -24,6 +24,8 @@ pub struct OpticalTransceiverStatus {
     pub temperature_celsius: Option<f32>,
     pub vcc_voltage: Option<f32>,
     pub cdr_locked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_enabled: Option<bool>,
     pub measurements: Measurements,
 }
 

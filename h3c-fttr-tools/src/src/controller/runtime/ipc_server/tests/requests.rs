@@ -1,12 +1,24 @@
+use super::super::super::{
+    OpticalActor, OpticalBackend, OpticalClient, OpticalCommand, OpticalRequest, OpticalState,
+};
 use super::*;
 
-#[test]
-fn production_dispatch_retains_status_and_adapter_routes() {
-    let handler = super::super::super::ipc_handler(
+fn optical_handler(optics: OpticalClient) -> impl Fn(UnixStream, &str) + Send + Sync + 'static {
+    super::super::super::ipc_handler(
         Arc::new(Mutex::new(Vec::new())),
         Arc::new(Mutex::new(crate::pon_engine::PonEngine::new())),
         Arc::new(Mutex::new(std::collections::BTreeMap::new())),
-    );
+        optics,
+    )
+}
+
+#[test]
+fn production_dispatch_retains_status_and_adapter_routes() {
+    let (requests, _receiver) = std::sync::mpsc::sync_channel(2);
+    let handler = optical_handler(OpticalClient {
+        requests,
+        hardware_ready: Arc::new(AtomicBool::new(false)),
+    });
     let server = Server::new(5, handler);
 
     let responses: Vec<serde_json::Value> =
@@ -21,6 +33,376 @@ fn production_dispatch_retains_status_and_adapter_routes() {
     for response in &responses[1..] {
         assert!(!response["error"].is_null(), "{response}");
     }
+}
+
+#[derive(Default)]
+struct TestOptics {
+    ready: bool,
+    tx: bool,
+    pending: bool,
+    write_failure: bool,
+    read_failure: bool,
+    mismatch: bool,
+    quiesce_failure: bool,
+    events: Vec<&'static str>,
+}
+
+impl OpticalBackend for TestOptics {
+    fn ready(&self) -> bool {
+        self.ready
+    }
+    fn cleanup_pending(&self) -> bool {
+        self.pending
+    }
+    fn quiesce(&mut self) -> io::Result<()> {
+        self.events.push("quiesce");
+        self.pending = true;
+        if self.quiesce_failure {
+            Err(io::Error::other("carrier unavailable"))
+        } else {
+            Ok(())
+        }
+    }
+    fn set_tx(&mut self, enabled: bool) -> io::Result<()> {
+        self.events.push(if enabled { "enable" } else { "disable" });
+        if self.write_failure {
+            return Err(io::Error::other("write unavailable"));
+        }
+        if !self.mismatch {
+            self.tx = enabled;
+        }
+        Ok(())
+    }
+    fn read_tx(&mut self) -> io::Result<bool> {
+        self.events.push("read");
+        if self.read_failure {
+            Err(io::Error::other("read unavailable"))
+        } else {
+            Ok(self.tx)
+        }
+    }
+}
+
+#[test]
+fn optical_ipc_rejects_requests_before_hardware_ready_without_queueing() {
+    let (requests, receiver) = std::sync::mpsc::sync_channel(2);
+    let server = Server::new(
+        3,
+        optical_handler(OpticalClient {
+            requests: requests.clone(),
+            hardware_ready: Arc::new(AtomicBool::new(false)),
+        }),
+    );
+
+    for command in ["OPTICAL ON\n", "OPTICAL OFF\n", "OPTICAL STATUS\n"] {
+        let response: serde_json::Value =
+            serde_json::from_str(&server.request(command.as_bytes())).unwrap();
+
+        assert_eq!(response["error"]["code"], "NotConnected");
+        assert_eq!(response["hardware_ready"], false);
+        assert!(response["tx_enabled"].is_null());
+    }
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn optical_owner_rechecks_readiness_before_hardware_access() {
+    let mut actor = OpticalActor {
+        state: OpticalState::Unknown,
+    };
+    let mut backend = TestOptics::default();
+
+    let response = actor.handle(OpticalCommand::Off, &mut backend);
+
+    assert_eq!(response["error"]["code"], "NotConnected");
+    assert!(backend.events.is_empty());
+}
+
+#[test]
+fn optical_failures_pause_discovery_without_false_success() {
+    for command in [
+        OpticalCommand::On,
+        OpticalCommand::Off,
+        OpticalCommand::Status,
+    ] {
+        for failure in ["write", "read", "mismatch", "quiesce"] {
+            if matches!(command, OpticalCommand::Status) && failure != "read" {
+                continue;
+            }
+            if matches!(command, OpticalCommand::On) && failure == "quiesce" {
+                continue;
+            }
+            let mut actor = OpticalActor {
+                state: OpticalState::Enabled,
+            };
+            let mut backend = TestOptics {
+                ready: true,
+                tx: matches!(command, OpticalCommand::Off | OpticalCommand::Status),
+                write_failure: failure == "write",
+                read_failure: failure == "read",
+                mismatch: failure == "mismatch",
+                quiesce_failure: failure == "quiesce",
+                ..TestOptics::default()
+            };
+
+            let response = actor.handle(command, &mut backend);
+
+            assert_eq!(response["status"], "error", "{failure}: {response}");
+            assert_eq!(response["actor_state"], "unknown");
+            assert_eq!(response["discovery_active"], false);
+            assert!(backend.pending);
+            if matches!(command, OpticalCommand::Off) {
+                assert_eq!(&backend.events[..2], &["quiesce", "disable"]);
+            }
+        }
+    }
+}
+
+#[test]
+fn optical_status_reads_hardware_instead_of_promoting_paused_actor() {
+    let mut actor = OpticalActor {
+        state: OpticalState::Unknown,
+    };
+    let mut backend = TestOptics {
+        ready: true,
+        tx: true,
+        ..TestOptics::default()
+    };
+
+    let response = actor.handle(OpticalCommand::Status, &mut backend);
+
+    assert_eq!(response["tx_enabled"], true);
+    assert_eq!(response["actor_state"], "unknown");
+    assert_eq!(response["discovery_active"], false);
+    assert_eq!(backend.events, ["read"]);
+}
+
+#[test]
+fn optical_status_quiesces_when_hardware_is_unexpectedly_disabled() {
+    let mut actor = OpticalActor {
+        state: OpticalState::Enabled,
+    };
+    let mut backend = TestOptics {
+        ready: true,
+        ..TestOptics::default()
+    };
+
+    let response = actor.handle(OpticalCommand::Status, &mut backend);
+
+    assert_eq!(response["tx_enabled"], false);
+    assert_eq!(response["actor_state"], "disabled");
+    assert_eq!(response["discovery_active"], false);
+    assert!(backend.pending);
+}
+
+#[test]
+fn optical_enable_holds_discovery_until_pending_cleanup_completes() {
+    let mut actor = OpticalActor {
+        state: OpticalState::Disabled,
+    };
+    let mut backend = TestOptics {
+        ready: true,
+        pending: true,
+        ..TestOptics::default()
+    };
+
+    let response = actor.handle(OpticalCommand::On, &mut backend);
+
+    assert_eq!(response["status"], "success");
+    assert_eq!(response["actor_state"], "enabled");
+    assert_eq!(response["tx_enabled"], true);
+    assert_eq!(response["discovery_active"], false);
+    assert_eq!(backend.events, ["enable", "read"]);
+}
+
+#[test]
+fn optical_status_resumes_discovery_only_after_cleanup_is_complete() {
+    let mut actor = OpticalActor {
+        state: OpticalState::Enabled,
+    };
+    let mut backend = TestOptics {
+        ready: true,
+        tx: true,
+        pending: false,
+        ..TestOptics::default()
+    };
+
+    let response = actor.handle(OpticalCommand::Status, &mut backend);
+
+    assert_eq!(response["tx_enabled"], true);
+    assert_eq!(response["discovery_active"], true);
+}
+
+#[test]
+fn optical_ipc_returns_owner_read_failure_without_cached_tx_state() {
+    let (requests, receiver) = std::sync::mpsc::sync_channel::<OpticalRequest>(2);
+    let server = Server::new(
+        1,
+        optical_handler(OpticalClient {
+            requests,
+            hardware_ready: Arc::new(AtomicBool::new(true)),
+        }),
+    );
+    let owner = thread::spawn(move || {
+        let mut actor = OpticalActor {
+            state: OpticalState::Enabled,
+        };
+        let mut backend = TestOptics {
+            ready: true,
+            tx: true,
+            read_failure: true,
+            ..TestOptics::default()
+        };
+        let request = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        request
+            .reply
+            .send(actor.handle(request.command, &mut backend))
+            .unwrap();
+    });
+
+    let response: serde_json::Value =
+        serde_json::from_str(&server.request(b"OPTICAL STATUS\n")).unwrap();
+
+    assert_eq!(response["status"], "error");
+    assert!(response["tx_enabled"].is_null());
+    assert_eq!(response["actor_state"], "unknown");
+    assert_eq!(response["discovery_active"], false);
+    owner.join().unwrap();
+}
+
+#[test]
+fn optical_quiesce_cancels_ranging_and_live_onus_even_when_carrier_fails() {
+    use super::super::super::{RangingSession, RuntimeOptics};
+    use crate::controller::service::{Services, State};
+    use crate::model::BusinessPhase;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let now = Instant::now();
+    let session = |id| RangingSession {
+        id,
+        serial: [0; 8],
+        started: now,
+        armed: true,
+        matched: true,
+        measured: None,
+        ranged: None,
+        allocated: false,
+        confirmed: false,
+        last_valid_rx: now,
+    };
+    let mut ranging = Some(session(1));
+    let mut online = BTreeMap::from([(2, session(2))]);
+    let mut pending_cleanup = BTreeSet::new();
+    let states = Arc::new(Mutex::new(BTreeMap::from([
+        (1, State::default()),
+        (2, State::default()),
+    ])));
+    let mut services = Services::new(states.clone());
+    let engine = Mutex::new(crate::pon_engine::PonEngine::new());
+    let mut backend = RuntimeOptics {
+        ready: true,
+        ranging: &mut ranging,
+        online: &mut online,
+        pending_cleanup: &mut pending_cleanup,
+        services: &mut services,
+        engine: &engine,
+    };
+    let mut lowered = Vec::new();
+
+    let result = backend.quiesce_with(|id| {
+        lowered.push(id);
+        if id == 1 {
+            Err(io::Error::other("carrier unavailable"))
+        } else {
+            Ok(())
+        }
+    });
+
+    assert!(result.is_err());
+    assert!(ranging.is_none());
+    assert!(online.is_empty());
+    assert_eq!(pending_cleanup, BTreeSet::from([1, 2]));
+    assert_eq!(lowered, [1, 2]);
+    for state in states.lock().unwrap().values() {
+        assert_eq!(state.phase, BusinessPhase::Offline);
+    }
+}
+
+#[test]
+fn optical_queue_rejects_overflow_and_disconnected_owner() {
+    let (requests, receiver) = std::sync::mpsc::sync_channel(1);
+    let client = OpticalClient {
+        requests,
+        hardware_ready: Arc::new(AtomicBool::new(true)),
+    };
+    let (reply, _response) = std::sync::mpsc::sync_channel(1);
+    client
+        .requests
+        .try_send(OpticalRequest {
+            command: OpticalCommand::Status,
+            reply,
+        })
+        .unwrap();
+
+    let full = client.request(OpticalCommand::On).unwrap_err();
+    drop(receiver);
+    let disconnected = client.request(OpticalCommand::Off).unwrap_err();
+
+    assert_eq!(full.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(disconnected.kind(), io::ErrorKind::NotConnected);
+}
+
+#[test]
+fn concurrent_optical_ipc_transitions_are_executed_by_one_owner() {
+    let (requests, receiver) = std::sync::mpsc::sync_channel::<OpticalRequest>(2);
+    let server = Server::new(
+        2,
+        optical_handler(OpticalClient {
+            requests,
+            hardware_ready: Arc::new(AtomicBool::new(true)),
+        }),
+    );
+    let (received, first_received) = channel();
+    let owner = thread::spawn(move || {
+        let mut actor = OpticalActor {
+            state: OpticalState::Disabled,
+        };
+        let mut backend = TestOptics {
+            ready: true,
+            ..TestOptics::default()
+        };
+        let first = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        received.send(()).unwrap();
+        let second = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        for request in [first, second] {
+            request
+                .reply
+                .send(actor.handle(request.command, &mut backend))
+                .unwrap();
+        }
+        backend.events
+    });
+    let mut on = server.connect();
+    on.write_all(b"OPTICAL ON\n").unwrap();
+    signal(&first_received);
+    let mut off = server.connect();
+
+    off.write_all(b"OPTICAL OFF\n").unwrap();
+    let enabled: serde_json::Value = serde_json::from_str(&reply(on)).unwrap();
+    let disabled: serde_json::Value = serde_json::from_str(&reply(off)).unwrap();
+
+    assert_eq!(enabled["tx_enabled"], true);
+    assert_eq!(enabled["discovery_active"], true);
+    assert_eq!(disabled["tx_enabled"], false);
+    assert_eq!(disabled["actor_state"], "disabled");
+    assert_eq!(disabled["discovery_active"], false);
+    assert_eq!(
+        owner.join().unwrap(),
+        ["enable", "read", "quiesce", "disable", "read"]
+    );
 }
 
 #[test]

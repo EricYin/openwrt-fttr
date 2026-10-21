@@ -1,4 +1,5 @@
 pub mod bosa;
+pub(crate) mod i2c;
 pub mod fpga;
 pub mod ipc;
 pub mod hl202_ipc;

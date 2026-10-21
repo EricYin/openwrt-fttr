@@ -1,8 +1,10 @@
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,6 +21,217 @@ use crate::pon_engine::PonEngine;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod ipc_server;
+
+#[derive(Clone, Copy)]
+enum OpticalCommand {
+    On,
+    Off,
+    Status,
+}
+
+#[derive(Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OpticalState {
+    Enabled,
+    Disabled,
+    Unknown,
+}
+
+struct OpticalRequest {
+    command: OpticalCommand,
+    reply: SyncSender<serde_json::Value>,
+}
+
+struct OpticalClient {
+    requests: SyncSender<OpticalRequest>,
+    hardware_ready: Arc<AtomicBool>,
+}
+
+impl OpticalClient {
+    fn request(&self, command: OpticalCommand) -> io::Result<serde_json::Value> {
+        if !self.hardware_ready.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "hardware initialization incomplete",
+            ));
+        }
+        let (reply, response) = mpsc::sync_channel(1);
+        self.requests
+            .try_send(OpticalRequest { command, reply })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => {
+                    io::Error::new(io::ErrorKind::WouldBlock, "optical request queue full")
+                }
+                mpsc::TrySendError::Disconnected(_) => {
+                    io::Error::new(io::ErrorKind::NotConnected, "PLOAM owner unavailable")
+                }
+            })?;
+        response
+            .recv()
+            .map_err(|error| io::Error::new(io::ErrorKind::NotConnected, error))
+    }
+}
+
+trait OpticalBackend {
+    fn ready(&self) -> bool;
+    fn cleanup_pending(&self) -> bool;
+    fn quiesce(&mut self) -> io::Result<()>;
+    fn set_tx(&mut self, enabled: bool) -> io::Result<()>;
+    fn read_tx(&mut self) -> io::Result<bool>;
+}
+
+struct OpticalActor {
+    state: OpticalState,
+}
+
+impl OpticalActor {
+    fn handle(
+        &mut self,
+        command: OpticalCommand,
+        backend: &mut impl OpticalBackend,
+    ) -> serde_json::Value {
+        let mut tx_enabled = None;
+        let mut quiesce_attempted = false;
+        let result = if !backend.ready() {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "hardware initialization incomplete",
+            ))
+        } else {
+            match command {
+                OpticalCommand::On | OpticalCommand::Off => {
+                    self.state = OpticalState::Unknown;
+                    let enabled = matches!(command, OpticalCommand::On);
+                    let quiesced = if enabled {
+                        Ok(())
+                    } else {
+                        quiesce_attempted = true;
+                        backend.quiesce()
+                    };
+                    let transition = backend.set_tx(enabled).and_then(|()| {
+                        let actual = backend.read_tx()?;
+                        tx_enabled = Some(actual);
+                        if actual == enabled {
+                            Ok(())
+                        } else {
+                            Err(io::Error::other("optical TX readback mismatch"))
+                        }
+                    });
+                    let result = match (quiesced, transition) {
+                        (Ok(()), result) => result,
+                        (Err(error), Ok(())) => Err(error),
+                        (Err(quiesce), Err(transition)) => Err(io::Error::other(format!(
+                            "quiesce failed: {quiesce}; optical transition failed: {transition}"
+                        ))),
+                    };
+                    result.map(|()| {
+                        self.state = if enabled {
+                            OpticalState::Enabled
+                        } else {
+                            OpticalState::Disabled
+                        };
+                    })
+                }
+                OpticalCommand::Status => backend.read_tx().and_then(|actual| {
+                    tx_enabled = Some(actual);
+                    if self.state == OpticalState::Enabled && !actual {
+                        self.state = OpticalState::Disabled;
+                        quiesce_attempted = true;
+                        backend.quiesce()?;
+                    }
+                    Ok(())
+                }),
+            }
+        };
+        let result = match result {
+            Err(error) => {
+                self.state = OpticalState::Unknown;
+                if backend.ready() && !quiesce_attempted {
+                    match backend.quiesce() {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(io::Error::other(format!(
+                            "{error}; quiesce failed: {cleanup}"
+                        ))),
+                    }
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        };
+        serde_json::json!({
+            "schema_version": 1,
+            "status": if result.is_ok() { "success" } else { "error" },
+            "action": match command {
+                OpticalCommand::On => "optical_on",
+                OpticalCommand::Off => "optical_off",
+                OpticalCommand::Status => "optical_status",
+            },
+            "tx_enabled": tx_enabled,
+            "actor_state": self.state,
+            "hardware_ready": backend.ready(),
+            "discovery_active": backend.ready() && self.state == OpticalState::Enabled && !backend.cleanup_pending(),
+            "cleanup_pending": backend.cleanup_pending(),
+            "error": result.err().map(|error| serde_json::json!({"code": format!("{:?}", error.kind()), "message": error.to_string()})),
+        })
+    }
+}
+
+struct RuntimeOptics<'a> {
+    ready: bool,
+    ranging: &'a mut Option<RangingSession>,
+    online: &'a mut BTreeMap<u8, RangingSession>,
+    pending_cleanup: &'a mut BTreeSet<u8>,
+    services: &'a mut super::service::Services,
+    engine: &'a Mutex<PonEngine>,
+}
+
+impl RuntimeOptics<'_> {
+    fn quiesce_with(
+        &mut self,
+        mut lower_carrier: impl FnMut(u8) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.pending_cleanup.extend(self.online.keys().copied());
+        if let Some(session) = self.ranging.take() {
+            self.pending_cleanup.insert(session.id);
+        }
+        self.online.clear();
+        let mut errors = Vec::new();
+        for &id in self.pending_cleanup.iter() {
+            self.services.stop(id);
+            match self.engine.lock() {
+                Ok(mut engine) => engine.mark_offline(id),
+                Err(error) => errors.push(error.to_string()),
+            }
+            if let Err(error) = lower_carrier(id) {
+                errors.push(format!("ONU {id} carrier: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(errors.join("; ")))
+        }
+    }
+}
+
+impl OpticalBackend for RuntimeOptics<'_> {
+    fn ready(&self) -> bool {
+        self.ready
+    }
+    fn cleanup_pending(&self) -> bool {
+        !self.pending_cleanup.is_empty()
+    }
+    fn quiesce(&mut self) -> io::Result<()> {
+        self.quiesce_with(|id| bosa::set_fttr_carrier(u32::from(id), false))
+    }
+    fn set_tx(&mut self, enabled: bool) -> io::Result<()> {
+        bosa::set_optical_tx_enable(enabled)
+    }
+    fn read_tx(&mut self) -> io::Result<bool> {
+        bosa::get_optical_tx_enable()
+    }
+}
 
 fn setup_bridge() {
     println!("[*] Initializing downstream FTTR DSA switch ports (fttr1 ~ fttr16)...");
@@ -48,14 +261,16 @@ fn start_ipc_server(
     devices: Arc<Mutex<Vec<SubDevice>>>,
     pon_engine: Arc<Mutex<PonEngine>>,
     services: super::service::States,
+    optics: OpticalClient,
 ) {
-    ipc_server::start(listener, ipc_handler(devices, pon_engine, services));
+    ipc_server::start(listener, ipc_handler(devices, pon_engine, services, optics));
 }
 
 fn ipc_handler(
     devices: Arc<Mutex<Vec<SubDevice>>>,
     pon_engine: Arc<Mutex<PonEngine>>,
     services: super::service::States,
+    optics: OpticalClient,
 ) -> impl Fn(std::os::unix::net::UnixStream, &str) + Send + Sync + 'static {
     move |mut stream, line| {
         if let Some(request) = line.strip_prefix("HL202 ") {
@@ -123,19 +338,13 @@ fn ipc_handler(
                 let _ = stream.write_all(b"\n");
             }
         } else if line == "DISCOVER" {
-            let engine = pon_engine.lock().unwrap();
-            let frames = engine.build_discovery_frames();
-            for frame in &frames {
-                let bytes = frame.to_bytes();
-                let _ = bosa::send_ploam_msg(&bytes);
+            if let Err(error) = stream.write_all(
+                IpcResponse::err("discovery is managed by the PLOAM owner")
+                    .to_json_line()
+                    .as_bytes(),
+            ) {
+                eprintln!("[-] Discovery IPC response failed: {error}");
             }
-            let _ = stream.write_all(
-                format!(
-                    "{{\"status\": \"discovery_dispatched\", \"frames\": {}}}\n",
-                    frames.len()
-                )
-                .as_bytes(),
-            );
         } else if line.starts_with("REGISTER ") {
             let _ = stream.write_all(
                 IpcResponse::err(
@@ -168,6 +377,24 @@ fn ipc_handler(
                     .to_json_line()
                     .as_bytes(),
             );
+        } else if let Some(command) = match line {
+            "OPTICAL ON" => Some(OpticalCommand::On),
+            "OPTICAL OFF" => Some(OpticalCommand::Off),
+            "OPTICAL STATUS" => Some(OpticalCommand::Status),
+            _ => None,
+        } {
+            let response = match optics.request(command) {
+                Ok(response) => response,
+                Err(error) => {
+                    serde_json::json!({"schema_version": 1, "status": "error", "tx_enabled": null, "actor_state": "unknown", "hardware_ready": optics.hardware_ready.load(Ordering::Acquire), "discovery_active": null, "error": {"code": format!("{:?}", error.kind()), "message": error.to_string()}})
+                }
+            };
+            if let Err(error) = serde_json::to_writer(&mut stream, &response)
+                .map_err(io::Error::other)
+                .and_then(|()| stream.write_all(b"\n"))
+            {
+                eprintln!("[-] Optical IPC response failed: {error}");
+            }
         }
     }
 }
@@ -186,6 +413,7 @@ pub fn run() {
     crate::provisioning::start(pon_engine.clone());
     let mqtt_client_arc: Arc<Mutex<Option<MqttClient>>> = Arc::new(Mutex::new(None));
     let hardware_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (optical_requests, optical_receiver) = mpsc::sync_channel(2);
     let service_states: super::service::States = Arc::new(Mutex::new(BTreeMap::new()));
 
     if let Ok(listener) = ipc::create_socket_listener() {
@@ -194,6 +422,10 @@ pub fn run() {
             devices.clone(),
             pon_engine.clone(),
             service_states.clone(),
+            OpticalClient {
+                requests: optical_requests,
+                hardware_ready: hardware_ready.clone(),
+            },
         );
         println!("[+] IPC socket server listening on {}", ipc::SOCKET_PATH);
     }
@@ -289,9 +521,33 @@ pub fn run() {
             let mut pending_cleanup = BTreeSet::new();
             let mut services = super::service::Services::new(service_states);
             let mut grant_cycle = 0usize;
+            let mut optics = OpticalActor { state: OpticalState::Unknown };
+            let mut optical_initialized = false;
             loop {
-                if !hardware_ready.load(std::sync::atomic::Ordering::Acquire) {
-                    thread::sleep(Duration::from_millis(250));
+                let ready = hardware_ready.load(Ordering::Acquire);
+                {
+                    let mut backend = RuntimeOptics {
+                        ready, ranging: &mut ranging, online: &mut online,
+                        pending_cleanup: &mut pending_cleanup, services: &mut services,
+                        engine: &pon_engine_ploam,
+                    };
+                    if ready && !optical_initialized {
+                        optical_initialized = true;
+                        match backend.read_tx() {
+                            Ok(true) => optics.state = OpticalState::Enabled,
+                            Ok(false) => optics.state = OpticalState::Disabled,
+                            Err(error) => eprintln!("[-] Initial optical readback failed; discovery paused: {error}"),
+                        }
+                    }
+                    for request in optical_receiver.try_iter().take(2) {
+                        let response = optics.handle(request.command, &mut backend);
+                        if let Err(error) = request.reply.send(response) {
+                            eprintln!("[-] Optical reply receiver unavailable: {error}");
+                        }
+                    }
+                }
+                if !ready || optics.state != OpticalState::Enabled {
+                    thread::sleep(Duration::from_millis(10));
                     continue;
                 }
                 for id in pending_cleanup.clone() {
@@ -308,6 +564,10 @@ pub fn run() {
                             ),
                         }
                     }
+                }
+                if !pending_cleanup.is_empty() {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
                 }
                 // Use independent 200ms overhead and 100ms serial grant
                 // timers; advertise before granting.
