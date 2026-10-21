@@ -119,7 +119,7 @@ impl PacketSocket {
     }
     pub fn receive_into<'a>(
         &self,
-        buffer: &'a mut [u8; 2048],
+        buffer: &'a mut [u8],
     ) -> io::Result<Option<(&'a [u8], u8, Option<u16>)>> {
         let mut address: Address = unsafe { std::mem::zeroed() };
         let mut control = [0usize; 16];
