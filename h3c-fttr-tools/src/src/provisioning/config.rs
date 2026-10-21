@@ -260,6 +260,35 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
         if cwmp_contract != "auto" {
             crate::devices::cwmp::registry::lookup(cwmp_contract)?;
         }
+        let use_defaults = boolean(
+            s.get("connection_request_defaults"),
+            s.get("connection_request_username").is_empty() || s.get("connection_request_password").is_empty(),
+        )
+        .map_err(|error| format!("{id}: connection_request_defaults: {error}"))?;
+        let (cr_username, cr_password, cr_defaults) = if use_defaults {
+            if adapter == "hl202" || cwmp_contract == "hl202" {
+                ("rms".to_string(), "rms".to_string(), false)
+            } else {
+                (s.get("connection_request_username").into(), s.get("connection_request_password").into(), true)
+            }
+        } else {
+            (s.get("connection_request_username").into(), s.get("connection_request_password").into(), false)
+        };
+        let port = if s.get("connection_request_port").is_empty() {
+            super::model::ConnectionRequest::default().port
+        } else {
+            s.get("connection_request_port").parse::<std::num::NonZeroU16>()
+                .map_err(|_| format!("{id}: connection_request_port must be 1..65535"))?
+        };
+        let connection_request = super::model::ConnectionRequest {
+            enabled: boolean(s.get("connection_request"), true)
+                .map_err(|error| format!("{id}: connection_request: {error}"))?,
+            defaults: cr_defaults,
+            username: cr_username,
+            password: cr_password,
+            port,
+            ..Default::default()
+        };
         cfg.devices.push(Device {
             id: id.clone(),
             optical_sn: s.get("optical_sn").to_ascii_uppercase(),
@@ -268,22 +297,7 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
             cwmp_contract: cwmp_contract.into(),
             omci_management: boolean(s.get("omci_management"), false)
                 .map_err(|error| format!("{id}: omci_management: {error}"))?,
-            connection_request: super::model::ConnectionRequest {
-                enabled: boolean(s.get("connection_request"), true)
-                    .map_err(|error| format!("{id}: connection_request: {error}"))?,
-                defaults: boolean(s.get("connection_request_defaults"),
-                    s.get("connection_request_username").is_empty() || s.get("connection_request_password").is_empty())
-                    .map_err(|error| format!("{id}: connection_request_defaults: {error}"))?,
-                username: s.get("connection_request_username").into(),
-                password: s.get("connection_request_password").into(),
-                port: if s.get("connection_request_port").is_empty() {
-                    super::model::ConnectionRequest::default().port
-                } else {
-                    s.get("connection_request_port").parse::<std::num::NonZeroU16>()
-                        .map_err(|_| format!("{id}: connection_request_port must be 1..65535"))?
-                },
-                ..Default::default()
-            },
+            connection_request,
             items: Vec::new(),
             wifi_cleanup: wifi_cleanup.into(),
             wifi_preserve,

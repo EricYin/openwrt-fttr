@@ -58,3 +58,18 @@ fn connection_request_rejects_an_invalid_opt_in_boolean() {
 
     assert!(result.is_err());
 }
+
+#[test]
+fn hl202_uses_reserved_default_credentials_when_defaults_are_enabled() {
+    let text = DEVICE.replace("option adapter 'generic'", "option adapter 'hl202'");
+    let config = parse(&text).unwrap();
+
+    let request = &config.devices[0].connection_request;
+    assert!(request.enabled);
+    assert!(!request.defaults);
+    assert_eq!(request.username, "rms");
+    assert_eq!(request.password, "rms");
+    assert_eq!(request.port.get(), 7547);
+    assert!(request.credentials_available());
+}
+
