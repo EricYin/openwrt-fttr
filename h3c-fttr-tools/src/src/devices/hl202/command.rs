@@ -1,10 +1,15 @@
 //! Shell-over-MQTT command transport. Separate connections from fttrd telemetry.
-use crate::mqtt::MqttClient;
+#[cfg(feature = "mqtt")]
+use crate::mqtt::session::CommandSession;
 use serde::Serialize;
+#[cfg(any(feature = "mqtt", test))]
 use std::fs::{File, OpenOptions};
 use std::io;
+#[cfg(any(feature = "mqtt", test))]
 use std::os::fd::AsRawFd;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(any(feature = "mqtt", test))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,20 +65,24 @@ pub fn normalize_mac(value: &str) -> io::Result<String> {
     Ok(mac.to_ascii_uppercase())
 }
 
+#[cfg(any(feature = "mqtt", test))]
 pub(super) fn request_id() -> String {
     format!("{:x}_{:x}", std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos())
 }
 
+#[cfg(any(feature = "mqtt", test))]
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\"'\"'"))
 }
 
+#[cfg(any(feature = "mqtt", test))]
 pub(super) fn framed_script(command: &str, id: &str) -> String {
     format!("printf '__FTTR_BEGIN_{id}__\\n'; sh -c {} 2>&1; fttr_rc=$?; printf '\\n__FTTR_END_{id}__=%s\\n' \"$fttr_rc\"",
         shell_quote(command))
 }
 
+#[cfg(any(feature = "mqtt", test))]
 pub(super) fn parse_reply(payload: &[u8], id: &str) -> Option<(String, i32, bool)> {
     let text = String::from_utf8_lossy(payload);
     let body = text.strip_prefix(&format!("__FTTR_BEGIN_{id}__\n"))?;
@@ -182,6 +191,7 @@ mod tests {
 
 // Advisory locks survive file reuse but are released automatically on process exit.
 // Do not unlink the lock file: doing so would let clients lock different inodes.
+#[cfg(any(feature = "mqtt", test))]
 pub(super) fn lock_target(target: &str) -> io::Result<File> {
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
         .open(format!("/tmp/fttr-command-{target}.lock"))?;
@@ -194,19 +204,25 @@ pub(super) fn lock_target(target: &str) -> io::Result<File> {
 }
 
 /// QoS 0 dispatch only. Success reports a socket write, not device execution.
+#[cfg(feature = "mqtt")]
 pub fn dispatch(target: &str, command: &str) -> io::Result<CommandResult> {
     let target = if target == "all" { "all".to_string() } else { normalize_mac(target)? };
     if command.trim().is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "command must not be empty"));
     }
     let _lock = lock_target(&target)?;
-    let mut mqtt = MqttClient::connect("127.0.0.1:1883", &format!("fttr-cmd-{}", request_id()))?;
-    mqtt.publish(&format!("/fttr/subdev/cmd/{target}"), command.as_bytes())?;
+    super::command_transport::blocking(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut session = CommandSession::connect("127.0.0.1:1883".parse().unwrap(), &format!("fttr-cmd-{}", request_id()), deadline).await.map_err(io::Error::other)?;
+        session.enqueue_publish(&format!("/fttr/subdev/cmd/{target}"), command.as_bytes()).map_err(io::Error::other)?;
+        session.flushed(deadline).await.map_err(io::Error::other)
+    })?;
     Ok(CommandResult { target, status: CommandStatus::Dispatched, request_id: None,
         exit_code: None, output: None, output_truncated: false, error: None })
 }
 
 /// Wait for a fresh, matching response frame containing combined output and exit code.
+#[cfg(feature = "mqtt")]
 pub fn execute(target: &str, command: &str, timeout: Duration) -> io::Result<CommandResult> {
     let target = normalize_mac(target)?;
     if command.trim().is_empty() {
@@ -214,8 +230,17 @@ pub fn execute(target: &str, command: &str, timeout: Duration) -> io::Result<Com
     }
     let _lock = lock_target(&target)?;
     let id = request_id();
-    let mut mqtt = MqttClient::connect("127.0.0.1:1883", &format!("fttr-exec-{id}"))?;
-    super::command_transport::run(&mut mqtt, super::command_transport::Request {
+    super::command_transport::blocking(super::command_transport::run("127.0.0.1:1883".parse().unwrap(), super::command_transport::Request {
         target, script: command, id, timeout,
-    })
+    }, super::command_transport::enqueue))
+}
+
+#[cfg(not(feature = "mqtt"))]
+pub fn dispatch(_: &str, _: &str) -> io::Result<CommandResult> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "MQTT commands unavailable: build requires mqtt"))
+}
+
+#[cfg(not(feature = "mqtt"))]
+pub fn execute(_: &str, _: &str, _: Duration) -> io::Result<CommandResult> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "MQTT commands unavailable: build requires mqtt"))
 }

@@ -1,6 +1,29 @@
 use super::{Queue, MAX_PENDING_BYTES};
 
 #[test]
+fn mqtt_telemetry_slow_consumer_pending_budget_and_eventual_drain() {
+    let mut queue = Queue::default();
+    let mut peak = 0;
+    // Hold the parser back while many maximum reports and invalid sources arrive.
+    for n in 0..200u64 {
+        assert!(queue.put(&format!("02000000{n:04X}"), vec![7; super::super::archive::MAX_COMPRESSED], n, &[]));
+        assert!(!queue.put("../../invalid", vec![0; 32], n, &[]));
+        let bytes = queue.pending.values().filter_map(|p| p.payload.as_ref()).map(Vec::len).sum::<usize>();
+        peak = peak.max(bytes);
+        assert!(bytes <= MAX_PENDING_BYTES);
+        assert!(queue.seen.len() <= 64);
+    }
+    assert_eq!(peak, MAX_PENDING_BYTES);
+    let mut count = 0;
+    while queue.take().is_some() { count += 1; }
+    assert_eq!(count, 64);
+    assert!(queue.pending.is_empty());
+    assert!(queue.put("020000000001", vec![1], 201, &[]));
+    assert_eq!(queue.take().unwrap().1.payload, Some(vec![1]));
+    println!("pending_peak_bytes={peak}, after_drain_bytes=0, retained_sources={}", queue.seen.len());
+}
+
+#[test]
 fn evicted_receipt_completes_without_losing_last_good_report() {
     let mut store = super::Store::default();
     let mac = "020000000001";

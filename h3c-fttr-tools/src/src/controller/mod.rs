@@ -1,9 +1,12 @@
 //! Production controller: one daemon owns activation and per-ONU business workers.
 mod activation;
+mod lifetime;
 pub mod business;
 pub mod health;
 pub mod inventory;
 pub mod management;
+#[cfg(feature = "mqtt")]
+pub mod mqtt;
 pub mod profile;
 mod runtime;
 mod status;

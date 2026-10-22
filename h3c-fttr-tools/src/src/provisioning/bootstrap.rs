@@ -98,6 +98,7 @@ fn now() -> u64 {
         .as_secs()
 }
 
+#[cfg(feature = "mqtt")]
 pub(crate) fn observe_mqtt(topic: &str, time: u64) {
     if let Ok(mut registry) = crate::mqtt_identity::shared().lock() {
         registry.observe(topic, time);

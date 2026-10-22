@@ -3,20 +3,25 @@ pub(crate) mod i2c;
 pub mod fpga;
 pub mod ipc;
 pub mod hl202_ipc;
+#[cfg(feature = "mqtt")]
 pub mod mqtt;
 pub mod mqtt_identity;
+#[cfg(any(feature = "mqtt", test))]
 mod telemetry_sources;
+#[cfg(any(feature = "mqtt", test))]
 mod mqtt_limits;
 pub mod pon_engine;
 pub mod devices;
-#[cfg(feature = "device-hl202")]
-pub use devices::hl202::legacy_commands as h3c_subdev;
 pub mod model;
-#[cfg(feature = "device-hl202")]
-pub use devices::hl202::command as subdev_command;
 pub mod controller;
 pub mod acs_cli;
 pub mod provisioning;
 pub mod provisioning_cli;
 #[cfg(feature = "acs")]
 pub mod acs;
+#[cfg(feature = "mqtt")]
+pub mod broker;
+
+// Unit fixtures which prove the MQTT-off boundary share the production port.
+#[cfg(all(test, not(feature = "mqtt")))]
+pub(crate) static MQTT_TEST_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());

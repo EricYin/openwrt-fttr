@@ -5,7 +5,7 @@ use std::process::{exit, Command};
 use h3c_fttr_tools::bosa;
 use h3c_fttr_tools::fpga;
 use h3c_fttr_tools::ipc;
-use h3c_fttr_tools::model::{FttrSystemStatus, IpcResponse};
+use h3c_fttr_tools::model::FttrSystemStatus;
 #[cfg(feature = "device-hl202")]
 #[path = "fttrctl/hl202.rs"]
 mod hl202;
@@ -40,7 +40,6 @@ Commands:\n  \
    exec [options] <mac> <command>  Execute, wait for combined output and exit status\n  \
    cmd [options] <mac> <command>   Dispatch without waiting for device execution\n  \
    broadcast [options] <command>  Broadcast dispatch, or --wait for per-device replies\n  \
-  subdev <sn> <action> Manage sub-gateway proprietary features (passwords, telnet, iptv, etc.)\n  \
   help                 Show this help message"
     );
 }
@@ -56,104 +55,6 @@ fn status_ipc_error(error: &str) -> serde_json::Value {
 #[cfg(not(feature = "device-hl202"))]
 fn handle_mqtt_command(_: &[String]) -> Result<i32, String> {
     Err("HL202 adapter not compiled; enable device-hl202".into())
-}
-
-fn print_subdev_usage() {
-    eprintln!(
-        "Usage: fttrctl subdev <sn> <action> [arguments...] [--json|-j]\n\n\
-Sub-Gateway Management Actions:\n  \
-  passwd <new_pwd>                  Update super administrator (CUAdmin) password and unlock account\n  \
-  user-passwd <new_pwd>             Update standard user account password\n  \
-  admin <enable|disable|unlock>     Enable, disable, or unlock CUAdmin account\n  \
-  telnet <enable|disable> [port]    Enable temporary root Telnet daemon (default port: 23) or disable it\n  \
-  tr069 set <acs_url> [vlan]        Configure TR-069 ACS URL and management VLAN\n  \
-  tr069 disable                     Completely shut down and disable TR-069\n  \
-  iptv enable <vlan> [port] [mvlan] Configure IPTV multi-play VLAN and dedicated LAN port (e.g. 43 2 4094)\n  \
-  iptv disable                      Disable IPTV service\n  \
-  internet-vlan <vlan> [ports...]   Configure Internet VLAN tagging on sub-gateway LAN ports (e.g. 41 1 2)\n  \
-  wifi <ssid> <pwd> [--no-5g]       Configure local Wi-Fi SSIDs and credentials via direct TCAPI\n  \
-  mesh <ssid> <pwd> [options]       Broadcast EasyMesh JSON configuration to sub-gateway\n  \
-  reboot                            Remote reboot sub-gateway\n  \
-  factory-reset                     Restore sub-gateway to factory defaults (tcapi default)\n  \
-  status                            Query sub-gateway Account, IPTV, and TR-069 status\n\n\
-Examples:\n  \
-  fttrctl subdev H3CT1A2B3C4D passwd MyPassw0rd!\n  \
-  fttrctl subdev H3CT1A2B3C4D admin unlock\n  \
-  fttrctl subdev H3CT1A2B3C4D telnet enable 2323\n  \
-  fttrctl subdev H3CT1A2B3C4D iptv enable 43 2 4094\n  \
-  fttrctl subdev H3CT1A2B3C4D tr069 disable"
-    );
-}
-
-fn handle_subdev_command(args: &[String]) {
-    let mut is_json = false;
-    let filtered_args: Vec<&str> = args
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|&a| {
-            if a == "--json" || a == "-j" {
-                is_json = true;
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
-
-    // filtered_args[0] is "subdev"
-    if filtered_args.len() < 3 {
-        print_subdev_usage();
-        exit(1);
-    }
-
-    let sn = filtered_args[1];
-    let action = filtered_args[2];
-    let extra_args = &filtered_args[3..];
-
-    let mut processed_extra: Vec<&str> = Vec::new();
-    for &arg in extra_args {
-        if arg == "--no-5g" {
-            processed_extra.push("false");
-        } else {
-            processed_extra.push(arg);
-        }
-    }
-
-    let payload = if processed_extra.is_empty() {
-        format!("SUBDEV {sn} {action}")
-    } else {
-        format!("SUBDEV {sn} {action} {}", processed_extra.join(" "))
-    };
-
-    match ipc::send_ipc_command(&payload) {
-        Ok(resp) => {
-            if is_json {
-                print!("{resp}");
-            } else {
-                match serde_json::from_str::<IpcResponse>(&resp) {
-                    Ok(r) => {
-                        if let Some(err) = r.error {
-                            eprintln!("[-] Error from sub-gateway daemon: {err}");
-                            exit(1);
-                        } else {
-                            println!("[+] Successfully dispatched action '{action}' to sub-gateway {sn} via MQTT.");
-                        }
-                    }
-                    Err(_) => {
-                        println!("{resp}");
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            if is_json {
-                println!("{{\"error\": \"fttrd IPC error: {}\"}}", e);
-            } else {
-                eprintln!("[-] Failed to communicate with fttrd daemon: {e}");
-            }
-            exit(1);
-        }
-    }
 }
 
 fn setup_bridge() {
@@ -799,9 +700,6 @@ fn main() {
                 eprintln!("HL202 adapter not compiled");
                 exit(1);
             }
-        }
-        "subdev" => {
-            handle_subdev_command(&args[1..]);
         }
         "read-reg" => {
             if args.len() < 3 {

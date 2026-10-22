@@ -19,6 +19,7 @@ mod wifi;
 use controller::acs;
 #[cfg(test)]
 use controller::RPC;
+#[cfg(feature = "mqtt")]
 pub(crate) use bootstrap::observe_mqtt;
 pub use controller::{control, snapshot, start};
 pub(crate) use controller::{

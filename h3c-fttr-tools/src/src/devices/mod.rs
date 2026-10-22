@@ -3,9 +3,9 @@ pub mod cwmp;
 use crate::model::BusinessPhase;
 
 pub fn observe_mqtt_report(source: &str, payload: Vec<u8>, received: u64) -> bool {
-    #[cfg(feature = "device-hl202")]
+    #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
     { hl202::telemetry::store::observe(source, payload, received) }
-    #[cfg(not(feature = "device-hl202"))]
+    #[cfg(not(all(feature = "device-hl202", feature = "mqtt")))]
     { let _ = (source, payload, received); false }
 }
 #[cfg(feature = "device-hl202")]
@@ -27,20 +27,20 @@ pub enum Adapter {
 #[derive(Clone,Copy)]
 pub enum ManagementWanStage {Configuring,Verifying}
 pub fn ensure_mqtt_management_wan(device_id: &str, vlans: &[u32], priority: u32, persist_matching:bool, progress:impl FnMut(ManagementWanStage)->bool) -> Result<u32, String> {
-    #[cfg(feature = "device-hl202")]
+    #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
     { hl202::management_wan::ensure(device_id, vlans, priority,persist_matching,progress) }
-    #[cfg(not(feature = "device-hl202"))]
-    { let _ = (device_id, vlans, priority,persist_matching,progress); Err("MQTT management WAN adapter is not compiled".into()) }
+    #[cfg(not(all(feature = "device-hl202", feature = "mqtt")))]
+    { let _ = (device_id, vlans, priority,persist_matching,progress); Err("MQTT management WAN unavailable: build requires mqtt and device-hl202".into()) }
 }
 #[derive(Clone,Default)]
 pub struct CwmpCredentials {pub username:String,pub password:String}
 pub fn read_authenticated_cwmp_settings(target:&str,url:&str,credentials:&CwmpCredentials)->Result<bool,String> {
-    #[cfg(feature="device-hl202")] {hl202::mqtt_lifecycle::read_authenticated_settings(target,url,credentials)}
-    #[cfg(not(feature="device-hl202"))] {let _=(target,url,credentials);Err("MQTT CWMP adapter is not compiled".into())}
+    #[cfg(all(feature="device-hl202", feature="mqtt"))] {hl202::mqtt_lifecycle::read_authenticated_settings(target,url,credentials)}
+    #[cfg(not(all(feature="device-hl202", feature="mqtt")))] {let _=(target,url,credentials);Err("MQTT CWMP unavailable: build requires mqtt and device-hl202".into())}
 }
 pub fn configure_authenticated_cwmp_settings(target:&str,url:&str,credentials:&CwmpCredentials)->Result<(),String> {
-    #[cfg(feature="device-hl202")] {hl202::mqtt_lifecycle::configure_settings(target,url,credentials)}
-    #[cfg(not(feature="device-hl202"))] {let _=(target,url,credentials);Err("MQTT CWMP adapter is not compiled".into())}
+    #[cfg(all(feature="device-hl202", feature="mqtt"))] {hl202::mqtt_lifecycle::configure_settings(target,url,credentials)}
+    #[cfg(not(all(feature="device-hl202", feature="mqtt")))] {let _=(target,url,credentials);Err("MQTT CWMP unavailable: build requires mqtt and device-hl202".into())}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,7 +49,7 @@ impl Adapter {
     pub fn capabilities(self) -> Capabilities {
         match self {
             #[cfg(feature = "device-hl202")]
-            Self::Hl202 => Capabilities { business: true, shell_commands: true },
+            Self::Hl202 => Capabilities { business: true, shell_commands: cfg!(feature = "mqtt") },
             #[cfg(feature = "device-hwtc")]
             Self::Hwtc(_) => Capabilities { business: true, shell_commands: false },
             Self::GenericBridge => Capabilities { business: true, shell_commands: false },
@@ -120,20 +120,39 @@ pub fn select_with_serial(vendor: &str, identity: &crate::model::OnuIdentity, se
     Adapter::Unavailable
 }
 
-/// Compatibility IPC delegates the entire command contract to its device adapter.
-pub fn legacy_command(line: &str) -> crate::model::IpcResponse {
-    #[cfg(feature = "device-hl202")]
-    return hl202::legacy_commands::handle(line);
-    #[cfg(not(feature = "device-hl202"))]
-    {
-        let _ = line;
-        crate::model::IpcResponse::err("HL202 adapter not compiled")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(not(feature = "mqtt"))]
+    fn mqtt_disabled_commands_are_local_and_inventory_remains_available() {
+        let _port = crate::MQTT_TEST_PORT.lock().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:1883").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let credentials = CwmpCredentials::default();
+        assert!(ensure_mqtt_management_wan("02AABBCCDDEE", &[1], 0, false, |_| true).unwrap_err().contains("unavailable"));
+        assert!(read_authenticated_cwmp_settings("02AABBCCDDEE", "http://acs", &credentials).unwrap_err().contains("unavailable"));
+        assert!(configure_authenticated_cwmp_settings("02AABBCCDDEE", "http://acs", &credentials).unwrap_err().contains("unavailable"));
+        #[cfg(feature = "device-hl202")]
+        {
+            assert_eq!(hl202::command::execute("02AABBCCDDEE", "fixture", std::time::Duration::from_secs(1)).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+            assert_eq!(hl202::command::dispatch("all", "fixture").unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+            let typed = hl202::api::Query::Run { request: hl202::request::Request {
+                schema_version: 1,
+                target: crate::mqtt_identity::Selection { optical_sn: "H3CT12345678".into(), onu_id: 2, binding_generation: "fixture".into() },
+                action: hl202::request::Action::AccountsRead,
+            }};
+            let reply = hl202::api::control(&serde_json::to_string(&typed).unwrap(), &[]);
+            assert_eq!(reply["error"]["code"], "mqtt_unavailable");
+            let identity = crate::model::OnuIdentity { equipment_id: Some("HL202-DU-C".into()), ..Default::default() };
+            let adapter = select("H3CT", &identity);
+            assert!(adapter.capabilities().business);
+            assert!(!adapter.capabilities().shell_commands);
+            assert_eq!(adapter.verification_status(), BusinessPhase::Verifying);
+        }
+        assert!(Adapter::GenericBridge.capabilities().business);
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
     #[test]
     fn selection_respects_vendor_model_rules_and_whole_device_features() {
         let mut identity = crate::model::OnuIdentity::default();

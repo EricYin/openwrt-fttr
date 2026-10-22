@@ -6,20 +6,26 @@ description = "H3C HM2004-DU FTTR Micro-OLT utilities and controller daemon"
 repository = "https://github.com/LazuliKao/openwrt-fttr"
 
 [features]
-default = ["device-hl202"]
+default = ["device-hl202", "mqtt"]
 device-hl202 = ["dep:flate2", "dep:tar"]
 device-hwtc = []
 all-devices = ["device-hl202", "device-hwtc"]
 acs = ["dep:roxmltree", "serde_json/raw_value"]
+mqtt = ["dep:rumqttd", "dep:rumqttc", "dep:tokio"]
 
 [dependencies]
 libc = "0.2"
-mqttrs2 = "0.1.0"
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 roxmltree = { version = "0.21.1", optional = true }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"], optional = true }
 tar = { version = "0.4", default-features = false, optional = true }
+rumqttd = { version = "=0.20.0", default-features = false, optional = true }
+rumqttc = { version = "=0.25.1", default-features = false, optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "net", "io-util", "sync", "time"], optional = true }
+
+[dev-dependencies]
+bytes = "1"
 
 [[bin]]
 name = "fttrctl"

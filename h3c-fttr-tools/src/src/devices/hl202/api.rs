@@ -73,7 +73,7 @@ pub fn control(input: &str, devices: &[Device]) -> Value {
                     && source.onu_id == Some(device.onu_id));
                 let report_revision = mqtt.and_then(|source| super::telemetry::store::revision(&source.mqtt_mac));
                 json!({"optical_sn":device.optical_sn,"onu_id":device.onu_id,"model":device.model,
-                    "optical_online":device.online,"can_execute":device.online && mqtt.is_some(),
+                    "optical_online":device.online,"can_execute":cfg!(feature = "mqtt") && device.online && mqtt.is_some(),
                     "mqtt":mqtt,"report_revision":report_revision})
             }).collect();
             json!({"schema_version":1,"devices":rows,"sources":sources})
@@ -98,6 +98,13 @@ pub fn control(input: &str, devices: &[Device]) -> Value {
             Err(_) => error("unavailable", "MQTT identity state unavailable"),
         },
         Query::Run { request } => {
+            #[cfg(not(feature = "mqtt"))]
+            {
+                let _ = request;
+                error("mqtt_unavailable", "MQTT commands unavailable: build requires mqtt")
+            }
+            #[cfg(feature = "mqtt")]
+            {
             if !devices.iter().any(|device| {
                 device.online
                     && device.optical_sn == request.target.optical_sn
@@ -142,6 +149,7 @@ pub fn control(input: &str, devices: &[Device]) -> Value {
                         ),
                     }
                 }
+            }
             }
         }
     }

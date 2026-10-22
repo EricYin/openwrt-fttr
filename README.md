@@ -31,11 +31,22 @@ make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
 
 ## 编译选项
 
-| OpenWrt 配置 | Cargo feature | 默认 |
-| --- | --- | --- |
-| `CONFIG_FTTR_DEVICE_HL202` | `device-hl202` | 开 |
-| `CONFIG_FTTR_DEVICE_HWTC` | `device-hwtc` | 关 |
-| `CONFIG_FTTR_ACS` | `acs` | 关 |
+| OpenWrt 配置 | Cargo feature | OpenWrt 默认 | Cargo 默认 |
+| --- | --- | --- | --- |
+| `CONFIG_FTTR_DEVICE_HL202` | `device-hl202` | 开 | 开 |
+| `CONFIG_FTTR_DEVICE_HWTC` | `device-hwtc` | 开 | 关 |
+| `CONFIG_FTTR_ACS` | `acs` | 开 | 关 |
+| `CONFIG_FTTR_MQTT` | `mqtt` | 开 | 开 |
+
+OpenWrt 使用 `--no-default-features`，逐项显式映射上述选项。设备及 ACS
+feature 不会隐式开启 MQTT；`all-devices` 只组合两类设备。Linux 下在
+`h3c-fttr-tools/src` 验证全部目标：
+
+```sh
+cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt
+cargo check --locked --all-targets --no-default-features --features all-devices,acs
+```
+
 
 ## Windows Rust 交叉编译
 
@@ -45,7 +56,7 @@ make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
 $previous = $env:RUSTFLAGS
 try {
     $env:RUSTFLAGS = '-C target-feature=+crt-static'
-    cargo zigbuild --release --target aarch64-unknown-linux-musl --no-default-features --features all-devices,acs --bin fttrd --bin fttrctl
+    cargo zigbuild --release --locked --target aarch64-unknown-linux-musl --no-default-features --features all-devices,acs,mqtt --bin fttrd --bin fttrctl
 } finally {
     $env:RUSTFLAGS = $previous
 }

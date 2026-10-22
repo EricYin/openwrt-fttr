@@ -6,15 +6,14 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, sleep};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::activation::{clear_offline_hardware, RangingSession};
 use crate::bosa;
 use crate::fpga;
 use crate::ipc::{self, SubDevice};
 use crate::model::{FttrSystemStatus, IpcResponse};
-use crate::mqtt::MqttClient;
 use crate::pon_engine::ploam::OnuState;
 use crate::pon_engine::ploam::PloamFrame;
 use crate::pon_engine::PonEngine;
@@ -365,18 +364,6 @@ fn ipc_handler(
                 .to_json_line()
                 .as_bytes(),
             );
-        } else if line.starts_with("EXEC ") {
-            let _ = stream.write_all(
-                crate::devices::legacy_command(line)
-                    .to_json_line()
-                    .as_bytes(),
-            );
-        } else if line.starts_with("SUBDEV ") {
-            let _ = stream.write_all(
-                crate::devices::legacy_command(line)
-                    .to_json_line()
-                    .as_bytes(),
-            );
         } else if let Some(command) = match line {
             "OPTICAL ON" => Some(OpticalCommand::On),
             "OPTICAL OFF" => Some(OpticalCommand::Off),
@@ -395,12 +382,18 @@ fn ipc_handler(
             {
                 eprintln!("[-] Optical IPC response failed: {error}");
             }
+        } else {
+            let _ = stream.write_all(IpcResponse::err("unsupported command").to_json_line().as_bytes());
         }
     }
 }
 
 pub fn run() {
     println!("[*] Starting H3C FTTR Master Controller Daemon (Rust fttrd)...");
+    let lifetime = super::lifetime::Lifetime::start().unwrap_or_else(|error| {
+        eprintln!("[-] MQTT startup failed: {error}");
+        std::process::exit(1);
+    });
     #[cfg(feature = "acs")]
     crate::acs::start_from_env();
 
@@ -411,7 +404,6 @@ pub fn run() {
     let pon_engine = Arc::new(Mutex::new(PonEngine::new()));
     super::service::init_pon_engine(pon_engine.clone());
     crate::provisioning::start(pon_engine.clone());
-    let mqtt_client_arc: Arc<Mutex<Option<MqttClient>>> = Arc::new(Mutex::new(None));
     let hardware_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (optical_requests, optical_receiver) = mpsc::sync_channel(2);
     let service_states: super::service::States = Arc::new(Mutex::new(BTreeMap::new()));
@@ -897,107 +889,10 @@ pub fn run() {
         });
     }
 
-    // 4. Connect to MQTT Broker
-    println!("[*] Connecting to local Mosquitto MQTT broker on 127.0.0.1:1883...");
-    let mut last_ping = Instant::now();
-
-    loop {
-        *mqtt_client_arc.lock().unwrap() = None;
-        let mut client = match MqttClient::connect("127.0.0.1:1883", "h3c-fttrd-rust") {
-            Ok(c) => {
-                println!("[+] Connected to local MQTT broker!");
-                if let Ok(cloned) = c.try_clone() {
-                    *mqtt_client_arc.lock().unwrap() = Some(cloned);
-                }
-                c
-            }
-            Err(_) => {
-                sleep(Duration::from_secs(2));
-                continue;
-            }
-        };
-
-        if let Err(e) = client.subscribe("/fttr/maindev/data/#") {
-            eprintln!("[-] Failed to subscribe to FTTR telemetry topics: {e}");
-            sleep(Duration::from_secs(2));
-            continue;
-        }
-
-        let prefix = "/fttr/maindev/data/";
-
-        loop {
-            match client.read_packet() {
-                Ok(Some((topic, payload))) => {
-                    if let Some(dev_id) = topic.strip_prefix(prefix) {
-                        let Some(mac) = crate::mqtt_identity::normalize_target(dev_id) else {
-                            continue;
-                        };
-                        let dev_id = mac.as_str();
-                        let payload_bytes = payload.len();
-                        println!(
-                            "[+] Telemetry packet received from sub-gateway: {} ({} bytes)",
-                            dev_id,
-                            payload.len()
-                        );
-
-                        // Telemetry is observation only: it must not enable
-                        // carrier or publish unverified configuration payloads.
-
-                        // Update device list
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-
-                        let protected = crate::mqtt_identity::shared()
-                            .lock()
-                            .map(|state| {
-                                state
-                                    .snapshots(now)
-                                    .into_iter()
-                                    .filter(|source| source.reason == "ready")
-                                    .map(|source| source.mqtt_mac)
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let mut devs = devices.lock().unwrap();
-                        crate::telemetry_sources::observe(
-                            &mut devs,
-                            SubDevice {
-                                id: dev_id.to_string(),
-                                last_seen: now,
-                                payload_bytes,
-                            },
-                            &protected,
-                        );
-
-                        let _ = ipc::update_status_file(&devs);
-                        drop(devs);
-
-                        crate::provisioning::observe_mqtt(dev_id, now);
-                        if !crate::devices::observe_mqtt_report(dev_id, payload, now) {
-                            eprintln!("[-] Telemetry report not queued for {}", dev_id);
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("[-] MQTT read error: {e}, reconnecting...");
-                    break;
-                }
-            }
-
-            if last_ping.elapsed() >= Duration::from_secs(30) {
-                if let Err(_) = client.ping() {
-                    break;
-                }
-                last_ping = Instant::now();
-            }
-
-            sleep(Duration::from_millis(50));
-        }
-
-        sleep(Duration::from_secs(2));
+    // 4. Keep the controller alive and own MQTT supervision when compiled in.
+    if let Err(error) = lifetime.wait(devices) {
+        eprintln!("[-] Controller MQTT supervision failed: {error}");
+        std::process::exit(1);
     }
 }
 
