@@ -39,13 +39,6 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
         return;
     }
     if op.stage == OperationPhase::Waiting {
-        if now().saturating_sub(op.started) > 900 {
-            op.finish_item(
-                ItemOutcome::Failed,
-                "operation deadline exceeded while waiting for management session",
-            );
-            return;
-        }
         if !reachable {
             return;
         }

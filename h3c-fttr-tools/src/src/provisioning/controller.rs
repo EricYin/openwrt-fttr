@@ -13,6 +13,9 @@ mod lifecycle_tests;
 #[cfg(test)]
 #[path = "controller/persistence_tests.rs"]
 mod persistence_tests;
+#[cfg(test)]
+#[path = "controller/scheduling_tests.rs"]
+mod scheduling_tests;
 use config::{Config, Device, Item, Parameter};
 use parameters::advance;
 #[cfg(test)]
@@ -72,6 +75,7 @@ struct Operation {
     passphrase_fallback: bool,
     results: BTreeMap<String, Value>,
     started: u64,
+    completed_at: Option<u64>,
     wan: wan::Reconciler,
     wifi: wifi::Reconciler,
 }
@@ -138,6 +142,7 @@ impl Operation {
             passphrase_fallback: false,
             results: BTreeMap::new(),
             started: now(),
+            completed_at: None,
         }
     }
     fn item(&self) -> &Item {
@@ -175,12 +180,16 @@ impl Operation {
             self.stage = OperationPhase::WifiReconciling;
         }
     }
+    fn complete(&mut self, time: u64) {
+        self.stage = OperationPhase::Completed;
+        self.completed_at.get_or_insert(time);
+    }
     fn view(&self) -> Value {
         let mut items: Vec<Value> = self.results.values().cloned().collect();
         for i in self.device.items.iter().skip(self.index) {
             items.push(json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":if i.id == self.item().id { self.stage.as_str() } else {"pending"},"task_id":if i.id == self.item().id {self.task} else {None},"revision":self.revision}));
         }
-        json!({"operation_id":self.id,"device":self.device.id,"optical_sn":self.device.optical_sn,"cwmp_id":self.device.cwmp_id,"revision":self.revision,"mode":if self.apply {"apply"} else {"plan"},"state":self.stage,"started_at":self.started,"items":items,"cwmp_contract":self.capabilities.view(),"wan_objects":self.wan.owned,"wan_lifecycle":self.wan.results,"wan_stage":self.wan.stage,"wifi_objects":self.wifi.registry,"wifi_lifecycle":self.wifi.results,"wifi_stage":self.wifi.stage,"wifi_cleanup":self.device.wifi_cleanup})
+        json!({"operation_id":self.id,"device":self.device.id,"optical_sn":self.device.optical_sn,"cwmp_id":self.device.cwmp_id,"revision":self.revision,"mode":if self.apply {"apply"} else {"plan"},"state":self.stage,"started_at":self.started,"completed_at":self.completed_at,"items":items,"cwmp_contract":self.capabilities.view(),"wan_objects":self.wan.owned,"wan_lifecycle":self.wan.results,"wan_stage":self.wan.stage,"wifi_objects":self.wifi.registry,"wifi_lifecycle":self.wifi.results,"wifi_stage":self.wifi.stage,"wifi_cleanup":self.device.wifi_cleanup})
     }
 }
 #[derive(Default)]
@@ -196,7 +205,6 @@ struct Controller {
     startup_pending: BTreeSet<String>,
     last_boot: BTreeMap<String, u64>,
     optical_epochs: BTreeMap<String, (u16, u64)>,
-    last_periodic: u64,
     recovered: BTreeMap<String, Value>,
     saved: String,
     owned: BTreeMap<String, BTreeMap<String, wan::Owned>>,
@@ -289,6 +297,26 @@ impl Controller {
     }
     fn startup_trigger_pending(&self, device: &str) -> bool {
         self.config.triggers.contains("program_start") && self.startup_pending.contains(device)
+    }
+    fn periodic_due(&self, device: &str, time: u64) -> bool {
+        if self.config.interval_seconds == 0 || !self.config.triggers.contains("periodic") {
+            return false;
+        }
+        let completed_at = if let Some(op) = self.operations.get(device) {
+            if op.stage != OperationPhase::Completed {
+                return false;
+            }
+            op.completed_at
+        } else if let Some(op) = self.recovered.get(device) {
+            if op["state"] != "completed" {
+                return false;
+            }
+            op["completed_at"].as_u64()
+        } else {
+            // A device with no previous operation can run its first periodic sync.
+            return true;
+        };
+        completed_at.is_some_and(|at| time.saturating_sub(at) >= self.config.interval_seconds)
     }
     fn start(&mut self, target: &str, apply: bool, management: bool) -> Result<Vec<u64>, String> {
         self.start_selected(target, apply, management, None)
@@ -672,12 +700,6 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                 c.optical_epochs.insert(serial.clone(), (*id, epoch));
             }
         }
-        let periodic = config.interval_seconds > 0
-            && time.saturating_sub(c.last_periodic) >= config.interval_seconds
-            && config.triggers.contains("periodic");
-        if periodic {
-            c.last_periodic = time;
-        }
         let mut fresh = BTreeSet::new();
         c.begin_history_tick();
         let mut history_changed = false;
@@ -780,6 +802,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                 .get(&d.id)
                 .is_some_and(|o| o.stage != OperationPhase::Completed && o.stage != OperationPhase::Interrupted);
             let startup_trigger = c.startup_trigger_pending(&d.id);
+            let periodic = c.periodic_due(&d.id, time);
             if !active_op && reachable && config.enabled && config.automatic {
                 if needs_reconcile {
                     let _ = c.start_selected(&d.id, false, false, None);
@@ -861,7 +884,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                             op.wifi = wifi::Reconciler::new(&op.device, registry, cleanup);
                         }
                         _ => {
-                            op.stage = OperationPhase::Completed;
+                            op.complete(now());
                             op.wan.results.insert(
                                 "identity".into(),
                                 json!({"state":"blocked","reason":"cannot load device ownership"}),
@@ -880,10 +903,6 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                         reachable,
                         acs,
                     );
-                    if !op.capabilities.ready() && now().saturating_sub(op.started) >= 900 {
-                        op.capabilities
-                            .invalidate("capability discovery deadline exceeded");
-                    }
                     if op.capabilities.blocked() {
                         let reason = op.capabilities.view()["reason"]
                             .as_str()
@@ -901,7 +920,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                                 })
                             });
                         }
-                        op.stage = OperationPhase::Completed;
+                        op.complete(now());
                         continue;
                     }
                     if !op.capabilities.ready() {
@@ -953,7 +972,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                             "persistence".into(),
                             json!({"state":"blocked","reason":error}),
                         );
-                        op.stage = OperationPhase::Completed;
+                        op.complete(now());
                     } else if ready {
                         op.wan.block_unresolved(&mut op.device);
                         let finish = op.index >= op.device.items.len();
@@ -988,7 +1007,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                             .tick(&op.device, op.apply, reachable, finish, verified)
                         {
                             if finish {
-                                op.stage = OperationPhase::Completed;
+                                op.complete(now());
                             } else {
                                 op.wifi.block_unresolved(&mut op.device);
                                 if matches!(
@@ -1020,13 +1039,6 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                     } else {
                         op.stage = OperationPhase::WanReconciling;
                     }
-                    if now().saturating_sub(op.started) >= 900
-                        && op.stage != OperationPhase::Completed
-                        && acs(json!({"op":"busy","device":op.device.cwmp_id}))["busy"] != true
-                    {
-                        op.wan.results.insert("timeout".into(),json!({"state":"unknown","reason":"operation deadline exceeded; review outstanding WAN/configuration state before retry"}));
-                        op.stage = OperationPhase::Completed;
-                    }
                 }
                 if let Err(error) = op.wan.save(&op.device.cwmp_id) {
                     history_changed = true;
@@ -1041,7 +1053,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
                         "persistence".into(),
                         json!({"state":"blocked","reason":error}),
                     );
-                    op.stage = OperationPhase::Completed;
+                    op.complete(now());
                 }
                 let wifi_owned = op.wifi.registry.clone();
                 c.wifi_owned.insert(d.cwmp_id.clone(), wifi_owned);
@@ -1181,6 +1193,9 @@ mod tests {
             false,
         );
         o.stage = stage;
+        if stage == OperationPhase::Completed {
+            o.complete(o.started);
+        }
         o.task = Some(1);
         o
     }

@@ -100,7 +100,13 @@ impl Controller {
                 {
                     continue;
                 }
-                if operation["state"] != "completed" {
+                if operation["state"] == "completed" {
+                    // Legacy history has no completion timestamp. Start a full wait
+                    // at recovery rather than treating the operation start as its end.
+                    if operation["completed_at"].as_u64().is_none() {
+                        operation["completed_at"] = json!(now());
+                    }
+                } else {
                     operation["state"] = json!("interrupted");
                     operation["reconcile_required"] = json!(true);
                     operation["reconcile_reason"] = json!("service_restarted");

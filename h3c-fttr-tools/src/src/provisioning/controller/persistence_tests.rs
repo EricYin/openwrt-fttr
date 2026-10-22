@@ -55,7 +55,7 @@ fn terminal_results_are_saved_when_last_active_operation_completes() {
     c.begin_history_tick();
     let op = c.operations.get_mut("child").unwrap();
     op.finish_item(ItemOutcome::Verified, "readback matches");
-    op.stage = OperationPhase::Completed;
+    op.complete(now());
     let mut written = false;
     c.persist_history(|data| {
         let history: Value = serde_json::from_slice(data).unwrap();
@@ -76,7 +76,7 @@ fn failed_terminal_save_retries_on_idle_tick() {
     let mut op = operation(OperationPhase::Verifying, false);
     c.saved = json!({"operations":[op.view()],"owned":{}}).to_string();
     op.finish_item(ItemOutcome::Failed, "readback differs");
-    op.stage = OperationPhase::Completed;
+    op.complete(now());
     c.operations.insert(op.device.id.clone(), op);
     c.dirty = true;
     let previous = c.saved.clone();
@@ -178,7 +178,7 @@ fn terminal_history_recovers_after_real_atomic_write_retry() {
     c.begin_history_tick();
     let op = c.operations.get_mut("child").unwrap();
     op.finish_item(ItemOutcome::Verified, "readback matches");
-    op.stage = OperationPhase::Completed;
+    op.complete(now());
 
     c.persist_history(|data| super::super::storage::write_atomic(path, data, false));
     assert!(c.dirty);
