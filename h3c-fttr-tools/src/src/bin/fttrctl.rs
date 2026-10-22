@@ -19,6 +19,7 @@ fn print_usage() {
     eprintln!(
         "Usage: fttrctl <command> [arguments]\n\n\
 Commands:\n  \
+  capabilities [--json] [--daemon]  Report compiled support (optionally from running fttrd)\n  \
   config check|reload  Validate or reload /etc/config/fttr desired state\n  \
   sync plan|apply [DEVICE|all] [--item SECTION] [--management] [--wait SECONDS]\n  \
   load-fpga [path]     Program FPGA bitstream (default: /lib/firmware/FTTR_TOP.sbit)\n  \
@@ -376,6 +377,26 @@ fn main() {
     }
 
     match args[1].as_str() {
+        "capabilities" => {
+            if args[2..]
+                .iter()
+                .any(|arg| arg != "--json" && arg != "-j" && arg != "--daemon")
+            {
+                eprintln!("Usage: fttrctl capabilities [--json|-j] [--daemon]");
+                exit(1);
+            }
+            if args[2..].iter().any(|arg| arg == "--daemon") {
+                match ipc::send_ipc_command("CAPABILITIES") {
+                    Ok(reply) => print!("{reply}"),
+                    Err(error) => {
+                        eprintln!("Capabilities IPC failed: {error}");
+                        exit(1);
+                    }
+                }
+            } else {
+                println!("{}", h3c_fttr_tools::capabilities::json());
+            }
+        }
         "acs" => match h3c_fttr_tools::acs_cli::run(&args[2..]) {
             Ok(code) => std::process::exit(code),
             Err(e) => {

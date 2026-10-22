@@ -328,6 +328,8 @@ fn ipc_handler(
             let response =
                 "{\"error\":\"ACS adapter not compiled (enable Cargo feature acs)\"}".to_string();
             let _ = stream.write_all(response.as_bytes());
+        } else if line == "CAPABILITIES" {
+            let _ = writeln!(stream, "{}", crate::capabilities::json());
         } else if line == "STATUS" {
             let provisioning = crate::provisioning::snapshot();
             let devs = devices.lock().unwrap();

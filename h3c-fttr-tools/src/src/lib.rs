@@ -1,4 +1,5 @@
 pub mod bosa;
+pub mod capabilities;
 pub mod fpga;
 pub mod ipc;
 pub mod hl202_ipc;
