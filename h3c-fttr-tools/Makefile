@@ -7,7 +7,7 @@ PKG_URL:=https://github.com/LazuliKao/openwrt-fttr/tree/main/h3c-fttr-tools
 
 PKG_BUILD_DEPENDS:=rust/host
 PKG_BUILD_PARALLEL:=1
-PKG_CONFIG_DEPENDS:=CONFIG_FTTR_DEVICE_HL202 CONFIG_FTTR_DEVICE_HWTC CONFIG_FTTR_ACS CONFIG_FTTR_MQTT
+PKG_CONFIG_DEPENDS:=CONFIG_FTTR_DEVICE_HL202 CONFIG_FTTR_DEVICE_HWTC CONFIG_FTTR_ACS CONFIG_FTTR_MQTT CONFIG_FTTR_MIMALLOC
 
 include $(INCLUDE_DIR)/package.mk
 include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk
@@ -42,9 +42,16 @@ define Package/h3c-fttr-tools/config
     bool "Compile controller-owned MQTT broker and clients"
     depends on PACKAGE_h3c-fttr-tools
     default y
+  config FTTR_MIMALLOC
+    bool "Use mimalloc for fttrd Rust allocations (experimental)"
+    depends on PACKAGE_h3c-fttr-tools
+    default n
+    help
+      Select mimalloc 3.5.3 for the daemon only, without explicit THP advice.
+      Compare target RSS, swap and service behavior before enabling in production.
 endef
 
-RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC),device-hwtc) $(if $(CONFIG_FTTR_ACS),acs) $(if $(CONFIG_FTTR_MQTT),mqtt)
+RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC),device-hwtc) $(if $(CONFIG_FTTR_ACS),acs) $(if $(CONFIG_FTTR_MQTT),mqtt) $(if $(CONFIG_FTTR_MIMALLOC),allocator-mimalloc)
 CARGO_PKG_ARGS+= --no-default-features
 
 define Build/Prepare

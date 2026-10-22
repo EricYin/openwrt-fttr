@@ -12,9 +12,12 @@ device-hwtc = []
 all-devices = ["device-hl202", "device-hwtc"]
 acs = ["dep:roxmltree", "serde_json/raw_value"]
 mqtt = ["dep:rumqttd", "dep:rumqttc", "dep:tokio"]
+allocator-mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 libc = "0.2"
+# The original mimalloc 0.1.52 still bundles C 3.3.2; this fork bundles 3.5.3.
+mimalloc = { package = "mold-mimalloc", version = "=0.1.52", default-features = false, features = ["no_thp"], optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 roxmltree = { version = "0.21.1", optional = true }

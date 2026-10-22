@@ -516,6 +516,7 @@ dependencies = [
  "bytes",
  "flate2",
  "libc",
+ "mold-mimalloc",
  "roxmltree",
  "rumqttc",
  "rumqttd",
@@ -857,6 +858,24 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mold-mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b7efd1b6c74e7a09c1d296af4875b79118a5ea32d70736601a8323ddcbcb4c2"
+dependencies = [
+ "mold-mimalloc-sys",
+]
+
+[[package]]
+name = "mold-mimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66a79c372cdbf45bf4548fd4aa40a0b2805ef2ee8e25e5185e11bf2b5c5de366"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
