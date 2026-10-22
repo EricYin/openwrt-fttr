@@ -26,6 +26,46 @@ enum OpticalCommand {
     On,
     Off,
     Status,
+    Reload,
+    Reinitialize,
+    Shutdown,
+}
+
+impl OpticalCommand {
+    fn action(self) -> &'static str {
+        match self {
+            Self::On => "optical_on", Self::Off => "optical_off", Self::Status => "optical_status",
+            Self::Reload => "optical_reload", Self::Reinitialize => "optical_reinitialize", Self::Shutdown => "optical_shutdown",
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct OpticalReply {
+    schema_version: u8,
+    status: &'static str,
+    action: &'static str,
+    desired_enabled: Option<bool>,
+    tx_enabled: Option<bool>,
+    actor_state: OpticalState,
+    hardware_ready: bool,
+    discovery_active: bool,
+    cleanup_pending: bool,
+    error: Option<OpticalError>,
+}
+
+#[derive(serde::Serialize)]
+struct OpticalError { code: String, message: String }
+
+impl OpticalReply {
+    fn value(self) -> serde_json::Value { serde_json::to_value(self).expect("optical reply is serializable") }
+    fn unavailable(command: OpticalCommand, ready: bool, error: io::Error) -> serde_json::Value {
+        Self { schema_version: 1, status: "error", action: command.action(), desired_enabled: None,
+            tx_enabled: None, actor_state: OpticalState::Unknown, hardware_ready: ready,
+            discovery_active: false, cleanup_pending: false,
+            error: Some(OpticalError { code: format!("{:?}", error.kind()), message: error.to_string() }),
+        }.value()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, serde::Serialize)]
@@ -39,16 +79,23 @@ enum OpticalState {
 struct OpticalRequest {
     command: OpticalCommand,
     reply: SyncSender<serde_json::Value>,
+    deadline: Instant,
 }
 
 struct OpticalClient {
     requests: SyncSender<OpticalRequest>,
     hardware_ready: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
 }
 
 impl OpticalClient {
     fn request(&self, command: OpticalCommand) -> io::Result<serde_json::Value> {
-        if !self.hardware_ready.load(Ordering::Acquire) {
+        if matches!(command, OpticalCommand::Shutdown) {
+            self.stopping.store(true, Ordering::Release);
+        } else if self.stopping.load(Ordering::Acquire) && !matches!(command, OpticalCommand::Status) {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "controller is stopping"));
+        }
+        if !self.hardware_ready.load(Ordering::Acquire) && !matches!(command, OpticalCommand::Shutdown) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "hardware initialization incomplete",
@@ -56,7 +103,7 @@ impl OpticalClient {
         }
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
-            .try_send(OpticalRequest { command, reply })
+            .try_send(OpticalRequest { command, reply, deadline: Instant::now() + Duration::from_secs(5) })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => {
                     io::Error::new(io::ErrorKind::WouldBlock, "optical request queue full")
@@ -66,8 +113,8 @@ impl OpticalClient {
                 }
             })?;
         response
-            .recv()
-            .map_err(|error| io::Error::new(io::ErrorKind::NotConnected, error))
+            .recv_timeout(Duration::from_secs(6))
+            .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, format!("{error}; optical operation outcome unknown; query status")))
     }
 }
 
@@ -77,6 +124,8 @@ trait OpticalBackend {
     fn quiesce(&mut self) -> io::Result<()>;
     fn set_tx(&mut self, enabled: bool) -> io::Result<()>;
     fn read_tx(&mut self) -> io::Result<bool>;
+    fn desired(&self) -> io::Result<bool>;
+    fn save(&mut self, enabled: bool) -> io::Result<()>;
 }
 
 struct OpticalActor {
@@ -84,16 +133,12 @@ struct OpticalActor {
 }
 
 impl OpticalActor {
-    fn refresh_unknown_state(&mut self, backend: &mut impl OpticalBackend) -> io::Result<()> {
-        if self.state != OpticalState::Unknown || !backend.ready() {
-            return Ok(());
-        }
-        self.state = if backend.read_tx()? {
-            OpticalState::Enabled
-        } else {
-            OpticalState::Disabled
-        };
-        Ok(())
+    fn dispatch(&mut self, request: &OpticalRequest, backend: &mut impl OpticalBackend, stopping: &AtomicBool) -> serde_json::Value {
+        if Instant::now() > request.deadline {
+            OpticalReply::unavailable(request.command, backend.ready(), io::Error::new(io::ErrorKind::TimedOut, "optical request expired before execution"))
+        } else if stopping.load(Ordering::Acquire) && !matches!(request.command, OpticalCommand::Shutdown | OpticalCommand::Status) {
+            OpticalReply::unavailable(request.command, backend.ready(), io::Error::new(io::ErrorKind::NotConnected, "controller is stopping"))
+        } else { self.handle(request.command, backend) }
     }
 
     fn handle(
@@ -103,30 +148,71 @@ impl OpticalActor {
     ) -> serde_json::Value {
         let mut tx_enabled = None;
         let mut quiesce_attempted = false;
-        let result = if !backend.ready() {
+        let desired = backend.desired();
+        let mut desired_enabled = desired.as_ref().ok().copied();
+        let result = if !backend.ready() && !matches!(command, OpticalCommand::Shutdown) {
             Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "hardware initialization incomplete",
             ))
         } else {
             match command {
-                OpticalCommand::On | OpticalCommand::Off => {
+                OpticalCommand::On | OpticalCommand::Off | OpticalCommand::Reload | OpticalCommand::Reinitialize | OpticalCommand::Shutdown => {
+                    let target = match command {
+                        OpticalCommand::On | OpticalCommand::Off => {
+                            let enabled = matches!(command, OpticalCommand::On);
+                            backend.save(enabled).map(|()| { desired_enabled = Some(enabled); enabled })
+                        }
+                        OpticalCommand::Shutdown => Ok(false),
+                        _ => desired,
+                    };
+                    // Persist first; failures must not falsely report a saved setting.
+                    if let Err(error) = target {
+                        let mut reply = if matches!(command, OpticalCommand::Reload | OpticalCommand::Reinitialize) {
+                            // Invalid desired state cannot authorize continued discovery.
+                            self.handle(OpticalCommand::Shutdown, backend)
+                        } else { self.handle(OpticalCommand::Status, backend) };
+                        reply["status"] = "error".into();
+                        reply["action"] = command.action().into();
+                        reply["error"] = serde_json::json!({"code":"Configuration","message":error.to_string()});
+                        return reply;
+                    }
+                    let enabled = target.unwrap();
+                    if matches!(command, OpticalCommand::Reload)
+                        && self.state == if enabled { OpticalState::Enabled } else { OpticalState::Disabled }
+                        && backend.read_tx().ok() == Some(enabled)
+                    {
+                        let mut reply = self.handle(OpticalCommand::Status, backend);
+                        reply["action"] = command.action().into();
+                        return reply;
+                    }
+                    let was_enabled = self.state != OpticalState::Disabled;
                     self.state = OpticalState::Unknown;
-                    let enabled = matches!(command, OpticalCommand::On);
-                    let quiesced = if enabled {
+                    let quiesced = if enabled && !was_enabled && !matches!(command, OpticalCommand::Reinitialize) {
                         Ok(())
                     } else {
                         quiesce_attempted = true;
                         backend.quiesce()
                     };
-                    let transition = backend.set_tx(enabled).and_then(|()| {
+                    // A failed quiesce must still permit reset, never a fresh enable.
+                    let target_tx = enabled && quiesced.is_ok();
+                    let transition = backend.set_tx(target_tx).and_then(|()| {
                         let actual = backend.read_tx()?;
                         tx_enabled = Some(actual);
-                        if actual == enabled {
+                        if actual == target_tx {
                             Ok(())
                         } else {
                             Err(io::Error::other("optical TX readback mismatch"))
                         }
+                    });
+                    let transition = transition.map_err(|error| {
+                        if enabled {
+                            let reset = backend.set_tx(false);
+                            tx_enabled = backend.read_tx().ok();
+                            if let Err(reset) = reset { return io::Error::other(format!("{error}; recovery reset failed: {reset}")); }
+                        }
+                        if tx_enabled.is_none() { tx_enabled = backend.read_tx().ok(); }
+                        error
                     });
                     let result = match (quiesced, transition) {
                         (Ok(()), result) => result,
@@ -150,7 +236,7 @@ impl OpticalActor {
                         quiesce_attempted = true;
                         backend.quiesce()?;
                     }
-                    Ok(())
+                    desired.map(|_| ())
                 }),
             }
         };
@@ -170,21 +256,13 @@ impl OpticalActor {
             }
             result => result,
         };
-        serde_json::json!({
-            "schema_version": 1,
-            "status": if result.is_ok() { "success" } else { "error" },
-            "action": match command {
-                OpticalCommand::On => "optical_on",
-                OpticalCommand::Off => "optical_off",
-                OpticalCommand::Status => "optical_status",
-            },
-            "tx_enabled": tx_enabled,
-            "actor_state": self.state,
-            "hardware_ready": backend.ready(),
-            "discovery_active": backend.ready() && self.state == OpticalState::Enabled && !backend.cleanup_pending(),
-            "cleanup_pending": backend.cleanup_pending(),
-            "error": result.err().map(|error| serde_json::json!({"code": format!("{:?}", error.kind()), "message": error.to_string()})),
-        })
+        OpticalReply {
+            schema_version: 1, status: if result.is_ok() { "success" } else { "error" }, action: command.action(),
+            desired_enabled, tx_enabled, actor_state: self.state, hardware_ready: backend.ready(),
+            discovery_active: backend.ready() && self.state == OpticalState::Enabled && !backend.cleanup_pending(),
+            cleanup_pending: backend.cleanup_pending(),
+            error: result.err().map(|error| OpticalError { code: format!("{:?}", error.kind()), message: error.to_string() }),
+        }.value()
     }
 }
 
@@ -242,6 +320,8 @@ impl OpticalBackend for RuntimeOptics<'_> {
     fn read_tx(&mut self) -> io::Result<bool> {
         bosa::get_optical_tx_enable()
     }
+    fn desired(&self) -> io::Result<bool> { crate::optical::load_enabled() }
+    fn save(&mut self, enabled: bool) -> io::Result<()> { crate::optical::save_enabled(enabled) }
 }
 
 fn setup_bridge() {
@@ -382,12 +462,15 @@ fn ipc_handler(
             "OPTICAL ON" => Some(OpticalCommand::On),
             "OPTICAL OFF" => Some(OpticalCommand::Off),
             "OPTICAL STATUS" => Some(OpticalCommand::Status),
+            "OPTICAL RELOAD" => Some(OpticalCommand::Reload),
+            "OPTICAL REINITIALIZE" => Some(OpticalCommand::Reinitialize),
+            "OPTICAL SHUTDOWN" => Some(OpticalCommand::Shutdown),
             _ => None,
         } {
             let response = match optics.request(command) {
                 Ok(response) => response,
                 Err(error) => {
-                    serde_json::json!({"schema_version": 1, "status": "error", "tx_enabled": null, "actor_state": "unknown", "hardware_ready": optics.hardware_ready.load(Ordering::Acquire), "discovery_active": null, "error": {"code": format!("{:?}", error.kind()), "message": error.to_string()}})
+                    OpticalReply::unavailable(command, optics.hardware_ready.load(Ordering::Acquire), error)
                 }
             };
             if let Err(error) = serde_json::to_writer(&mut stream, &response)
@@ -406,8 +489,59 @@ fn ipc_handler(
     }
 }
 
+fn restore_optical_state(
+    enabled: io::Result<bool>,
+    stopping: &AtomicBool,
+    prepare: impl FnOnce() -> io::Result<()>,
+    mut set_tx: impl FnMut(bool) -> io::Result<()>,
+) -> io::Result<OpticalState> {
+    set_tx(false)?;
+    let enabled = enabled?;
+    prepare()?;
+    if enabled && !stopping.load(Ordering::Acquire) {
+        if let Err(error) = set_tx(true) {
+            return match set_tx(false) {
+                Ok(()) => Err(error),
+                Err(reset) => Err(io::Error::other(format!("{error}; recovery reset failed: {reset}"))),
+            };
+        }
+        if stopping.load(Ordering::Acquire) {
+            set_tx(false)?;
+            return Ok(OpticalState::Disabled);
+        }
+        Ok(OpticalState::Enabled)
+    } else { Ok(OpticalState::Disabled) }
+}
+
+fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
+    if stopping.load(Ordering::Acquire) { return Err(io::Error::new(io::ErrorKind::Interrupted, "controller stopping")); }
+    let fw_path = Path::new("/lib/firmware/FTTR_TOP.sbit");
+    if fw_path.exists() { fpga::load_bitstream(fw_path)?; }
+    let start = Instant::now();
+    loop {
+        if stopping.load(Ordering::Acquire) { return Err(io::Error::new(io::ErrorKind::Interrupted, "controller stopping")); }
+        match fpga::get_fpga_status() {
+            fpga::FpgaStatus::Ready => break,
+            fpga::FpgaStatus::Failed => return Err(io::Error::other("FPGA programming failed")),
+            _ if start.elapsed() >= Duration::from_secs(90) => return Err(io::Error::new(io::ErrorKind::TimedOut, "FPGA readiness timed out")),
+            _ => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    // Read committed intent before any optical enable. Invalid configuration fails closed.
+    restore_optical_state(crate::optical::load_enabled(), stopping, || {
+        bosa::configure_discovery_timing()?;
+        setup_bridge();
+        for id in 1..=15 { clear_offline_hardware(id)?; }
+        Ok(())
+    }, bosa::set_optical_tx_enable)
+}
+
 pub fn run() {
     println!("[*] Starting H3C FTTR Master Controller Daemon (Rust fttrd)...");
+    let _owner = crate::optical::claim_owner().unwrap_or_else(|error| {
+        eprintln!("[-] Optical ownership failed: {error}");
+        std::process::exit(1);
+    });
     let lifetime = super::lifetime::Lifetime::start().unwrap_or_else(|error| {
         eprintln!("[-] MQTT startup failed: {error}");
         std::process::exit(1);
@@ -423,6 +557,7 @@ pub fn run() {
     super::service::init_pon_engine(pon_engine.clone());
     crate::provisioning::start(pon_engine.clone());
     let hardware_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = Arc::new(AtomicBool::new(false));
     let (optical_requests, optical_receiver) = mpsc::sync_channel(2);
     let service_states: super::service::States = Arc::new(Mutex::new(BTreeMap::new()));
 
@@ -435,81 +570,13 @@ pub fn run() {
             OpticalClient {
                 requests: optical_requests,
                 hardware_ready: hardware_ready.clone(),
+                stopping: stopping.clone(),
             },
         );
         println!("[+] IPC socket server listening on {}", ipc::SOCKET_PATH);
     }
 
-    // 2. Background Hardware Initialization (Async resilient)
-    {
-        let hardware_ready = hardware_ready.clone();
-        let _ = thread::Builder::new()
-            .name("hw-init".into())
-            .stack_size(256 * 1024)
-            .spawn(move || {
-            let fw_path = Path::new("/lib/firmware/FTTR_TOP.sbit");
-            if fw_path.exists() {
-                let _ = fpga::load_bitstream(fw_path);
-            }
-
-            // Wait for FPGA bitstream programming to complete if in progress
-            println!("[*] Waiting for FPGA bitstream to be ready...");
-            let mut wait_count = 0;
-            loop {
-                match fpga::get_fpga_status() {
-                    fpga::FpgaStatus::Ready => {
-                        println!(
-                            "[+] FPGA bitstream is ready! Proceeding with BOSA & switch init."
-                        );
-                        break;
-                    }
-                    fpga::FpgaStatus::Failed => {
-                        eprintln!("[-] FPGA bitstream programming failed in kernel! Micro-OLT not available.");
-                        return;
-                    }
-                    fpga::FpgaStatus::Programming | fpga::FpgaStatus::NotStarted => {
-                        if wait_count % 5 == 0 {
-                            println!("[*] FPGA bitstream is programming in kernel ({wait_count}s elapsed)...");
-                        }
-                    }
-                    fpga::FpgaStatus::Unknown => {
-                        if wait_count > 3 {
-                            break;
-                        }
-                    }
-                }
-                thread::sleep(Duration::from_secs(1));
-                wait_count += 1;
-                if wait_count > 90 {
-                    eprintln!("[-] Timeout waiting for FPGA bitstream readiness.");
-                    return;
-                }
-            }
-
-            if let Err(e) = bosa::init_optical_transceiver() {
-                eprintln!("[-] Optical initialization failed: {e}; discovery paused");
-                return;
-            }
-            if let Err(e) = bosa::configure_discovery_timing() {
-                eprintln!("[-] Discovery timing initialization failed: {e}; discovery paused");
-                return;
-            }
-            setup_bridge();
-            // A daemon restart establishes a new registration generation too.
-            // Revoke stale carrier/mappings and request fresh activation from
-            // every verified slot before the only PLOAM receiver starts.
-            for id in 1..=15 {
-                if let Err(error) = clear_offline_hardware(id) {
-                    eprintln!("[-] Initial ONU {id} hardware reset failed: {error}");
-                    return;
-                }
-            }
-            hardware_ready.store(true, std::sync::atomic::Ordering::Release);
-            println!("[+] Micro-OLT BOSA and bridge ready. Waiting for dynamic sub-gateways...");
-        });
-    }
-
-    // 3. Background PLOAM discovery broadcast & reception thread
+    // One hardware owner performs initialization, transitions and PLOAM reception.
     {
         let pon_engine_ploam = pon_engine.clone();
         let _ = thread::Builder::new()
@@ -517,6 +584,18 @@ pub fn run() {
             .stack_size(256 * 1024)
             .spawn(move || {
             println!("[+] Started background PLOAM discovery & reception loop.");
+            let initial = initialize_hardware(&stopping);
+            let (ready, state) = match initial {
+                Ok(state) => (true, state),
+                Err(error) => {
+                    eprintln!("[-] Hardware initialization failed; discovery paused: {error}");
+                    if let Err(reset) = bosa::set_optical_tx_enable(false) {
+                        eprintln!("[-] Recovery reset failed: {reset}");
+                    }
+                    (false, OpticalState::Unknown)
+                }
+            };
+            hardware_ready.store(ready, Ordering::Release);
             let mut last_disc = Instant::now() - Duration::from_secs(5);
             let mut last_grant = Instant::now() - Duration::from_secs(5);
             let mut last_report = Instant::now();
@@ -531,8 +610,7 @@ pub fn run() {
             let mut pending_cleanup = BTreeSet::new();
             let mut services = super::service::Services::new(service_states);
             let mut grant_cycle = 0usize;
-            let mut optics = OpticalActor { state: OpticalState::Unknown };
-            let mut last_optical_probe = Instant::now() - Duration::from_secs(1);
+            let mut optics = OpticalActor { state };
             loop {
                 let ready = hardware_ready.load(Ordering::Acquire);
                 {
@@ -541,23 +619,14 @@ pub fn run() {
                         pending_cleanup: &mut pending_cleanup, services: &mut services,
                         engine: &pon_engine_ploam,
                     };
-                    if ready
-                        && optics.state == OpticalState::Unknown
-                        && last_optical_probe.elapsed() >= Duration::from_secs(1)
-                    {
-                        last_optical_probe = Instant::now();
-                        if let Err(error) = optics.refresh_unknown_state(&mut backend) {
-                            eprintln!("[-] Optical TX readback failed; discovery paused and will retry: {error}");
-                        }
-                    }
                     for request in optical_receiver.try_iter().take(2) {
-                        let response = optics.handle(request.command, &mut backend);
+                        let response = optics.dispatch(&request, &mut backend, &stopping);
                         if let Err(error) = request.reply.send(response) {
                             eprintln!("[-] Optical reply receiver unavailable: {error}");
                         }
                     }
                 }
-                if !ready || optics.state != OpticalState::Enabled {
+                if stopping.load(Ordering::Acquire) || !ready || optics.state != OpticalState::Enabled {
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 }
@@ -919,6 +988,41 @@ pub fn run() {
 mod lifecycle_tests {
     use super::*;
     use crate::pon_engine::ploam::PloamFrame;
+
+    #[test]
+    fn optical_boot_restores_off_without_any_enable_and_stop_interrupts_restore() {
+        for (desired, stop, expected) in [(false, false, vec![false]), (true, false, vec![false, true]), (true, true, vec![false])] {
+            let stopping = AtomicBool::new(stop);
+            let mut writes = Vec::new();
+            let state = restore_optical_state(Ok(desired), &stopping, || Ok(()), |enabled| { writes.push(enabled); Ok(()) }).unwrap();
+            assert_eq!(writes, expected);
+            assert!(state == if desired && !stop { OpticalState::Enabled } else { OpticalState::Disabled });
+        }
+        let stopping = AtomicBool::new(false);
+        let mut writes = Vec::new();
+        let state = restore_optical_state(Ok(true), &stopping, || Ok(()), |enabled| {
+            writes.push(enabled);
+            if enabled { stopping.store(true, Ordering::Release); }
+            Ok(())
+        }).unwrap();
+        assert!(state == OpticalState::Disabled);
+        assert_eq!(writes, [false, true, false]);
+    }
+
+    #[test]
+    fn optical_boot_failure_never_authorizes_discovery_and_reasserts_reset() {
+        let stopping = AtomicBool::new(false);
+        let mut writes = Vec::new();
+        let failed = restore_optical_state(Ok(true), &stopping, || Ok(()), |enabled| {
+            writes.push(enabled);
+            if enabled { Err(io::Error::other("calibration failed after reset release")) } else { Ok(()) }
+        });
+        assert!(failed.is_err());
+        assert_eq!(writes, [false, true, false]);
+        writes.clear();
+        assert!(restore_optical_state(Err(io::Error::other("invalid configuration")), &stopping, || panic!("must not prepare invalid configuration"), |enabled| { writes.push(enabled); Ok(()) }).is_err());
+        assert_eq!(writes, [false]);
+    }
 
     #[test]
     fn only_valid_directed_rx_keeps_operation_alive_and_activation_is_bounded() {

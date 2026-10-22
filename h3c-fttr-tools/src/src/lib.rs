@@ -1,4 +1,5 @@
 pub mod bosa;
+pub mod optical;
 pub mod capabilities;
 pub mod fpga;
 pub mod ipc;

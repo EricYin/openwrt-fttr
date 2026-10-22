@@ -18,6 +18,7 @@ fn production_dispatch_retains_status_and_adapter_routes() {
     let handler = optical_handler(OpticalClient {
         requests,
         hardware_ready: Arc::new(AtomicBool::new(false)),
+        stopping: Arc::new(AtomicBool::new(false)),
     });
     let server = Server::new(5, handler);
 
@@ -43,6 +44,7 @@ fn removed_ipc_commands_are_unsupported_without_publication() {
         optical_handler(OpticalClient {
             requests,
             hardware_ready: Arc::new(AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
         }),
     );
     // No broker is needed: the real production handler rejects these locally.
@@ -66,9 +68,18 @@ struct TestOptics {
     mismatch: bool,
     quiesce_failure: bool,
     events: Vec<&'static str>,
+    desired: bool,
+    save_failure: bool,
+    enable_failure_after_write: bool,
 }
 
 impl OpticalBackend for TestOptics {
+    fn desired(&self) -> io::Result<bool> { Ok(self.desired) }
+    fn save(&mut self, enabled: bool) -> io::Result<()> {
+        if self.save_failure { return Err(io::Error::other("read-only configuration")); }
+        self.desired = enabled;
+        Ok(())
+    }
     fn ready(&self) -> bool {
         self.ready
     }
@@ -92,6 +103,7 @@ impl OpticalBackend for TestOptics {
         if !self.mismatch {
             self.tx = enabled;
         }
+        if enabled && self.enable_failure_after_write { return Err(io::Error::other("calibration failed after release")); }
         Ok(())
     }
     fn read_tx(&mut self) -> io::Result<bool> {
@@ -112,6 +124,7 @@ fn optical_ipc_rejects_requests_before_hardware_ready_without_queueing() {
         optical_handler(OpticalClient {
             requests: requests.clone(),
             hardware_ready: Arc::new(AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
         }),
     );
 
@@ -122,6 +135,10 @@ fn optical_ipc_rejects_requests_before_hardware_ready_without_queueing() {
         assert_eq!(response["error"]["code"], "NotConnected");
         assert_eq!(response["hardware_ready"], false);
         assert!(response["tx_enabled"].is_null());
+        assert!(response["desired_enabled"].is_null());
+        assert_eq!(response["cleanup_pending"], false);
+        assert_eq!(response["discovery_active"], false);
+        assert!(response["action"].as_str().unwrap().starts_with("optical_"));
     }
     assert!(matches!(
         receiver.try_recv(),
@@ -139,6 +156,96 @@ fn optical_owner_rechecks_readiness_before_hardware_access() {
     let response = actor.handle(OpticalCommand::Off, &mut backend);
 
     assert_eq!(response["error"]["code"], "NotConnected");
+    assert!(backend.events.is_empty());
+}
+
+#[test]
+fn optical_saved_intent_survives_shutdown_and_failed_enable() {
+    let mut actor = OpticalActor { state: OpticalState::Enabled };
+    let mut backend = TestOptics { ready: true, tx: true, desired: true, ..TestOptics::default() };
+    let stopped = actor.handle(OpticalCommand::Shutdown, &mut backend);
+    assert_eq!(stopped["desired_enabled"], true);
+    assert_eq!(stopped["tx_enabled"], false);
+    assert!(backend.desired, "service stop must not save off");
+    backend.write_failure = true;
+    let failed = actor.handle(OpticalCommand::On, &mut backend);
+    assert_eq!(failed["status"], "error");
+    assert_eq!(failed["desired_enabled"], true);
+    assert_eq!(failed["actor_state"], "unknown");
+    assert_eq!(failed["discovery_active"], false);
+    assert_eq!(failed["tx_enabled"], false);
+    assert!(backend.events.ends_with(&["enable", "disable", "read", "quiesce"]));
+}
+
+#[test]
+fn optical_save_failure_retains_actual_state_and_reload_is_idempotent() {
+    let mut actor = OpticalActor { state: OpticalState::Enabled };
+    let mut backend = TestOptics { ready: true, tx: true, desired: true, save_failure: true, ..TestOptics::default() };
+    let failed = actor.handle(OpticalCommand::Off, &mut backend);
+    assert_eq!(failed["status"], "error");
+    assert_eq!(failed["desired_enabled"], true);
+    assert_eq!(failed["tx_enabled"], true);
+    assert_eq!(failed["discovery_active"], true);
+    assert_eq!(backend.events, ["read"]);
+    backend.events.clear();
+    let reloaded = actor.handle(OpticalCommand::Reload, &mut backend);
+    assert_eq!(reloaded["action"], "optical_reload");
+    assert_eq!(reloaded["status"], "success");
+    assert!(backend.events.iter().all(|event| *event == "read"));
+    backend.desired = false;
+    let reloaded = actor.handle(OpticalCommand::Reload, &mut backend);
+    assert_eq!(reloaded["desired_enabled"], false);
+    assert_eq!(reloaded["tx_enabled"], false);
+    assert_eq!(reloaded["actor_state"], "disabled");
+}
+
+#[test]
+fn optical_stop_before_ready_cancels_later_enable_requests() {
+    let (requests, receiver) = std::sync::mpsc::sync_channel::<OpticalRequest>(2);
+    let stopping = Arc::new(AtomicBool::new(false));
+    let client = OpticalClient { requests, hardware_ready: Arc::new(AtomicBool::new(false)), stopping: stopping.clone() };
+    let owner = thread::spawn(move || {
+        let request = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut actor = OpticalActor { state: OpticalState::Unknown };
+        let mut backend = TestOptics { desired: true, ..TestOptics::default() };
+        request.reply.send(actor.handle(request.command, &mut backend)).unwrap();
+    });
+    let response = client.request(OpticalCommand::Shutdown).unwrap();
+    assert!(stopping.load(Ordering::Acquire));
+    assert_eq!(response["tx_enabled"], false);
+    assert_eq!(response["desired_enabled"], true);
+    assert!(client.request(OpticalCommand::On).is_err());
+    owner.join().unwrap();
+}
+
+#[test]
+fn optical_failed_quiesce_resets_instead_of_reenabling() {
+    let mut actor = OpticalActor { state: OpticalState::Enabled };
+    let mut backend = TestOptics { ready: true, tx: true, quiesce_failure: true, ..TestOptics::default() };
+    let response = actor.handle(OpticalCommand::On, &mut backend);
+    assert_eq!(response["status"], "error");
+    assert_eq!(response["desired_enabled"], true);
+    assert_eq!(response["tx_enabled"], false);
+    assert_eq!(response["actor_state"], "unknown");
+    assert_eq!(response["discovery_active"], false);
+    assert_eq!(backend.events, ["quiesce", "disable", "read"]);
+}
+
+#[test]
+fn optical_partial_enable_resets_hardware_and_expired_queue_never_saves() {
+    let mut actor = OpticalActor { state: OpticalState::Disabled };
+    let mut backend = TestOptics { ready: true, enable_failure_after_write: true, ..TestOptics::default() };
+    let failed = actor.handle(OpticalCommand::On, &mut backend);
+    assert_eq!(failed["desired_enabled"], true);
+    assert_eq!(failed["tx_enabled"], false);
+    assert_eq!(failed["actor_state"], "unknown");
+    assert!(backend.events.starts_with(&["enable", "disable", "read"]));
+    backend.events.clear();
+    let (reply, _receiver) = std::sync::mpsc::sync_channel(1);
+    let request = OpticalRequest { command: OpticalCommand::Off, reply, deadline: Instant::now() - Duration::from_secs(1) };
+    let expired = actor.dispatch(&request, &mut backend, &AtomicBool::new(false));
+    assert_eq!(expired["error"]["code"], "TimedOut");
+    assert!(backend.desired);
     assert!(backend.events.is_empty());
 }
 
@@ -265,6 +372,7 @@ fn optical_ipc_returns_owner_read_failure_without_cached_tx_state() {
         optical_handler(OpticalClient {
             requests,
             hardware_ready: Arc::new(AtomicBool::new(true)),
+            stopping: Arc::new(AtomicBool::new(false)),
         }),
     );
     let owner = thread::spawn(move || {
@@ -358,6 +466,7 @@ fn optical_queue_rejects_overflow_and_disconnected_owner() {
     let client = OpticalClient {
         requests,
         hardware_ready: Arc::new(AtomicBool::new(true)),
+        stopping: Arc::new(AtomicBool::new(false)),
     };
     let (reply, _response) = std::sync::mpsc::sync_channel(1);
     client
@@ -365,6 +474,7 @@ fn optical_queue_rejects_overflow_and_disconnected_owner() {
         .try_send(OpticalRequest {
             command: OpticalCommand::Status,
             reply,
+            deadline: Instant::now() + Duration::from_secs(5),
         })
         .unwrap();
 
@@ -384,6 +494,7 @@ fn concurrent_optical_ipc_transitions_are_executed_by_one_owner() {
         optical_handler(OpticalClient {
             requests,
             hardware_ready: Arc::new(AtomicBool::new(true)),
+            stopping: Arc::new(AtomicBool::new(false)),
         }),
     );
     let (received, first_received) = channel();

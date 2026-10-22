@@ -22,12 +22,8 @@ start_service() {
 	fi
 
 	echo "[*] Initializing H3C FTTR Micro-OLT Subsystem..."
-	# 1. Program FPGA Bitstream if needed (fallback if not auto-loaded by driver)
-	if [ -f /lib/firmware/FTTR_TOP.sbit ] && [ ! -e /sys/devices/platform/fmcs/reload_fpga ]; then
-		/usr/sbin/fttrctl load-fpga /lib/firmware/FTTR_TOP.sbit 2>/dev/null || true
-	fi
-
-	# 2. Setup downstream DSA switch ports (fttr1 ~ fttr16)
+	# FPGA and BOSA initialization belong exclusively to fttrd.
+	# Setup downstream DSA switch ports (fttr1 ~ fttr16)
 	for i in $(seq 1 16); do
 		dev="fttr${i}"
 		if [ -d "/sys/class/net/${dev}" ]; then
@@ -36,7 +32,7 @@ start_service() {
 		fi
 	done
 
-	# 3. Start Controller Daemon
+	# Start the controller daemon.
 	procd_open_instance
 	procd_set_param command "$PROG"
 	# ACS listener activation is coordinated by fttrd after management authorization.
@@ -44,6 +40,7 @@ start_service() {
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1
+	procd_set_param term_timeout 5
 	procd_close_instance
 	# Record the listener value handed to this process, including an empty value.
 	# MQTT-enabled fttrd validates it and fails before reporting broker readiness.
@@ -52,7 +49,14 @@ start_service() {
 
 stop_service() {
 	echo "[*] Stopping H3C FTTR Subsystem..."
+	/usr/sbin/fttrctl optical shutdown --json || logger -t fttr "Owner shutdown failed; checking reset after termination"
 	rm -f "$LAN_STATE"
+}
+
+service_stopped() {
+	# procd deletion is asynchronous. The CLI waits boundedly for ownership;
+	# it never writes hardware while a daemon still owns it.
+	/usr/sbin/fttrctl optical shutdown-offline --json || logger -t fttr "Optical reset not confirmed after stop"
 }
 
 service_triggers() {
@@ -71,6 +75,7 @@ reload_service() {
 		# recursive reload. start_service records the new value exactly once.
 		restart
 	else
+		/usr/sbin/fttrctl optical reload --json || return $?
 		/usr/sbin/fttrctl config reload
 	fi
 }

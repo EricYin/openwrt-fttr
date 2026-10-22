@@ -58,7 +58,7 @@ pub(super) fn normalize_custom_vlan_service_list(values: &[String]) -> Result<Ve
 }
 
 // UCI export uses shell quoting, including the '\'' sequence inside strings.
-pub(super) fn words(line: &str) -> Result<Vec<String>, String> {
+pub(crate) fn words(line: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut word = String::new();
     let mut quote = None;

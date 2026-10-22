@@ -25,7 +25,7 @@ Commands:\n  \
   load-fpga [path]     Program FPGA bitstream (default: /lib/firmware/FTTR_TOP.sbit)\n  \
   bosa-init            Initialize BOSA optical transceiver registers\n  \
   bridge-setup         Ensure downstream FTTR switch ports (fttr1~16) are bridged to br-lan\n  \
-  optical on|off|status [--json]  Control downstream PON TX enable through fttrd\n  \
+  optical on|off|status|reload|shutdown|shutdown-offline [--json]\n  \
   status [--json|-j]   Display active FTTR optical link and DSA switch ports (table or JSON)\n  \
   mib ONU_ID [--summary|--json] [--tables]  Read structured OMCI inventory (default: JSON)\n  \
   fpga-read <addr>     Directly read 32-bit FPGA hardware register\n  \
@@ -325,7 +325,10 @@ fn print_status_table(status: &FttrSystemStatus) {
 
 fn parse_optical_args(args: &[String]) -> Result<(&'static str, bool), String> {
     if args.len() < 3 {
-        return Err("Usage: fttrctl optical <on|off|status> [--json|-j]".into());
+        return Err("Usage: fttrctl optical <on|off|status|reload|shutdown|shutdown-offline> [--json|-j]".into());
+    }
+    if args[3..].iter().any(|arg| arg != "--json" && arg != "-j") {
+        return Err("Unknown optical argument".into());
     }
     let sub = args[2].to_lowercase();
     let is_json = args.iter().any(|a| a == "--json" || a == "-j");
@@ -333,25 +336,49 @@ fn parse_optical_args(args: &[String]) -> Result<(&'static str, bool), String> {
         "on" => Ok(("OPTICAL ON", is_json)),
         "off" => Ok(("OPTICAL OFF", is_json)),
         "status" => Ok(("OPTICAL STATUS", is_json)),
+        "reload" => Ok(("OPTICAL RELOAD", is_json)),
+        "shutdown" => Ok(("OPTICAL SHUTDOWN", is_json)),
+        "shutdown-offline" => Ok(("OFFLINE SHUTDOWN", is_json)),
         unknown => Err(format!("Unknown optical subcommand: {unknown}")),
     }
 }
 
 fn handle_optical_command(cmd: &str, is_json: bool) {
-    let action = match cmd {
-        "OPTICAL ON" => "on",
-        "OPTICAL OFF" => "off",
-        "OPTICAL STATUS" => "status",
-        _ => return,
-    };
+    let action = cmd.split_whitespace().last().unwrap_or("status").to_ascii_lowercase();
 
-    match ipc::send_ipc_command(cmd) {
+    let result = if cmd == "OFFLINE SHUTDOWN" {
+        let start = std::time::Instant::now();
+        loop {
+            match h3c_fttr_tools::optical::claim_owner() {
+                Ok(_owner) => {
+                    let reset = bosa::set_optical_tx_enable(false);
+                    let tx = bosa::get_optical_tx_enable().ok();
+                    let reply = serde_json::json!({"schema_version":1,"status":if reset.is_ok() {"success"} else {"error"},"action":"optical_shutdown",
+                        "desired_enabled":h3c_fttr_tools::optical::load_enabled().ok(),"tx_enabled":tx,"actor_state":if reset.is_ok() {"disabled"} else {"unknown"},
+                        "hardware_ready":false,"discovery_active":false,"cleanup_pending":true,
+                        "error":reset.err().map(|e| serde_json::json!({"code":format!("{:?}",e.kind()),"message":e.to_string()}))});
+                    break Ok(reply.to_string());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && start.elapsed().as_secs() < 6 => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(error) => break Err(error),
+            }
+        }
+    } else { ipc::send_ipc_command(cmd) };
+    let result = result.and_then(|response| {
+        let value: serde_json::Value = serde_json::from_str(&response)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if !matches!(value.get("status").and_then(serde_json::Value::as_str), Some("success" | "error")) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid optical response status"));
+        }
+        Ok(response)
+    });
+    match result {
         Ok(response) => {
             let daemon_error = match serde_json::from_str::<serde_json::Value>(&response) {
                 Ok(value) => {
                     value.get("status").and_then(serde_json::Value::as_str) == Some("error")
                 }
-                Err(_) => false,
+                Err(_) => true,
             };
             if is_json {
                 println!("{response}");
@@ -363,7 +390,11 @@ fn handle_optical_command(cmd: &str, is_json: bool) {
             }
         }
         Err(error) => {
-            eprintln!("[-] Optical IPC failed: {error}");
+            if is_json {
+                println!("{}", serde_json::json!({"schema_version":1,"status":"error","action":format!("optical_{action}"),
+                    "desired_enabled":null,"tx_enabled":null,"actor_state":"unknown","hardware_ready":false,"discovery_active":false,"cleanup_pending":false,
+                    "error":{"code":format!("{:?}",error.kind()),"message":format!("{error}; outcome unknown; query optical status")}}));
+            } else { eprintln!("[-] Optical request failed: {error}"); }
             exit(1);
         }
     }
@@ -375,6 +406,13 @@ fn main() {
         print_usage();
         exit(1);
     }
+
+    let _hardware_owner = if matches!(args[1].as_str(), "load-fpga" | "fpga-write" | "bosa-write") {
+        Some(h3c_fttr_tools::optical::claim_owner().unwrap_or_else(|error| {
+            eprintln!("[-] Direct hardware write refused: {error}");
+            exit(1);
+        }))
+    } else { None };
 
     match args[1].as_str() {
         "capabilities" => {
@@ -423,10 +461,7 @@ fn main() {
             }
         }
         "bosa-init" => {
-            if let Err(e) = bosa::init_optical_transceiver() {
-                eprintln!("[-] Error initializing BOSA: {e}");
-                exit(1);
-            }
+            handle_optical_command("OPTICAL REINITIALIZE", false);
         }
         "bridge-setup" => {
             setup_bridge();
@@ -435,7 +470,7 @@ fn main() {
             Ok((cmd, is_json)) => handle_optical_command(cmd, is_json),
             Err(err) => {
                 eprintln!("[-] {err}");
-                eprintln!("Usage: fttrctl optical <on|off|status> [--json|-j]");
+                eprintln!("Usage: fttrctl optical <on|off|status|reload|shutdown|shutdown-offline> [--json|-j]");
                 exit(1);
             }
         },

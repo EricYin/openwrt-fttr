@@ -444,6 +444,7 @@ pub fn compile_wan(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "device-hl202", feature = "device-hwtc"))]
     use super::*;
     #[cfg(feature = "device-hwtc")]
     #[test]
@@ -502,6 +503,7 @@ mod tests {
         );
         assert!(compile_wan(&wan, c, &objects, &map).is_err());
     }
+    #[cfg(any(feature = "device-hl202", feature = "device-hwtc"))]
     fn intent() -> WanIntent {
         WanIntent {
             services: vec!["OTHER".into()],

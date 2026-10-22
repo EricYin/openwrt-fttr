@@ -6,6 +6,7 @@
 //! provides persistence mechanics without choosing formats or retry behavior.
 mod bootstrap;
 mod config;
+pub(crate) use config::words as uci_words;
 mod management_network;
 mod controller;
 mod link_identity;

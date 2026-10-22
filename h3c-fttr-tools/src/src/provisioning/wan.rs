@@ -25,6 +25,7 @@ pub fn load(id: &str) -> Result<Option<BTreeMap<String, Owned>>, String> {
         .map(Some)
         .map_err(|e| format!("invalid WAN ownership records: {e}"))
 }
+#[cfg(not(test))]
 pub fn reset(id: &str) -> Result<(), String> {
     super::storage::remove_registry(&registry_path(id))
 }

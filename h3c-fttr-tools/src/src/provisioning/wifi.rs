@@ -227,6 +227,7 @@ pub fn load(id: &str) -> Result<Registry, String> {
     serde_json::from_value(v["registry"].clone())
         .map_err(|e| format!("invalid Wi-Fi registry: {e}"))
 }
+#[cfg(not(test))]
 pub fn reset(id: &str) -> Result<(), String> {
     super::storage::remove_registry(&path(id))
 }

@@ -39,6 +39,10 @@ pub fn create_socket_listener() -> io::Result<UnixListener> {
 
 pub fn send_ipc_command(cmd: &str) -> io::Result<String> {
     let mut stream = UnixStream::connect(SOCKET_PATH)?;
+    if cmd.starts_with("OPTICAL ") {
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(8)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(1)))?;
+    }
     stream.write_all(format!("{cmd}\n").as_bytes())?;
 
     let mut response = String::new();
