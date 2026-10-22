@@ -552,47 +552,69 @@ pub fn invalidate_optical_cache() {
     }
 }
 
-pub(crate) fn update_tx_dis_byte(current: u8, enable: bool) -> u8 {
-    if enable {
-        current & !0x02
-    } else {
-        current | 0x02
+pub const FPGA_REG_OPTICAL_RESET: u32 = 0x84;
+
+pub(crate) fn parse_optical_reset_state(val: u32) -> io::Result<bool> {
+    match val {
+        1 => Ok(true),
+        0 => Ok(false),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unexpected FPGA reset line state 0x{other:08X} (expected 0 or 1)"),
+        )),
     }
 }
 
-pub(crate) fn is_tx_enabled(reg_val: u8) -> bool {
-    (reg_val & 0x02) == 0
-}
-
-/// Controls the downstream PON TX_DIS bit using the stock UX3326 I2C register path.
+/// Controls downstream PON optical transmission via hardware reset line (FPGA register 0x84).
 ///
-/// This verifies the register bit, not emitted optical power.
-pub(crate) fn set_optical_tx_enable(enable: bool) -> io::Result<()> {
-    let current = crate::i2c::read_register(crate::i2c::Register::TxDis)?;
-    let new_val = update_tx_dis_byte(current, enable);
-    crate::i2c::write_register(crate::i2c::Register::TxDis, new_val)?;
-    thread::sleep(Duration::from_millis(1));
-    let verify = crate::i2c::read_register(crate::i2c::Register::TxDis)?;
-    if (verify & 0x02) != (new_val & 0x02) {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "Optical TX verification failed: expected bit1={}, readback 0x{:02X}",
-                (new_val & 0x02) >> 1,
-                verify
-            ),
-        ));
+/// When `enable` is false (OFF):
+/// - Writes 0 to FPGA register 0x84, asserting RESET_N (hardware reset/power-down).
+/// - UX3326 laser diode driver (LDD) is cut off, completely extinguishing 1490nm optical emission.
+/// - Verifies readback of register 0x84 is 0.
+///
+/// When `enable` is true (ON):
+/// - UX3326 registers are volatile and lose calibration across reset.
+/// - Performs the full optical initialization sequence via `init_optical_transceiver()`,
+///   releasing reset (0x84 = 1), waiting for stabilization, and reprogramming the 56-byte
+///   factory calibration table followed by latching.
+/// - Verifies readback of register 0x84 is 1.
+pub fn set_optical_tx_enable(enable: bool) -> io::Result<()> {
+    if enable {
+        init_optical_transceiver()?;
+        let verify = read_fpga_reg(FPGA_REG_OPTICAL_RESET)?;
+        if verify != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Optical TX enable verification failed: expected 0x00000001, got 0x{verify:08X}"
+                ),
+            ));
+        }
+    } else {
+        write_fpga_reg(FPGA_REG_OPTICAL_RESET, 0)?;
+        thread::sleep(Duration::from_millis(10));
+        let verify = read_fpga_reg(FPGA_REG_OPTICAL_RESET)?;
+        if verify != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Optical TX disable verification failed: expected 0x00000000, got 0x{verify:08X}"
+                ),
+            ));
+        }
     }
     invalidate_optical_cache();
     Ok(())
 }
 
-/// Reads the UX3326 TX_DIS register bit over the stock I2C path.
+/// Reads the downstream PON optical transceiver reset line state via FPGA register 0x84.
 ///
-/// The result is register readback, not an independent optical-power measurement.
-pub(crate) fn get_optical_tx_enable() -> io::Result<bool> {
-    let val = crate::i2c::read_register(crate::i2c::Register::TxDis)?;
-    Ok(is_tx_enabled(val))
+/// Returns:
+/// - `Ok(true)`: 0x84 is 1 (normal active/calibrated state)
+/// - `Ok(false)`: 0x84 is 0 (hardware reset/power-down state)
+pub fn get_optical_tx_enable() -> io::Result<bool> {
+    let val = read_fpga_reg(FPGA_REG_OPTICAL_RESET)?;
+    parse_optical_reset_state(val)
 }
 
 pub fn get_optical_status() -> OpticalTransceiverStatus {
@@ -607,112 +629,158 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
     let cal = load_calibration();
     let tx_enabled = get_optical_tx_enable().ok();
 
+    let mut measurements = BTreeMap::new();
+
     // UX3326 internal ADC channels:
     // 0x2E/0x2F: Temperature
     // 0x30/0x31: Supply Voltage (Vcc)
     // 0x32/0x33: Laser Bias Current
     // 0x34/0x35: Transmit Power
-    let temp_res = read_adc_u16(0x2e);
-    let volt_res = read_adc_u16(0x30);
-    let bias_res = read_adc_u16(0x32);
-    let tx_res = read_adc_u16(0x34);
+    let (temperature_celsius, vcc_voltage, laser_bias_current_ma, tx_power_dbm) = if tx_enabled
+        == Some(false)
+    {
+        // When hardware reset is asserted (FPGA 0x84 = 0), UX3326 is powered down
+        // and SPI reads return floating idle (0x4040). Do not interpret as valid telemetry.
+        measurements.insert(
+            "temperature_celsius".into(),
+            MeasurementEvidence::unavailable(
+                "UX3326/FMCS",
+                "C",
+                "optical_tx_disabled_hardware_reset",
+            ),
+        );
+        measurements.insert(
+            "vcc_voltage".into(),
+            MeasurementEvidence::unavailable(
+                "UX3326/FMCS",
+                "V",
+                "optical_tx_disabled_hardware_reset",
+            ),
+        );
+        measurements.insert(
+            "laser_bias_current_ma".into(),
+            MeasurementEvidence::unavailable(
+                "UX3326/FMCS",
+                "mA",
+                "optical_tx_disabled_hardware_reset",
+            ),
+        );
+        measurements.insert(
+            "tx_power_dbm".into(),
+            MeasurementEvidence::unavailable(
+                "UX3326/FMCS",
+                "dBm",
+                "optical_tx_disabled_hardware_reset",
+            ),
+        );
+        (None, None, None, None)
+    } else {
+        let temp_res = read_adc_u16(0x2e);
+        let volt_res = read_adc_u16(0x30);
+        let bias_res = read_adc_u16(0x32);
+        let tx_res = read_adc_u16(0x34);
 
-    let mut measurements = BTreeMap::new();
-
-    let temperature_celsius = match temp_res {
-        Ok(raw) => {
-            let val = calc_temperature(raw, &cal);
-            measurements.insert(
-                "temperature_celsius".into(),
-                MeasurementEvidence::observed(
-                    "UX3326 ADC Reg 0x2E/0x2F with modified_UX3326.bin calibration",
-                    "C",
-                    format!("{raw:04x}"),
-                ),
-            );
-            Some(val)
-        }
-        Err(_) => {
-            measurements.insert(
-                "temperature_celsius".into(),
-                MeasurementEvidence::unavailable("UX3326/FMCS", "C", "bosa_adc_read_failed"),
-            );
-            None
-        }
-    };
-
-    let vcc_voltage = match volt_res {
-        Ok(raw) => {
-            let val = calc_voltage(raw, &cal);
-            measurements.insert(
-                "vcc_voltage".into(),
-                MeasurementEvidence::observed(
-                    "UX3326 ADC Reg 0x30/0x31 with modified_UX3326.bin calibration",
-                    "V",
-                    format!("{raw:04x}"),
-                ),
-            );
-            Some(val)
-        }
-        Err(_) => {
-            measurements.insert(
-                "vcc_voltage".into(),
-                MeasurementEvidence::unavailable("UX3326/FMCS", "V", "bosa_adc_read_failed"),
-            );
-            None
-        }
-    };
-
-    let laser_bias_current_ma = match bias_res {
-        Ok(raw) => {
-            let val = calc_bias(raw, &cal);
-            measurements.insert(
-                "laser_bias_current_ma".into(),
-                MeasurementEvidence::observed(
-                    "UX3326 ADC Reg 0x32/0x33 with modified_UX3326.bin calibration",
-                    "mA",
-                    format!("{raw:04x}"),
-                ),
-            );
-            Some(val)
-        }
-        Err(_) => {
-            measurements.insert(
-                "laser_bias_current_ma".into(),
-                MeasurementEvidence::unavailable("UX3326/FMCS", "mA", "bosa_adc_read_failed"),
-            );
-            None
-        }
-    };
-
-    let tx_power_dbm = match tx_res {
-        Ok(raw) => {
-            let val = calc_tx_power(raw, &cal);
-            if let Some(v) = val {
+        let temp = match temp_res {
+            Ok(raw) => {
+                let val = calc_temperature(raw, &cal);
                 measurements.insert(
-                    "tx_power_dbm".into(),
+                    "temperature_celsius".into(),
                     MeasurementEvidence::observed(
-                        "UX3326 ADC Reg 0x34/0x35 with modified_UX3326.bin calibration",
-                        "dBm",
+                        "UX3326 ADC Reg 0x2E/0x2F with modified_UX3326.bin calibration",
+                        "C",
                         format!("{raw:04x}"),
                     ),
                 );
-                Some(v)
-            } else {
+                Some(val)
+            }
+            Err(_) => {
                 measurements.insert(
-                    "tx_power_dbm".into(),
-                    MeasurementEvidence::unavailable("UX3326/FMCS", "dBm", "tx_power_non_positive"),
+                    "temperature_celsius".into(),
+                    MeasurementEvidence::unavailable("UX3326/FMCS", "C", "bosa_adc_read_failed"),
                 );
                 None
             }
-        }
-        Err(_) => {
-            measurements.insert(
-                "tx_power_dbm".into(),
-                MeasurementEvidence::unavailable("UX3326/FMCS", "dBm", "bosa_adc_read_failed"),
-            );
-            None
-        }
+        };
+
+        let volt = match volt_res {
+            Ok(raw) => {
+                let val = calc_voltage(raw, &cal);
+                measurements.insert(
+                    "vcc_voltage".into(),
+                    MeasurementEvidence::observed(
+                        "UX3326 ADC Reg 0x30/0x31 with modified_UX3326.bin calibration",
+                        "V",
+                        format!("{raw:04x}"),
+                    ),
+                );
+                Some(val)
+            }
+            Err(_) => {
+                measurements.insert(
+                    "vcc_voltage".into(),
+                    MeasurementEvidence::unavailable("UX3326/FMCS", "V", "bosa_adc_read_failed"),
+                );
+                None
+            }
+        };
+
+        let bias = match bias_res {
+            Ok(raw) => {
+                let val = calc_bias(raw, &cal);
+                measurements.insert(
+                    "laser_bias_current_ma".into(),
+                    MeasurementEvidence::observed(
+                        "UX3326 ADC Reg 0x32/0x33 with modified_UX3326.bin calibration",
+                        "mA",
+                        format!("{raw:04x}"),
+                    ),
+                );
+                Some(val)
+            }
+            Err(_) => {
+                measurements.insert(
+                    "laser_bias_current_ma".into(),
+                    MeasurementEvidence::unavailable("UX3326/FMCS", "mA", "bosa_adc_read_failed"),
+                );
+                None
+            }
+        };
+
+        let tx = match tx_res {
+            Ok(raw) => {
+                let val = calc_tx_power(raw, &cal);
+                if let Some(v) = val {
+                    measurements.insert(
+                        "tx_power_dbm".into(),
+                        MeasurementEvidence::observed(
+                            "UX3326 ADC Reg 0x34/0x35 with modified_UX3326.bin calibration",
+                            "dBm",
+                            format!("{raw:04x}"),
+                        ),
+                    );
+                    Some(v)
+                } else {
+                    measurements.insert(
+                        "tx_power_dbm".into(),
+                        MeasurementEvidence::unavailable(
+                            "UX3326/FMCS",
+                            "dBm",
+                            "tx_power_non_positive",
+                        ),
+                    );
+                    None
+                }
+            }
+            Err(_) => {
+                measurements.insert(
+                    "tx_power_dbm".into(),
+                    MeasurementEvidence::unavailable("UX3326/FMCS", "dBm", "bosa_adc_read_failed"),
+                );
+                None
+            }
+        };
+
+        (temp, volt, bias, tx)
     };
 
     // CDR locked state remains unknown: reading bit 3 of register 0x00 is not verified as a dynamic hardware indicator.
@@ -721,7 +789,11 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         MeasurementEvidence::unavailable(
             "UX3326/FMCS",
             "boolean",
-            "diagnostic_register_and_scaling_unverified",
+            if tx_enabled == Some(false) {
+                "optical_tx_disabled_hardware_reset"
+            } else {
+                "diagnostic_register_and_scaling_unverified"
+            },
         ),
     );
 
@@ -729,12 +801,12 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         measurements.insert(
             "tx_enabled".into(),
             MeasurementEvidence::observed(
-                "UX3326 Reg 0x14 bit 1 (TX_DIS)",
+                "FPGA Reg 0x84 (UX3326 RESET_N)",
                 "boolean",
                 if enabled {
-                    "true (TX_DIS=0)"
+                    "true (active/calibrated)"
                 } else {
-                    "false (TX_DIS=1)"
+                    "false (reset/powered_down)"
                 },
             ),
         );
@@ -1035,29 +1107,11 @@ mod tests {
     }
 
     #[test]
-    fn test_optical_tx_bit_semantics() {
-        let initial = 0xa9u8;
-        assert!(is_tx_enabled(initial), "bit 1 == 0 means TX is enabled");
-
-        // Turning OFF sets bit 1 (TX_DIS = 1) while preserving other bits
-        let reg_off = update_tx_dis_byte(initial, false);
-        assert_eq!(reg_off, 0xab);
-        assert!(!is_tx_enabled(reg_off), "bit 1 == 1 means TX is disabled");
-
-        // Turning ON clears bit 1 (TX_DIS = 0) while preserving other bits
-        let reg_on = update_tx_dis_byte(reg_off, true);
-        assert_eq!(reg_on, initial);
-        assert!(is_tx_enabled(reg_on), "bit 1 == 0 means TX is enabled");
-
-        // Verify preservation of other arbitrary bits
-        for base in [0x00u8, 0x01, 0x55, 0xAA, 0xFF] {
-            let disabled = update_tx_dis_byte(base, false);
-            assert_eq!(disabled, base | 0x02);
-            assert!(!is_tx_enabled(disabled));
-
-            let enabled = update_tx_dis_byte(disabled, true);
-            assert_eq!(enabled, base & !0x02);
-            assert!(is_tx_enabled(enabled));
-        }
+    fn test_optical_tx_reset_line_semantics() {
+        assert_eq!(FPGA_REG_OPTICAL_RESET, 0x84);
+        assert_eq!(parse_optical_reset_state(1).unwrap(), true);
+        assert_eq!(parse_optical_reset_state(0).unwrap(), false);
+        assert!(parse_optical_reset_state(2).is_err());
+        assert!(parse_optical_reset_state(0xFFFFFFFF).is_err());
     }
 }

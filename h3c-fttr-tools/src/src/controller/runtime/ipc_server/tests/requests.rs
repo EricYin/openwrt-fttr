@@ -38,13 +38,20 @@ fn production_dispatch_retains_status_and_adapter_routes() {
 #[test]
 fn removed_ipc_commands_are_unsupported_without_publication() {
     let (requests, _receiver) = std::sync::mpsc::sync_channel(2);
-    let server = Server::new(2, optical_handler(OpticalClient {
-        requests,
-        hardware_ready: Arc::new(AtomicBool::new(false)),
-    }));
+    let server = Server::new(
+        2,
+        optical_handler(OpticalClient {
+            requests,
+            hardware_ready: Arc::new(AtomicBool::new(false)),
+        }),
+    );
     // No broker is needed: the real production handler rejects these locally.
-    for request in ["EXEC 02AABBCCDDEE fixture\n", "SUBDEV 02AABBCCDDEE status\n"] {
-        let response: serde_json::Value = serde_json::from_str(&server.request(request.as_bytes())).unwrap();
+    for request in [
+        "EXEC 02AABBCCDDEE fixture\n",
+        "SUBDEV 02AABBCCDDEE status\n",
+    ] {
+        let response: serde_json::Value =
+            serde_json::from_str(&server.request(request.as_bytes())).unwrap();
         assert_eq!(response["error"], "unsupported command");
     }
 }

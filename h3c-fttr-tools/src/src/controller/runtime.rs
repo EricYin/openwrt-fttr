@@ -84,6 +84,18 @@ struct OpticalActor {
 }
 
 impl OpticalActor {
+    fn refresh_unknown_state(&mut self, backend: &mut impl OpticalBackend) -> io::Result<()> {
+        if self.state != OpticalState::Unknown || !backend.ready() {
+            return Ok(());
+        }
+        self.state = if backend.read_tx()? {
+            OpticalState::Enabled
+        } else {
+            OpticalState::Disabled
+        };
+        Ok(())
+    }
+
     fn handle(
         &mut self,
         command: OpticalCommand,
@@ -383,7 +395,11 @@ fn ipc_handler(
                 eprintln!("[-] Optical IPC response failed: {error}");
             }
         } else {
-            let _ = stream.write_all(IpcResponse::err("unsupported command").to_json_line().as_bytes());
+            let _ = stream.write_all(
+                IpcResponse::err("unsupported command")
+                    .to_json_line()
+                    .as_bytes(),
+            );
         }
     }
 }
@@ -514,7 +530,7 @@ pub fn run() {
             let mut services = super::service::Services::new(service_states);
             let mut grant_cycle = 0usize;
             let mut optics = OpticalActor { state: OpticalState::Unknown };
-            let mut optical_initialized = false;
+            let mut last_optical_probe = Instant::now() - Duration::from_secs(1);
             loop {
                 let ready = hardware_ready.load(Ordering::Acquire);
                 {
@@ -523,12 +539,13 @@ pub fn run() {
                         pending_cleanup: &mut pending_cleanup, services: &mut services,
                         engine: &pon_engine_ploam,
                     };
-                    if ready && !optical_initialized {
-                        optical_initialized = true;
-                        match backend.read_tx() {
-                            Ok(true) => optics.state = OpticalState::Enabled,
-                            Ok(false) => optics.state = OpticalState::Disabled,
-                            Err(error) => eprintln!("[-] Initial optical readback failed; discovery paused: {error}"),
+                    if ready
+                        && optics.state == OpticalState::Unknown
+                        && last_optical_probe.elapsed() >= Duration::from_secs(1)
+                    {
+                        last_optical_probe = Instant::now();
+                        if let Err(error) = optics.refresh_unknown_state(&mut backend) {
+                            eprintln!("[-] Optical TX readback failed; discovery paused and will retry: {error}");
                         }
                     }
                     for request in optical_receiver.try_iter().take(2) {
