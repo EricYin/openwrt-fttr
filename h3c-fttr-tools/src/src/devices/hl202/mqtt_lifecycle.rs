@@ -14,13 +14,29 @@ pub fn mqtt_target(device_id: &str) -> Option<String> {
 }
 
 /// Read only the settings we manage; never return credentials or the full TCAPI dump.
-pub fn read_authenticated_settings(device_id:&str,acs_url:&str,credentials:&crate::devices::CwmpCredentials)->Result<bool,String> {
+pub fn read_authenticated_settings(
+    device_id: &str,
+    acs_url: &str,
+    credentials: &crate::devices::CwmpCredentials,
+) -> Result<bool, String> {
+    crate::runtime::block_on(read_authenticated_settings_async(
+        device_id,
+        acs_url,
+        credentials,
+    ))
+}
+pub async fn read_authenticated_settings_async(
+    device_id: &str,
+    acs_url: &str,
+    credentials: &crate::devices::CwmpCredentials,
+) -> Result<bool, String> {
     let target = mqtt_target(device_id).ok_or("invalid MQTT command target")?;
     let script = format!(
         "if {}; then printf 'FTTR_CWMP_MATCH\\n'; else printf 'FTTR_CWMP_DIFF\\n'; fi",
-        authenticated_tests(Some(acs_url),credentials).join(" && ")
+        authenticated_tests(Some(acs_url), credentials).join(" && ")
     );
-    let result = command::execute(&target, &script, Duration::from_secs(30))
+    let result = command::execute_async(&target, &script, Duration::from_secs(30))
+        .await
         .map_err(|_| "CWMP settings read transport failed")?;
     if !result.success() {
         return Err(format!(
@@ -34,29 +50,60 @@ pub fn read_authenticated_settings(device_id:&str,acs_url:&str,credentials:&crat
         _ => Err("CWMP settings read returned no valid result".into()),
     }
 }
-pub fn configure_settings(device_id:&str,acs_url:&str,credentials:&crate::devices::CwmpCredentials)->Result<(),String> {
-    let target=mqtt_target(device_id).ok_or("invalid MQTT command target")?;
-    let script=authenticated_script(Some(acs_url),credentials);
-    let result=command::execute(&target,&script,Duration::from_secs(90)).map_err(|_|"CWMP configuration transport failed")?;
-    if !result.success()||!result.output.as_deref().is_some_and(|s|s.trim()=="HL202_CWMP_SETTINGS_VERIFIED") {return Err(format!("CWMP configuration not verified (status={}, exit={:?}, out={:?}); readback required",result.status,result.exit_code,result.output));}
+pub fn configure_settings(
+    device_id: &str,
+    acs_url: &str,
+    credentials: &crate::devices::CwmpCredentials,
+) -> Result<(), String> {
+    crate::runtime::block_on(configure_settings_async(device_id, acs_url, credentials))
+}
+pub async fn configure_settings_async(
+    device_id: &str,
+    acs_url: &str,
+    credentials: &crate::devices::CwmpCredentials,
+) -> Result<(), String> {
+    let target = mqtt_target(device_id).ok_or("invalid MQTT command target")?;
+    let script = authenticated_script(Some(acs_url), credentials);
+    let result = command::execute_async(&target, &script, Duration::from_secs(90))
+        .await
+        .map_err(|_| "CWMP configuration transport failed")?;
+    if !result.success()
+        || !result
+            .output
+            .as_deref()
+            .is_some_and(|s| s.trim() == "HL202_CWMP_SETTINGS_VERIFIED")
+    {
+        return Err(format!(
+            "CWMP configuration not verified (status={}, exit={:?}, out={:?}); readback required",
+            result.status, result.exit_code, result.output
+        ));
+    }
     Ok(())
 }
 
 #[cfg(test)]
 fn config_script(acs_url: Option<&str>) -> String {
-    authenticated_script(acs_url,&crate::devices::CwmpCredentials::default())
+    authenticated_script(acs_url, &crate::devices::CwmpCredentials::default())
 }
-fn authenticated_script(acs_url:Option<&str>,credentials:&crate::devices::CwmpCredentials)->String {
+fn authenticated_script(
+    acs_url: Option<&str>,
+    credentials: &crate::devices::CwmpCredentials,
+) -> String {
     let mut commands = Vec::new();
     commands.push("changed=0".to_string());
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     commands.push(format!("date -s @{now} >/dev/null 2>&1 || true"));
     commands.push("if [ \"$(tcapi get DeviceInfo_DevParaDynamic mainGatewayOUI)\" != 000FE2 ]; then tcapi set DeviceInfo_DevParaDynamic mainGatewayOUI 000FE2 || exit 1; changed=1; fi".into());
     commands.push("if [ \"$(tcapi get DeviceInfo_DevParaDynamic mainGatewaySN)\" != 1C94685AF429 ]; then tcapi set DeviceInfo_DevParaDynamic mainGatewaySN 1C94685AF429 || exit 1; changed=1; fi".into());
     commands.push("if [ \"$(tcapi get Cwmp_Entry DevInfCfgFlag)\" != 1 ]; then tcapi set Cwmp_Entry DevInfCfgFlag 1 || exit 1; changed=1; fi".into());
     commands.push("case \"$(tcapi get Cwmp_Entry devregInform)\" in 0|1) true;; *) tcapi set Cwmp_Entry devregInform 1 || exit 1; changed=1;; esac".into());
     if let Some(acs_url) = acs_url {
-        let host = acs_url.strip_prefix("http://").or_else(|| acs_url.strip_prefix("https://"))
+        let host = acs_url
+            .strip_prefix("http://")
+            .or_else(|| acs_url.strip_prefix("https://"))
             .and_then(|s| s.split([':', '/']).next())
             .unwrap_or("192.168.46.1");
 
@@ -74,27 +121,54 @@ fn authenticated_script(acs_url:Option<&str>,credentials:&crate::devices::CwmpCr
         commands.push(format!("if [ \"$(tcapi get Cwmp_Entry {key})\" != {value} ]; then tcapi set Cwmp_Entry {key} {value} || exit 1; changed=1; fi"));
     }
     // Also persist matching runtime values after a previous command with an unknown outcome.
-    if !credentials.username.is_empty() {for (key,value) in [("acsUserName",&credentials.username),("acsPassword",&credentials.password)] {
-        commands.push(format!("if [ \"$(tcapi get Cwmp_Entry {key})\" != {0} ]; then tcapi set Cwmp_Entry {key} {0} || exit 1; fi",shell_quote(value)));
-    }}
-    commands.push("tcapi commit Cwmp && tcapi commit CwmpRoute && tcapi commit DeviceInfo && tcapi save".into());
+    if !credentials.username.is_empty() {
+        for (key, value) in [
+            ("acsUserName", &credentials.username),
+            ("acsPassword", &credentials.password),
+        ] {
+            commands.push(format!("if [ \"$(tcapi get Cwmp_Entry {key})\" != {0} ]; then tcapi set Cwmp_Entry {key} {0} || exit 1; fi",shell_quote(value)));
+        }
+    }
+    commands.push(
+        "tcapi commit Cwmp && tcapi commit CwmpRoute && tcapi commit DeviceInfo && tcapi save"
+            .into(),
+    );
     commands.push("printf 'HL202_CWMP_SETTINGS_VERIFIED\\n'".into());
     commands.join(" && ")
 }
-fn authenticated_tests(url:Option<&str>,credentials:&crate::devices::CwmpCredentials)->Vec<String> {
-    let mut tests=settings_tests(url);
-    if !credentials.username.is_empty() {for (key,value) in [("acsUserName",&credentials.username),("acsPassword",&credentials.password)] {tests.push(format!("test \"$(tcapi get Cwmp_Entry {key})\" = {}",shell_quote(value)));}}
+fn authenticated_tests(
+    url: Option<&str>,
+    credentials: &crate::devices::CwmpCredentials,
+) -> Vec<String> {
+    let mut tests = settings_tests(url);
+    if !credentials.username.is_empty() {
+        for (key, value) in [
+            ("acsUserName", &credentials.username),
+            ("acsPassword", &credentials.password),
+        ] {
+            tests.push(format!(
+                "test \"$(tcapi get Cwmp_Entry {key})\" = {}",
+                shell_quote(value)
+            ));
+        }
+    }
     tests
 }
 
 fn settings_tests(acs_url: Option<&str>) -> Vec<String> {
     let mut commands = Vec::new();
     commands.push("test \"$(tcapi get DeviceInfo_DevParaDynamic mainGatewayOUI)\" = 000FE2".into());
-    commands.push("test \"$(tcapi get DeviceInfo_DevParaDynamic mainGatewaySN)\" = 1C94685AF429".into());
+    commands.push(
+        "test \"$(tcapi get DeviceInfo_DevParaDynamic mainGatewaySN)\" = 1C94685AF429".into(),
+    );
     commands.push("test \"$(tcapi get Cwmp_Entry DevInfCfgFlag)\" = 1".into());
-    commands.push("case \"$(tcapi get Cwmp_Entry devregInform)\" in 0|1) true;; *) false;; esac".into());
+    commands.push(
+        "case \"$(tcapi get Cwmp_Entry devregInform)\" in 0|1) true;; *) false;; esac".into(),
+    );
     if let Some(acs_url) = acs_url {
-        let host = acs_url.strip_prefix("http://").or_else(|| acs_url.strip_prefix("https://"))
+        let host = acs_url
+            .strip_prefix("http://")
+            .or_else(|| acs_url.strip_prefix("https://"))
             .and_then(|s| s.split([':', '/']).next())
             .unwrap_or("192.168.46.1");
 
@@ -107,8 +181,14 @@ fn settings_tests(acs_url: Option<&str>) -> Vec<String> {
         commands.push(
             "case \"$(tcapi get Cwmp_Entry SyncAcsUrl)\" in No) false;; *) true;; esac".into(),
         );
-        commands.push("case \"$(tcapi get CwmpRoute_Entry ifStatus0)\" in Up|old|new) true;; *) false;; esac".into());
-        commands.push(format!("test \"$(tcapi get CwmpRoute_Entry ifGateway0)\" = {}", shell_quote(host)));
+        commands.push(
+            "case \"$(tcapi get CwmpRoute_Entry ifStatus0)\" in Up|old|new) true;; *) false;; esac"
+                .into(),
+        );
+        commands.push(format!(
+            "test \"$(tcapi get CwmpRoute_Entry ifGateway0)\" = {}",
+            shell_quote(host)
+        ));
     }
     commands.push("test \"$(tcapi get Cwmp_Entry Active)\" = Yes".into());
     commands
@@ -156,7 +236,9 @@ mod tests {
             "if [ \"$(tcapi get Cwmp_Entry acsUrl)\" != 'http://192.168.1.1:7547/cwmp' ]"
         ));
         assert!(script.contains("case \"$(tcapi get Cwmp_Entry SyncAcsUrl)\" in No) tcapi set"));
-        assert!(script.contains("tcapi commit Cwmp && tcapi commit CwmpRoute && tcapi commit DeviceInfo && tcapi save"));
+        assert!(script.contains(
+            "tcapi commit Cwmp && tcapi commit CwmpRoute && tcapi commit DeviceInfo && tcapi save"
+        ));
         assert!(script.contains("printf 'HL202_CWMP_SETTINGS_VERIFIED\\n'"));
 
         let tests = settings_tests(Some("http://192.168.1.1:7547/cwmp")).join(" && ");
@@ -167,14 +249,28 @@ mod tests {
 
     #[test]
     fn authentication_values_are_quoted_and_verified_without_a_credentials_dump() {
-        let credentials=crate::devices::CwmpCredentials{username:"test'user".into(),password:"a'b;$(false)".into()};let script=authenticated_script(Some("http://192.0.2.1/cwmp"),&credentials);
-        assert!(script.contains("tcapi set Cwmp_Entry acsUserName 'test'\"'\"'user'"));assert!(script.contains("tcapi set Cwmp_Entry acsPassword 'a'\"'\"'b;$(false)'"));assert!(script.contains("tcapi get Cwmp_Entry acsUserName"));assert!(script.contains("tcapi get Cwmp_Entry acsPassword"));assert!(!script.contains("tcapi show Cwmp"));
+        let credentials = crate::devices::CwmpCredentials {
+            username: "test'user".into(),
+            password: "a'b;$(false)".into(),
+        };
+        let script = authenticated_script(Some("http://192.0.2.1/cwmp"), &credentials);
+        assert!(script.contains("tcapi set Cwmp_Entry acsUserName 'test'\"'\"'user'"));
+        assert!(script.contains("tcapi set Cwmp_Entry acsPassword 'a'\"'\"'b;$(false)'"));
+        assert!(script.contains("tcapi get Cwmp_Entry acsUserName"));
+        assert!(script.contains("tcapi get Cwmp_Entry acsPassword"));
+        assert!(!script.contains("tcapi show Cwmp"));
     }
 
     #[test]
     fn empty_credentials_leave_existing_device_values_untouched() {
-        let script=authenticated_script(Some("http://192.0.2.1/cwmp"),&crate::devices::CwmpCredentials::default());
-        assert!(!script.contains("tcapi set Cwmp_Entry acsUserName"));assert!(!script.contains("tcapi set Cwmp_Entry acsPassword"));assert!(!script.contains("tcapi get Cwmp_Entry acsUserName"));assert!(!script.contains("tcapi get Cwmp_Entry acsPassword"));
+        let script = authenticated_script(
+            Some("http://192.0.2.1/cwmp"),
+            &crate::devices::CwmpCredentials::default(),
+        );
+        assert!(!script.contains("tcapi set Cwmp_Entry acsUserName"));
+        assert!(!script.contains("tcapi set Cwmp_Entry acsPassword"));
+        assert!(!script.contains("tcapi get Cwmp_Entry acsUserName"));
+        assert!(!script.contains("tcapi get Cwmp_Entry acsPassword"));
     }
     #[test]
     fn missing_optional_sync_field_does_not_prevent_url_commit_and_readback() {

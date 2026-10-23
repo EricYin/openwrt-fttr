@@ -614,6 +614,7 @@ mod tests {
         requests
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC contract")]
     fn readonly_discovery_resolves_profile_caches_schema_and_protects_management() {
         let identity = identity(1);
         let mut first = Discovery::new("auto");

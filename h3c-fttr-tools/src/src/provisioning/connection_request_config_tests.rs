@@ -24,10 +24,13 @@ fn connection_request_rejects_ports_outside_the_tcp_range() {
 
 #[test]
 fn connection_request_preserves_explicit_credentials_through_template_expansion() {
-    let text = format!("{DEVICE}{}", r#" option connection_request '1'
+    let text = format!(
+        "{DEVICE}{}",
+        r#" option connection_request '1'
  option connection_request_username 'cr user'
  option connection_request_password 'p\word "quoted"'\''s'
-"#);
+"#
+    );
 
     let config = parse(&text).unwrap();
 
@@ -46,8 +49,14 @@ fn connection_request_toggle_changes_revision_without_changing_credentials() {
 
     assert_ne!(disabled.revision, enabled.revision);
     assert!(enabled.devices[0].connection_request.enabled);
-    assert_eq!(enabled.devices[0].connection_request.username, disabled.devices[0].connection_request.username);
-    assert_eq!(enabled.devices[0].connection_request.password, disabled.devices[0].connection_request.password);
+    assert_eq!(
+        enabled.devices[0].connection_request.username,
+        disabled.devices[0].connection_request.username
+    );
+    assert_eq!(
+        enabled.devices[0].connection_request.password,
+        disabled.devices[0].connection_request.password
+    );
 }
 
 #[test]
@@ -60,6 +69,7 @@ fn connection_request_rejects_an_invalid_opt_in_boolean() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
 fn hl202_uses_reserved_default_credentials_when_defaults_are_enabled() {
     let text = DEVICE.replace("option adapter 'generic'", "option adapter 'hl202'");
     let config = parse(&text).unwrap();
@@ -72,4 +82,3 @@ fn hl202_uses_reserved_default_credentials_when_defaults_are_enabled() {
     assert_eq!(request.port.get(), 7547);
     assert!(request.credentials_available());
 }
-

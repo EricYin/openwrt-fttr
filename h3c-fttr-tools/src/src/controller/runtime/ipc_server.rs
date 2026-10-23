@@ -1,9 +1,9 @@
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
 
 pub(super) mod metrics;
 
@@ -25,144 +25,132 @@ struct Request {
     line: String,
 }
 
+/// Intake is asynchronous; driver/config handlers use bounded blocking slots.
+/// STATUS has independent admission so nested status calls cannot deadlock.
+struct Dispatch<H> {
+    handler: Arc<H>,
+    intake: Arc<Semaphore>,
+    handlers: Arc<Semaphore>,
+    status: Arc<Semaphore>,
+    running: Arc<Semaphore>,
+    status_running: Arc<Semaphore>,
+}
+
+impl<H: Fn(UnixStream, &str) + Send + Sync + 'static> Dispatch<H> {
+    fn new(handler: H) -> Self {
+        Self {
+            handler: Arc::new(handler),
+            intake: Arc::new(Semaphore::new(INTAKE_WORKERS * 2)),
+            handlers: Arc::new(Semaphore::new(HANDLER_WORKERS * 2)),
+            status: Arc::new(Semaphore::new(STATUS_WORKERS * 2)),
+            running: Arc::new(Semaphore::new(HANDLER_WORKERS)),
+            status_running: Arc::new(Semaphore::new(STATUS_WORKERS)),
+        }
+    }
+
+    fn accept(&self, stream: UnixStream) {
+        metrics::accepted();
+        let Ok(intake) = self.intake.clone().try_acquire_owned() else {
+            reject(stream);
+            return;
+        };
+        let handler = self.handler.clone();
+        let handlers = self.handlers.clone();
+        let status = self.status.clone();
+        let running = self.running.clone();
+        let status_running = self.status_running.clone();
+        let accepted = Instant::now();
+        crate::runtime::spawn_service("IPC request", async move {
+            let request = read_request_async(Connection { stream, accepted }).await;
+            drop(intake);
+            let request = match request {
+                Ok(request) => request,
+                Err(error) => {
+                    metrics::read_error();
+                    eprintln!("[-] IPC request read failed: {error}");
+                    return;
+                }
+            };
+            let is_status = request.line.trim() == "STATUS";
+            let slots = if is_status { status } else { handlers };
+            let Ok(admission) = slots.try_acquire_owned() else {
+                reject(request.stream);
+                return;
+            };
+            let running = if is_status { status_running } else { running };
+            let Ok(execution) = running.acquire_owned().await else {
+                return;
+            };
+            if let Err(error) = crate::runtime::spawn_blocking(move || {
+                let (_admission, _execution) = (admission, execution);
+                let started = Instant::now();
+                handler(request.stream, request.line.trim());
+                metrics::handled(started.elapsed());
+            })
+            .await
+            {
+                eprintln!("[-] IPC handler failed: {error}");
+            }
+        });
+    }
+}
+
 pub(super) fn start(
     listener: UnixListener,
     handler: impl Fn(UnixStream, &str) + Send + Sync + 'static,
 ) {
-    if let Err(error) = thread::Builder::new()
-        .name("ipc-accept".into())
-        .stack_size(256 * 1024)
-        .spawn(move || {
-            serve(listener.incoming(), handler);
-        })
-    {
-        eprintln!("[-] IPC accept startup failed: {error}");
+    if let Err(error) = listener.set_nonblocking(true) {
+        eprintln!("[-] IPC listener setup failed: {error}");
+        return;
     }
-}
-
-fn serve(
-    streams: impl Iterator<Item = io::Result<UnixStream>>,
-    handler: impl Fn(UnixStream, &str) + Send + Sync + 'static,
-) {
-    let handler = Arc::new(handler);
-    let dispatch = {
-        let handler = Arc::clone(&handler);
-        move |request: Request| {
-            let started = Instant::now();
-            handler(request.stream, request.line.trim());
-            metrics::handled(started.elapsed());
-        }
-    };
-    let handlers = match pool(HANDLER_WORKERS, dispatch) {
-        Ok(pool) => pool,
-        Err(error) => {
-            eprintln!("[-] IPC handler startup failed: {error}");
-            return;
-        }
-    };
-    let status = match pool(STATUS_WORKERS, move |request: Request| {
-        let started = Instant::now();
-        handler(request.stream, request.line.trim());
-        metrics::handled(started.elapsed());
-    }) {
-        Ok(pool) => pool,
-        Err(error) => {
-            eprintln!("[-] IPC status startup failed: {error}");
-            return;
-        }
-    };
-    let intake = match pool(
-        INTAKE_WORKERS,
-        move |connection: Connection| match read_request(connection) {
-            Ok(request) => {
-                let target = if request.line.trim() == "STATUS" {
-                    &status
-                } else {
-                    &handlers
-                };
-                match target.try_send(request) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(request) | TrySendError::Disconnected(request)) => {
-                        reject(request.stream)
-                    }
-                }
-            }
+    crate::runtime::spawn_service("IPC listener", async move {
+        let listener = match tokio::net::UnixListener::from_std(listener) {
+            Ok(listener) => listener,
             Err(error) => {
-                metrics::read_error();
-                eprintln!("[-] IPC request read failed: {error}");
+                eprintln!("[-] IPC listener setup failed: {error}");
+                return;
             }
-        },
-    ) {
-        Ok(pool) => pool,
-        Err(error) => {
-            eprintln!("[-] IPC intake startup failed: {error}");
-            return;
-        }
-    };
-    for stream in streams {
-        match stream {
-            Ok(stream) => {
-                metrics::accepted();
-                match intake.try_send(Connection {
-                    stream,
-                    accepted: Instant::now(),
-                }) {
-                    Ok(()) => {}
-                    Err(
-                        TrySendError::Full(connection) | TrySendError::Disconnected(connection),
-                    ) => reject(connection.stream),
+        };
+        let dispatch = Dispatch::new(handler);
+        loop {
+            let accepted = tokio::select! {
+                result = listener.accept() => result,
+                _ = crate::runtime::cancelled() => break,
+            };
+            match accepted {
+                Ok((stream, _)) => match stream.into_std() {
+                    Ok(stream) => dispatch.accept(stream),
+                    Err(error) => eprintln!("[-] IPC socket setup failed: {error}"),
+                },
+                Err(error) => {
+                    eprintln!("[-] IPC accept failed: {error}");
+                    break;
                 }
             }
-            Err(error) => eprintln!("[-] IPC accept failed: {error}"),
         }
-    }
+    });
 }
 
-fn pool<Job: Send + 'static>(
-    workers: usize,
-    handle: impl Fn(Job) + Send + Sync + 'static,
-) -> io::Result<SyncSender<Job>> {
-    let (sender, receiver) = mpsc::sync_channel(workers);
-    let receiver = Arc::new(Mutex::new(receiver));
-    let handle = Arc::new(handle);
-    for _ in 0..workers {
-        let receiver = Arc::clone(&receiver);
-        let handle = Arc::clone(&handle);
-        thread::Builder::new()
-            .name("ipc-worker".into())
-            .stack_size(256 * 1024)
-            .spawn(move || loop {
-                let job = match receiver.lock() {
-                    Ok(receiver) => receiver.recv(),
-                    Err(_) => return,
-                };
-                match job {
-                    Ok(job) => handle(job),
-                    Err(_) => return,
-                }
-            })?;
-    }
-    Ok(sender)
-}
-
-fn read_request(connection: Connection) -> io::Result<Request> {
-    let Connection {
-        mut stream,
-        accepted,
-    } = connection;
-    let deadline = accepted + SOCKET_TIMEOUT;
+async fn read_request_async(connection: Connection) -> io::Result<Request> {
+    let Connection { stream, accepted } = connection;
+    stream.set_nonblocking(true)?;
+    let mut stream = tokio::net::UnixStream::from_std(stream)?;
+    let deadline = tokio::time::Instant::from_std(accepted + SOCKET_TIMEOUT);
     let mut bytes = Vec::new();
     let mut buffer = [0; 8192];
     loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::TimedOut, "IPC request deadline exceeded")
-            })?;
-        stream.set_read_timeout(Some(remaining))?;
+        if Instant::now() >= accepted + SOCKET_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "IPC request deadline exceeded",
+            ));
+        }
         let available = buffer.len().min(MAX_REQUEST_BYTES - bytes.len());
-        let count = stream.read(&mut buffer[..available])?;
+        let count = tokio::time::timeout_at(deadline, stream.read(&mut buffer[..available]))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "IPC request deadline exceeded")
+            })??;
         if count == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -174,6 +162,8 @@ fn read_request(connection: Connection) -> io::Result<Request> {
             bytes.extend_from_slice(&received[..=end]);
             let line = String::from_utf8(bytes)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let stream = stream.into_std()?;
+            stream.set_nonblocking(false)?;
             stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
             metrics::intake(accepted.elapsed());
             return Ok(Request { stream, line });
@@ -196,6 +186,30 @@ fn reject(mut stream: UnixStream) {
     {
         eprintln!("[-] IPC busy response failed: {error}");
     }
+}
+
+#[cfg(test)]
+use std::io::Read;
+#[cfg(test)]
+use std::{
+    sync::{mpsc, Mutex},
+    thread,
+};
+
+#[cfg(test)]
+fn serve(
+    streams: impl Iterator<Item = io::Result<UnixStream>>,
+    handler: impl Fn(UnixStream, &str) + Send + Sync + 'static,
+) {
+    let dispatch = Dispatch::new(handler);
+    for stream in streams {
+        dispatch.accept(stream.unwrap());
+    }
+}
+
+#[cfg(test)]
+fn read_request(connection: Connection) -> io::Result<Request> {
+    crate::runtime::block_on(read_request_async(connection))
 }
 
 #[cfg(test)]

@@ -1,80 +1,155 @@
-use std::io::{self, BufRead, Read, Write};
+//! HTTP framing belongs to Hyper. This module only enforces application limits.
+use super::{actor, session::Session, Server};
+use base64::Engine;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::{body::Incoming, header, server::conn::http1, service::service_fn, Method};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use std::collections::BTreeMap;
-// Recursive parameter-name responses on HL202/V152 exceed 512 KiB.
-// Keep a finite bound, including for chunked bodies.
-const MAX_BODY: usize = 2 * 1024 * 1024;
-pub struct Request { pub path: String, pub headers: BTreeMap<String, String>, pub body: Vec<u8> }
-fn invalid() -> io::Error { io::Error::new(io::ErrorKind::InvalidData, "invalid or oversized HTTP request") }
-fn line<R: BufRead>(reader: &mut R) -> io::Result<String> {
-    let mut data = Vec::new();
-    reader.take(8193).read_until(b'\n', &mut data)?;
-    if data.len() > 8192 || !data.ends_with(b"\r\n") { return Err(invalid()); }
-    String::from_utf8(data).map_err(|_| invalid())
+use std::convert::Infallible;
+use std::io;
+use std::sync::{atomic::Ordering, Arc, Mutex};
+use std::time::Duration;
+use tokio::net::TcpStream;
+
+pub(super) const MAX_BODY: usize = 2 * 1024 * 1024;
+pub(super) struct Request {
+    pub path: String,
+    pub headers: BTreeMap<String, String>,
+    pub body: Bytes,
 }
-pub fn read<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<Request> {
-    let first = line(reader)?;
-    let parts: Vec<_> = first.split_whitespace().collect();
-    if parts.len() != 3 || parts[0] != "POST" || !matches!(parts[2], "HTTP/1.0" | "HTTP/1.1") { return Err(invalid()); }
-    let mut headers = BTreeMap::new();
-    let mut size = 0;
-    loop {
-        let h = line(reader)?; size += h.len(); if size > 32768 { return Err(invalid()); }
-        if h == "\r\n" { break; }
-        let (key, value) = h.split_once(':').ok_or_else(invalid)?;
-        if headers.insert(key.to_ascii_lowercase(), value.trim().to_owned()).is_some() { return Err(invalid()); }
-    }
-    if headers.get("expect").is_some_and(|s| s.eq_ignore_ascii_case("100-continue")) { writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?; writer.flush()?; }
-    if headers.contains_key("content-encoding") { return Err(invalid()); }
-    let mut body = Vec::new();
-    if let Some(encoding) = headers.get("transfer-encoding") {
-        if !encoding.eq_ignore_ascii_case("chunked") || headers.contains_key("content-length") { return Err(invalid()); }
-        loop {
-            let chunk = line(reader)?;
-            let length = usize::from_str_radix(chunk.trim().split(';').next().unwrap_or(""), 16).map_err(|_| invalid())?;
-            if length == 0 {
-                let mut trailers = 0;
-                loop { let h = line(reader)?; trailers += h.len(); if trailers > 8192 { return Err(invalid()); } if h == "\r\n" { break; } }
-                break;
-            }
-            if length > MAX_BODY - body.len() { return Err(invalid()); }
-            let offset = body.len(); body.resize(offset + length, 0); reader.read_exact(&mut body[offset..])?;
-            let mut end = [0; 2]; reader.read_exact(&mut end)?; if end != *b"\r\n" { return Err(invalid()); }
+
+pub(super) struct Reply {
+    pub code: u16,
+    pub body: String,
+    pub cookie: Option<String>,
+    pub close: bool,
+}
+
+impl Reply {
+    pub(super) fn empty(code: u16) -> Self {
+        Self {
+            code,
+            body: String::new(),
+            cookie: None,
+            close: code != 401,
         }
-    } else {
-        let length: usize = headers.get("content-length").map(String::as_str).unwrap_or("0").parse().map_err(|_| invalid())?;
-        if length > MAX_BODY { return Err(io::Error::new(io::ErrorKind::InvalidData, format!("HTTP body {length} bytes exceeds limit {MAX_BODY}"))); } body.resize(length, 0); reader.read_exact(&mut body)?;
     }
-    Ok(Request { path: parts[1].into(), headers, body })
-}
-pub fn reply<W: Write>(writer: &mut W, code: u16, body: &str, extra: &str, close: bool) -> io::Result<()> {
-    let reason = match code { 200 => "OK", 204 => "No Content", 401 => "Unauthorized", 404 => "Not Found", 503 => "Service Unavailable", _ => "Bad Request" };
-    write!(writer, "HTTP/1.1 {code} {reason}\r\nContent-Length: {}\r\nContent-Type: text/xml; charset=utf-8\r\nConnection: {}\r\n{extra}\r\n{body}", body.len(), if close { "close" } else { "keep-alive" })?;
-    writer.flush()
-}
-pub fn basic(user: &str, password: &str) -> String {
-    let bytes = format!("{user}:{password}").into_bytes(); let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let mut result = String::from("Basic ");
-    for group in bytes.chunks(3) { let n = ((group[0] as u32) << 16) | ((group.get(1).copied().unwrap_or(0) as u32) << 8) | group.get(2).copied().unwrap_or(0) as u32;
-        result.push(chars[(n >> 18) as usize] as char); result.push(chars[((n >> 12) & 63) as usize] as char);
-        result.push(if group.len() > 1 { chars[((n >> 6) & 63) as usize] as char } else { '=' }); result.push(if group.len() > 2 { chars[(n & 63) as usize] as char } else { '=' }); }
-    result
-}
-#[cfg(test)] mod tests {
-    use super::*;
-    #[test] fn bounded_chunked_and_continue() {
-        let wire = b"POST /cwmp HTTP/1.1\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
-        let mut output = Vec::new(); let req = read(&mut &wire[..], &mut output).unwrap(); assert_eq!(req.body, b"abcde"); assert!(output.starts_with(b"HTTP/1.1 100"));
-        assert!(read(&mut &b"POST / HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n"[..], &mut output).is_err());
-        assert!(read(&mut &b"POST / HTTP/1.1\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n"[..], &mut output).is_err());
-        assert_eq!(basic("user", "password"), "Basic dXNlcjpwYXNzd29yZA==");
+
+    fn into_http(self) -> hyper::Response<Full<Bytes>> {
+        let mut response = hyper::Response::builder()
+            .status(self.code)
+            .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+            .header(header::CONTENT_LENGTH, self.body.len())
+            .header(
+                header::CONNECTION,
+                if self.close { "close" } else { "keep-alive" },
+            );
+        if let Some(cookie) = self.cookie {
+            response = response.header(header::SET_COOKIE, cookie);
+        }
+        if self.code == 401 {
+            response = response.header(header::WWW_AUTHENTICATE, "Basic realm=\"FTTR ACS\"");
+        }
+        response
+            .body(Full::new(Bytes::from(self.body)))
+            .expect("validated HTTP response")
     }
-    #[test] fn large_parameter_response_and_body_limit() {
-        let body = "x".repeat(700_000);
-        let wire = format!("POST /cwmp HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len());
-        let mut output = Vec::new();
-        assert_eq!(read(&mut wire.as_bytes(), &mut output).unwrap().body.len(), body.len());
-        let oversized = format!("POST /cwmp HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1);
-        assert!(read(&mut oversized.as_bytes(), &mut output).is_err());
-        let chunked = format!("POST /cwmp HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n", MAX_BODY + 1);
-        assert!(read(&mut chunked.as_bytes(), &mut output).is_err());
+}
+
+pub(super) fn basic(user: &str, password: &str) -> String {
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+    )
+}
+
+async fn request(req: hyper::Request<Incoming>) -> Result<Request, Reply> {
+    if req.method() != Method::POST || req.headers().contains_key(header::CONTENT_ENCODING) {
+        return Err(Reply::empty(400));
+    }
+    if req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|n| n > MAX_BODY as u64)
+    {
+        return Err(Reply::empty(413));
+    }
+    let path = req
+        .uri()
+        .path_and_query()
+        .map_or("/", |p| p.as_str())
+        .to_owned();
+    let mut headers = BTreeMap::new();
+    for (name, value) in req.headers() {
+        let value = value.to_str().map_err(|_| Reply::empty(400))?;
+        if headers.insert(name.to_string(), value.to_owned()).is_some() {
+            return Err(Reply::empty(400));
+        }
+    }
+    let body = tokio::time::timeout(
+        Duration::from_secs(30),
+        Limited::new(req.into_body(), MAX_BODY).collect(),
+    )
+    .await
+    .map_err(|_| Reply::empty(408))?
+    .map_err(|error| {
+        Reply::empty(if error.is::<http_body_util::LengthLimitError>() {
+            413
+        } else {
+            400
+        })
+    })?
+    .to_bytes();
+    Ok(Request {
+        path,
+        headers,
+        body,
+    })
+}
+
+pub(super) async fn serve(server: Arc<Server>, stream: TcpStream) -> io::Result<()> {
+    let peer = stream.peer_addr()?.ip().to_string();
+    let mut stream = tokio_io_timeout::TimeoutStream::new(stream);
+    stream.set_read_timeout(Some(Duration::from_secs(30)));
+    stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let stream = Box::pin(stream);
+    let session = Arc::new(Mutex::new(Session::new(peer)));
+    let policy = server.clone();
+    let service = service_fn(move |req| {
+        let server = policy.clone();
+        let session = session.clone();
+        async move {
+            let reply = match request(req).await {
+                Ok(req) => actor::call(move || session.lock().unwrap().handle(&server, req))
+                    .await
+                    .unwrap_or_else(|_| Reply::empty(503)),
+                Err(reply) => reply,
+            };
+            Ok::<_, Infallible>(reply.into_http())
+        }
+    });
+    let connection = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(30))
+        .max_buf_size(32 * 1024)
+        .max_headers(64)
+        .title_case_headers(true)
+        .serve_connection(TokioIo::new(stream), service);
+    tokio::pin!(connection);
+    loop {
+        tokio::select! {
+            result = &mut connection => return result.map_err(io::Error::other),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                let expired = server.drain_deadline.lock().unwrap()
+                    .is_some_and(|at| std::time::Instant::now() >= at);
+                if expired { return Ok(()); }
+                if server.stopping.load(Ordering::Acquire) {
+                    connection.as_mut().graceful_shutdown();
+                }
+            }
+        }
     }
 }

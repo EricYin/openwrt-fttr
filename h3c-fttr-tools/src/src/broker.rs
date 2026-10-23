@@ -16,11 +16,16 @@ pub struct EmbeddedBroker {
 
 /// Production addresses are fixed to loopback and the configured LAN IPv4.
 pub fn lan_addresses(lan: &str) -> Result<Vec<SocketAddr>, String> {
-    let ip: Ipv4Addr = lan.parse().map_err(|_| "FTTR_MQTT_LAN_ADDR must be a LAN IPv4 address")?;
+    let ip: Ipv4Addr = lan
+        .parse()
+        .map_err(|_| "FTTR_MQTT_LAN_ADDR must be a LAN IPv4 address")?;
     if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() {
         return Err("FTTR_MQTT_LAN_ADDR must be a non-loopback unicast LAN IPv4 address".into());
     }
-    Ok(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 1883)), SocketAddr::from((ip, 1883))])
+    Ok(vec![
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 1883)),
+        SocketAddr::from((ip, 1883)),
+    ])
 }
 
 fn configuration(addresses: &[SocketAddr]) -> rumqttd::Config {
@@ -32,31 +37,36 @@ fn configuration(addresses: &[SocketAddr]) -> rumqttd::Config {
             max_segment_count: 2,
             ..Default::default()
         },
-        v4: Some(addresses.iter().enumerate().map(|(i, addr)| {
-            let name = format!("fttr-mqtt-{i}");
-            (name.clone(), rumqttd::ServerSettings {
-                name,
-                listen: *addr,
-                tls: None,
-                next_connection_delay_ms: 1,
-                connections: rumqttd::ConnectionSettings {
-                    connection_timeout_ms: 5000,
-                    // Pinned v4::check compares REMAINING length, not frame length.
-                    max_payload_size: MAX_REMAINING_BYTES,
-                    max_inflight_count: 16,
-                    auth: None,
-                    external_auth: None,
-                    dynamic_filters: false,
-                },
-            })
-        }).collect::<HashMap<_, _>>()),
+        v4: Some(
+            addresses
+                .iter()
+                .enumerate()
+                .map(|(i, addr)| {
+                    let name = format!("fttr-mqtt-{i}");
+                    (
+                        name.clone(),
+                        rumqttd::ServerSettings {
+                            name,
+                            listen: *addr,
+                            tls: None,
+                            next_connection_delay_ms: 1,
+                            connections: rumqttd::ConnectionSettings {
+                                connection_timeout_ms: 5000,
+                                // Pinned v4::check compares REMAINING length, not frame length.
+                                max_payload_size: MAX_REMAINING_BYTES,
+                                max_inflight_count: 16,
+                                auth: None,
+                                external_auth: None,
+                                dynamic_filters: false,
+                            },
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+        ),
         // v5, WS, TLS, bridge, console, metrics and Prometheus are absent.
         ..Default::default()
     }
-}
-
-fn runtime() -> Result<tokio::runtime::Runtime, String> {
-    tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())
 }
 
 fn fatal(error: &str) -> ! {
@@ -69,50 +79,69 @@ impl EmbeddedBroker {
     pub(crate) fn inject_finished_thread(&mut self) {
         // Used only inside a reaped lifecycle child. Its real broker threads
         // remain process-owned and are reclaimed by the expected fatal exit.
-        self.handle = Some(thread::spawn(|| Err("injected runtime broker failure".into())));
+        self.handle = Some(thread::spawn(|| {
+            Err("injected runtime broker failure".into())
+        }));
     }
 
     /// Fixture callers may choose isolated ports/loopback aliases. Production
     /// must pass only `lan_addresses`. No caller may treat a failure as fallback.
-    pub fn start(listen_addrs: &[SocketAddr]) -> Result<Self, String> {
+    pub async fn start(listen_addrs: &[SocketAddr]) -> Result<Self, String> {
         Self::start_with(listen_addrs, |config| {
             let mut broker = rumqttd::Broker::new(config);
             broker.start().map_err(|e| format!("rumqttd start: {e:?}"))
         })
+        .await
     }
 
-    fn start_with(listen_addrs: &[SocketAddr], run: impl FnOnce(rumqttd::Config) -> Result<(), String> + Send + 'static) -> Result<Self, String> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err("start the owned broker outside the host Tokio runtime".into());
-        }
+    async fn start_with(
+        listen_addrs: &[SocketAddr],
+        run: impl FnOnce(rumqttd::Config) -> Result<(), String> + Send + 'static,
+    ) -> Result<Self, String> {
         let mut addresses = listen_addrs.to_vec();
         addresses.sort_unstable();
         addresses.dedup();
-        if addresses.is_empty() || addresses.iter().any(|a| !a.is_ipv4() || a.ip().is_unspecified() || a.port() == 0) {
+        if addresses.is_empty()
+            || addresses
+                .iter()
+                .any(|a| !a.is_ipv4() || a.ip().is_unspecified() || a.port() == 0)
+        {
             return Err("MQTT requires explicit IPv4 listeners and nonzero ports".into());
         }
         // Hold every preflight bind together, so a conflict starts no threads.
-        let reservations = addresses.iter().map(|a| TcpListener::bind(a)
-            .map_err(|e| format!("MQTT listener {a} unavailable: {e}"))).collect::<Result<Vec<_>, _>>()?;
+        let reservations = addresses
+            .iter()
+            .map(|a| {
+                TcpListener::bind(a).map_err(|e| format!("MQTT listener {a} unavailable: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let config = configuration(&addresses);
-        let rt = runtime()?;
         drop(reservations);
-        let handle = thread::Builder::new().name("fttr-rumqttd".into()).spawn(move || run(config))
+        let handle = thread::Builder::new()
+            .name("fttr-rumqttd".into())
+            .spawn(move || run(config))
             .map_err(|e| format!("spawn MQTT broker: {e}"))?;
-        let mut broker = Self { handle: Some(handle), addresses };
+        let mut broker = Self {
+            handle: Some(handle),
+            addresses,
+        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        rt.block_on(async {
-            loop {
-                broker.check_thread().unwrap_or_else(|e| fatal(&e));
-                let attempt = deadline.saturating_duration_since(tokio::time::Instant::now()).min(Duration::from_millis(500));
-                if attempt.is_zero() { fatal("startup readiness deadline exceeded"); }
-                match tokio::time::timeout(attempt, cross_listener_probe(&broker.addresses)).await {
-                    Ok(Ok(())) => break,
-                    _ if tokio::time::Instant::now() >= deadline => fatal("startup cross-listener readiness deadline exceeded"),
-                    _ => tokio::time::sleep(Duration::from_millis(25)).await,
-                }
+        loop {
+            broker.check_thread().unwrap_or_else(|e| fatal(&e));
+            let attempt = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(Duration::from_millis(500));
+            if attempt.is_zero() {
+                fatal("startup readiness deadline exceeded");
             }
-        });
+            match tokio::time::timeout(attempt, cross_listener_probe(&broker.addresses)).await {
+                Ok(Ok(())) => break,
+                _ if tokio::time::Instant::now() >= deadline => {
+                    fatal("startup cross-listener readiness deadline exceeded")
+                }
+                _ => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
         broker.check_thread().unwrap_or_else(|e| fatal(&e));
         Ok(broker)
     }
@@ -134,8 +163,12 @@ impl EmbeddedBroker {
     /// alone misses an individual listener failure in pinned Broker::start.
     pub async fn check_health(&mut self) -> Result<(), String> {
         self.check_thread()?;
-        tokio::time::timeout(Duration::from_secs(2), cross_listener_probe(&self.addresses)).await
-            .map_err(|_| "MQTT cross-listener health deadline exceeded".to_string())??;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            cross_listener_probe(&self.addresses),
+        )
+        .await
+        .map_err(|_| "MQTT cross-listener health deadline exceeded".to_string())??;
         self.check_thread()
     }
 }
@@ -145,7 +178,14 @@ fn probe_client(addr: SocketAddr, id: &str) -> (AsyncClient, rumqttc::EventLoop)
 }
 
 async fn cross_listener_probe(addresses: &[SocketAddr]) -> Result<(), String> {
-    let nonce = format!("{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos());
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos()
+    );
     // Health traffic never reaches gateway command/report topics.
     // Reuse the process topic: generating a new topic per check would grow
     // rumqttd's topic registry even after subscribers disconnect.
@@ -155,13 +195,17 @@ async fn cross_listener_probe(addresses: &[SocketAddr]) -> Result<(), String> {
         Event::Incoming(Packet::ConnAck(_)) => (),
         _ => return Err("health subscriber missing CONNACK".into()),
     }
-    subscriber.try_subscribe(&topic, QoS::AtMostOnce).map_err(|e| e.to_string())?;
+    subscriber
+        .try_subscribe(&topic, QoS::AtMostOnce)
+        .map_err(|e| e.to_string())?;
     let mut subscription = None;
     loop {
         match receiving.poll().await.map_err(|e| e.to_string())? {
             Event::Outgoing(rumqttc::Outgoing::Subscribe(id)) => subscription = Some(id),
             Event::Incoming(Packet::SubAck(ack)) => {
-                if subscription != Some(ack.pkid) || ack.return_codes != [SubscribeReasonCode::Success(QoS::AtMostOnce)] {
+                if subscription != Some(ack.pkid)
+                    || ack.return_codes != [SubscribeReasonCode::Success(QoS::AtMostOnce)]
+                {
                     return Err("health subscription rejected/mismatched".into());
                 }
                 break;
@@ -176,13 +220,27 @@ async fn cross_listener_probe(addresses: &[SocketAddr]) -> Result<(), String> {
             _ => return Err("health publisher missing CONNACK".into()),
         }
         let payload = format!("{i}:{nonce}");
-        publisher.try_publish(&topic, QoS::AtMostOnce, false, payload.as_bytes()).map_err(|e| e.to_string())?;
+        publisher
+            .try_publish(&topic, QoS::AtMostOnce, false, payload.as_bytes())
+            .map_err(|e| e.to_string())?;
         loop {
-            if matches!(sending.poll().await.map_err(|e| e.to_string())?, Event::Outgoing(rumqttc::Outgoing::Publish(_))) { break; }
+            if matches!(
+                sending.poll().await.map_err(|e| e.to_string())?,
+                Event::Outgoing(rumqttc::Outgoing::Publish(_))
+            ) {
+                break;
+            }
         }
         loop {
-            if let Event::Incoming(Packet::Publish(report)) = receiving.poll().await.map_err(|e| e.to_string())? {
-                if !report.retain && report.topic == topic && report.payload.as_ref() == payload.as_bytes() { break; }
+            if let Event::Incoming(Packet::Publish(report)) =
+                receiving.poll().await.map_err(|e| e.to_string())?
+            {
+                if !report.retain
+                    && report.topic == topic
+                    && report.payload.as_ref() == payload.as_bytes()
+                {
+                    break;
+                }
                 return Err("health nonce mismatch".into());
             }
         }
@@ -197,16 +255,27 @@ mod tests {
     #[test]
     #[ignore = "reaped child helper for broker thread failure injection"]
     fn broker_failure_child() {
-        let address = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        let _ = EmbeddedBroker::start_with(&[address], |_| Err("injected broker thread failure".into()));
+        let address = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let _ = crate::runtime::block_on(EmbeddedBroker::start_with(&[address], |_| {
+            Err("injected broker thread failure".into())
+        }));
         panic!("failed broker unexpectedly returned ready");
     }
 
     #[test]
     fn broker_lifecycle_start_thread_failure() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--ignored", "--exact", "broker::tests::broker_failure_child", "--nocapture"])
-            .output().unwrap();
+            .args([
+                "--ignored",
+                "--exact",
+                "broker::tests::broker_failure_child",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("injected broker thread failure"));
     }

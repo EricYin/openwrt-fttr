@@ -1,27 +1,28 @@
+#[cfg(feature = "acs")]
+pub mod acs;
+pub mod acs_cli;
 pub mod bosa;
-pub mod optical;
+#[cfg(feature = "mqtt")]
+pub mod broker;
 pub mod capabilities;
+pub mod controller;
+pub mod devices;
 pub mod fpga;
-pub mod ipc;
 pub mod hl202_ipc;
+pub mod ipc;
+pub mod model;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
 pub mod mqtt_identity;
 #[cfg(any(feature = "mqtt", test))]
-mod telemetry_sources;
-#[cfg(any(feature = "mqtt", test))]
 mod mqtt_limits;
+pub mod optical;
 pub mod pon_engine;
-pub mod devices;
-pub mod model;
-pub mod controller;
-pub mod acs_cli;
 pub mod provisioning;
 pub mod provisioning_cli;
-#[cfg(feature = "acs")]
-pub mod acs;
-#[cfg(feature = "mqtt")]
-pub mod broker;
+mod runtime;
+#[cfg(any(feature = "mqtt", test))]
+mod telemetry_sources;
 
 // Unit fixtures which prove the MQTT-off boundary share the production port.
 #[cfg(all(test, not(feature = "mqtt")))]

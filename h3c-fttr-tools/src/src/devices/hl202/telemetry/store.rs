@@ -4,7 +4,7 @@ mod state;
 pub use state::State;
 use std::{
     collections::BTreeMap,
-    sync::{Condvar, Mutex, OnceLock},
+    sync::{Mutex, OnceLock},
 };
 
 struct Pending {
@@ -41,9 +41,25 @@ impl Queue {
             self.pending.remove(&oldest);
         }
         self.seen.insert(mac.clone(), received);
-        self.pending.insert(mac, Pending { payload, received, budget_evicted: false });
-        while self.pending.values().filter_map(|item| item.payload.as_ref()).map(Vec::len).sum::<usize>() > MAX_PENDING_BYTES {
-            let oldest = self.pending.values_mut()
+        self.pending.insert(
+            mac,
+            Pending {
+                payload,
+                received,
+                budget_evicted: false,
+            },
+        );
+        while self
+            .pending
+            .values()
+            .filter_map(|item| item.payload.as_ref())
+            .map(Vec::len)
+            .sum::<usize>()
+            > MAX_PENDING_BYTES
+        {
+            let oldest = self
+                .pending
+                .values_mut()
                 .filter(|item| item.payload.is_some())
                 .min_by_key(|item| item.received);
             if let Some(item) = oldest {
@@ -69,13 +85,16 @@ struct Store {
     queue: Queue,
     states: BTreeMap<String, State>,
 }
-static SHARED: OnceLock<(Mutex<Store>, Condvar)> = OnceLock::new();
+static SHARED: OnceLock<(Mutex<Store>, tokio::sync::Notify)> = OnceLock::new();
 
 impl Store {
     fn take(&mut self) -> Option<(String, Pending)> {
         while let Some((mac, item)) = self.queue.take() {
             if item.budget_evicted {
-                self.states.entry(mac).or_default().apply(item.received, Err("pending telemetry byte budget exceeded".into()));
+                self.states.entry(mac).or_default().apply(
+                    item.received,
+                    Err("pending telemetry byte budget exceeded".into()),
+                );
             } else {
                 return Some((mac, item));
             }
@@ -84,13 +103,10 @@ impl Store {
     }
 }
 
-fn shared() -> &'static (Mutex<Store>, Condvar) {
+fn shared() -> &'static (Mutex<Store>, tokio::sync::Notify) {
     SHARED.get_or_init(|| {
-        let _ = std::thread::Builder::new()
-            .name("hl202-worker".into())
-            .stack_size(512 * 1024)
-            .spawn(super::worker::run);
-        (Mutex::new(Store::default()), Condvar::new())
+        crate::runtime::spawn_service("HL202 telemetry", super::worker::run());
+        (Mutex::new(Store::default()), tokio::sync::Notify::new())
     })
 }
 
@@ -136,14 +152,17 @@ pub fn revision(mac: &str) -> Option<u64> {
     Some(store.states.get(mac)?.revision)
 }
 
-pub(super) fn next() -> Option<(String, Option<Vec<u8>>, u64)> {
+pub(super) async fn next() -> Option<(String, Option<Vec<u8>>, u64)> {
     let (mutex, signal) = shared();
-    let mut store = mutex.lock().ok()?;
     loop {
-        if let Some((mac, item)) = store.take() {
+        let notified = signal.notified();
+        if let Some((mac, item)) = mutex.lock().ok()?.take() {
             return Some((mac, item.payload, item.received));
         }
-        store = signal.wait(store).ok()?;
+        tokio::select! {
+            _ = notified => {},
+            _ = crate::runtime::cancelled() => return None,
+        }
     }
 }
 
@@ -174,11 +193,18 @@ mod tests {
     #[test]
     fn revision_matches_snapshot_when_report_is_retained_after_error() {
         let mac = "revision-test-retained";
-        let report = super::super::parse(&super::super::tests::fixture(&[("unknown", b"raw text")])).unwrap();
+        let report =
+            super::super::parse(&super::super::tests::fixture(&[("unknown", b"raw text")]))
+                .unwrap();
         let mut state = super::State::default();
         state.apply(10, Ok(report));
         state.apply(11, Err("invalid gzip".into()));
-        super::shared().0.lock().unwrap().states.insert(mac.into(), state);
+        super::shared()
+            .0
+            .lock()
+            .unwrap()
+            .states
+            .insert(mac.into(), state);
         let revision = super::revision(mac);
         let snapshot = super::snapshot(mac).unwrap();
         assert_eq!(revision, Some(2));
@@ -191,7 +217,12 @@ mod tests {
     #[test]
     fn revision_returns_zero_when_state_is_pending() {
         let mac = "revision-test-pending";
-        super::shared().0.lock().unwrap().states.insert(mac.into(), super::State::default());
+        super::shared()
+            .0
+            .lock()
+            .unwrap()
+            .states
+            .insert(mac.into(), super::State::default());
         let revision = super::revision(mac);
         assert_eq!(revision, Some(0));
         super::shared().0.lock().unwrap().states.remove(mac);

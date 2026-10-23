@@ -25,18 +25,25 @@ fn save(mac: &str, payload: &[u8]) -> io::Result<()> {
     result
 }
 
-pub(super) fn run() {
-    while let Some((mac, payload, received)) = super::store::next() {
-        let result = match payload {
-            Some(payload) => save(&mac, &payload)
-                .map_err(|_| "private telemetry storage failed".to_owned())
-                .and_then(|_| {
-                    super::parse(&payload)
-                        .map_err(|_| "invalid or oversized gzip/tar telemetry".to_owned())
-                }),
-            None => Err("compressed telemetry limit exceeded".to_owned()),
-        };
-        super::store::complete(mac, received, result);
+pub(super) async fn run() {
+    while let Some((mac, payload, received)) = super::store::next().await {
+        let work = crate::runtime::spawn_blocking(move || {
+            let result = match payload {
+                Some(payload) => save(&mac, &payload)
+                    .map_err(|_| "private telemetry storage failed".to_owned())
+                    .and_then(|_| {
+                        super::parse(&payload)
+                            .map_err(|_| "invalid or oversized gzip/tar telemetry".to_owned())
+                    }),
+                None => Err("compressed telemetry limit exceeded".to_owned()),
+            };
+            super::store::complete(mac, received, result);
+        })
+        .await;
+        if let Err(error) = work {
+            eprintln!("[-] Telemetry parser failed: {error}");
+            break;
+        }
     }
     eprintln!("[-] Telemetry worker stopped: state unavailable");
 }

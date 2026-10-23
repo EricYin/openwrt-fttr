@@ -112,7 +112,7 @@ impl Controller {
                     operation["reconcile_reason"] = json!("service_restarted");
                     if let Some(items) = operation["items"].as_array_mut() {
                         for item in items {
-                            if item["state"] != "verified" {
+                            if item["state"] != "verified" && item["state"] != "unknown" {
                                 item["state"] = json!("reconcile_required");
                                 item["reason"] = json!("reconcile after service restart");
                             }
@@ -174,7 +174,10 @@ impl Controller {
             }
         }
         for previous in &self.config.devices {
-            previous.connection_request.authorization.store(false, std::sync::atomic::Ordering::Release);
+            previous
+                .connection_request
+                .authorization
+                .store(false, std::sync::atomic::Ordering::Release);
         }
         self.config = config;
         self.load_reset_intents();

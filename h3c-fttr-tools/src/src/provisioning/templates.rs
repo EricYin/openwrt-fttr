@@ -74,7 +74,10 @@ pub fn compile(text: &str) -> Result<Config, String> {
             "option" | "list" if w.len() == 3 => {
                 let s = &mut all.last_mut().ok_or("option without section")?.1;
                 if s.kind == "management" && w[1] == "vlan" && w[0] != "list" {
-                    return Err("management VLAN requires list vlan; scalar option vlan is unsupported".into());
+                    return Err(
+                        "management VLAN requires list vlan; scalar option vlan is unsupported"
+                            .into(),
+                    );
                 }
                 if w[0] == "option" {
                     s.options.insert(w[1].clone(), vec![w[2].clone()]);
@@ -383,7 +386,10 @@ pub fn compile(text: &str) -> Result<Config, String> {
             .collect();
         if all.iter().any(|(_, n)| {
             n.kind == "network"
-                && n.get("vlan").parse::<u32>().ok().is_some_and(|v|desired.management.vlans.contains(&v))
+                && n.get("vlan")
+                    .parse::<u32>()
+                    .ok()
+                    .is_some_and(|v| desired.management.vlans.contains(&v))
         }) {
             return Err("management VLAN conflicts with a business VLAN".into());
         }
@@ -487,15 +493,44 @@ mod tests {
 
     #[test]
     fn management_vlan_list_is_strict_ordered_and_reserves_every_member() {
-        let head="config management 'management'\n option address '192.0.2.1/24'\n";
-        for values in ["", " option vlan '46'\n", " list vlan '0'\n", " list vlan '4095'\n", " list vlan 'abc'\n", " list vlan '+46'\n", " list vlan '46'\n list vlan '046'\n"] {assert!(super::compile(&format!("{head}{values}")).is_err(),"accepted {values:?}");}
-        let config=super::compile(&format!("{head} list vlan '47'\n list vlan '46'\n")).unwrap();let m=config.management.unwrap();assert_eq!(m.vlans,[47,46]);assert_eq!(m.vlan,47);
-        assert_eq!(super::compile(&format!("{head} list vlan '46'\n")).unwrap().management.unwrap().vlans,[46]);
+        let head = "config management 'management'\n option address '192.0.2.1/24'\n";
+        for values in [
+            "",
+            " option vlan '46'\n",
+            " list vlan '0'\n",
+            " list vlan '4095'\n",
+            " list vlan 'abc'\n",
+            " list vlan '+46'\n",
+            " list vlan '46'\n list vlan '046'\n",
+        ] {
+            assert!(
+                super::compile(&format!("{head}{values}")).is_err(),
+                "accepted {values:?}"
+            );
+        }
+        let config = super::compile(&format!("{head} list vlan '47'\n list vlan '46'\n")).unwrap();
+        let m = config.management.unwrap();
+        assert_eq!(m.vlans, [47, 46]);
+        assert_eq!(m.vlan, 47);
+        assert_eq!(
+            super::compile(&format!("{head} list vlan '46'\n"))
+                .unwrap()
+                .management
+                .unwrap()
+                .vlans,
+            [46]
+        );
         let business="config template 't'\nconfig network 'n'\n option template 't'\n option vlan '46'\n list service_list 'INTERNET'\n";
-        let error=super::compile(&format!("{head} list vlan '47'\n list vlan '46'\n{business}")).err().unwrap();assert!(error.contains("conflicts with a business VLAN"));
+        let error = super::compile(&format!(
+            "{head} list vlan '47'\n list vlan '46'\n{business}"
+        ))
+        .err()
+        .unwrap();
+        assert!(error.contains("conflicts with a business VLAN"));
     }
 
     #[test]
+    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC adapter")]
     fn configuration_outputs_only_business_intent_before_discovery() {
         let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'hwtc'\n option group 'g'\nconfig network 'n'\n option template 't'\n option vlan '66'\n list service_list 'OTHER'\n list port 'lan2'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '5g'";
         let cfg = super::compile(text).unwrap();
@@ -566,6 +601,7 @@ mod tests {
             .contains("omci_management"));
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
     fn hl202_internet_bridge_dhcp_and_second_radio_slots_compile_for_binding() {
         let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'a2'\n option template 't'\n option ssid 'base2'\n option radio '2g'\nconfig wifi 'a5'\n option template 't'\n option ssid 'base5'\n option radio '5g'\nconfig wifi 'b2'\n option template 't'\n option ssid 'TTTT'\n option radio '2g'\nconfig wifi 'b5'\n option template 't'\n option ssid 'YYYY'\n option radio '5g'\nconfig network 'iot'\n option template 't'\n option vlan '66'\n list service_list 'INTERNET'\n option priority '6'\n list ssid 'b2'\n list ssid 'b5'";
         let cfg = compile(text).unwrap();
@@ -660,6 +696,10 @@ mod tests {
             .contains("select at least one WAN Service List label"));
     }
     #[test]
+    #[cfg_attr(
+        not(all(feature = "device-hl202", feature = "device-hwtc")),
+        ignore = "requires both device contracts"
+    )]
     fn wpa2_uses_device_beacon_contract() {
         let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '2g'\n option security 'wpa2-psk'\n option key 'testpassword'";
         let cfg = compile(text).unwrap();
@@ -676,14 +716,39 @@ mod tests {
         }
     }
     #[test]
+    #[cfg_attr(
+        not(all(feature = "device-hl202", feature = "device-hwtc")),
+        ignore = "requires both device contracts"
+    )]
     fn wifi_security_modes_compile_expected_parameters() {
         // 1. None (Open)
         let text_none = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'open_net'\n option radio '2g'\n option security 'none'";
         let cfg_none = compile(text_none).unwrap();
         let p_none = &cfg_none.devices[0].items[0].parameters;
-        assert_eq!(p_none.iter().find(|p| p.name.ends_with(".BeaconType")).unwrap().value, "None");
-        assert_eq!(p_none.iter().find(|p| p.name.ends_with(".BasicEncryptionModes")).unwrap().value, "None");
-        assert_eq!(p_none.iter().find(|p| p.name.ends_with(".BasicAuthenticationMode")).unwrap().value, "None");
+        assert_eq!(
+            p_none
+                .iter()
+                .find(|p| p.name.ends_with(".BeaconType"))
+                .unwrap()
+                .value,
+            "None"
+        );
+        assert_eq!(
+            p_none
+                .iter()
+                .find(|p| p.name.ends_with(".BasicEncryptionModes"))
+                .unwrap()
+                .value,
+            "None"
+        );
+        assert_eq!(
+            p_none
+                .iter()
+                .find(|p| p.name.ends_with(".BasicAuthenticationMode"))
+                .unwrap()
+                .value,
+            "None"
+        );
         assert!(p_none.iter().all(|p| !p.name.contains("PreSharedKey")));
 
         // 2. WPA3-SAE
@@ -691,10 +756,34 @@ mod tests {
         let cfg_wpa3 = compile(text_wpa3).unwrap();
         for d in &cfg_wpa3.devices {
             let p = &d.items[0].parameters;
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".BeaconType")).unwrap().value, "WPA3");
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".IEEE11iEncryptionModes")).unwrap().value, "AESEncryption");
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".IEEE11iAuthenticationMode")).unwrap().value, "PSKAuthentication");
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".KeyPassphrase")).unwrap().value, "pass123456");
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".BeaconType"))
+                    .unwrap()
+                    .value,
+                "WPA3"
+            );
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".IEEE11iEncryptionModes"))
+                    .unwrap()
+                    .value,
+                "AESEncryption"
+            );
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".IEEE11iAuthenticationMode"))
+                    .unwrap()
+                    .value,
+                "PSKAuthentication"
+            );
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".KeyPassphrase"))
+                    .unwrap()
+                    .value,
+                "pass123456"
+            );
         }
 
         // 3. WPA2-PSK / WPA3-SAE mixed
@@ -702,9 +791,27 @@ mod tests {
         let cfg_wpa2_wpa3 = compile(text_wpa2_wpa3).unwrap();
         for d in &cfg_wpa2_wpa3.devices {
             let p = &d.items[0].parameters;
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".BeaconType")).unwrap().value, "WPA2/WPA3");
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".IEEE11iEncryptionModes")).unwrap().value, "AESEncryption");
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".KeyPassphrase")).unwrap().value, "pass123456");
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".BeaconType"))
+                    .unwrap()
+                    .value,
+                "WPA2/WPA3"
+            );
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".IEEE11iEncryptionModes"))
+                    .unwrap()
+                    .value,
+                "AESEncryption"
+            );
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".KeyPassphrase"))
+                    .unwrap()
+                    .value,
+                "pass123456"
+            );
         }
 
         // 4. WPA-PSK / WPA2-PSK mixed
@@ -712,20 +819,62 @@ mod tests {
         let cfg_wpa_wpa2 = compile(text_wpa_wpa2).unwrap();
         for d in &cfg_wpa_wpa2.devices {
             let p = &d.items[0].parameters;
-            let expected_beacon = if d.adapter == "hl202" { "WPA/WPA2" } else { "WPAand11i" };
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".BeaconType")).unwrap().value, expected_beacon);
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".WPAEncryptionModes")).unwrap().value, "TKIPandAESEncryption");
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".WPAAuthenticationMode")).unwrap().value, "PSKAuthentication");
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".IEEE11iEncryptionModes")).unwrap().value, "TKIPandAESEncryption");
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".IEEE11iAuthenticationMode")).unwrap().value, "PSKAuthentication");
-            assert_eq!(p.iter().find(|p| p.name.ends_with(".KeyPassphrase")).unwrap().value, "pass123456");
+            let expected_beacon = if d.adapter == "hl202" {
+                "WPA/WPA2"
+            } else {
+                "WPAand11i"
+            };
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".BeaconType"))
+                    .unwrap()
+                    .value,
+                expected_beacon
+            );
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".WPAEncryptionModes"))
+                    .unwrap()
+                    .value,
+                "TKIPandAESEncryption"
+            );
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".WPAAuthenticationMode"))
+                    .unwrap()
+                    .value,
+                "PSKAuthentication"
+            );
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".IEEE11iEncryptionModes"))
+                    .unwrap()
+                    .value,
+                "TKIPandAESEncryption"
+            );
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".IEEE11iAuthenticationMode"))
+                    .unwrap()
+                    .value,
+                "PSKAuthentication"
+            );
+            assert_eq!(
+                p.iter()
+                    .find(|p| p.name.ends_with(".KeyPassphrase"))
+                    .unwrap()
+                    .value,
+                "pass123456"
+            );
         }
 
         // 5. Keep current key (empty security)
         let text_keep = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'keep_net'\n option radio '2g'\n option security ''";
         let cfg_keep = compile(text_keep).unwrap();
         let p_keep = &cfg_keep.devices[0].items[0].parameters;
-        assert!(p_keep.iter().all(|p| !p.name.contains("BeaconType") && !p.name.contains("KeyPassphrase")));
+        assert!(p_keep
+            .iter()
+            .all(|p| !p.name.contains("BeaconType") && !p.name.contains("KeyPassphrase")));
     }
     #[test]
     fn rejects_legacy_and_acs_management() {
@@ -733,6 +882,7 @@ mod tests {
         assert!(compile("config template 't'\nconfig network 'n'\n option template 't'\n option type 'tr069'\n option vlan '46'").err().unwrap().contains("unsupported option type"));
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC adapter")]
     fn enabled_ssid_requires_radio_but_disabled_ssid_does_not_disable_shared_radio() {
         let text="config device 'd'\n option optical_sn 'HWTC3C6DE5B3'\n option cwmp_id 'test:hwtc'\n option adapter 'hwtc'\nconfig wifi_profile 'a'\n option ssid 'enabled'\n option enabled '1'\nconfig wifi_profile 'b'\n option ssid 'disabled'\n option enabled '0'\nconfig ssid 'a'\n option device 'd'\n option profile 'a'\n option radio '2g'\n option slot '1'\nconfig ssid 'b'\n option device 'd'\n option profile 'b'\n option radio '2g'\n option slot '2'";
         let text = text
@@ -769,6 +919,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
     fn wlan_cleanup_defaults_to_disable_and_explicit_policy_is_preserved() {
         let base="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'";
         assert_eq!(compile(base).unwrap().devices[0].wifi_cleanup, "disable");
@@ -779,6 +930,7 @@ mod tests {
         assert!(compile(&format!("{base}\n option wifi_cleanup 'remove-everything'")).is_err());
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
     fn group_expansion_keeps_creation_order_and_no_public_indices() {
         let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig network 'z'\n option template 't'\n option vlan '100'\n list service_list 'INTERNET'\nconfig network 'a'\n option template 't'\n option vlan '43'\n list service_list 'OTHER'\nconfig wifi 'w5'\n option template 't'\n option ssid 'five'\n option radio '5g'\nconfig wifi 'w2'\n option template 't'\n option ssid 'two'\n option radio '2g'";
         let cfg = compile(text).unwrap();

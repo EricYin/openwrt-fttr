@@ -91,7 +91,10 @@ impl Fixture {
         let length: usize = headers
             .lines()
             .find_map(|line| line.strip_prefix("Content-Length: "))
-            .unwrap()
+            .unwrap_or_else(|| {
+                assert!(headers.starts_with("HTTP/1.1 204"));
+                "0"
+            })
             .parse()
             .unwrap();
         let mut bytes = vec![0; length];

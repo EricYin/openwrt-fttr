@@ -50,7 +50,10 @@ pub fn compile_wlan(
         add("RadioEnabled", "1".into(), ParameterKind::Boolean, false);
     }
     let security = intent.security.or_else(|| {
-        intent.key.as_ref().map(|_| crate::provisioning::model::WifiSecurity::Wpa2Psk)
+        intent
+            .key
+            .as_ref()
+            .map(|_| crate::provisioning::model::WifiSecurity::Wpa2Psk)
     });
     if let Some(sec) = security {
         use crate::provisioning::model::WifiSecurity;
@@ -105,12 +108,7 @@ pub fn compile_wlan(
                 if !(8..=63).contains(&key.len()) {
                     return Err("WPA3 key must be 8..63 bytes".into());
                 }
-                add(
-                    "BeaconType",
-                    "WPA3".into(),
-                    ParameterKind::String,
-                    false,
-                );
+                add("BeaconType", "WPA3".into(), ParameterKind::String, false);
                 add(
                     "IEEE11iEncryptionModes",
                     "AESEncryption".into(),
@@ -516,6 +514,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC contract")]
     fn intent_resolves_actual_instances_and_rejects_management() {
         let c = super::super::registry::lookup("hwtc-hw").unwrap();
         #[cfg(feature = "device-hwtc")]

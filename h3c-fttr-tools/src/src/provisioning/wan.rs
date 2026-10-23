@@ -1,5 +1,5 @@
 //! Discover every connection, protect fallback services, then reconcile in order.
-use super::model::{ItemKind, ItemOutcome, TaskOutcome, WanPhase, WanOwnershipState};
+use super::model::{ItemKind, ItemOutcome, TaskOutcome, WanOwnershipState, WanPhase};
 use super::policy::protected;
 use super::{acs, config::Device};
 use serde::{Deserialize, Serialize};
@@ -128,7 +128,11 @@ impl Reconciler {
             self.task = Some(id);
             self.stage = stage;
         } else {
-            self.fail(device, ItemOutcome::Failed, "cannot queue WAN lifecycle RPC");
+            self.fail(
+                device,
+                ItemOutcome::Failed,
+                "cannot queue WAN lifecycle RPC",
+            );
         }
     }
     fn fail(&mut self, device: &Device, state: ItemOutcome, reason: &str) {
@@ -204,8 +208,13 @@ impl Reconciler {
             if matches!(state, TaskOutcome::Queued | TaskOutcome::Sent) {
                 return false;
             }
-            if !matches!(state, TaskOutcome::Completed | TaskOutcome::AcceptedPendingApply) {
-                if matches!(state, TaskOutcome::Fault | TaskOutcome::Expired) && self.stage == WanPhase::AddingParent {
+            if !matches!(
+                state,
+                TaskOutcome::Completed | TaskOutcome::AcceptedPendingApply
+            ) {
+                if matches!(state, TaskOutcome::Fault | TaskOutcome::Expired)
+                    && self.stage == WanPhase::AddingParent
+                {
                     if let Some((id, _)) = &self.current {
                         self.owned.remove(id);
                     }
@@ -315,7 +324,11 @@ impl Reconciler {
                         let Some(priority) =
                             value(contract.priority.name).and_then(|v| v.parse::<u32>().ok())
                         else {
-                            self.fail(device, ItemOutcome::Blocked, "incomplete parent priority readback");
+                            self.fail(
+                                device,
+                                ItemOutcome::Blocked,
+                                "incomplete parent priority readback",
+                            );
                             self.stage = WanPhase::Done;
                             return true;
                         };
@@ -346,7 +359,11 @@ impl Reconciler {
                         .and_then(|n| n.parse::<u32>().ok())
                         .filter(|n| *n > 0);
                     let Some(n) = n else {
-                        self.fail(device, ItemOutcome::Unknown, "AddObject did not return an instance");
+                        self.fail(
+                            device,
+                            ItemOutcome::Unknown,
+                            "AddObject did not return an instance",
+                        );
                         return false;
                     };
                     self.parents.insert(n);
@@ -794,7 +811,10 @@ impl Reconciler {
                 self.results.insert(id.clone(),json!({"state":"blocked","reason":"untagged INTERNET is reserved for the fallback network"}));
                 continue;
             }
-            if let Some(old) = previous.get(id).filter(|o| o.state != WanOwnershipState::Ready) {
+            if let Some(old) = previous
+                .get(id)
+                .filter(|o| o.state != WanOwnershipState::Ready)
+            {
                 let mut old = old.clone();
                 if old.parent == 0 {
                     let candidates: Vec<_> = old
@@ -1101,6 +1121,7 @@ mod tests {
         json!({"state":"completed","result":{"parameters":parameters}})
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC contract")]
     fn auto_creation_uses_returned_parent_and_child_instances() {
         let mut d = device();
         let mut r = Reconciler::new(&d, BTreeMap::new(), true);
@@ -1181,6 +1202,7 @@ mod tests {
         assert!(d.items[0].blocked.is_some());
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC contract")]
     fn plan_allocates_nothing_and_unknown_add_is_not_replayed() {
         let mut d = device();
         let mut r = Reconciler::new(&d, BTreeMap::new(), true);
@@ -1219,6 +1241,7 @@ mod tests {
         assert!(r.owned.is_empty());
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC contract")]
     fn pruning_refuses_a_management_or_reassigned_wan() {
         let mut d = device();
         d.items.clear();
@@ -1248,6 +1271,7 @@ mod tests {
         assert!(!protected("OTHER", false));
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC contract")]
     fn discovery_replaces_stale_registry_and_preserves_order() {
         let mut d = device();
         let mut r = Reconciler::new(&d, BTreeMap::new(), true);
@@ -1277,6 +1301,7 @@ mod tests {
             .contains("12.WANIPConnection.2."));
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 contract")]
     fn shared_protected_parent_blocks_mutation() {
         let mut d = device();
         d.adapter = "hl202".into();
@@ -1306,6 +1331,7 @@ mod tests {
         assert!(r.actions.is_empty());
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC contract")]
     fn interrupted_add_recovers_only_a_unique_empty_parent() {
         let mut d = device();
         let old = Owned {
@@ -1328,6 +1354,7 @@ mod tests {
         assert_eq!(r.results["internet"]["state"], "unknown");
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC contract")]
     fn surplus_deletes_child_then_only_an_empty_parent() {
         let mut d = device();
         d.items.clear();
@@ -1379,6 +1406,7 @@ mod tests {
         });
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC contract")]
     fn final_inventory_detects_an_extra_connection() {
         let mut d = device();
         let mut r = Reconciler::new(&d, BTreeMap::new(), true);
@@ -1399,6 +1427,7 @@ mod tests {
         assert_eq!(r.owned["internet"].parent, 4);
     }
     #[test]
+    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC contract")]
     fn reused_instance_holes_are_remapped_in_numeric_order() {
         let mut d = device();
         let mut second = d.items[0].clone();

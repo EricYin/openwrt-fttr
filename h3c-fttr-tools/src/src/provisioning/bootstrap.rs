@@ -1,11 +1,11 @@
 //! Per-device ACS bootstrap; MQTT, settings verification and Inform are independent evidence.
 use super::model::{Device, Management};
+use crate::mqtt_identity::Registry;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::mqtt_identity::Registry;
 
 const STATE_FILE: &str = "/var/lib/fttr/acs-bootstrap.json";
 
@@ -48,7 +48,7 @@ struct Record {
     settings_verified_at: Option<u64>,
     selected_vlan: Option<u32>,
     last_inform: Option<u64>,
-    expected_acs_url:String,
+    expected_acs_url: String,
     last_error: Option<String>,
     transport_epoch: u64,
     completed_authorization: u64,
@@ -198,7 +198,7 @@ struct Job {
     persist_matching: bool,
     vlans: Vec<u32>,
     priority: u32,
-    authorization_epoch:u64,
+    authorization_epoch: u64,
 }
 
 pub(super) fn retain_devices(ids: &std::collections::BTreeSet<String>) {
@@ -222,14 +222,16 @@ pub(super) fn retain_devices(ids: &std::collections::BTreeSet<String>) {
 
 /// Scheduler entry point. Remote commands execute outside controller and bootstrap locks.
 pub(super) fn tick(observation: Observation<'_>) {
-    let Ok(sources) = crate::mqtt_identity::shared().lock() else { return; };
+    let Ok(sources) = crate::mqtt_identity::shared().lock() else {
+        return;
+    };
     let mut c = coordinator().lock().unwrap();
     let job = c.schedule(observation, &sources);
     drop(sources);
     c.persist();
     drop(c);
     if let Some(job) = job {
-        std::thread::spawn(move || {
+        crate::runtime::spawn_service("CWMP bootstrap", async move {
             run(
                 job.id,
                 job.generation,
@@ -240,6 +242,7 @@ pub(super) fn tick(observation: Observation<'_>) {
                 job.priority,
                 job.authorization_epoch,
             )
+            .await
         });
     }
 }
@@ -247,7 +250,10 @@ pub(super) fn tick(observation: Observation<'_>) {
 impl Coordinator {
     fn restart(&mut self, time: u64) {
         for record in self.records.values_mut() {
-            record.invalidate(time, "daemon restarted; fresh transport and Inform required");
+            record.invalidate(
+                time,
+                "daemon restarted; fresh transport and Inform required",
+            );
         }
     }
 
@@ -264,23 +270,35 @@ impl Coordinator {
             authorization,
         } = observation;
         let automatic = sources.automatic_source(&device.optical_sn, time);
-        let automatic_target = automatic.as_ref().ok().and_then(|source| source.map(|(mac, _)| mac));
+        let automatic_target = automatic
+            .as_ref()
+            .ok()
+            .and_then(|source| source.map(|(mac, _)| mac));
         let binding_source = if automatic_target.is_some() {
             "onu_link"
         } else {
             "unresolved"
         };
         let target = automatic_target;
-        let transport = automatic.as_ref().ok().and_then(|source| source.map(|(_, source)| source.epoch));
+        let transport = automatic
+            .as_ref()
+            .ok()
+            .and_then(|source| source.map(|(_, source)| source.epoch));
         let r = self.records.entry(device.id.clone()).or_default();
         if r.last_observed_time > time {
             r.invalidate(time, "system clock moved backwards; fresh Inform required");
             r.initial_inform = Some(at);
         }
         r.last_observed_time = time;
-        let desired = format!("{}-{}",version(device, management, target),authorization.map(|(epoch,_)|epoch).unwrap_or_default());
+        let desired = format!(
+            "{}-{}",
+            version(device, management, target),
+            authorization.map(|(epoch, _)| epoch).unwrap_or_default()
+        );
         let initialized = !r.desired_version.is_empty();
-        if r.connection_request_enabled.is_some_and(|enabled| enabled != device.connection_request.enabled) {
+        if r.connection_request_enabled
+            .is_some_and(|enabled| enabled != device.connection_request.enabled)
+        {
             r.completed_authorization = 0;
         }
         r.connection_request_enabled = Some(device.connection_request.enabled);
@@ -327,16 +345,22 @@ impl Coordinator {
             );
         }
         r.last_inform = at;
-        r.expected_acs_url=management.map(|m|m.acs_url.clone()).unwrap_or_default();
+        r.expected_acs_url = management.map(|m| m.acs_url.clone()).unwrap_or_default();
         // A recent Inform proves reachability, but does not prove that the
         // currently authorized ACS credentials have been written to the CPE.
         // Require a post-readback Inform before declaring the bootstrap ready.
         let settings_verified = device.adapter != "hl202"
             || !cfg!(feature = "device-hl202")
-            || r.settings_verified_at.is_some_and(|verified| at.is_some_and(|at| at >= verified));
+            || r.settings_verified_at
+                .is_some_and(|verified| at.is_some_and(|at| at >= verified));
         let fresh = acs_available
             && settings_verified
-            && r.fresh_inform(at, time, device.connection_request.effective_freshness(freshness), online);
+            && r.fresh_inform(
+                at,
+                time,
+                device.connection_request.effective_freshness(freshness),
+                online,
+            );
         if r.state == Phase::Ready && !fresh {
             r.invalidate(
                 time,
@@ -344,7 +368,9 @@ impl Coordinator {
             );
         }
         if fresh {
-            if let Some((epoch, _))=authorization {r.completed_authorization=epoch;}
+            if let Some((epoch, _)) = authorization {
+                r.completed_authorization = epoch;
+            }
             r.set_phase(
                 Phase::Ready,
                 time,
@@ -366,7 +392,9 @@ impl Coordinator {
                 time,
                 "local ACS is disabled, unavailable or has a listener error",
             );
-        } else if authorization.is_none_or(|(epoch,automatic)|!automatic && (epoch==0 || epoch==r.completed_authorization)) {
+        } else if authorization.is_none_or(|(epoch, automatic)| {
+            !automatic && (epoch == 0 || epoch == r.completed_authorization)
+        }) {
             r.set_phase(Phase::AwaitingApply,time,"management drift or reset detected; apply management configuration to authorize recovery");
         } else if device.adapter != "hl202" || !cfg!(feature = "device-hl202") {
             r.set_phase(Phase::ManualRequired, time, "automatic ACS bootstrap is unavailable for this adapter; follow the current management settings");
@@ -395,7 +423,7 @@ impl Coordinator {
                     persist_matching: r.settings_verified_at.is_none() || r.last_error.is_some(),
                     vlans: management.vlans.clone(),
                     priority: management.priority,
-                    authorization_epoch:authorization.map(|(epoch,_)|epoch).unwrap_or_default(),
+                    authorization_epoch: authorization.map(|(epoch, _)| epoch).unwrap_or_default(),
                 });
             }
             if r.state != Phase::WaitingInform {
@@ -435,7 +463,7 @@ fn progress(id: &str, generation: u64, state: Phase, reason: &str) -> bool {
     if r.generation != generation || r.worker != Some(generation) || r.state == Phase::Ready {
         return false;
     }
-    if matches!(state,Phase::Configuring|Phase::ConfiguringManagementWan) {
+    if matches!(state, Phase::Configuring | Phase::ConfiguringManagementWan) {
         r.settings_verified_at = None;
     }
     r.set_phase(state, now(), reason);
@@ -443,47 +471,147 @@ fn progress(id: &str, generation: u64, state: Phase, reason: &str) -> bool {
     true
 }
 
-fn run(id: String, generation: u64, target: String, url: String, persist_matching: bool, vlans: Vec<u32>, priority: u32, authorization_epoch:u64) {
-    let result = (|| {
-        let credentials=super::management_network::credentials(authorization_epoch).ok_or("management authorization changed before execution")?;
-        if !progress(&id, generation, Phase::DiscoveringManagementWan, "discovering the dedicated TR069 management WAN") { return Ok(false); }
-        let selected=crate::devices::ensure_mqtt_management_wan(&target, &vlans, priority,persist_matching,|stage|super::management_network::credentials(authorization_epoch).is_some()&&match stage {
-            crate::devices::ManagementWanStage::Configuring=>progress(&id,generation,Phase::ConfiguringManagementWan,"conditionally configuring and persisting the dedicated TR069 WAN"),
-            crate::devices::ManagementWanStage::Verifying=>progress(&id,generation,Phase::VerifyingManagementWan,"reading back management VLAN, routing, DHCP and unbound interfaces"),
-        })?;
-        {let mut c=coordinator().lock().unwrap();let Some(r)=c.records.get_mut(&id) else{return Ok(false);};if r.generation!=generation||r.worker!=Some(generation){return Ok(false);}r.selected_vlan=Some(selected);c.persist();}
-        if !progress(&id,generation,Phase::Reading,"reading CWMP configuration after management WAN verification") {return Ok(false);}
-        let matched = crate::devices::read_authenticated_cwmp_settings(&target, &url,&credentials)?;
+async fn progress_async(id: &str, generation: u64, state: Phase, reason: &'static str) -> bool {
+    let id = id.to_owned();
+    crate::runtime::spawn_blocking(move || progress(&id, generation, state, reason))
+        .await
+        .unwrap_or(false)
+}
+
+async fn run(
+    id: String,
+    generation: u64,
+    target: String,
+    url: String,
+    persist_matching: bool,
+    vlans: Vec<u32>,
+    priority: u32,
+    authorization_epoch: u64,
+) {
+    let result = async {
+        let credentials = super::management_network::credentials(authorization_epoch)
+            .ok_or("management authorization changed before execution")?;
+        if !progress_async(
+            &id,
+            generation,
+            Phase::DiscoveringManagementWan,
+            "discovering the dedicated TR069 management WAN",
+        )
+        .await
+        {
+            return Ok(false);
+        }
+        let selected = crate::devices::ensure_mqtt_management_wan_async(
+            &target,
+            &vlans,
+            priority,
+            persist_matching,
+            |stage| {
+                let id = id.clone();
+                async move {
+                    if super::management_network::credentials(authorization_epoch).is_none() {
+                        return false;
+                    }
+                    match stage {
+                        crate::devices::ManagementWanStage::Configuring => {
+                            progress_async(
+                                &id,
+                                generation,
+                                Phase::ConfiguringManagementWan,
+                                "conditionally configuring and persisting the dedicated TR069 WAN",
+                            )
+                            .await
+                        }
+                        crate::devices::ManagementWanStage::Verifying => progress_async(
+                            &id,
+                            generation,
+                            Phase::VerifyingManagementWan,
+                            "reading back management VLAN, routing, DHCP and unbound interfaces",
+                        )
+                        .await,
+                    }
+                }
+            },
+        )
+        .await?;
+        let record_id = id.clone();
+        if !crate::runtime::spawn_blocking(move || {
+            let mut c = coordinator().lock().unwrap();
+            let Some(r) = c.records.get_mut(&record_id) else {
+                return false;
+            };
+            if r.generation != generation || r.worker != Some(generation) {
+                return false;
+            }
+            r.selected_vlan = Some(selected);
+            c.persist();
+            true
+        })
+        .await
+        .map_err(|_| "bootstrap persistence worker failed")?
+        {
+            return Ok(false);
+        }
+        if !progress_async(
+            &id,
+            generation,
+            Phase::Reading,
+            "reading CWMP configuration after management WAN verification",
+        )
+        .await
+        {
+            return Ok(false);
+        }
+        let matched =
+            crate::devices::read_authenticated_cwmp_settings_async(&target, &url, &credentials)
+                .await?;
         if !matched || persist_matching {
-            if !progress(
+            if !progress_async(
                 &id,
                 generation,
                 Phase::Configuring,
                 "conditionally correcting and persisting CWMP settings",
-            ) {
+            )
+            .await
+            {
                 return Ok(false);
             }
-            if super::management_network::credentials(authorization_epoch).is_none() {return Ok(false);}
-            crate::devices::configure_authenticated_cwmp_settings(&target, &url,&credentials)?;
+            if super::management_network::credentials(authorization_epoch).is_none() {
+                return Ok(false);
+            }
+            crate::devices::configure_authenticated_cwmp_settings_async(
+                &target,
+                &url,
+                &credentials,
+            )
+            .await?;
         }
-        if !progress(
+        if !progress_async(
             &id,
             generation,
             Phase::Verifying,
             "independently reading back CWMP settings",
-        ) {
+        )
+        .await
+        {
             return Ok(false);
         }
-        if !crate::devices::read_authenticated_cwmp_settings(&target, &url,&credentials)? {
+        if !crate::devices::read_authenticated_cwmp_settings_async(&target, &url, &credentials)
+            .await?
+        {
             return Err("CWMP settings do not match after configuration".into());
         }
         Ok(true)
-    })();
-    let mut c = coordinator().lock().unwrap();
-    if let Some(r) = c.records.get_mut(&id) {
-        r.finish(generation, result, now());
     }
-    c.persist();
+    .await;
+    let _ = crate::runtime::spawn_blocking(move || {
+        let mut c = coordinator().lock().unwrap();
+        if let Some(r) = c.records.get_mut(&id) {
+            r.finish(generation, result, now());
+        }
+        c.persist();
+    })
+    .await;
 }
 
 fn public_url(url: &str) -> String {
@@ -507,8 +635,25 @@ pub(super) fn is_ready(id: &str) -> bool {
         .get(id)
         .is_some_and(|r| r.state == Phase::Ready)
 }
-pub(super) fn is_ready_for_management(id:&str,sn:&str,url:&str,epoch:u64)->bool {coordinator().lock().unwrap().records.get(id).is_some_and(|r|r.state==Phase::Ready&&r.optical_sn==sn&&r.expected_acs_url==url&&r.completed_authorization==epoch)}
-pub(super) fn omci_write_allowed(id:&str,epoch:u64,automatic:bool)->bool {let c=coordinator().lock().unwrap();c.records.get(id).is_none_or(|r|r.state!=Phase::Ready&&(automatic||(epoch!=0&&r.completed_authorization!=epoch)))}
+pub(super) fn is_ready_for_management(id: &str, sn: &str, url: &str, epoch: u64) -> bool {
+    coordinator()
+        .lock()
+        .unwrap()
+        .records
+        .get(id)
+        .is_some_and(|r| {
+            r.state == Phase::Ready
+                && r.optical_sn == sn
+                && r.expected_acs_url == url
+                && r.completed_authorization == epoch
+        })
+}
+pub(super) fn omci_write_allowed(id: &str, epoch: u64, automatic: bool) -> bool {
+    let c = coordinator().lock().unwrap();
+    c.records.get(id).is_none_or(|r| {
+        r.state != Phase::Ready && (automatic || (epoch != 0 && r.completed_authorization != epoch))
+    })
+}
 
 pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Value {
     let Ok(sources) = crate::mqtt_identity::shared().lock() else {
@@ -523,10 +668,7 @@ pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Va
     view["persistence_error"] = json!(c.persistence_error);
     view["link_identity_error"] = json!(sources.topology_error());
     view["listener"] = json!({"enabled":acs["enabled"],"listen":acs["listen"],"path":acs["path"],"error":acs["error"]});
-    view["mqtt_last_seen"] = json!(r
-        .mqtt_target
-        .as_ref()
-        .and_then(|t| sources.last_seen(t)));
+    view["mqtt_last_seen"] = json!(r.mqtt_target.as_ref().and_then(|t| sources.last_seen(t)));
     if let Some(m) = management {
         let url = public_url(&m.acs_url);
         view["desired"] = json!({"vlan":r.selected_vlan.filter(|v|m.vlans.contains(v)).unwrap_or(m.vlan),"vlans":m.vlans,"priority":m.priority,"acs_url":url});
@@ -574,16 +716,27 @@ mod tests {
     }
     impl std::ops::Deref for TestCoordinator {
         type Target = Coordinator;
-        fn deref(&self) -> &Coordinator { &self.coordinator }
+        fn deref(&self) -> &Coordinator {
+            &self.coordinator
+        }
     }
     impl std::ops::DerefMut for TestCoordinator {
-        fn deref_mut(&mut self) -> &mut Coordinator { &mut self.coordinator }
+        fn deref_mut(&mut self) -> &mut Coordinator {
+            &mut self.coordinator
+        }
     }
     impl TestCoordinator {
         fn schedule(&mut self, observation: Observation<'_>) -> Option<Job> {
-            let onus = self.links.values().collect::<std::collections::BTreeSet<_>>()
-                .into_iter().enumerate().map(|(index, sn)| (u16::try_from(index).unwrap(), sn.clone())).collect();
-            self.sources.update_topology(onus, Ok(self.links.clone()), observation.time);
+            let onus = self
+                .links
+                .values()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .enumerate()
+                .map(|(index, sn)| (u16::try_from(index).unwrap(), sn.clone()))
+                .collect();
+            self.sources
+                .update_topology(onus, Ok(self.links.clone()), observation.time);
             self.coordinator.schedule(observation, &self.sources)
         }
     }
@@ -621,7 +774,7 @@ mod tests {
             freshness: 180,
             time,
             acs_available: true,
-            authorization: Some((1,true)),
+            authorization: Some((1, true)),
         })
     }
     #[cfg(feature = "device-hl202")]
@@ -629,10 +782,21 @@ mod tests {
     fn registry_admission_cannot_be_bypassed_by_bootstrap() {
         let mut c = TestCoordinator::default();
         let d = device("bounded", "hl202");
-        let m = Management { vlans: vec![46], vlan: 46, priority: 0, acs_url: "http://192.0.2.1/cwmp".into() };
-        c.links = (0..64).map(|index| (format!("02000000{index:04X}"), "OTHER12345678".into())).collect();
+        let m = Management {
+            vlans: vec![46],
+            vlan: 46,
+            priority: 0,
+            acs_url: "http://192.0.2.1/cwmp".into(),
+        };
+        c.links = (0..64)
+            .map(|index| (format!("02000000{index:04X}"), "OTHER12345678".into()))
+            .collect();
         c.links.insert("02AABBCCDDEE".into(), d.optical_sn.clone());
-        c.sources.update_topology(BTreeMap::from([(1, d.optical_sn.clone())]), Ok(c.links.clone()), 100);
+        c.sources.update_topology(
+            BTreeMap::from([(1, d.optical_sn.clone())]),
+            Ok(c.links.clone()),
+            100,
+        );
         for index in 0..64 {
             c.sources.observe(&format!("02000000{index:04X}"), 100);
         }
@@ -650,11 +814,19 @@ mod tests {
     fn reconnect_invalidates_verified_settings_before_a_fresh_inform_can_mark_ready() {
         let mut c = TestCoordinator::default();
         let d = device("reconnect", "hl202");
-        let m = Management { vlans: vec![46], vlan: 46, priority: 0, acs_url: "http://192.0.2.1/cwmp".into() };
+        let m = Management {
+            vlans: vec![46],
+            vlan: 46,
+            priority: 0,
+            acs_url: "http://192.0.2.1/cwmp".into(),
+        };
         let mac = "02AABBCCDDEE";
         c.sources.observe(mac, 100);
         let first = schedule(&mut c, &d, &m, Some(mac), 100, None).unwrap();
-        c.records.get_mut(&d.id).unwrap().finish(first.generation, Ok(true), 101);
+        c.records
+            .get_mut(&d.id)
+            .unwrap()
+            .finish(first.generation, Ok(true), 101);
         let epoch = c.records[&d.id].transport_epoch;
 
         c.sources.observe(mac, 161);
@@ -671,11 +843,19 @@ mod tests {
     fn restart_discards_persisted_settings_even_when_the_source_epoch_matches() {
         let mut c = TestCoordinator::default();
         let d = device("restart", "hl202");
-        let m = Management { vlans: vec![46], vlan: 46, priority: 0, acs_url: "http://192.0.2.1/cwmp".into() };
+        let m = Management {
+            vlans: vec![46],
+            vlan: 46,
+            priority: 0,
+            acs_url: "http://192.0.2.1/cwmp".into(),
+        };
         let mac = "02AABBCCDDEE";
         c.sources.observe(mac, 100);
         let first = schedule(&mut c, &d, &m, Some(mac), 100, None).unwrap();
-        c.records.get_mut(&d.id).unwrap().finish(first.generation, Ok(true), 101);
+        c.records
+            .get_mut(&d.id)
+            .unwrap()
+            .finish(first.generation, Ok(true), 101);
         schedule(&mut c, &d, &m, None, 103, Some(102));
         assert_eq!(c.records[&d.id].state, Phase::Ready);
         let bytes = serde_json::to_vec(&c.records).unwrap();
@@ -687,32 +867,94 @@ mod tests {
         let next = schedule(&mut restarted, &d, &m, Some(mac), 202, Some(202)).unwrap();
 
         assert_ne!(next.generation, first.generation);
-        assert_eq!(restarted.records[&d.id].transport_epoch, c.records[&d.id].transport_epoch);
+        assert_eq!(
+            restarted.records[&d.id].transport_epoch,
+            c.records[&d.id].transport_epoch
+        );
         assert!(restarted.records[&d.id].settings_verified_at.is_none());
     }
 
     #[cfg(feature = "device-hl202")]
     #[test]
     fn manual_authorization_is_consumed_by_fresh_inform_and_reset_needs_a_new_grant() {
-        let mut c=TestCoordinator::default();let d=device("manual","hl202");let m=Management{vlans:vec![46],vlan:46,priority:0,acs_url:"http://192.0.2.1:7547/cwmp".into()};let mac="02AABBCCDDEE";
-        c.links.insert(mac.into(),d.optical_sn.clone());c.sources.observe(mac,100);
-        let observe=|c:&mut TestCoordinator,time,at,new_boot,epoch|c.schedule(Observation{device:&d,management:Some(&m),last_inform:at,online:true,new_boot,freshness:180,time,acs_available:true,authorization:Some((epoch,false))});
-        let first=observe(&mut c,100,None,false,1).unwrap();c.records.get_mut(&d.id).unwrap().finish(first.generation,Ok(true),101);assert!(observe(&mut c,103,Some(102),false,1).is_none());assert_eq!(c.records[&d.id].state,Phase::Ready);
-        assert!(observe(&mut c,104,None,true,1).is_none());assert_eq!(c.records[&d.id].state,Phase::AwaitingApply);
-        let next=observe(&mut c,105,None,false,2).unwrap();assert_eq!(next.authorization_epoch,2);assert_ne!(next.generation,first.generation);
+        let mut c = TestCoordinator::default();
+        let d = device("manual", "hl202");
+        let m = Management {
+            vlans: vec![46],
+            vlan: 46,
+            priority: 0,
+            acs_url: "http://192.0.2.1:7547/cwmp".into(),
+        };
+        let mac = "02AABBCCDDEE";
+        c.links.insert(mac.into(), d.optical_sn.clone());
+        c.sources.observe(mac, 100);
+        let observe = |c: &mut TestCoordinator, time, at, new_boot, epoch| {
+            c.schedule(Observation {
+                device: &d,
+                management: Some(&m),
+                last_inform: at,
+                online: true,
+                new_boot,
+                freshness: 180,
+                time,
+                acs_available: true,
+                authorization: Some((epoch, false)),
+            })
+        };
+        let first = observe(&mut c, 100, None, false, 1).unwrap();
+        c.records
+            .get_mut(&d.id)
+            .unwrap()
+            .finish(first.generation, Ok(true), 101);
+        assert!(observe(&mut c, 103, Some(102), false, 1).is_none());
+        assert_eq!(c.records[&d.id].state, Phase::Ready);
+        assert!(observe(&mut c, 104, None, true, 1).is_none());
+        assert_eq!(c.records[&d.id].state, Phase::AwaitingApply);
+        let next = observe(&mut c, 105, None, false, 2).unwrap();
+        assert_eq!(next.authorization_epoch, 2);
+        assert_ne!(next.generation, first.generation);
     }
     #[cfg(feature = "device-hl202")]
     #[test]
     fn existing_inform_does_not_skip_mqtt_settings_readback_and_post_write_inform_is_required() {
-        let mut c=TestCoordinator::default();let d=device("manual","hl202");let m=Management{vlans:vec![46],vlan:46,priority:0,acs_url:"http://192.0.2.1:7547/cwmp".into()};let mac="02AABBCCDDEE";
-        c.links.insert(mac.into(),d.optical_sn.clone());c.sources.observe(mac,100);
-        c.records.insert(d.id.clone(),Record{desired_version:format!("{}-1",version(&d,Some(&m),Some(mac))),optical_sn:d.optical_sn.clone(),initial_inform:Some(Some(90)),..Default::default()});
-        let first=schedule(&mut c,&d,&m,Some(mac),100,Some(95)).expect("fresh existing Inform must not skip credential readback");
-        c.records.get_mut(&d.id).unwrap().finish(first.generation,Ok(true),101);
-        assert!(schedule(&mut c,&d,&m,Some(mac),102,Some(95)).is_none());
-        assert_ne!(c.records[&d.id].state,Phase::Ready,"an Inform predating settings verification cannot confirm the new credentials");
-        assert!(schedule(&mut c,&d,&m,Some(mac),103,Some(102)).is_none());
-        assert_eq!(c.records[&d.id].state,Phase::Ready,"a subsequent Inform confirms the verified settings");
+        let mut c = TestCoordinator::default();
+        let d = device("manual", "hl202");
+        let m = Management {
+            vlans: vec![46],
+            vlan: 46,
+            priority: 0,
+            acs_url: "http://192.0.2.1:7547/cwmp".into(),
+        };
+        let mac = "02AABBCCDDEE";
+        c.links.insert(mac.into(), d.optical_sn.clone());
+        c.sources.observe(mac, 100);
+        c.records.insert(
+            d.id.clone(),
+            Record {
+                desired_version: format!("{}-1", version(&d, Some(&m), Some(mac))),
+                optical_sn: d.optical_sn.clone(),
+                initial_inform: Some(Some(90)),
+                ..Default::default()
+            },
+        );
+        let first = schedule(&mut c, &d, &m, Some(mac), 100, Some(95))
+            .expect("fresh existing Inform must not skip credential readback");
+        c.records
+            .get_mut(&d.id)
+            .unwrap()
+            .finish(first.generation, Ok(true), 101);
+        assert!(schedule(&mut c, &d, &m, Some(mac), 102, Some(95)).is_none());
+        assert_ne!(
+            c.records[&d.id].state,
+            Phase::Ready,
+            "an Inform predating settings verification cannot confirm the new credentials"
+        );
+        assert!(schedule(&mut c, &d, &m, Some(mac), 103, Some(102)).is_none());
+        assert_eq!(
+            c.records[&d.id].state,
+            Phase::Ready,
+            "a subsequent Inform confirms the verified settings"
+        );
     }
     #[cfg(feature = "device-hl202")]
     #[test]
@@ -749,9 +991,16 @@ mod tests {
         assert!(schedule(&mut c, &d, &m, None, 105, None).is_none());
         assert!(c.records[&d.id].reason.contains("ambiguous"));
         c.sources.observe(mac, 170);
-        c.sources.update_topology(BTreeMap::from([(1, d.optical_sn.clone())]), Ok(c.links.clone()), 170);
+        c.sources.update_topology(
+            BTreeMap::from([(1, d.optical_sn.clone())]),
+            Ok(c.links.clone()),
+            170,
+        );
         assert_eq!(
-            c.sources.automatic_source(&d.optical_sn, 170).unwrap().map(|(mac, _)|mac.to_owned()),
+            c.sources
+                .automatic_source(&d.optical_sn, 170)
+                .unwrap()
+                .map(|(mac, _)| mac.to_owned()),
             Some(mac.into())
         );
     }

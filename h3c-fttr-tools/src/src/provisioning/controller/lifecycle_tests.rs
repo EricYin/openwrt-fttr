@@ -1,5 +1,5 @@
-use super::*;
 use super::tests::operation;
+use super::*;
 
 fn configured() -> Controller {
     let op = operation(OperationPhase::Completed, false);
@@ -7,23 +7,37 @@ fn configured() -> Controller {
     let mut c = Controller::default();
     c.config.devices.push(device.clone());
     c.recovered.insert(device.id.clone(), op.view());
-    c.management.insert(device.id.clone(), json!({"state":"online"}));
+    c.management
+        .insert(device.id.clone(), json!({"state":"online"}));
     c.last_boot.insert(device.id.clone(), 10);
     c.last_online.insert(device.id.clone());
-    c.omci_management.insert(device.optical_sn.clone(), json!({"state":"verified"}));
+    c.omci_management
+        .insert(device.optical_sn.clone(), json!({"state":"verified"}));
     c.optical_epochs.insert(device.optical_sn.clone(), (1, 10));
-    c.owned.insert(device.cwmp_id.clone(), BTreeMap::from([("old-wan".into(), wan::Owned {
-        parent: 4, connection: 1, state: super::super::model::WanOwnershipState::Ready, service_list: "INTERNET".into(),
-        kind: "WANIPConnection".into(), baseline: None,
-    })]));
-    c.wifi_owned.insert(device.cwmp_id.clone(), wifi::Registry::default());
+    c.owned.insert(
+        device.cwmp_id.clone(),
+        BTreeMap::from([(
+            "old-wan".into(),
+            wan::Owned {
+                parent: 4,
+                connection: 1,
+                state: super::super::model::WanOwnershipState::Ready,
+                service_list: "INTERNET".into(),
+                kind: "WANIPConnection".into(),
+                baseline: None,
+            },
+        )]),
+    );
+    c.wifi_owned
+        .insert(device.cwmp_id.clone(), wifi::Registry::default());
     c
 }
 
 #[test]
 fn removed_devices_release_all_volatile_state() {
     let mut c = configured();
-    c.operations.insert("child".into(), operation(OperationPhase::Completed, false));
+    c.operations
+        .insert("child".into(), operation(OperationPhase::Completed, false));
 
     c.replace_config(Config::default()).unwrap();
 
@@ -44,7 +58,8 @@ fn removed_devices_release_all_volatile_state() {
 #[test]
 fn renamed_device_keeps_identity_ownership_but_drops_old_id_state() {
     let mut c = configured();
-    c.operations.insert("child".into(), operation(OperationPhase::Completed, false));
+    c.operations
+        .insert("child".into(), operation(OperationPhase::Completed, false));
     let mut config = c.config.clone();
     config.devices[0].id = "renamed".into();
 
@@ -58,13 +73,17 @@ fn renamed_device_keeps_identity_ownership_but_drops_old_id_state() {
     assert_eq!(c.owned["id"]["old-wan"].parent, 4);
     assert!(c.wifi_owned.contains_key("id"));
     assert!(c.omci_management.contains_key("H3CT12345678"));
-    assert_eq!(c.snapshot()["devices"][0]["provisioning"]["wan_objects"]["old-wan"]["parent"], 4);
+    assert_eq!(
+        c.snapshot()["devices"][0]["provisioning"]["wan_objects"]["old-wan"]["parent"],
+        4
+    );
 }
 
 #[test]
 fn replacement_identity_drops_previous_device_observations() {
     let mut c = configured();
-    c.operations.insert("child".into(), operation(OperationPhase::Completed, false));
+    c.operations
+        .insert("child".into(), operation(OperationPhase::Completed, false));
     let mut config = c.config.clone();
     config.devices[0].optical_sn = "H3CT87654321".into();
     config.devices[0].cwmp_id = "replacement".into();
@@ -84,7 +103,8 @@ fn replacement_identity_drops_previous_device_observations() {
 #[test]
 fn active_operation_rejects_replacement_before_pruning() {
     let mut c = configured();
-    c.operations.insert("child".into(), operation(OperationPhase::Writing, false));
+    c.operations
+        .insert("child".into(), operation(OperationPhase::Writing, false));
     let before = c.history();
 
     let result = c.replace_config(Config::default());
@@ -122,7 +142,8 @@ fn startup_filters_history_and_ownership_to_configured_identities() {
     interrupted["state"] = json!("writing");
     let data = json!({"operations":[stale,interrupted],"owned":{
         "id":c.owned["id"],"removed":c.owned["id"]
-    }}).to_string();
+    }})
+    .to_string();
 
     c.recover(data.as_bytes());
     c.retain_configured_state();
@@ -130,14 +151,18 @@ fn startup_filters_history_and_ownership_to_configured_identities() {
     assert_eq!(c.next_id, 90);
     assert_eq!(c.recovered.len(), 1);
     assert_eq!(c.owned.len(), 1);
-    assert_eq!(c.snapshot()["devices"][0]["provisioning"]["state"], "interrupted");
+    assert_eq!(
+        c.snapshot()["devices"][0]["provisioning"]["state"],
+        "interrupted"
+    );
     assert_eq!(c.owned["id"]["old-wan"].parent, 4);
 }
 
 #[test]
 fn live_operation_replaces_shadow_in_history_without_duplicate_entries() {
     let mut c = configured();
-    c.operations.insert("child".into(), operation(OperationPhase::Completed, false));
+    c.operations
+        .insert("child".into(), operation(OperationPhase::Completed, false));
 
     let history: Value = serde_json::from_str(&c.history()).unwrap();
 
@@ -153,13 +178,20 @@ fn partial_start_preserves_other_results_before_releasing_recovered_shadow() {
         {"id":"wifi","state":"failed"}, {"id":"untouched","state":"verified"}
     ]);
 
-    c.start_selected("child", false, false, Some("wifi")).unwrap();
+    c.start_selected("child", false, false, Some("wifi"))
+        .unwrap();
 
     assert!(c.recovered.is_empty());
-    assert_eq!(c.operations["child"].results["untouched"]["state"], "verified");
+    assert_eq!(
+        c.operations["child"].results["untouched"]["state"],
+        "verified"
+    );
     assert!(!c.operations["child"].results.contains_key("wifi"));
     assert_eq!(c.operations["child"].wan.owned["old-wan"].parent, 4);
-    assert_eq!(c.snapshot()["devices"][0]["provisioning"]["state"], "waiting");
+    assert_eq!(
+        c.snapshot()["devices"][0]["provisioning"]["state"],
+        "waiting"
+    );
 }
 
 #[test]
@@ -198,6 +230,7 @@ fn discovered(id: &str) -> Value {
 }
 
 #[test]
+#[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
 fn startup_preserves_template_safety_and_ownership_until_binding_is_discovered() {
     for state in ["writing", "completed"] {
         let previous = configured();
@@ -211,7 +244,14 @@ fn startup_preserves_template_safety_and_ownership_until_binding_is_discovered()
 
         c.retain_configured_state();
 
-        assert_eq!(c.recovered["child"]["state"], if state == "writing" {"interrupted"} else {"completed"});
+        assert_eq!(
+            c.recovered["child"]["state"],
+            if state == "writing" {
+                "interrupted"
+            } else {
+                "completed"
+            }
+        );
         assert_eq!(c.recovered["child"]["items"][0]["state"], "unknown");
         assert_eq!(c.owned["id"]["old-wan"].parent, 4);
         c.resolve_pending_identities(&discovered("id"));
@@ -222,12 +262,14 @@ fn startup_preserves_template_safety_and_ownership_until_binding_is_discovered()
 }
 
 #[test]
+#[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
 fn unchanged_template_reload_preserves_resolved_binding_and_unknown_outcomes() {
     let mut c = configured();
     c.config = template_config();
     c.config.devices[0].cwmp_id = "id".into();
     let mut op = operation(OperationPhase::Completed, false);
-    op.results.insert("wifi".into(), json!({"id":"wifi","state":"unknown"}));
+    op.results
+        .insert("wifi".into(), json!({"id":"wifi","state":"unknown"}));
     c.operations.insert("child".into(), op);
 
     c.replace_config(template_config()).unwrap();
@@ -242,6 +284,7 @@ fn unchanged_template_reload_preserves_resolved_binding_and_unknown_outcomes() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
 fn discovered_template_replacement_prunes_previous_resolved_history_and_ownership() {
     let previous = configured();
     let mut c = Controller::default();
@@ -256,5 +299,8 @@ fn discovered_template_replacement_prunes_previous_resolved_history_and_ownershi
     assert_eq!(c.config.devices[0].cwmp_id, "replacement");
     assert!(c.recovered.is_empty());
     assert!(c.owned.is_empty());
-    assert_eq!(c.snapshot()["devices"][0]["provisioning"]["state"], "not_started");
+    assert_eq!(
+        c.snapshot()["devices"][0]["provisioning"]["state"],
+        "not_started"
+    );
 }
