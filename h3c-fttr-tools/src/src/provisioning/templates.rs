@@ -38,6 +38,9 @@ fn get<'a>(all: &'a [(String, Section)], id: &str, kind: &str) -> Result<&'a Sec
         .ok_or_else(|| format!("unknown {kind}: {id}"))
 }
 pub fn compile(text: &str) -> Result<Config, String> {
+    // Optical state belongs to the controller, not the expanded provisioning plan.
+    // Share its validation so config check and optical startup accept the same input.
+    crate::optical::parse_export(text).map_err(|error| error.to_string())?;
     let mut all = Vec::<(String, Section)>::new();
     for line in text.lines() {
         let w = config::words(line)?;
@@ -52,7 +55,8 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 }
                 if !matches!(
                     w[1].as_str(),
-                    "acs"
+                    "optical"
+                        | "acs"
                         | "provisioning"
                         | "management"
                         | "device"
@@ -97,6 +101,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
     // Validate every template, including ones not assigned to a group yet.
     for (id, s) in &all {
         let allowed: &[&str] = match s.kind.as_str() {
+            "optical" => &["enabled"],
             "device" => &[
                 "name",
                 "optical_sn",
@@ -489,6 +494,32 @@ mod tests {
     }
     fn compile(text: &str) -> Result<Config, String> {
         plan(super::compile(text)?)
+    }
+
+    #[test]
+    fn packaged_defaults_accept_controller_optical_settings() {
+        let defaults = include_str!("../../../files/fttr.config");
+        assert!(super::compile(defaults).is_ok());
+        let disabled = defaults.replace(
+            "config optical 'optical'\n\toption enabled '1'",
+            "config optical 'optical'\n\toption enabled '0'",
+        );
+        assert!(super::compile(&disabled).is_ok());
+        assert!(super::compile("config acs 'acs'\n option enabled '0'\n").is_ok());
+    }
+
+    #[test]
+    fn optical_validation_matches_controller_contract() {
+        for text in [
+            "config optical 'other'",
+            "config acs 'optical'",
+            "config optical 'optical'\n option enabled 'yes'",
+            "config optical 'optical'\n list enabled '1'",
+            "config optical 'optical'\nconfig optical 'optical'",
+            "config optical 'optical'\n option unknown '1'",
+        ] {
+            assert!(super::compile(text).is_err(), "{text}");
+        }
     }
 
     #[test]

@@ -119,7 +119,7 @@ fn replace_config(config: &std::path::Path, source: &File, original: &[u8], byte
     Ok(())
 }
 
-fn parse_export(text: &str) -> io::Result<bool> {
+pub(crate) fn parse_export(text: &str) -> io::Result<bool> {
     let mut optical = false;
     let mut seen = false;
     let mut enabled = true; // Upgrade compatibility: old configurations have no optical section.
