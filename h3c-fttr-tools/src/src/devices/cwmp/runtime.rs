@@ -23,6 +23,8 @@ pub struct Discovery {
     reason: String,
     schema: String,
     cache_hit: bool,
+    retries: usize,
+    retry_at: u64,
 }
 impl Discovery {
     pub fn new(requested: &str) -> Self {
@@ -40,6 +42,8 @@ impl Discovery {
             reason: String::new(),
             schema: String::new(),
             cache_hit: false,
+            retries: 0,
+            retry_at: 0,
         }
     }
     pub fn ready(&self) -> bool {
@@ -179,7 +183,23 @@ impl Discovery {
             .selected
             .as_deref()
             .and_then(|id| registry::lookup(id).ok());
-        json!({"state":self.stage,"requested":self.requested,"contract":self.selected,"task_id":self.task,"reason":self.reason,"schema":self.schema,"contract_version":registry::VERSION,"cache_hit":self.cache_hit,"capabilities":contract.map(|c| c.capabilities())})
+        json!({"state":self.stage,"requested":self.requested,"contract":self.selected,"task_id":self.task,"reason":self.reason,"schema":self.schema,"contract_version":registry::VERSION,"cache_hit":self.cache_hit,"retry_attempt":self.retries,"retry_at":self.retry_at,"capabilities":contract.map(|c| c.capabilities())})
+    }
+    fn retry(&mut self, reason: &str) {
+        const DELAYS: [u64; 3] = [5, 15, 30];
+        let Some(delay) = DELAYS.get(self.retries) else {
+            self.invalidate(&format!("retry_exhausted: {reason}"));
+            return;
+        };
+        self.retry_at = discovery_now().saturating_add(*delay);
+        self.retries += 1;
+        self.stage = "retrying";
+        self.reason = reason.into();
+        self.task = None;
+        self.names.clear();
+        self.values.clear();
+        self.pending.clear();
+        self.awaited.clear();
     }
     pub fn tick(
         &mut self,
@@ -210,11 +230,21 @@ impl Discovery {
         if self.ready() || self.blocked() {
             return;
         }
+        if self.stage == "retrying" {
+            if discovery_now() < self.retry_at {
+                return;
+            }
+            self.stage = "pending";
+        }
         if let Some(id) = self.task {
             let result = rpc(json!({"op":"task","id":id}));
             match result["state"].as_str() {
                 Some("queued" | "sent") => return,
                 Some("completed") => (),
+                Some("unknown" | "expired") | None => {
+                    self.retry("read-only discovery transport/result unavailable");
+                    return;
+                }
                 _ => {
                     self.invalidate("read-only capability discovery failed");
                     return;
@@ -222,7 +252,12 @@ impl Discovery {
             }
             self.task = None;
             let Some(rows) = result["result"]["parameters"].as_array() else {
-                self.invalidate("missing discovery response");
+                if result.get("result").is_none() || result["result_status"] == "resource_exhausted"
+                {
+                    self.retry("missing discovery response or resource_exhausted");
+                } else {
+                    self.invalidate("malformed discovery response: missing parameter evidence");
+                }
                 return;
             };
             if rows.len() > 32768 {
@@ -303,7 +338,14 @@ impl Discovery {
             self.task = reply["id"].as_u64();
             self.stage = "names";
             if self.task.is_none() {
-                self.invalidate("cannot queue parameter tree discovery");
+                if reply["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("resource_exhausted") || e.contains("queue full"))
+                {
+                    self.retry("temporary discovery capacity exhausted");
+                } else {
+                    self.invalidate("cannot queue parameter tree discovery");
+                }
             }
         } else if let Some(names) = self.pending.pop_front() {
             self.awaited = names.clone();
@@ -312,7 +354,14 @@ impl Discovery {
             );
             self.task = reply["id"].as_u64();
             if self.task.is_none() {
-                self.invalidate("cannot queue capability value discovery");
+                if reply["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("resource_exhausted") || e.contains("queue full"))
+                {
+                    self.retry("temporary discovery capacity exhausted");
+                } else {
+                    self.invalidate("cannot queue capability value discovery");
+                }
             }
         } else {
             self.resolve();
@@ -500,9 +549,38 @@ impl Discovery {
     }
 }
 
+fn discovery_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transient_discovery_retries_are_bounded_and_never_queue_writes() {
+        let mut probe = Discovery::new("auto");
+        for attempt in 0..4 {
+            probe.retry_at = 0;
+            probe.tick("test", identity(90), 1, true, |request| {
+                assert_eq!(request["method"], "GetParameterNames");
+                json!({"error":"resource_exhausted"})
+            });
+            if attempt < 3 {
+                assert_eq!(probe.stage, "retrying");
+                assert!(!probe.blocked());
+                assert_eq!(probe.retries, attempt + 1);
+                probe.tick("test", identity(90), 1, true, |_| {
+                    panic!("backoff must not queue")
+                });
+            } else {
+                assert!(probe.blocked());
+                assert!(probe.reason.contains("retry_exhausted"));
+            }
+        }
+    }
     #[cfg(feature = "device-hwtc")]
     #[test]
     fn v152_requires_complete_current_binding_switch_evidence() {

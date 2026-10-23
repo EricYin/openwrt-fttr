@@ -13,7 +13,9 @@ pub const CONTRACT: Contract = Contract {
     wan: WanContract {
         binding: Some(ignore_wlan(
             reference(connection("X_CU_LanInterface")),
-            &[10, 14],
+            // Firmware appends these non-addressable vendor WLAN references.
+            // Actual, discoverable WLAN slots remain 1..=8 and are compared exactly.
+            &[9, 10, 13, 14],
         )),
         cloud_cpe: Some(boolean(connection("X_CU_CloudCPEEnable"))),
         ..cu::BASE.wan
@@ -27,3 +29,30 @@ pub const CONTRACT: Contract = Contract {
     },
     ..cu::BASE
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binding_ignores_phantom_references_but_requires_exact_real_wlan_set() {
+        let field = CONTRACT.wan.binding.unwrap();
+        let wlan = "InternetGatewayDevice.LANDevice.1.WLANConfiguration";
+        let desired = format!("{wlan}.1,{wlan}.5");
+        assert!(equivalent_field(
+            field,
+            &desired,
+            &format!("{desired},{wlan}.9,{wlan}.13")
+        ));
+        assert!(!equivalent_field(
+            field,
+            &desired,
+            &format!("{desired},{wlan}.2")
+        ));
+        assert!(!equivalent_field(
+            field,
+            &desired,
+            &format!("{wlan}.1,{wlan}.9,{wlan}.13")
+        ));
+    }
+}

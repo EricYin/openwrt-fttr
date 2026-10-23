@@ -9,6 +9,35 @@ fn periodic_controller() -> Controller {
 }
 
 #[test]
+fn discovery_retry_wait_is_part_of_same_operation_before_periodic_anchor() {
+    let mut c = periodic_controller();
+    let mut op = operation(OperationPhase::Waiting, false);
+    op.started = 100;
+    op.capabilities = crate::devices::cwmp::runtime::Discovery::new("auto");
+    op.capabilities.tick(
+        "test",
+        crate::devices::cwmp::identity::Identity {
+            optical_vendor: "HWTC".into(),
+            optical_serial: "HWTC00000042".into(),
+            cwmp_serial: "4857544300000042".into(),
+            product_class: "V152".into(),
+            software_version: String::new(),
+            hardware_version: String::new(),
+        },
+        1,
+        true,
+        |_| json!({"error":"resource_exhausted"}),
+    );
+    assert_eq!(op.capabilities.view()["state"], "retrying");
+    c.operations.insert("child".into(), op);
+    assert!(!c.periodic_due("child", 100_000));
+    assert_eq!(c.operations["child"].completed_at, None);
+    c.operations.get_mut("child").unwrap().complete(100_000);
+    assert!(!c.periodic_due("child", 101_799));
+    assert!(c.periodic_due("child", 101_800));
+}
+
+#[test]
 fn long_tail_devices_wait_independently_from_completion_without_backlog() {
     let mut c = periodic_controller();
     let mut slow = operation(OperationPhase::WifiReconciling, false);

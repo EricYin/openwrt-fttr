@@ -7,23 +7,174 @@ fn server() -> Arc<Server> {
 
 fn task(id: u64) -> Task {
     Task {
-        id, device: "compact-test".into(), method: "GetParameterValues".into(),
-        args: json!({"names":["InternetGatewayDevice."]}), state: TaskState::Sent,
-        created: now(), sent: Some(now()), result: None,
+        id,
+        device: "compact-test".into(),
+        method: "GetParameterValues".into(),
+        args: json!({"names":["InternetGatewayDevice."]}),
+        state: TaskState::Sent,
+        created: now(),
+        sent: Some(now()),
+        result: None,
     }
+}
+
+#[test]
+fn protected_slow_large_responses_survive_newer_small_results_and_ack() {
+    let server = server();
+    let mut state = State::default();
+    for id in 1..=3 {
+        let mut t = task(id);
+        t.sent = Some(now() - 60);
+        state.tasks.insert(id, t);
+        if id < 3 {
+            state.results.insert(id, retention::ResultInfo::protected());
+        }
+        let mut message = soap::parse(&soap::envelope(
+            "urn:dslforum-org:cwmp-1-0",
+            &format!("fttr-{id}"),
+            "<cwmp:GetParameterValuesResponse/>",
+        ))
+        .unwrap();
+        message.data =
+            json!({"parameters":[],"padding":"x".repeat(if id < 3 { 753_000 } else { 10 })});
+        state.response("compact-test", &message).unwrap();
+    }
+    state.prune();
+    for id in 1..=2 {
+        assert!(state.tasks[&id].result.as_ref().unwrap().get().len() > 753_000);
+        assert!(state.results[&id].completed_at.unwrap() >= now() - 1);
+    }
+    server.save(&state).unwrap();
+    *server.state.lock().unwrap() = State::load(&server.state_file).unwrap();
+    // Ordinary task queries, including repeated queries, cannot acknowledge a lease.
+    for _ in 0..2 {
+        assert!(server.execute_value(json!({"op":"task","id":1}))["result"].is_object());
+    }
+    let mut state = server.state.lock().unwrap();
+    assert!(state.results[&1].protected);
+    assert!(state.ack_result(1));
+    assert!(!state.ack_result(1));
+    assert!(state.tasks[&1].result.is_some());
+    state.results.get_mut(&2).unwrap().completed_at = Some(now() - retention::LEASE_SECONDS);
+    state.prune();
+    assert!(!state.results[&2].protected);
+    assert!(state.tasks[&2].result.is_none());
+    assert_eq!(state.results[&2].reason, "consumer lease expired");
+    fs::remove_file(&server.state_file).unwrap();
+}
+
+#[test]
+fn discovery_admission_reserves_two_large_responses_and_releases_capacity() {
+    let mut state = State::default();
+    for id in 1..=2 {
+        assert!(state.admit_result("GetParameterNames"));
+        let mut t = task(id);
+        t.method = "GetParameterNames".into();
+        state.tasks.insert(id, t);
+        state.results.insert(id, retention::ResultInfo::protected());
+    }
+    assert!(!state.admit_result("GetParameterNames"));
+    state.mark_completed(1);
+    assert!(state.ack_result(1));
+    assert!(state.admit_result("GetParameterNames"));
+}
+
+#[test]
+fn queued_consumer_lease_starts_at_completion_not_queue_time() {
+    let mut state = State::default();
+    let mut t = task(1);
+    t.state = TaskState::Queued;
+    t.created = now() - 300;
+    t.sent = None;
+    state.tasks.insert(1, t);
+    state.results.insert(1, retention::ResultInfo::protected());
+    state.expire();
+    assert!(state.results[&1].protected);
+    assert_eq!(state.results[&1].completed_at, None);
+    assert!(!state.ack_result(1));
+    let t = state.tasks.get_mut(&1).unwrap();
+    t.state = TaskState::Sent;
+    t.sent = Some(now() - 60);
+    let message = soap::parse(&soap::envelope(
+        "urn:dslforum-org:cwmp-1-0",
+        "fttr-1",
+        "<cwmp:GetParameterValuesResponse/>",
+    ))
+    .unwrap();
+    state.response("compact-test", &message).unwrap();
+    assert!(state.results[&1].protected);
+    assert!(state.tasks[&1].result.is_some());
+    assert!(state.results[&1].completed_at.unwrap() >= now() - 1);
+}
+
+#[test]
+fn compact_wan_safety_evidence_survives_raw_cache_cleanup_but_expires() {
+    let mut state = State::default();
+    let mut t = task(1);
+    t.sent = Some(now() - 60);
+    state.tasks.insert(1, t);
+    let prefix = "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.2.WANIPConnection.1.";
+    let mut message = soap::parse(&soap::envelope(
+        "urn:dslforum-org:cwmp-1-0",
+        "fttr-1",
+        "<cwmp:GetParameterValuesResponse/>",
+    ))
+    .unwrap();
+    message.data =
+        json!({"parameters":[{"name":format!("{prefix}X_CU_ServiceList"),"value":"OTHER"}]});
+    state.response("compact-test", &message).unwrap();
+    state.results.get_mut(&1).unwrap().completed_at = Some(now() - 30);
+    state.prune();
+    assert!(state.tasks[&1].result.is_none());
+    assert_eq!(
+        readback::observed(&state, "compact-test", prefix),
+        Some(false)
+    );
+    state.results.get_mut(&1).unwrap().completed_at = Some(now() - 91);
+    assert_eq!(readback::observed(&state, "compact-test", prefix), None);
+    let evidence = readback::service_evidence(&json!({"parameters":[
+        {"name":format!("{prefix}X_CU_ServiceList"),"value":"OTHER"},
+        {"name":format!("{prefix}X_CU_ServiceList"),"value":"INTERNET_TR069"}
+    ]}));
+    assert_eq!(evidence.get(prefix), Some(&true));
+}
+
+#[test]
+fn oversized_save_preserves_previous_readable_state() {
+    let server = server();
+    server.save(&State::default()).unwrap();
+    let before = fs::read(&server.state_file).unwrap();
+    let mut state = State::default();
+    let mut t = task(1);
+    t.result = Some(to_raw_value(&"x".repeat(8 * 1024 * 1024)).unwrap());
+    state.tasks.insert(1, t);
+    assert!(server.save(&state).is_err());
+    assert_eq!(fs::read(&server.state_file).unwrap(), before);
+    assert!(State::load(&server.state_file).is_ok());
+    fs::remove_file(format!("{}.tmp", server.state_file)).unwrap();
+    fs::remove_file(&server.state_file).unwrap();
 }
 
 #[test]
 fn large_result_survives_response_save_load_and_direct_query() {
     let server = server();
-    let parameters: Vec<_> = (0..24_000).map(|n| json!({
-        "name":format!("InternetGatewayDevice.LANDevice.1.Test.{n}"),
-        "value":format!("{n}:\"\\\n{}", "x".repeat(170)), "type":"xsd:string"
-    })).collect();
+    let parameters: Vec<_> = (0..24_000)
+        .map(|n| {
+            json!({
+                "name":format!("InternetGatewayDevice.LANDevice.1.Test.{n}"),
+                "value":format!("{n}:\"\\\n{}", "x".repeat(170)), "type":"xsd:string"
+            })
+        })
+        .collect();
     let expected = json!({"parameters":parameters});
     let mut state = State::default();
     state.tasks.insert(1, task(1));
-    let mut message = soap::parse(&soap::envelope("urn:dslforum-org:cwmp-1-0", "fttr-1", "<cwmp:GetParameterValuesResponse/>")).unwrap();
+    let mut message = soap::parse(&soap::envelope(
+        "urn:dslforum-org:cwmp-1-0",
+        "fttr-1",
+        "<cwmp:GetParameterValuesResponse/>",
+    ))
+    .unwrap();
     message.data = expected.clone();
 
     state.response("compact-test", &message).unwrap();
@@ -60,8 +211,12 @@ fn malformed_or_oversized_state_blocks_queries_mutation_and_replacement() {
         fs::write(&server.state_file, &contents).unwrap();
         *server.state.lock().unwrap() = State::load_or_block(&server.state_file);
 
-        let query: Value = serde_json::from_str(&server.execute(json!({"op":"task","id":1}))).unwrap();
-        let reset: Value = serde_json::from_str(&server.execute(json!({"op":"reset_device_tasks","device":"compact-test"}))).unwrap();
+        let query: Value =
+            serde_json::from_str(&server.execute(json!({"op":"task","id":1}))).unwrap();
+        let reset: Value = serde_json::from_str(
+            &server.execute(json!({"op":"reset_device_tasks","device":"compact-test"})),
+        )
+        .unwrap();
         let saved = server.save(&server.state.lock().unwrap());
         let activated = transition(server.clone(), true, "127.0.0.1:0", "/cwmp", "", "", false);
 
@@ -88,8 +243,16 @@ fn restart_marks_sent_unknown_without_losing_completed_results() {
     let loaded = State::load(&server.state_file).unwrap();
 
     assert_eq!(loaded.tasks[&7].state, TaskState::Unknown);
-    assert!(loaded.tasks[&7].result.as_ref().unwrap().get().contains("execution is unknown"));
-    assert_eq!(loaded.tasks[&8].result.as_ref().unwrap().get(), state.tasks[&8].result.as_ref().unwrap().get());
+    assert!(loaded.tasks[&7]
+        .result
+        .as_ref()
+        .unwrap()
+        .get()
+        .contains("execution is unknown"));
+    assert_eq!(
+        loaded.tasks[&8].result.as_ref().unwrap().get(),
+        state.tasks[&8].result.as_ref().unwrap().get()
+    );
     assert_eq!(loaded.next_id, 8);
     fs::remove_file(&server.state_file).unwrap();
 }
@@ -128,13 +291,30 @@ fn wan_readback_guard_requires_eligible_fresh_non_management_result() {
     assert_eq!(observed, Some(false));
     for (device, method, status, sent) in [
         ("other", "GetParameterValues", TaskState::Completed, now()),
-        ("compact-test", "GetParameterNames", TaskState::Completed, now()),
-        ("compact-test", "GetParameterValues", TaskState::Fault, now()),
-        ("compact-test", "GetParameterValues", TaskState::Completed, now() - 91),
+        (
+            "compact-test",
+            "GetParameterNames",
+            TaskState::Completed,
+            now(),
+        ),
+        (
+            "compact-test",
+            "GetParameterValues",
+            TaskState::Fault,
+            now(),
+        ),
+        (
+            "compact-test",
+            "GetParameterValues",
+            TaskState::Completed,
+            now() - 91,
+        ),
     ] {
         let mut ineligible = record.clone();
-        ineligible.device = device.into(); ineligible.method = method.into();
-        ineligible.state = status; ineligible.sent = Some(sent);
+        ineligible.device = device.into();
+        ineligible.method = method.into();
+        ineligible.state = status;
+        ineligible.sent = Some(sent);
         state.tasks.insert(1, ineligible);
         assert_eq!(readback::observed(&state, "compact-test", prefix), None);
     }
@@ -169,7 +349,11 @@ fn test_prune_bounds_inactive_tasks_and_preserves_active() {
     for i in 1..=50 {
         let mut t = task(i);
         t.state = TaskState::Completed;
-        t.created = if i <= 25 { current_time - 2000 } else { current_time - 100 };
+        t.created = if i <= 25 {
+            current_time - 2000
+        } else {
+            current_time - 100
+        };
         t.sent = Some(t.created);
         state.tasks.insert(i, t);
     }
@@ -197,7 +381,11 @@ fn test_prune_bounds_inactive_tasks_and_preserves_active() {
     }
 
     // Fresh inactive tasks (26..=50) remain
-    let inactive_count = state.tasks.values().filter(|t| !t.state.is_active()).count();
+    let inactive_count = state
+        .tasks
+        .values()
+        .filter(|t| !t.state.is_active())
+        .count();
     assert_eq!(inactive_count, 25);
 }
 

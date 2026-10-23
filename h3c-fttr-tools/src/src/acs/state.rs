@@ -12,29 +12,69 @@ impl State {
     pub(super) fn prune(&mut self) {
         let time = now();
         self.tasks.retain(|_, task| {
-            task.state.is_active() || time.saturating_sub(task.sent.unwrap_or(task.created)) < 180
+            task.state.is_active()
+                || time.saturating_sub(
+                    self.results
+                        .get(&task.id)
+                        .and_then(|i| i.completed_at)
+                        .unwrap_or(task.sent.unwrap_or(task.created)),
+                ) < 180
         });
+        self.results.retain(|id, _| self.tasks.contains_key(id));
         for task in self.tasks.values_mut() {
-            if !task.state.is_active()
-                && time.saturating_sub(task.sent.unwrap_or(task.created)) >= 15
+            let mut legacy = super::retention::ResultInfo::default();
+            let info = self.results.get_mut(&task.id).unwrap_or(&mut legacy);
+            let age = time.saturating_sub(
+                info.completed_at
+                    .unwrap_or(task.sent.unwrap_or(task.created)),
+            );
+            if info.protected
+                && info.completed_at.is_some()
+                && age >= super::retention::LEASE_SECONDS
             {
+                info.protected = false;
+                info.reason = "consumer lease expired".into();
+            }
+            if !task.state.is_active() && !info.protected && age >= 15 {
                 task.result = None;
+                info.status = "expired".into();
+                if info.reason.is_empty() {
+                    info.reason = "ordinary response TTL".into();
+                }
             }
         }
         let mut total_result_bytes: usize = self
             .tasks
             .values()
+            .filter(|t| !self.results.get(&t.id).is_some_and(|i| i.protected))
             .filter_map(|t| t.result.as_ref())
             .map(|r| r.get().len())
             .sum();
+        let protected_bytes: usize = self
+            .tasks
+            .values()
+            .filter(|t| self.results.get(&t.id).is_some_and(|i| i.protected))
+            .filter_map(|t| t.result.as_ref())
+            .map(|r| r.get().len())
+            .sum();
+        // Reserve 1 MiB for task arguments, device Inform records and JSON metadata.
+        let ordinary_ceiling = (7 * 1024 * 1024usize).saturating_sub(protected_bytes);
         if total_result_bytes > 256 * 1024 {
             let inactive_ids: Vec<u64> = self
                 .tasks
                 .iter()
-                .filter(|(_, t)| !t.state.is_active() && t.result.is_some())
+                .filter(|(id, t)| {
+                    !t.state.is_active()
+                        && t.result.is_some()
+                        && !self.results.get(id).is_some_and(|i| i.protected)
+                })
                 .map(|(id, _)| *id)
                 .collect();
-            let max_drop = inactive_ids.len().saturating_sub(1);
+            let max_drop = if total_result_bytes > ordinary_ceiling {
+                inactive_ids.len()
+            } else {
+                inactive_ids.len().saturating_sub(1)
+            };
             for id in inactive_ids.into_iter().take(max_drop) {
                 if total_result_bytes <= 256 * 1024 {
                     break;
@@ -42,6 +82,9 @@ impl State {
                 if let Some(task) = self.tasks.get_mut(&id) {
                     if let Some(res) = task.result.take() {
                         total_result_bytes = total_result_bytes.saturating_sub(res.get().len());
+                        let info = self.results.entry(id).or_default();
+                        info.status = "expired".into();
+                        info.reason = "ordinary cache capacity".into();
                     }
                 }
             }
@@ -55,11 +98,17 @@ impl State {
         for t in self.tasks.values_mut() {
             if t.state == TaskState::Sent && time.saturating_sub(t.sent.unwrap_or(time)) >= 90 {
                 t.state = TaskState::Unknown;
+                let info = self.results.entry(t.id).or_default();
+                info.completed_at = Some(time);
+                info.status = "available".into();
                 t.result = Some(error_result(
                     "response timeout: device execution is unknown; no automatic write retry",
                 ));
             } else if t.state == TaskState::Queued && time.saturating_sub(t.created) >= 600 {
                 t.state = TaskState::Expired;
+                let info = self.results.entry(t.id).or_default();
+                info.completed_at = Some(time);
+                info.status = "available".into();
                 t.result = Some(error_result("no device session within 600 seconds"));
             }
         }
@@ -96,6 +145,7 @@ impl State {
                 let task = self.tasks.get_mut(&id).unwrap();
                 task.state = TaskState::Fault;
                 task.result = Some(error_result(&reason));
+                self.mark_completed(id);
                 return Ok(None);
             }
         }
@@ -171,6 +221,26 @@ impl State {
             ));
         }
         task.result = Some(serde_json::value::to_raw_value(&message.data)?);
+        if task.method == "GetParameterValues" && task.state == TaskState::Completed {
+            let evidence = super::readback::service_evidence(&message.data);
+            self.results.entry(id).or_default().management_services = evidence;
+        }
+        self.mark_completed(id);
+        let protected_bytes: usize = self
+            .tasks
+            .iter()
+            .filter(|(id, _)| self.results.get(id).is_some_and(|i| i.protected))
+            .filter_map(|(_, t)| t.result.as_ref())
+            .map(|r| r.get().len())
+            .sum();
+        if protected_bytes > super::retention::PROTECTED_BYTES {
+            self.tasks.get_mut(&id).unwrap().result = Some(error_result(
+                "resource_exhausted: protected response budget",
+            ));
+            let info = self.results.get_mut(&id).unwrap();
+            info.status = "resource_exhausted".into();
+            info.reason = "protected response budget".into();
+        }
         self.prune();
         Ok(())
     }

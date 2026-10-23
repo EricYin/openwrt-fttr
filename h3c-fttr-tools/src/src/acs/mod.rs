@@ -4,6 +4,7 @@ mod endpoint;
 mod http;
 mod listener;
 mod policy;
+mod retention;
 mod session;
 mod state;
 use endpoint::stop_listener;
@@ -73,6 +74,8 @@ struct Device {
 struct State {
     devices: BTreeMap<String, Device>,
     tasks: BTreeMap<u64, Task>,
+    #[serde(default)]
+    results: BTreeMap<u64, retention::ResultInfo>,
     next_id: u64,
     #[serde(skip)]
     sessions: BTreeMap<String, (String, String, u64)>,
@@ -86,6 +89,13 @@ struct State {
     interval_authorizations: BTreeMap<u64, periodic_task::Authorization>,
     #[serde(skip)]
     connection_request_proofs: BTreeMap<String, connection_request_proof::Proof>,
+}
+#[derive(Serialize)]
+struct TaskView<'a> {
+    #[serde(flatten)]
+    task: &'a Task,
+    #[serde(flatten)]
+    result_info: Option<&'a retention::ResultInfo>,
 }
 struct Server {
     state: Arc<Mutex<State>>,
@@ -146,8 +156,11 @@ impl Server {
             }
             state.expire();
             return match request["id"].as_u64().and_then(|id| state.tasks.get(&id)) {
-                Some(task) => serde_json::to_value(task)
-                    .unwrap_or_else(|err| error(&format!("task serialization: {err}"))),
+                Some(task) => serde_json::to_value(TaskView {
+                    task,
+                    result_info: state.results.get(&task.id),
+                })
+                .unwrap_or_else(|err| error(&format!("task serialization: {err}"))),
                 None => error("unknown task"),
             };
         }
@@ -161,14 +174,20 @@ impl Server {
             }
             state.expire();
             return match request["id"].as_u64().and_then(|id| state.tasks.get(&id)) {
-                Some(task) => serde_json::to_string(task)
-                    .unwrap_or_else(|err| error(&format!("task serialization: {err}")).to_string()),
+                Some(task) => serde_json::to_string(&TaskView {
+                    task,
+                    result_info: state.results.get(&task.id),
+                })
+                .unwrap_or_else(|err| error(&format!("task serialization: {err}")).to_string()),
                 None => error("unknown task").to_string(),
             };
         }
         self.execute_value(request).to_string()
     }
     fn execute_small(&self, request: Value) -> Value {
+        self.execute_owned(request, false)
+    }
+    fn execute_owned(&self, request: Value, internal: bool) -> Value {
         let mut state = self.state.lock().unwrap();
         if request["op"] != "status" && request["op"] != "clean" {
             if let Some(reason) = &state.load_failure {
@@ -179,6 +198,8 @@ impl Server {
         match request["op"].as_str().unwrap_or("") {
             "clean" => {
                 state.tasks.retain(|_, t| t.state.is_active());
+                let ids: std::collections::BTreeSet<_> = state.tasks.keys().copied().collect();
+                state.results.retain(|id, _| ids.contains(id));
                 state.load_failure = None;
                 *self.failure.lock().unwrap() = None;
                 if let Err(err) = self.save(&state) {
@@ -226,6 +247,9 @@ impl Server {
                 let Some(id) = state.next_id.checked_add(1) else {
                     return error("ACS task IDs exhausted");
                 };
+                if internal && !state.admit_result(method) {
+                    return error("resource_exhausted: protected ACS response capacity; retry read-only discovery later");
+                }
                 let task = Task {
                     id,
                     device: device.into(),
@@ -236,7 +260,7 @@ impl Server {
                     sent: None,
                     result: None,
                 };
-                self.enqueue(&mut state, task)
+                self.enqueue_owned(&mut state, task, internal)
             }
             _ => error("unknown ACS operation"),
         }
@@ -244,9 +268,31 @@ impl Server {
 }
 pub fn control_value(request: Value) -> Value {
     crate::runtime::block_on(async move {
-        actor::call(move || init().execute_value(request))
-            .await
-            .unwrap_or_else(|_| error("ACS transaction queue unavailable"))
+        actor::call(move || {
+            let server = init();
+            if request["op"] == "queue" {
+                return server.execute_owned(request, true);
+            }
+            let mut reply = server.execute_value(request.clone());
+            if request["op"] == "task" {
+                let mut state = server.state.lock().unwrap();
+                if let Some(id) = request["id"].as_u64() {
+                    if let Some(info) = state.results.get(&id) {
+                        reply["completed_at"] = json!(info.completed_at);
+                        reply["result_status"] = json!(info.status);
+                        reply["cleanup_reason"] = json!(info.reason);
+                    }
+                    // The full response has now been copied into the consumer-owned Value.
+                    // Acknowledgment only releases the lease; it does not delete readback history.
+                    if reply.get("result").is_some() && state.ack_result(id) {
+                        let _ = server.save(&state);
+                    }
+                }
+            }
+            reply
+        })
+        .await
+        .unwrap_or_else(|_| error("ACS transaction queue unavailable"))
     })
 }
 pub fn control(request: &str) -> String {

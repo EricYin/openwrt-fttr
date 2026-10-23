@@ -27,13 +27,18 @@ impl DispatchUndo {
 
 impl Server {
     pub(super) fn enqueue(&self, state: &mut State, task: Task) -> Value {
+        self.enqueue_owned(state, task, false)
+    }
+    pub(super) fn enqueue_owned(&self, state: &mut State, task: Task, protected: bool) -> Value {
         state.prune();
         let mut evicted = Vec::new();
         while state.tasks.len() >= 256 {
             let oldest = state
                 .tasks
                 .iter()
-                .find(|(_, task)| !task.state.is_active())
+                .find(|(id, task)| {
+                    !task.state.is_active() && !state.results.get(id).is_some_and(|i| i.protected)
+                })
                 .map(|(id, _)| *id);
             let Some(id) = oldest else {
                 state.tasks.extend(evicted);
@@ -47,10 +52,19 @@ impl Server {
         let id = task.id;
         state.next_id = id;
         state.tasks.insert(id, task);
+        if protected {
+            state
+                .results
+                .insert(id, super::retention::ResultInfo::protected());
+        }
         match self.save(state) {
-            Ok(()) => json!(state.tasks[&id]),
+            Ok(()) => {
+                super::connection_request::wake();
+                json!(state.tasks[&id])
+            }
             Err(err) => {
                 state.tasks.remove(&id);
+                state.results.remove(&id);
                 state.tasks.extend(evicted);
                 state.next_id = previous_id;
                 error(&format!("cannot persist queued task: {err}"))
@@ -63,6 +77,10 @@ impl Server {
             .tasks
             .extract_if(.., |_, task| task.device == device)
             .collect();
+        let results: Vec<_> = state
+            .results
+            .extract_if(.., |id, _| tasks.iter().any(|(task_id, _)| id == task_id))
+            .collect();
         let sessions: Vec<_> = state
             .sessions
             .extract_if(.., |_, (id, _, _)| id == device)
@@ -71,6 +89,7 @@ impl Server {
             Ok(()) => Ok(()),
             Err(err) => {
                 state.tasks.extend(tasks);
+                state.results.extend(results);
                 state.sessions.extend(sessions);
                 Err(err)
             }
