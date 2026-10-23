@@ -194,6 +194,8 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
                     "config_change".into(),
                     "device_online".into(),
                     "cwmp_boot".into(),
+                    "program_start".into(),
+                    "periodic".into(),
                 ]
             })
             .into_iter()
