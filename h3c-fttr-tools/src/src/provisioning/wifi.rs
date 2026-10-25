@@ -1,6 +1,6 @@
 //! WLAN lifecycle is separate from parameter diffs. Inventory, actual returned
 //! instances and readback are authoritative; an acknowledged Delete is not proof.
-use super::model::{ItemKind, ItemOutcome, TaskOutcome, WifiPhase, WifiPendingAction};
+use super::model::{ItemKind, ItemOutcome, TaskOutcome, WifiPendingAction, WifiPhase};
 use super::{acs, config::Device};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -234,9 +234,8 @@ pub fn reset(id: &str) -> Result<(), String> {
 pub fn instance(name: &str) -> Option<u32> {
     name.strip_prefix(ROOT)?.split('.').next()?.parse().ok()
 }
-fn inventory(v: &Value) -> BTreeSet<u32> {
-    v["result"]["parameters"]
-        .as_array()
+fn inventory(v: &crate::devices::cwmp::response::Data) -> BTreeSet<u32> {
+    v.rows()
         .into_iter()
         .flatten()
         .filter_map(|p| {
@@ -251,6 +250,7 @@ fn inventory(v: &Value) -> BTreeSet<u32> {
 }
 #[derive(Clone)]
 pub struct Reconciler {
+    submission: Option<crate::devices::cwmp::transport::Pending<WifiPhase>>,
     pub registry: Registry,
     pub results: BTreeMap<String, Value>,
     pub stage: WifiPhase,
@@ -266,6 +266,15 @@ pub struct Reconciler {
     reused: bool,
 }
 impl Reconciler {
+    pub(super) fn progress(&self) -> (WifiPhase, Option<u64>, bool, Option<u32>, u32) {
+        (
+            self.stage,
+            self.task,
+            self.prepared,
+            self.current,
+            self.additions,
+        )
+    }
     pub fn new(d: &Device, registry: Registry, cleanup: bool) -> Self {
         let desired: BTreeSet<_> = d
             .items
@@ -286,6 +295,7 @@ impl Reconciler {
             desired,
             existing: BTreeSet::new(),
             task: None,
+            submission: None,
             current: None,
             cleanup,
             policy: d.wifi_cleanup.clone(),
@@ -322,6 +332,7 @@ impl Reconciler {
         self.stage = WifiPhase::Done;
         self.prepared = true;
         self.task = None;
+        self.submission = None;
     }
     pub fn block_unresolved(&self, d: &mut Device) {
         for item in d.items.iter_mut().filter(|i| i.kind == ItemKind::Ssid) {
@@ -338,15 +349,34 @@ impl Reconciler {
         }
     }
     fn queue(&mut self, d: &Device, method: &str, args: Value, stage: WifiPhase) {
+        self.submission = Some(crate::devices::cwmp::transport::Pending {
+            method: method.into(),
+            args,
+            stage,
+        });
+        self.submit(d);
+    }
+    fn submit(&mut self, d: &Device) {
         if self.save(&d.cwmp_id).is_err() {
-            self.fail(ItemOutcome::Blocked, "cannot persist Wi-Fi lifecycle intent");
+            self.fail(
+                ItemOutcome::Blocked,
+                "cannot persist Wi-Fi lifecycle intent",
+            );
             return;
         }
-        let v = acs(json!({"op":"queue","device":d.cwmp_id,"method":method,"args":args}));
+        let pending = self.submission.as_ref().unwrap();
+        let v = acs(Command::queue(
+            &d.cwmp_id,
+            &pending.method,
+            pending.args.clone(),
+        ));
         if let Some(id) = v["id"].as_u64() {
             self.task = Some(id);
-            self.stage = stage;
+            self.stage = self.submission.take().unwrap().stage;
+        } else if crate::devices::cwmp::transport::backpressure(&v) {
+            self.task = None;
         } else {
+            self.submission = None;
             self.registry.pending = None;
             self.registry.pending_instance = None;
             self.fail(ItemOutcome::Failed, "cannot queue Wi-Fi RPC");
@@ -369,7 +399,16 @@ impl Reconciler {
         if !reachable {
             return false;
         }
-        if self.task.is_none() && acs(json!({"op":"busy","device":d.cwmp_id}))["busy"] == true {
+        if self.submission.is_some() {
+            self.submit(d);
+            return false;
+        }
+        if self.task.is_none()
+            && acs(Command::Busy {
+                device: d.cwmp_id.clone(),
+            })["busy"]
+                == true
+        {
             return false;
         }
         if self.stage == WifiPhase::Waiting {
@@ -382,12 +421,15 @@ impl Reconciler {
             return false;
         }
         if let Some(task) = self.task {
-            let v = acs(json!({"op":"task","id":task}));
+            let v = acs(Command::Task { id: task });
             let state = TaskOutcome::from_task(&v);
             if matches!(state, TaskOutcome::Queued | TaskOutcome::Sent) {
                 return false;
             }
-            if !matches!(state, TaskOutcome::Completed | TaskOutcome::AcceptedPendingApply) {
+            if !matches!(
+                state,
+                TaskOutcome::Completed | TaskOutcome::AcceptedPendingApply
+            ) {
                 if matches!(state, TaskOutcome::Fault | TaskOutcome::Expired) {
                     self.registry.pending = None;
                     self.registry.pending_instance = None;
@@ -405,7 +447,7 @@ impl Reconciler {
             self.task = None;
             match self.stage {
                 WifiPhase::Inventory => {
-                    self.existing = inventory(&v);
+                    self.existing = inventory(v.result());
                     self.registry.owned.retain(|n| self.existing.contains(n));
                     if self.registry.pending.is_some() {
                         if self.registry.pending == Some(WifiPendingAction::Deleting)
@@ -423,12 +465,15 @@ impl Reconciler {
                     }
                 }
                 WifiPhase::Adding => {
-                    let n = v["result"]["instance_number"]
+                    let n = v.result()["instance_number"]
                         .as_str()
                         .and_then(|n| n.parse::<u32>().ok())
                         .filter(|n| *n > 0);
                     let Some(n) = n else {
-                        self.fail(ItemOutcome::Unknown, "AddObject did not return a WLAN instance");
+                        self.fail(
+                            ItemOutcome::Unknown,
+                            "AddObject did not return a WLAN instance",
+                        );
                         return true;
                     };
                     self.reused = self.existing.contains(&n);
@@ -447,10 +492,13 @@ impl Reconciler {
                 }
                 WifiPhase::VerifyAdd => {
                     let before = self.existing.clone();
-                    self.existing = inventory(&v);
+                    self.existing = inventory(v.result());
                     let n = self.current.unwrap();
                     if !self.existing.contains(&n) {
-                        self.fail(ItemOutcome::Unknown, "AddObject acknowledged but WLAN is absent");
+                        self.fail(
+                            ItemOutcome::Unknown,
+                            "AddObject acknowledged but WLAN is absent",
+                        );
                         return true;
                     }
                     if self.reused {
@@ -477,10 +525,13 @@ impl Reconciler {
                     return false;
                 }
                 WifiPhase::VerifyDelete => {
-                    self.existing = inventory(&v);
+                    self.existing = inventory(v.result());
                     let n = self.current.unwrap();
                     if self.existing.contains(&n) {
-                        self.fail(ItemOutcome::Unknown, "DeleteObject acknowledged but WLAN still exists");
+                        self.fail(
+                            ItemOutcome::Unknown,
+                            "DeleteObject acknowledged but WLAN still exists",
+                        );
                         return true;
                     }
                     self.registry.owned.remove(&n);
@@ -490,8 +541,9 @@ impl Reconciler {
                 }
                 WifiPhase::ReadingDisable | WifiPhase::VerifyingDisable => {
                     let name = format!("{ROOT}{}.Enable", self.current.unwrap());
-                    let disabled = v["result"]["parameters"]
-                        .as_array()
+                    let disabled = v
+                        .result()
+                        .rows()
                         .into_iter()
                         .flatten()
                         .find(|p| p["name"] == name)
@@ -579,7 +631,10 @@ impl Reconciler {
                     && !self.preserve.contains(n)
                     && (self.policy != "preserve" || self.registry.owned.contains(n))
                     && !self.results.get(&n.to_string()).is_some_and(|r| {
-                        matches!(ItemOutcome::from_result(r), Some(ItemOutcome::Deleted | ItemOutcome::Disabled | ItemOutcome::Drift))
+                        matches!(
+                            ItemOutcome::from_result(r),
+                            Some(ItemOutcome::Deleted | ItemOutcome::Disabled | ItemOutcome::Drift)
+                        )
                     })
             });
             if let Some(n) = candidate {
@@ -612,3 +667,4 @@ impl Reconciler {
         true
     }
 }
+use crate::devices::cwmp::transport::Command;

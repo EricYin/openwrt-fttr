@@ -26,9 +26,9 @@ fn discovery_retry_wait_is_part_of_same_operation_before_periodic_anchor() {
         },
         1,
         true,
-        |_| json!({"error":"resource_exhausted"}),
+        |_| json!({"error":"queue full","code":"backpressure"}).into(),
     );
-    assert_eq!(op.capabilities.view()["state"], "retrying");
+    assert_eq!(op.capabilities.view()["state"], "pending");
     c.operations.insert("child".into(), op);
     assert!(!c.periodic_due("child", 100_000));
     assert_eq!(c.operations["child"].completed_at, None);

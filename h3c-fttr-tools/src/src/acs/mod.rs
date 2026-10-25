@@ -1,9 +1,11 @@
 //! Optional, bounded CWMP endpoint. It never takes a PON/OMCI lock.
 mod actor;
+mod dispatch;
 mod endpoint;
 mod http;
 mod listener;
 mod policy;
+mod resources;
 mod retention;
 mod session;
 mod state;
@@ -72,6 +74,10 @@ struct Device {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct State {
+    #[serde(skip)]
+    budget: Arc<resources::Budget>,
+    #[serde(skip)]
+    dispatch: dispatch::Dispatcher,
     devices: BTreeMap<String, Device>,
     tasks: BTreeMap<u64, Task>,
     #[serde(default)]
@@ -185,18 +191,26 @@ impl Server {
         self.execute_value(request).to_string()
     }
     fn execute_small(&self, request: Value) -> Value {
-        self.execute_owned(request, false)
+        match serde_json::from_value(request) {
+            Ok(command) => self.execute_command(command, false),
+            Err(_) => error("invalid ACS operation"),
+        }
     }
-    fn execute_owned(&self, request: Value, internal: bool) -> Value {
+    fn execute_command(
+        &self,
+        command: crate::devices::cwmp::transport::Command,
+        internal: bool,
+    ) -> Value {
+        use crate::devices::cwmp::transport::Command;
         let mut state = self.state.lock().unwrap();
-        if request["op"] != "status" && request["op"] != "clean" {
+        if !matches!(command, Command::Status | Command::Clean) {
             if let Some(reason) = &state.load_failure {
                 return error(reason);
             }
         }
         state.expire();
-        match request["op"].as_str().unwrap_or("") {
-            "clean" => {
+        match command {
+            Command::Clean => {
                 state.tasks.retain(|_, t| t.state.is_active());
                 let ids: std::collections::BTreeSet<_> = state.tasks.keys().copied().collect();
                 state.results.retain(|id, _| ids.contains(id));
@@ -207,53 +221,52 @@ impl Server {
                 }
                 json!({"cleaned":true, "tasks":state.tasks.len()})
             }
-            "status" => {
-                json!({"compiled":true, "enabled":self.enabled && !self.stopped.load(Ordering::Acquire), "listen":self.listen, "path":self.path, "endpoint_id":self.endpoint_id,"auth":self.auth.is_some(), "devices":state.devices.len(), "tasks":state.tasks.len(), "http_requests":self.requests.load(Ordering::Relaxed), "error":self.failure.lock().unwrap().clone()})
+            Command::Status => {
+                let resources = state.resources_view();
+                json!({"compiled":true, "enabled":self.enabled && !self.stopped.load(Ordering::Acquire), "listen":self.listen, "path":self.path, "endpoint_id":self.endpoint_id,"auth":self.auth.is_some(), "devices":state.devices.len(), "tasks":state.tasks.len(), "response_bytes":state.budget.used(), "response_budget":resources::RESULT_BYTES, "resources":resources, "waiting_capacity":state.tasks.keys().filter(|id| state.waiting_capacity(**id)).count(), "http_requests":self.requests.load(Ordering::Relaxed), "error":self.failure.lock().unwrap().clone()})
             }
-            "devices" => {
+            Command::Devices => {
                 json!({"devices":state.devices,"connection_requests":state.connection_requests,"periodic_inform":state.periodic_inform})
             }
-            "reset_device_tasks" => {
-                let Some(device) = request["device"].as_str().filter(|id| !id.is_empty()) else {
+            Command::ResetDeviceTasks { device } => {
+                if device.is_empty() {
                     return error("device required");
-                };
-                if let Err(err) = self.reset_tasks(&mut state, device) {
+                }
+                if let Err(err) = self.reset_tasks(&mut state, &device) {
                     return error(&format!("cannot persist device task reset: {err}"));
                 }
                 json!({"reset":true})
             }
-            "busy" => {
-                json!({"busy":state.tasks.values().any(|t| t.device == request["device"].as_str().unwrap_or("") && t.state.is_active())})
+            Command::Busy { device } => {
+                json!({"busy":state.tasks.values().any(|t| t.device == device && t.state.is_active())})
             }
-            "queue" => {
+            Command::Queue {
+                device,
+                method,
+                args,
+            } => {
                 if !self.enabled {
                     return error("ACS disabled by UCI");
                 }
-                let device = request["device"].as_str().unwrap_or("");
-                if !state.devices.contains_key(device) {
+                if !state.devices.contains_key(&device) {
                     return error("unknown device: a real Inform is required before queuing RPCs; use acs devices");
                 }
-                let method = request["method"].as_str().unwrap_or("");
-                let args = request["args"].clone();
-                if let Err(err) = validate(method, &args) {
+                if let Err(err) = validate(&method, &args) {
                     return error(&err);
                 }
-                if let Err(err) = protect_management(&state, device, method, &args) {
+                if let Err(err) = protect_management(&state, &device, &method, &args) {
                     return error(&err);
                 }
                 if state.tasks.values().filter(|t| t.state.is_active()).count() >= 128 {
-                    return error("ACS queue full");
+                    return json!({"error":"ACS queue full", "code":"backpressure", "retryable":true});
                 }
                 let Some(id) = state.next_id.checked_add(1) else {
                     return error("ACS task IDs exhausted");
                 };
-                if internal && !state.admit_result(method) {
-                    return error("resource_exhausted: protected ACS response capacity; retry read-only discovery later");
-                }
                 let task = Task {
                     id,
-                    device: device.into(),
-                    method: method.into(),
+                    device,
+                    method,
                     args,
                     state: TaskState::Queued,
                     created: now(),
@@ -262,37 +275,59 @@ impl Server {
                 };
                 self.enqueue_owned(&mut state, task, internal)
             }
-            _ => error("unknown ACS operation"),
+            Command::Task { id } => match state.tasks.get(&id) {
+                Some(task) => serde_json::to_value(TaskView {
+                    task,
+                    result_info: state.results.get(&id),
+                })
+                .unwrap_or_else(|e| error(&e.to_string())),
+                None => error("unknown task"),
+            },
         }
     }
 }
-pub fn control_value(request: Value) -> Value {
+pub fn transact(
+    command: crate::devices::cwmp::transport::Command,
+) -> crate::devices::cwmp::transport::Reply {
     crate::runtime::block_on(async move {
         actor::call(move || {
             let server = init();
-            if request["op"] == "queue" {
-                return server.execute_owned(request, true);
-            }
-            let mut reply = server.execute_value(request.clone());
-            if request["op"] == "task" {
+            if let crate::devices::cwmp::transport::Command::Task { id } = command {
                 let mut state = server.state.lock().unwrap();
-                if let Some(id) = request["id"].as_u64() {
-                    if let Some(info) = state.results.get(&id) {
-                        reply["completed_at"] = json!(info.completed_at);
-                        reply["result_status"] = json!(info.status);
-                        reply["cleanup_reason"] = json!(info.reason);
-                    }
-                    // The full response has now been copied into the consumer-owned Value.
-                    // Acknowledgment only releases the lease; it does not delete readback history.
-                    if reply.get("result").is_some() && state.ack_result(id) {
-                        let _ = server.save(&state);
-                    }
+                if let Some(reason) = &state.load_failure {
+                    return error(reason).into();
                 }
+                state.expire();
+                if let Some(task) = state.tasks.get(&id) {
+                    let mut snapshot = task.clone();
+                    let response = snapshot.result.take();
+                    let mut metadata = serde_json::to_value(TaskView {
+                        task: &snapshot,
+                        result_info: state.results.get(&id),
+                    })
+                    .unwrap_or_else(|e| error(&e.to_string()));
+                    metadata["queue_state"] = json!(if state.waiting_capacity(id) {
+                        "waiting_capacity"
+                    } else if task.state == TaskState::Queued {
+                        "waiting_device"
+                    } else {
+                        "ready"
+                    });
+                    if let Some(response) = response {
+                        let reply = response.reply(metadata);
+                        if state.ack_result(id) {
+                            let _ = server.save(&state);
+                        }
+                        return reply;
+                    }
+                    return metadata.into();
+                }
+                return error("unknown task").into();
             }
-            reply
+            server.execute_command(command, true).into()
         })
         .await
-        .unwrap_or_else(|_| error("ACS transaction queue unavailable"))
+        .unwrap_or_else(|_| error("ACS transaction queue unavailable").into())
     })
 }
 pub fn control(request: &str) -> String {
@@ -357,10 +392,9 @@ mod tests {
                 state: TaskState::Completed,
                 created: 1,
                 sent: Some(2),
-                result: Some(
-                    serde_json::value::to_raw_value(&json!({"raw":"\"\\\n".repeat(100_000)}))
-                        .unwrap(),
-                ),
+                result: Some(resources::Response::uncharged(
+                    json!({"raw":"\"\\\n".repeat(100_000)}),
+                )),
             },
         );
         let result = server.save(&state);
@@ -459,8 +493,18 @@ mod tests {
             "<cwmp:SetParameterValuesResponse><Status>1</Status></cwmp:SetParameterValuesResponse>",
         ))
         .unwrap();
-        assert!(s.response("b", &msg).is_err());
-        s.response("a", &msg).unwrap();
+        assert!(s
+            .response(
+                "b",
+                soap::parse(&soap::envelope(
+                    "urn:dslforum-org:cwmp-1-0",
+                    "fttr-1",
+                    "<cwmp:GetParameterValuesResponse/>"
+                ))
+                .unwrap()
+            )
+            .is_err());
+        s.response("a", msg).unwrap();
         assert_eq!(s.tasks[&4].state, TaskState::AcceptedPendingApply);
         s.tasks.get_mut(&4).unwrap().state = TaskState::Sent;
         s.tasks.get_mut(&4).unwrap().sent = Some(now() - 100);
@@ -513,7 +557,7 @@ mod tests {
             "<cwmp:SetParameterValuesResponse><Status>0</Status></cwmp:SetParameterValuesResponse>",
         ))
         .unwrap();
-        assert!(state.response("a", &reply).is_err());
+        assert!(state.response("a", reply).is_err());
     }
     #[test]
     fn listener_bind_failure_preserves_the_existing_listener() {

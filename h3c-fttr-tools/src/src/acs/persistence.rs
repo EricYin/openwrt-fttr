@@ -39,7 +39,11 @@ impl State {
                 "ACS state exceeds 8 MiB",
             ));
         }
-        let mut state: Self = serde_json::from_reader(BufReader::new(file.take(MAX_STATE_BYTES)))?;
+        let budget = std::sync::Arc::new(super::resources::Budget::default());
+        let mut state: Self = super::resources::restoring(budget.clone(), || {
+            serde_json::from_reader(BufReader::new(file.take(MAX_STATE_BYTES)))
+        })?;
+        state.budget = budget;
         for task in state
             .tasks
             .values_mut()
@@ -63,6 +67,24 @@ impl State {
             .next_id
             .max(state.tasks.keys().next_back().copied().unwrap_or(0));
         state.prune();
+        for task in state.tasks.values_mut() {
+            if let Some(response) = task.result.take() {
+                if response.charged_already() {
+                    task.result = Some(response);
+                    continue;
+                }
+                let permit = state
+                    .budget
+                    .reserve(response.bytes(), super::resources::RESULT_BYTES)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "restored responses exceed memory budget",
+                        )
+                    })?;
+                task.result = Some(response.with_charge(permit));
+            }
+        }
         Ok(state)
     }
 

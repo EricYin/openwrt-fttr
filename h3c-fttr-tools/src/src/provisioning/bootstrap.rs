@@ -610,6 +610,8 @@ async fn run(
             r.finish(generation, result, now());
         }
         c.persist();
+        drop(c);
+        super::controller::wake();
     })
     .await;
 }

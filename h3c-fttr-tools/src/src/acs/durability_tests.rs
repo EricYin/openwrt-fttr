@@ -220,7 +220,7 @@ fn response_plus_next_save_failure_never_requeues_the_already_emitted_write() {
     let state = fixture.0.state.lock().unwrap();
     assert_eq!(state.tasks[&1].state, TaskState::Completed);
     let result: Value =
-        serde_json::from_str(state.tasks[&1].result.as_ref().unwrap().get()).unwrap();
+        serde_json::to_value(state.tasks[&1].result.as_ref().unwrap().get()).unwrap();
     assert_eq!(result["status"], "0");
     assert_eq!(state.tasks[&2].state, TaskState::Queued);
     drop(state);

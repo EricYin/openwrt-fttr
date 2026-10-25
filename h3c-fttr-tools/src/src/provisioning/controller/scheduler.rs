@@ -2,7 +2,7 @@
 use super::*;
 use crate::provisioning::{bootstrap, link_identity, management_network, storage};
 
-pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>) {
+pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Ready) -> Duration {
     // Release the optical lock before consulting ACS or the controller.
     let online_onus: BTreeMap<_, _> = engine
         .lock()
@@ -17,8 +17,8 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>) {
     if let Ok(mut registry) = crate::mqtt_identity::shared().lock() {
         registry.update_topology(online_onus.clone(), source_links, now());
     }
-    let devices = acs(json!({"op":"devices"}));
-    let acs_status = acs(json!({"op":"status"}));
+    let devices = acs(Command::Devices);
+    let acs_status = acs(Command::Status);
     let desired = controller()
         .lock()
         .unwrap()
@@ -28,7 +28,7 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>) {
     management_network::tick(desired.as_ref());
     let active_management = management_network::active();
     let mut c = controller().lock().unwrap();
-    c.acs_status = acs_status;
+    c.acs_status = acs_status.into_metadata();
     c.resolve_pending_identities(&devices);
     let config = c.config.clone();
     bootstrap::retain_devices(&config.devices.iter().map(|d| d.id.clone()).collect());
@@ -127,6 +127,7 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>) {
         )
             .hash(&mut epoch_hash);
         let capability_epoch = epoch_hash.finish();
+        let availability_changed = reachable != c.last_online.contains(&d.id);
         if let Some(op) = c.operations.get_mut(&d.id) {
             if op.stage == OperationPhase::Completed
                 && (new_boot
@@ -156,11 +157,38 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>) {
                     }
                 }
             }
-            if op.stage != OperationPhase::Completed {
+            if op.stage != OperationPhase::Completed
+                && (batch.all
+                    || batch.devices.contains(&d.cwmp_id)
+                    || new_boot
+                    || availability_changed)
+            {
                 if config.management_network.is_some() && !host_matches {
                     continue;
                 }
-                if !reconcile(op, capability_identity, capability_epoch, reachable) {
+                let before = (
+                    op.stage,
+                    op.index,
+                    op.task,
+                    op.compiled,
+                    op.capabilities.progress(),
+                    op.wan.progress(),
+                    op.wifi.progress(),
+                );
+                let publish = reconcile(op, capability_identity, capability_epoch, reachable);
+                let after = (
+                    op.stage,
+                    op.index,
+                    op.task,
+                    op.compiled,
+                    op.capabilities.progress(),
+                    op.wan.progress(),
+                    op.wifi.progress(),
+                );
+                if before != after && op.stage != OperationPhase::Completed {
+                    wake_device(&d.cwmp_id);
+                }
+                if !publish {
                     continue;
                 }
             }
@@ -190,6 +218,20 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>) {
     c.persist_history(|data| {
         storage::write_atomic("/var/lib/fttr/provisioning-state.json", data, false)
     });
+    // State remains authoritative; the low-frequency sweep also detects optical
+    // changes from backends that do not publish CWMP events.
+    let deadline = c
+        .operations
+        .values()
+        .flat_map(|op| [op.verify_after, op.capabilities.deadline()])
+        .chain(c.next_retry_at.values().copied())
+        .filter(|at| *at > time)
+        .min();
+    Duration::from_secs(
+        deadline
+            .map_or(10, |at| at.saturating_sub(time).min(10))
+            .max(1),
+    )
 }
 
 fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, time: u64) {

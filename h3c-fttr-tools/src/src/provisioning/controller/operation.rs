@@ -59,6 +59,7 @@ impl Operation {
             index: 0,
             stage: OperationPhase::Waiting,
             task: None,
+            submission: None,
             wan,
             wifi,
             roots: Vec::new(),
@@ -91,13 +92,18 @@ impl Operation {
         if i.kind == ItemKind::WanActivation && state != ItemOutcome::Verified {
             if let Some(service) = i.wan_ref.clone() {
                 if let Some(result) = self.results.get_mut(&service) {
-                    result["state"] = json!(state);
-                    result["reason"] = json!(format!("WAN activation: {reason}"));
+                    // A dependent activation must not hide the service's
+                    // original configuration failure.
+                    if ItemOutcome::from_result(result) == Some(ItemOutcome::Verified) {
+                        result["state"] = json!(state);
+                        result["reason"] = json!(format!("WAN activation: {reason}"));
+                    }
                 }
             }
         }
         self.index += 1;
         self.task = None;
+        self.submission = None;
         self.stage = OperationPhase::Waiting;
         self.roots.clear();
         self.writable.clear();
@@ -112,6 +118,7 @@ impl Operation {
     }
 
     pub(super) fn complete(&mut self, time: u64) {
+        self.submission = None;
         self.stage = OperationPhase::Completed;
         self.completed_at.get_or_insert(time);
     }

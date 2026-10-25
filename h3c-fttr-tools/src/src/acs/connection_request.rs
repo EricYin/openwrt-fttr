@@ -77,7 +77,7 @@ impl Worker {
                 state
                     .connection_requests
                     .retain(|id, _| configs.get(id).is_some_and(|c| c.enabled));
-                let candidate = configs
+                let candidates: Vec<_> = configs
                     .iter()
                     .filter(|(id, config)| {
                         config.enabled
@@ -107,6 +107,13 @@ impl Worker {
                                 .values()
                                 .any(|t| t.device == **id && t.state == TaskState::Sent)
                     })
+                    .collect();
+                for (id, _) in &candidates {
+                    state.dispatch_demand(id);
+                }
+                let candidate = candidates
+                    .into_iter()
+                    .filter(|(id, _)| state.schedule_device(id))
                     .min_by_key(|(id, _)| self.attempts.get(*id).copied());
                 let Some((id, config)) = candidate else {
                     return;

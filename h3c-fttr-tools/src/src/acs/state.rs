@@ -48,14 +48,14 @@ impl State {
             .values()
             .filter(|t| !self.results.get(&t.id).is_some_and(|i| i.protected))
             .filter_map(|t| t.result.as_ref())
-            .map(|r| r.get().len())
+            .map(|r| r.bytes())
             .sum();
         let protected_bytes: usize = self
             .tasks
             .values()
             .filter(|t| self.results.get(&t.id).is_some_and(|i| i.protected))
             .filter_map(|t| t.result.as_ref())
-            .map(|r| r.get().len())
+            .map(|r| r.bytes())
             .sum();
         // Reserve 1 MiB for task arguments, device Inform records and JSON metadata.
         let ordinary_ceiling = (7 * 1024 * 1024usize).saturating_sub(protected_bytes);
@@ -81,7 +81,7 @@ impl State {
                 }
                 if let Some(task) = self.tasks.get_mut(&id) {
                     if let Some(res) = task.result.take() {
-                        total_result_bytes = total_result_bytes.saturating_sub(res.get().len());
+                        total_result_bytes = total_result_bytes.saturating_sub(res.bytes());
                         let info = self.results.entry(id).or_default();
                         info.status = "expired".into();
                         info.reason = "ordinary cache capacity".into();
@@ -113,6 +113,15 @@ impl State {
             }
         }
         self.prune();
+        let terminal: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|(_, t)| !t.state.is_active())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in terminal {
+            self.release_dispatch(id);
+        }
     }
 
     pub(super) fn next(
@@ -125,6 +134,9 @@ impl State {
             .values()
             .any(|t| t.device == device && t.state == TaskState::Sent)
         {
+            return Ok(None);
+        }
+        if !self.schedule_device(device) {
             return Ok(None);
         }
         if let Some(task) = self
@@ -146,6 +158,7 @@ impl State {
                 task.state = TaskState::Fault;
                 task.result = Some(error_result(&reason));
                 self.mark_completed(id);
+                self.release_dispatch(id);
                 return Ok(None);
             }
         }
@@ -166,7 +179,7 @@ impl State {
         Ok(None)
     }
 
-    pub(super) fn response(&mut self, device: &str, message: &soap::Message) -> io::Result<()> {
+    pub(super) fn response(&mut self, device: &str, message: soap::Message) -> io::Result<()> {
         let id = message
             .id
             .strip_prefix("fttr-")
@@ -220,27 +233,31 @@ impl State {
                 "RPC response method mismatch",
             ));
         }
-        task.result = Some(serde_json::value::to_raw_value(&message.data)?);
-        if task.method == "GetParameterValues" && task.state == TaskState::Completed {
+        let method = task.method.clone();
+        let completed = task.state == TaskState::Completed;
+        if method == "GetParameterValues" && completed {
             let evidence = super::readback::service_evidence(&message.data);
             self.results.entry(id).or_default().management_services = evidence;
         }
+        let value = message.data;
+        let bytes = value.bytes();
+        // Parser and dispatch both enforce this bound. Synthetic tests without a
+        // dispatch lease still use the same global accounting.
+        let permit = self.take_permit(id);
+        let permit = match permit {
+            Some(permit) => permit.shrink(bytes),
+            None => self.budget.reserve(bytes, super::resources::RESULT_BYTES),
+        };
+        let result = permit.map(|p| super::resources::Response::charged(value, p));
+        let task = self.tasks.get_mut(&id).unwrap();
+        task.result = Some(match result {
+            Some(result) => result,
+            None => {
+                task.state = TaskState::Fault;
+                error_result("response_too_large: result exceeds its dispatch contract")
+            }
+        });
         self.mark_completed(id);
-        let protected_bytes: usize = self
-            .tasks
-            .iter()
-            .filter(|(id, _)| self.results.get(id).is_some_and(|i| i.protected))
-            .filter_map(|(_, t)| t.result.as_ref())
-            .map(|r| r.get().len())
-            .sum();
-        if protected_bytes > super::retention::PROTECTED_BYTES {
-            self.tasks.get_mut(&id).unwrap().result = Some(error_result(
-                "resource_exhausted: protected response budget",
-            ));
-            let info = self.results.get_mut(&id).unwrap();
-            info.status = "resource_exhausted".into();
-            info.reason = "protected response budget".into();
-        }
         self.prune();
         Ok(())
     }

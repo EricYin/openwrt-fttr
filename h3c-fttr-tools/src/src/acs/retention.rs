@@ -2,17 +2,15 @@
 use super::{now, State};
 use serde::{Deserialize, Serialize};
 
-pub(super) const PROTECTED_BYTES: usize = 4 * 1024 * 1024;
-const RESPONSE_RESERVATION: usize = 2 * 1024 * 1024;
 pub(super) const LEASE_SECONDS: u64 = 120;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(super) struct ResultInfo {
     pub completed_at: Option<u64>,
     pub protected: bool,
-    #[serde(rename = "result_status", alias = "status")]
+    #[serde(rename = "result_status")]
     pub status: String,
-    #[serde(rename = "cleanup_reason", alias = "reason")]
+    #[serde(rename = "cleanup_reason")]
     pub reason: String,
     /// Compact safety evidence outlives the ordinary raw-response cache.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -28,30 +26,6 @@ impl ResultInfo {
     }
 }
 impl State {
-    pub(super) fn admit_result(&self, method: &str) -> bool {
-        let used: usize = self
-            .results
-            .iter()
-            .filter(|(_, i)| i.protected)
-            .map(|(id, _)| {
-                self.tasks.get(id).map_or(0, |t| {
-                    t.result.as_ref().map_or(
-                        if t.method == "GetParameterNames" {
-                            RESPONSE_RESERVATION
-                        } else {
-                            64 * 1024
-                        },
-                        |r| r.get().len(),
-                    )
-                })
-            })
-            .sum();
-        used + if method == "GetParameterNames" {
-            RESPONSE_RESERVATION
-        } else {
-            64 * 1024
-        } <= PROTECTED_BYTES
-    }
     pub(super) fn ack_result(&mut self, id: u64) -> bool {
         let Some(info) = self.results.get_mut(&id) else {
             return false;
@@ -61,12 +35,19 @@ impl State {
         }
         info.protected = false;
         info.status = "released".into();
-        info.reason = "consumer copied response".into();
+        info.reason = "consumer owns shared response".into();
+        // The returned handle keeps the charge; history stores compact evidence.
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.result = None;
+        }
         true
     }
     pub(super) fn mark_completed(&mut self, id: u64) {
         let info = self.results.entry(id).or_default();
         info.completed_at.get_or_insert_with(now);
         info.status = "available".into();
+        if let Some(task) = self.tasks.get(&id) {
+            crate::provisioning::controller::wake_device(&task.device);
+        }
     }
 }

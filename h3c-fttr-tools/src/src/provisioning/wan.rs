@@ -56,6 +56,7 @@ fn ip_kind() -> String {
 }
 #[derive(Clone)]
 pub struct Reconciler {
+    submission: Option<crate::devices::cwmp::transport::Pending<WanPhase>>,
     pub evidence_paths: BTreeMap<String, Vec<String>>,
     pub protected_roots: BTreeSet<String>,
     pub owned: BTreeMap<String, Owned>,
@@ -76,6 +77,16 @@ pub struct Reconciler {
     final_apply: bool,
 }
 impl Reconciler {
+    pub(super) fn progress(&self) -> (WanPhase, Option<u64>, bool, usize, usize, bool) {
+        (
+            self.stage,
+            self.task,
+            self.initialized,
+            self.discovery.len(),
+            self.actions.len(),
+            self.final_started,
+        )
+    }
     pub fn new(device: &Device, owned: BTreeMap<String, Owned>, prune: bool) -> Self {
         let _ = device;
         Self {
@@ -86,6 +97,7 @@ impl Reconciler {
             actions: VecDeque::new(),
             stage: WanPhase::Waiting,
             task: None,
+            submission: None,
             current: None,
             initialized: false,
             discovery: VecDeque::new(),
@@ -106,6 +118,7 @@ impl Reconciler {
         self.final_started = true;
         self.final_apply = apply;
         self.initialized = false;
+        self.submission = None;
         self.stage = WanPhase::Waiting;
         self.parents.clear();
         self.vlans.clear();
@@ -115,6 +128,14 @@ impl Reconciler {
         self.prune
     }
     fn queue(&mut self, device: &Device, method: &str, args: Value, stage: WanPhase) {
+        self.submission = Some(crate::devices::cwmp::transport::Pending {
+            method: method.into(),
+            args,
+            stage,
+        });
+        self.submit(device);
+    }
+    fn submit(&mut self, device: &Device) {
         if self.save(&device.cwmp_id).is_err() {
             self.fail(
                 device,
@@ -123,11 +144,19 @@ impl Reconciler {
             );
             return;
         }
-        let v = acs(json!({"op":"queue","device":device.cwmp_id,"method":method,"args":args}));
+        let pending = self.submission.as_ref().unwrap();
+        let v = acs(Command::queue(
+            &device.cwmp_id,
+            &pending.method,
+            pending.args.clone(),
+        ));
         if let Some(id) = v["id"].as_u64() {
             self.task = Some(id);
-            self.stage = stage;
+            self.stage = self.submission.take().unwrap().stage;
+        } else if crate::devices::cwmp::transport::backpressure(&v) {
+            self.task = None;
         } else {
+            self.submission = None;
             self.fail(
                 device,
                 ItemOutcome::Failed,
@@ -146,6 +175,7 @@ impl Reconciler {
             json!({"state":state,"reason":reason,"task_id":self.task,"cwmp_id":device.cwmp_id}),
         );
         self.task = None;
+        self.submission = None;
         self.current = None;
         self.stage = WanPhase::Next;
     }
@@ -188,7 +218,15 @@ impl Reconciler {
         if !reachable {
             return false;
         }
-        if self.task.is_none() && acs(json!({"op":"busy","device":device.cwmp_id}))["busy"] == true
+        if self.submission.is_some() {
+            self.submit(device);
+            return false;
+        }
+        if self.task.is_none()
+            && acs(Command::Busy {
+                device: device.cwmp_id.clone(),
+            })["busy"]
+                == true
         {
             return false;
         }
@@ -203,7 +241,7 @@ impl Reconciler {
             return false;
         }
         if let Some(task) = self.task {
-            let v = acs(json!({"op":"task","id":task}));
+            let v = acs(Command::Task { id: task });
             let state = TaskOutcome::from_task(&v);
             if matches!(state, TaskOutcome::Queued | TaskOutcome::Sent) {
                 return false;
@@ -248,7 +286,7 @@ impl Reconciler {
                     | WanPhase::VerifyDelete
                     | WanPhase::EmptyParent
                     | WanPhase::VerifyParentDelete
-            ) && v["result"]["parameters"].as_array().is_none()
+            ) && v.result().rows().is_none()
             {
                 self.fail(
                     device,
@@ -262,7 +300,7 @@ impl Reconciler {
             match self.stage {
                 WanPhase::Inventory => {
                     let mut connections = BTreeSet::new();
-                    for p in v["result"]["parameters"].as_array().into_iter().flatten() {
+                    for p in v.result().rows().into_iter().flatten() {
                         if let Some(n) = p["name"].as_str().and_then(|n| n.strip_prefix(ROOT)) {
                             let parts: Vec<_> = n.split('.').collect();
                             if let Ok(parent) = parts[0].parse::<u32>() {
@@ -292,7 +330,7 @@ impl Reconciler {
                 }
                 WanPhase::Classifying => {
                     let (parent, connection, kind) = self.discovery.pop_front().unwrap();
-                    let parameters = v["result"]["parameters"].as_array();
+                    let parameters = v.result().rows();
                     let value = |suffix: &str| {
                         parameters
                             .and_then(|a| {
@@ -340,7 +378,7 @@ impl Reconciler {
                         kind: kind.clone(),
                         state: if protected(service, enabled)
                             || crate::devices::cwmp::observed::protected(
-                                parameters.map(Vec::as_slice).unwrap_or_default(),
+                                parameters.unwrap_or_default(),
                                 &format!("{ROOT}{parent}.{kind}.{connection}."),
                             ) {
                             WanOwnershipState::Protected
@@ -354,7 +392,7 @@ impl Reconciler {
                     return false;
                 }
                 WanPhase::AddingParent => {
-                    let n = v["result"]["instance_number"]
+                    let n = v.result()["instance_number"]
                         .as_str()
                         .and_then(|n| n.parse::<u32>().ok())
                         .filter(|n| *n > 0);
@@ -383,8 +421,9 @@ impl Reconciler {
                     let id = self.current.as_ref().unwrap().0.clone();
                     let o = &self.owned[&id];
                     let prefix = format!("{ROOT}{}.WANIPConnection.", o.parent);
-                    let children: BTreeSet<u32> = v["result"]["parameters"]
-                        .as_array()
+                    let children: BTreeSet<u32> = v
+                        .result()
+                        .rows()
                         .into_iter()
                         .flatten()
                         .filter_map(|p| {
@@ -424,7 +463,7 @@ impl Reconciler {
                     }
                 }
                 WanPhase::AddingChild => {
-                    let n = v["result"]["instance_number"]
+                    let n = v.result()["instance_number"]
                         .as_str()
                         .and_then(|n| n.parse::<u32>().ok())
                         .filter(|n| *n > 0);
@@ -458,7 +497,7 @@ impl Reconciler {
                         );
                         return false;
                     }
-                    let parameters = v["result"]["parameters"].as_array();
+                    let parameters = v.result().rows();
                     let value = |suffix: &str| {
                         parameters
                             .and_then(|a| {
@@ -479,7 +518,7 @@ impl Reconciler {
                         return false;
                     };
                     if crate::devices::cwmp::observed::protected(
-                        parameters.map(Vec::as_slice).unwrap_or_default(),
+                        parameters.unwrap_or_default(),
                         &format!("{ROOT}{}.{}.{}.", o.parent, o.kind, o.connection),
                     ) || super::contains_service_token(observed, "TR069")
                         || (!observed.is_empty() && observed != o.service_list)
@@ -530,8 +569,9 @@ impl Reconciler {
                     let id = self.current.as_ref().unwrap().0.clone();
                     let o = &self.owned[&id];
                     let path = format!("{ROOT}{}.{}.{}.", o.parent, o.kind, o.connection);
-                    let exists = v["result"]["parameters"]
-                        .as_array()
+                    let exists = v
+                        .result()
+                        .rows()
                         .is_some_and(|a| a.iter().any(|p| p["name"] == path));
                     if exists {
                         self.fail(
@@ -570,24 +610,17 @@ impl Reconciler {
                     let id = self.current.as_ref().unwrap().0.clone();
                     let parent = self.owned[&id].parent;
                     let prefix = format!("{ROOT}{parent}.");
-                    let children = v["result"]["parameters"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .any(|p| {
-                            p["name"]
-                                .as_str()
-                                .and_then(|n| n.strip_prefix(&prefix))
-                                .is_some_and(|n| {
-                                    let parts: Vec<_> = n.split('.').collect();
-                                    parts.len() > 1
-                                        && matches!(
-                                            parts[0],
-                                            "WANIPConnection" | "WANPPPConnection"
-                                        )
-                                        && parts[1].parse::<u32>().is_ok()
-                                })
-                        });
+                    let children = v.result().rows().into_iter().flatten().any(|p| {
+                        p["name"]
+                            .as_str()
+                            .and_then(|n| n.strip_prefix(&prefix))
+                            .is_some_and(|n| {
+                                let parts: Vec<_> = n.split('.').collect();
+                                parts.len() > 1
+                                    && matches!(parts[0], "WANIPConnection" | "WANPPPConnection")
+                                    && parts[1].parse::<u32>().is_ok()
+                            })
+                    });
                     if children {
                         self.owned.remove(&id);
                         self.results.insert(id,json!({"state":"deleted","reason":"surplus connection absence verified; shared parent retained","task_id":task}));
@@ -616,8 +649,8 @@ impl Reconciler {
                     let id = self.current.as_ref().unwrap().0.clone();
                     let parent = self.owned[&id].parent;
                     let path = format!("{ROOT}{parent}.");
-                    if v["result"]["parameters"]
-                        .as_array()
+                    if v.result()
+                        .rows()
                         .is_none_or(|a| a.iter().any(|p| p["name"] == path))
                     {
                         self.fail(
@@ -1505,3 +1538,4 @@ mod tests {
         });
     }
 }
+use crate::devices::cwmp::transport::Command;

@@ -7,9 +7,9 @@
 mod bootstrap;
 mod config;
 pub(crate) use config::words as uci_words;
-mod management_network;
-mod controller;
+pub(crate) mod controller;
 mod link_identity;
+mod management_network;
 pub mod model;
 mod policy;
 mod storage;
@@ -17,18 +17,18 @@ mod templates;
 mod wan;
 mod wifi;
 
-use controller::acs;
-#[cfg(test)]
-use controller::RPC;
 #[cfg(feature = "mqtt")]
 pub(crate) use bootstrap::observe_mqtt;
-pub use controller::{control, snapshot, start};
+use controller::acs;
+#[cfg(feature = "acs")]
+pub(crate) use controller::connection_request_devices;
+#[cfg(test)]
+use controller::RPC;
 pub(crate) use controller::{
     allows_generic_bridge, is_device_adapter, management_desired, management_result,
     management_version,
 };
+pub use controller::{control, snapshot, start};
 pub(crate) use policy::contains_service_token;
 #[cfg(feature = "acs")]
 pub(crate) use policy::{owns_business_wan, protected_wan_parent};
-#[cfg(feature = "acs")]
-pub(crate) use controller::connection_request_devices;

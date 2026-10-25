@@ -22,6 +22,7 @@ impl DispatchUndo {
             .expect("prepared task remains locked");
         task.state = TaskState::Queued;
         task.sent = self.sent;
+        state.release_dispatch(self.id);
     }
 }
 
@@ -31,6 +32,22 @@ impl Server {
     }
     pub(super) fn enqueue_owned(&self, state: &mut State, task: Task, protected: bool) -> Value {
         state.prune();
+        let argument_bytes: usize = state
+            .tasks
+            .values()
+            .filter(|t| t.state.is_active())
+            .map(|t| super::resources::memory(&t.args))
+            .sum();
+        if argument_bytes + super::resources::memory(&task.args) > super::resources::ARGUMENT_BYTES
+            || state
+                .tasks
+                .values()
+                .filter(|t| t.device == task.device && t.state.is_active())
+                .count()
+                >= 4
+        {
+            return json!({"error":"task ingress capacity exhausted", "code":"backpressure", "retryable":true});
+        }
         let mut evicted = Vec::new();
         while state.tasks.len() >= 256 {
             let oldest = state
@@ -42,7 +59,7 @@ impl Server {
                 .map(|(id, _)| *id);
             let Some(id) = oldest else {
                 state.tasks.extend(evicted);
-                return error("ACS task history full");
+                return json!({"error":"ACS task history full", "code":"backpressure", "retryable":true});
             };
             if let Some(task) = state.tasks.remove(&id) {
                 evicted.push((id, task));
@@ -60,6 +77,7 @@ impl Server {
         match self.save(state) {
             Ok(()) => {
                 super::connection_request::wake();
+                crate::provisioning::controller::wake_device(&state.tasks[&id].device);
                 json!(state.tasks[&id])
             }
             Err(err) => {
@@ -86,7 +104,12 @@ impl Server {
             .extract_if(.., |_, (id, _, _)| id == device)
             .collect();
         match self.save(state) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                for (id, _) in &tasks {
+                    state.release_dispatch(*id);
+                }
+                Ok(())
+            }
             Err(err) => {
                 state.tasks.extend(tasks);
                 state.results.extend(results);

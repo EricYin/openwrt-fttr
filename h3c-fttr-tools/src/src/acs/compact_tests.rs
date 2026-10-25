@@ -1,5 +1,5 @@
+use super::resources::Response;
 use super::*;
-use serde_json::value::{to_raw_value, RawValue};
 
 fn server() -> Arc<Server> {
     super::tests::listener_test_server()
@@ -35,13 +35,15 @@ fn protected_slow_large_responses_survive_newer_small_results_and_ack() {
             "<cwmp:GetParameterValuesResponse/>",
         ))
         .unwrap();
-        message.data =
-            json!({"parameters":[],"padding":"x".repeat(if id < 3 { 753_000 } else { 10 })});
-        state.response("compact-test", &message).unwrap();
+        message.data = serde_json::from_value(
+            json!({"parameters":[],"padding":"x".repeat(if id < 3 { 753_000 } else { 10 })}),
+        )
+        .unwrap();
+        state.response("compact-test", message).unwrap();
     }
     state.prune();
     for id in 1..=2 {
-        assert!(state.tasks[&id].result.as_ref().unwrap().get().len() > 753_000);
+        assert!(state.tasks[&id].result.as_ref().unwrap().bytes() > 753_000);
         assert!(state.results[&id].completed_at.unwrap() >= now() - 1);
     }
     server.save(&state).unwrap();
@@ -54,7 +56,7 @@ fn protected_slow_large_responses_survive_newer_small_results_and_ack() {
     assert!(state.results[&1].protected);
     assert!(state.ack_result(1));
     assert!(!state.ack_result(1));
-    assert!(state.tasks[&1].result.is_some());
+    assert!(state.tasks[&1].result.is_none());
     state.results.get_mut(&2).unwrap().completed_at = Some(now() - retention::LEASE_SECONDS);
     state.prune();
     assert!(!state.results[&2].protected);
@@ -64,19 +66,126 @@ fn protected_slow_large_responses_survive_newer_small_results_and_ack() {
 }
 
 #[test]
-fn discovery_admission_reserves_two_large_responses_and_releases_capacity() {
+fn dispatch_waits_without_reserving_queued_results() {
     let mut state = State::default();
-    for id in 1..=2 {
-        assert!(state.admit_result("GetParameterNames"));
+    for id in 1..=16 {
         let mut t = task(id);
         t.method = "GetParameterNames".into();
+        t.device = format!("device-{id}");
+        t.state = TaskState::Queued;
         state.tasks.insert(id, t);
         state.results.insert(id, retention::ResultInfo::protected());
     }
-    assert!(!state.admit_result("GetParameterNames"));
-    state.mark_completed(1);
-    assert!(state.ack_result(1));
-    assert!(state.admit_result("GetParameterNames"));
+    assert_eq!(state.budget.used(), 0);
+    assert!(state.schedule_device("device-1"));
+    assert!(!state.schedule_device("device-2"));
+    assert_eq!(state.budget.used(), 2 * 1024 * 1024);
+    state.tasks.get_mut(&1).unwrap().state = TaskState::Completed;
+    state.release_dispatch(1);
+    assert!(state.schedule_device("device-2"));
+}
+
+#[test]
+#[ignore = "isolated Linux RSS stress run; execute with --ignored --exact --nocapture"]
+fn mixed_response_memory_plateaus() {
+    fn rss_kib() -> usize {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmRSS:")
+                    .and_then(|v| v.split_whitespace().next())
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap()
+    }
+    let rows = (0..6000).map(|n| format!("<ParameterInfoStruct><Name>InternetGatewayDevice.WANDevice.1.Test.{n}</Name><Writable>true</Writable></ParameterInfoStruct>")).collect::<String>();
+    let large = format!("<cwmp:GetParameterNamesResponse><ParameterList>{rows}</ParameterList></cwmp:GetParameterNamesResponse>");
+    let medium = format!("<cwmp:GetParameterValuesResponse><ParameterList>{}</ParameterList></cwmp:GetParameterValuesResponse>", (0..500).map(|n| format!("<ParameterValueStruct><Name>InternetGatewayDevice.Test.{n}</Name><Value xsi:type=\"xsd:string\">value</Value></ParameterValueStruct>")).collect::<String>());
+    let mut state = State::default();
+    let mut samples = Vec::new();
+    let mut high_water = 0;
+    let mut next = 0;
+    for round in 0..40 {
+        let mut outstanding = Vec::new();
+        for device in 0..16 {
+            next += 1;
+            let mut t = task(next);
+            t.device = format!("stress-{device}");
+            t.method = match device % 4 {
+                0 => "GetParameterNames",
+                1 => "GetParameterValues",
+                _ => "SetParameterValues",
+            }
+            .into();
+            t.state = TaskState::Queued;
+            t.sent = None;
+            state.dispatch_demand(&t.device);
+            state
+                .results
+                .insert(next, retention::ResultInfo::protected());
+            state.tasks.insert(next, t);
+            outstanding.push(next);
+        }
+        let mut consumers = std::collections::VecDeque::new();
+        while !outstanding.is_empty() {
+            // All live CPEs request work, with small and large replies mixed.
+            let mut progress = false;
+            for id in outstanding.clone() {
+                let device = state.tasks[&id].device.clone();
+                if !state.schedule_device(&device) {
+                    continue;
+                }
+                high_water = high_water.max(state.budget.used());
+                assert!(high_water <= resources::RESULT_BYTES);
+                let t = state.tasks.get_mut(&id).unwrap();
+                t.state = TaskState::Sent;
+                t.sent = Some(now());
+                let body = match t.method.as_str() { "GetParameterNames" => large.as_str(), "GetParameterValues" => medium.as_str(), _ => "<cwmp:SetParameterValuesResponse><Status>0</Status></cwmp:SetParameterValuesResponse>" };
+                let xml = soap::envelope("urn:dslforum-org:cwmp-1-0", &format!("fttr-{id}"), body);
+                let limit = state.parsing_permit(id).unwrap().bytes();
+                let message = crate::runtime::block_on(soap::parse_stream(
+                    tokio::io::BufReader::new(xml.as_bytes()),
+                    |_| limit,
+                ))
+                .unwrap();
+                state.response(&device, message).unwrap();
+                assert_ne!(state.tasks[&id].state, TaskState::Fault);
+                consumers.push_back(
+                    state.tasks[&id]
+                        .result
+                        .as_ref()
+                        .unwrap()
+                        .reply(json!({"state":"completed"})),
+                );
+                assert!(state.ack_result(id));
+                if consumers.len() > 2 {
+                    consumers.pop_front();
+                }
+                outstanding.retain(|n| *n != id);
+                progress = true;
+            }
+            if !progress {
+                assert!(
+                    consumers.pop_front().is_some(),
+                    "fair scheduler stalled with no consumer holding capacity"
+                );
+            }
+        }
+        drop(consumers);
+        assert_eq!(state.budget.used(), 0);
+        state.tasks.clear();
+        state.results.clear();
+        if round % 5 == 4 {
+            samples.push(rss_kib());
+        }
+    }
+    println!("640 mixed-device RPCs; budget high-water={high_water} bytes; RSS KiB (5-round intervals)={samples:?}");
+    let warm = samples[1];
+    assert!(
+        samples[2..].iter().all(|rss| *rss <= warm + 8 * 1024),
+        "RSS failed to plateau after warmup"
+    );
 }
 
 #[test]
@@ -101,7 +210,7 @@ fn queued_consumer_lease_starts_at_completion_not_queue_time() {
         "<cwmp:GetParameterValuesResponse/>",
     ))
     .unwrap();
-    state.response("compact-test", &message).unwrap();
+    state.response("compact-test", message).unwrap();
     assert!(state.results[&1].protected);
     assert!(state.tasks[&1].result.is_some());
     assert!(state.results[&1].completed_at.unwrap() >= now() - 1);
@@ -120,9 +229,11 @@ fn compact_wan_safety_evidence_survives_raw_cache_cleanup_but_expires() {
         "<cwmp:GetParameterValuesResponse/>",
     ))
     .unwrap();
-    message.data =
-        json!({"parameters":[{"name":format!("{prefix}X_CU_ServiceList"),"value":"OTHER"}]});
-    state.response("compact-test", &message).unwrap();
+    message.data = serde_json::from_value(
+        json!({"parameters":[{"name":format!("{prefix}X_CU_ServiceList"),"value":"OTHER"}]}),
+    )
+    .unwrap();
+    state.response("compact-test", message).unwrap();
     state.results.get_mut(&1).unwrap().completed_at = Some(now() - 30);
     state.prune();
     assert!(state.tasks[&1].result.is_none());
@@ -132,10 +243,13 @@ fn compact_wan_safety_evidence_survives_raw_cache_cleanup_but_expires() {
     );
     state.results.get_mut(&1).unwrap().completed_at = Some(now() - 91);
     assert_eq!(readback::observed(&state, "compact-test", prefix), None);
-    let evidence = readback::service_evidence(&json!({"parameters":[
-        {"name":format!("{prefix}X_CU_ServiceList"),"value":"OTHER"},
-        {"name":format!("{prefix}X_CU_ServiceList"),"value":"INTERNET_TR069"}
-    ]}));
+    let evidence = readback::service_evidence(
+        &serde_json::from_value(json!({"parameters":[
+            {"name":format!("{prefix}X_CU_ServiceList"),"value":"OTHER"},
+            {"name":format!("{prefix}X_CU_ServiceList"),"value":"INTERNET_TR069"}
+        ]}))
+        .unwrap(),
+    );
     assert_eq!(evidence.get(prefix), Some(&true));
 }
 
@@ -146,7 +260,9 @@ fn oversized_save_preserves_previous_readable_state() {
     let before = fs::read(&server.state_file).unwrap();
     let mut state = State::default();
     let mut t = task(1);
-    t.result = Some(to_raw_value(&"x".repeat(8 * 1024 * 1024)).unwrap());
+    t.result = Some(Response::uncharged(
+        json!({"padding":"x".repeat(8 * 1024 * 1024)}),
+    ));
     state.tasks.insert(1, t);
     assert!(server.save(&state).is_err());
     assert_eq!(fs::read(&server.state_file).unwrap(), before);
@@ -158,7 +274,7 @@ fn oversized_save_preserves_previous_readable_state() {
 #[test]
 fn large_result_survives_response_save_load_and_direct_query() {
     let server = server();
-    let parameters: Vec<_> = (0..24_000)
+    let parameters: Vec<_> = (0..2_000)
         .map(|n| {
             json!({
                 "name":format!("InternetGatewayDevice.LANDevice.1.Test.{n}"),
@@ -175,15 +291,16 @@ fn large_result_survives_response_save_load_and_direct_query() {
         "<cwmp:GetParameterValuesResponse/>",
     ))
     .unwrap();
-    message.data = expected.clone();
+    message.data = serde_json::from_value(expected.clone()).unwrap();
 
-    state.response("compact-test", &message).unwrap();
+    state.results.insert(1, retention::ResultInfo::protected());
+    state.response("compact-test", message).unwrap();
     server.save(&state).unwrap();
     let loaded = State::load(&server.state_file).unwrap();
     *server.state.lock().unwrap() = loaded;
     let reply = server.execute(json!({"op":"task","id":1}));
 
-    assert!(reply.len() > 6 * 1024 * 1024);
+    assert!(reply.len() > 400 * 1024);
     let reply: Value = serde_json::from_str(&reply).unwrap();
     assert_eq!(reply["result"], expected);
     assert_eq!(reply["state"], "completed");
@@ -191,17 +308,28 @@ fn large_result_survives_response_save_load_and_direct_query() {
 }
 
 #[test]
-fn query_serializes_raw_result_without_a_dom_round_trip() {
-    let server = server();
-    let raw = r#"{ "parameters" : [ ], "number" : 1e+02 }"#;
+fn result_budget_lives_until_last_shared_consumer_drops() {
+    let mut state = State::default();
+    let value = json!({"parameters":[], "padding":"x".repeat(100_000)});
+    let permit = state
+        .budget
+        .reserve(resources::memory(&value), resources::RESULT_BYTES)
+        .unwrap();
+    let response = Response::charged(serde_json::from_value(value).unwrap(), permit);
+    let reply = response.reply(json!({"state":"completed"}));
+    let second = reply.clone();
     let mut record = task(1);
     record.state = TaskState::Completed;
-    record.result = Some(RawValue::from_string(raw.into()).unwrap());
-    server.state.lock().unwrap().tasks.insert(1, record);
-
-    let reply = server.execute(json!({"op":"task","id":1}));
-
-    assert!(reply.contains(raw));
+    record.result = Some(response);
+    state.tasks.insert(1, record);
+    state.results.insert(1, retention::ResultInfo::protected());
+    state.mark_completed(1);
+    assert!(state.ack_result(1));
+    assert!(state.budget.used() > 100_000);
+    drop(reply);
+    assert!(state.budget.used() > 100_000);
+    drop(second);
+    assert_eq!(state.budget.used(), 0);
 }
 
 #[test]
@@ -236,18 +364,18 @@ fn restart_marks_sent_unknown_without_losing_completed_results() {
     state.tasks.insert(7, task(7));
     let mut completed = task(8);
     completed.state = TaskState::Completed;
-    completed.result = Some(to_raw_value(&json!({"status":"1","instance_number":"12"})).unwrap());
+    completed.result = Some(Response::uncharged(
+        json!({"status":"1","instance_number":"12"}),
+    ));
     state.tasks.insert(8, completed);
     server.save(&state).unwrap();
 
     let loaded = State::load(&server.state_file).unwrap();
 
     assert_eq!(loaded.tasks[&7].state, TaskState::Unknown);
-    assert!(loaded.tasks[&7]
-        .result
-        .as_ref()
+    assert!(loaded.tasks[&7].result.as_ref().unwrap().get()["error"]
+        .as_str()
         .unwrap()
-        .get()
         .contains("execution is unknown"));
     assert_eq!(
         loaded.tasks[&8].result.as_ref().unwrap().get(),
@@ -270,10 +398,53 @@ fn fault_and_add_object_fields_survive_raw_retention() {
         let message = soap::parse(&soap::envelope("urn:dslforum-org:cwmp-1-0", "fttr-1", body)).unwrap();
         let expected = message.data.clone();
 
-        state.response("compact-test", &message).unwrap();
+        state.response("compact-test", message).unwrap();
 
         assert_eq!(state.tasks[&1].state, expected_state);
-        assert_eq!(serde_json::from_str::<Value>(state.tasks[&1].result.as_ref().unwrap().get()).unwrap(), expected);
+        assert_eq!(state.tasks[&1].result.as_ref().unwrap().get(), &expected);
+    }
+}
+
+#[test]
+fn parent_wan_evidence_survives_ack_and_persistence_without_retaining_body() {
+    let parent = "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.2.";
+    let connection = format!("{parent}WANIPConnection.1.");
+    for sibling in [None, Some(json!("TR069")), Some(json!(false))] {
+        let mut state = State::default();
+        state.tasks.insert(1, task(1));
+        state.results.insert(1, retention::ResultInfo::protected());
+        let mut rows =
+            vec![json!({"name":format!("{connection}X_CU_ServiceList"),"value":"OTHER"})];
+        let protected = sibling.is_some();
+        if let Some(value) = sibling {
+            rows.push(
+                json!({"name":format!("{parent}WANIPConnection.2.X_CU_ServiceList"),"value":value}),
+            );
+        }
+        let mut message = soap::parse(&soap::envelope(
+            "urn:dslforum-org:cwmp-1-0",
+            "fttr-1",
+            "<cwmp:GetParameterValuesResponse/>",
+        ))
+        .unwrap();
+        message.data = serde_json::from_value(json!({"parameters":rows})).unwrap();
+        state.response("compact-test", message).unwrap();
+        assert!(state.ack_result(1));
+        assert!(state.tasks[&1].result.is_none());
+        assert_eq!(state.budget.used(), 0);
+        let mut restored: State =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            readback::observed(&restored, "compact-test", &connection),
+            Some(false)
+        );
+        assert_eq!(
+            readback::observed(&restored, "compact-test", parent),
+            Some(protected)
+        );
+        assert_eq!(readback::observed(&restored, "other-device", parent), None);
+        restored.results.get_mut(&1).unwrap().completed_at = Some(now() - 91);
+        assert_eq!(readback::observed(&restored, "compact-test", parent), None);
     }
 }
 
@@ -283,7 +454,9 @@ fn wan_readback_guard_requires_eligible_fresh_non_management_result() {
     let mut state = State::default();
     let mut record = task(1);
     record.state = TaskState::Completed;
-    record.result = Some(to_raw_value(&json!({"parameters":[{"name":format!("{prefix}X_CU_ServiceList"),"value":"INTERNET"}]})).unwrap());
+    record.result = Some(Response::uncharged(
+        json!({"parameters":[{"name":format!("{prefix}X_CU_ServiceList"),"value":"INTERNET"}]}),
+    ));
     state.tasks.insert(1, record.clone());
 
     let observed = readback::observed(&state, "compact-test", prefix);
@@ -331,7 +504,7 @@ fn wan_readback_guard_fails_closed_on_management_or_malformed_results() {
         let mut state = State::default();
         let mut record = task(1);
         record.state = TaskState::Completed;
-        record.result = Some(to_raw_value(&data).unwrap());
+        record.result = Some(Response::uncharged(data));
         state.tasks.insert(1, record);
 
         let observed = readback::observed(&state, "compact-test", prefix);
@@ -398,14 +571,18 @@ fn test_prune_bounds_total_result_bytes_dropping_older_inactive_tasks() {
     t1.state = TaskState::Completed;
     t1.created = current_time - 20;
     t1.sent = Some(t1.created);
-    t1.result = Some(RawValue::from_string(format!("\"{}\"", "a".repeat(200 * 1024))).unwrap());
+    t1.result = Some(Response::uncharged(
+        json!({"padding":"a".repeat(200 * 1024)}),
+    ));
     state.tasks.insert(1, t1);
 
     let mut t2 = task(2);
     t2.state = TaskState::Completed;
     t2.created = current_time - 5;
     t2.sent = Some(t2.created);
-    t2.result = Some(RawValue::from_string(format!("\"{}\"", "b".repeat(100 * 1024))).unwrap());
+    t2.result = Some(Response::uncharged(
+        json!({"padding":"b".repeat(100 * 1024)}),
+    ));
     state.tasks.insert(2, t2);
 
     state.prune();

@@ -1,6 +1,3 @@
-use serde::Deserialize;
-use serde_json::value::RawValue;
-
 pub(super) fn observed(state: &super::State, device: &str, prefix: &str) -> Option<bool> {
     state
         .tasks
@@ -22,18 +19,25 @@ pub(super) fn observed(state: &super::State, device: &str, prefix: &str) -> Opti
             state
                 .results
                 .get(&task.id)
-                .and_then(|i| i.management_services.get(prefix))
-                .copied()
+                .and_then(|i| {
+                    // Parent-scoped fields (for example X_CU_VLAN) need the
+                    // descendant connections' evidence after ACK drops the body.
+                    i.management_services
+                        .iter()
+                        .filter(|(root, _)| root.starts_with(prefix))
+                        .map(|(_, management)| *management)
+                        .reduce(|a, b| a || b)
+                })
                 .or_else(|| is_management(task.result.as_deref()?, prefix))
         })
 }
 
 pub(super) fn service_evidence(
-    value: &serde_json::Value,
+    value: &crate::devices::cwmp::response::Data,
 ) -> std::collections::BTreeMap<String, bool> {
     let mut evidence = std::collections::BTreeMap::new();
-    for row in value["parameters"].as_array().into_iter().flatten() {
-        let (Some(name), Some(value)) = (row["name"].as_str(), row["value"].as_str()) else {
+    for row in value.rows().into_iter().flatten() {
+        let Some(name) = row["name"].as_str() else {
             continue;
         };
         if name.len() > 512 || !(name.ends_with("ServiceList") || name.ends_with("SERVICELIST")) {
@@ -42,7 +46,9 @@ pub(super) fn service_evidence(
         let Some((prefix, _)) = name.rsplit_once('.') else {
             continue;
         };
-        let management = crate::provisioning::contains_service_token(value, "TR069");
+        let management = row["value"]
+            .as_str()
+            .is_none_or(|value| crate::provisioning::contains_service_token(value, "TR069"));
         evidence
             .entry(format!("{prefix}."))
             .and_modify(|v| *v |= management)
@@ -54,31 +60,22 @@ pub(super) fn service_evidence(
     evidence
 }
 
-#[derive(Deserialize)]
-struct Readback<'a> {
-    #[serde(borrow)]
-    parameters: Vec<Parameter<'a>>,
-}
-
-#[derive(Deserialize)]
-struct Parameter<'a> {
-    #[serde(borrow)]
-    name: std::borrow::Cow<'a, str>,
-    #[serde(borrow)]
-    value: std::borrow::Cow<'a, str>,
-}
-
-pub(super) fn is_management(result: &RawValue, prefix: &str) -> Option<bool> {
-    let readback: Readback<'_> = match serde_json::from_str(result.get()) {
-        Ok(readback) => readback,
-        Err(_) => return Some(true),
+pub(super) fn is_management(
+    result: &crate::devices::cwmp::response::Data,
+    prefix: &str,
+) -> Option<bool> {
+    let Some(rows) = result.rows() else {
+        return Some(true);
     };
-    readback
-        .parameters
-        .iter()
-        .find(|p| {
-            p.name.starts_with(prefix)
-                && (p.name.ends_with("ServiceList") || p.name.ends_with("SERVICELIST"))
+    let row = rows.iter().find(|p| {
+        p["name"].as_str().is_some_and(|name| {
+            name.starts_with(prefix)
+                && (name.ends_with("ServiceList") || name.ends_with("SERVICELIST"))
         })
-        .map(|p| crate::provisioning::contains_service_token(&p.value, "TR069"))
+    })?;
+    Some(
+        row["value"]
+            .as_str()
+            .is_none_or(|v| crate::provisioning::contains_service_token(v, "TR069")),
+    )
 }

@@ -92,7 +92,7 @@ impl Session {
         let mut cookie = None;
         let mut dispatch = None;
         let mut changed = false;
-        let response = if req.body.is_empty() {
+        let response = if req.message.is_none() {
             let Some(device) = &self.device else {
                 return Ok(Reply::empty(400));
             };
@@ -106,10 +106,7 @@ impl Session {
                 rpc.xml
             })
         } else {
-            let body = std::str::from_utf8(&req.body).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "SOAP body is not UTF-8")
-            })?;
-            let message = soap::parse(body)?;
+            let message = req.message.unwrap();
             match message.method.as_str() {
                 "Inform" => {
                     if message.serial.is_empty() || message.serial.len() > 128
@@ -132,7 +129,7 @@ impl Session {
                     state.devices.insert(device.clone(), Device {
                         serial: message.serial, oui: message.oui, product_class: message.product,
                         peer: self.peer.clone(), namespace: message.namespace.clone(), last_inform: now(),
-                        endpoint_id: policy.endpoint_id.clone(), inform: message.data,
+                        endpoint_id: policy.endpoint_id.clone(), inform: serde_json::to_value(message.data).map_err(io::Error::other)?,
                     });
                     if let Some(mut proof) = state.connection_request_proofs.remove(&device) {
                         proof.inform(&state.devices[&device], &key);
@@ -141,7 +138,9 @@ impl Session {
                         }
                     }
                     self.cookie = Some(key);
+                    crate::provisioning::controller::wake_device(&device);
                     self.device = Some(device);
+                    super::connection_request::wake();
                     changed = true;
                     Some(soap::envelope(&message.namespace, &message.id,
                         "<cwmp:InformResponse><MaxEnvelopes>1</MaxEnvelopes></cwmp:InformResponse>"))
@@ -152,12 +151,13 @@ impl Session {
                     &message.namespace, &message.id, "<cwmp:TransferCompleteResponse/>")),
                 _ => {
                     let Some(device) = &self.device else { return Ok(Reply::empty(400)); };
-                    state.response(device, &message)?;
+                    let namespace = message.namespace.clone();
+                    state.response(device, message)?;
                     if let Some(session) = &self.cookie {
                         connection_request_proof::completed(&mut state, device, session);
                     }
                     changed = true;
-                    state.next(device, &message.namespace)?.map(|rpc| { dispatch = Some(rpc.undo); rpc.xml })
+                    state.next(device, &namespace)?.map(|rpc| { dispatch = Some(rpc.undo); rpc.xml })
                 }
             }
         };

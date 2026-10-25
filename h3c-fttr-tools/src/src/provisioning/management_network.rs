@@ -15,9 +15,9 @@ mod command;
 use command::run;
 #[path = "management_network/verification.rs"]
 mod verification;
-use verification::{verify_bridge, verify_dhcp, verify_firewall, verify_network};
 #[cfg(test)]
 use verification::dhcp_range_matches;
+use verification::{verify_bridge, verify_dhcp, verify_firewall, verify_network};
 
 const JOURNAL: &str = "/etc/fttr/management-applied.json";
 type Sections = BTreeMap<String, Section>;
@@ -404,6 +404,7 @@ fn spawn(work: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
             c.error = Some(format!("management worker failed: {error}"));
             c.next_retry = now() + 15;
         }
+        super::controller::wake();
     });
     Ok(())
 }

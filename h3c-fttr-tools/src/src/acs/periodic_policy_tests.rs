@@ -1,15 +1,23 @@
-use super::*;
 use super::durability_tests::{Fixture, DEVICE};
+use super::*;
 use crate::provisioning::model::ConnectionRequest;
 
 const NS: &str = "urn:dslforum-org:cwmp-1-0";
 
 fn config() -> ConnectionRequest {
-    ConnectionRequest { defaults: false, username: "test-user".into(), password: "test-password".into(), ..Default::default() }
+    ConnectionRequest {
+        defaults: false,
+        username: "test-user".into(),
+        password: "test-password".into(),
+        ..Default::default()
+    }
 }
 
 fn poll(fixture: &Fixture, config: &ConnectionRequest) -> Value {
-    periodic_policy::poll(&fixture.0, &BTreeMap::from([(DEVICE.into(), config.clone())]));
+    periodic_policy::poll(
+        &fixture.0,
+        &BTreeMap::from([(DEVICE.into(), config.clone())]),
+    );
     fixture.0.execute_small(json!({"op":"devices"}))["periodic_inform"][DEVICE].clone()
 }
 
@@ -25,20 +33,57 @@ fn respond(fixture: &Fixture, request: &soap::Message, body: &str) {
 }
 
 fn exchange(fixture: &Fixture, body: &str) -> (String, String) {
-    let cookie = fixture.0.state.lock().unwrap().sessions.keys().next().unwrap().clone();
+    let cookie = fixture
+        .0
+        .state
+        .lock()
+        .unwrap()
+        .sessions
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
     fixture.exchange_session(body, &cookie)
 }
 
 fn probe(fixture: &Fixture, root: &str) -> ConnectionRequest {
-    let (url, cpe) = super::connection_request_tests::mock_cpe("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into());
-    let port = url.strip_prefix("http://").unwrap().split('/').next().unwrap().parse::<std::net::SocketAddr>().unwrap().port();
-    let config = ConnectionRequest { port: port.try_into().unwrap(), ..config() };
-    fixture.0.state.lock().unwrap().devices.get_mut(DEVICE).unwrap().inform = json!({"parameters":[{"name":format!("{root}.ManagementServer.ConnectionRequestURL"),"value":url}]});
+    let (url, cpe) = super::connection_request_tests::mock_cpe(
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+    );
+    let port = url
+        .strip_prefix("http://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap()
+        .port();
+    let config = ConnectionRequest {
+        port: port.try_into().unwrap(),
+        ..config()
+    };
+    fixture
+        .0
+        .state
+        .lock()
+        .unwrap()
+        .devices
+        .get_mut(DEVICE)
+        .unwrap()
+        .inform = json!({"parameters":[{"name":format!("{root}.ManagementServer.ConnectionRequestURL"),"value":url}]});
     poll(fixture, &config);
-    super::connection_request::Worker::default().poll(&fixture.0, &BTreeMap::from([(DEVICE.into(),config.clone())]), std::time::Instant::now());
+    super::connection_request::Worker::default().poll(
+        &fixture.0,
+        &BTreeMap::from([(DEVICE.into(), config.clone())]),
+        std::time::Instant::now(),
+    );
     assert!(cpe.join().unwrap().contains("Authorization: Digest"));
     let inform = soap::envelope(NS, "probe", &format!("<cwmp:Inform><DeviceId><OUI>ABCDEF</OUI><ProductClass>test</ProductClass><SerialNumber>durability</SerialNumber></DeviceId><Event><EventStruct><EventCode>6 CONNECTION REQUEST</EventCode></EventStruct></Event><ParameterList><ParameterValueStruct><Name>{root}.ManagementServer.ConnectionRequestURL</Name><Value>{}</Value></ParameterValueStruct></ParameterList></cwmp:Inform>",soap::escape(&url)));
-    assert_eq!(soap::parse(&exchange(fixture,&inform).1).unwrap().method,"InformResponse");
+    assert_eq!(
+        soap::parse(&exchange(fixture, &inform).1).unwrap().method,
+        "InformResponse"
+    );
     config
 }
 
@@ -55,7 +100,15 @@ fn capability(fixture: &Fixture, root: &str, writable: bool) {
 fn fixture(root: &str) -> Fixture {
     let fixture = Fixture::new();
     fixture.0.stopped.store(false, Ordering::Release);
-    fixture.0.state.lock().unwrap().devices.get_mut(DEVICE).unwrap().inform = json!({"parameters":[{"name":format!("{root}.ManagementServer.ConnectionRequestURL"),"value":"http://127.0.0.1:7547/tr69"}]});
+    fixture
+        .0
+        .state
+        .lock()
+        .unwrap()
+        .devices
+        .get_mut(DEVICE)
+        .unwrap()
+        .inform = json!({"parameters":[{"name":format!("{root}.ManagementServer.ConnectionRequestURL"),"value":"http://127.0.0.1:7547/tr69"}]});
     fixture
 }
 
@@ -66,23 +119,51 @@ fn configured_credentials_without_session_proof_never_queue_a_write() {
     poll(&fixture, &config);
     values(&fixture, "Device", true, 5);
     poll(&fixture, &config);
-    if fixture.0.state.lock().unwrap().tasks.values().any(|t| t.method == "GetParameterNames") {
+    if fixture
+        .0
+        .state
+        .lock()
+        .unwrap()
+        .tasks
+        .values()
+        .any(|t| t.method == "GetParameterNames")
+    {
         capability(&fixture, "Device", true);
         poll(&fixture, &config);
     }
-    assert!(fixture.0.state.lock().unwrap().tasks.values().all(|t| t.method != "SetParameterValues"));
+    assert!(fixture
+        .0
+        .state
+        .lock()
+        .unwrap()
+        .tasks
+        .values()
+        .all(|t| t.method != "SetParameterValues"));
 }
 
 #[test]
 fn pending_cycle_consumes_inform_before_idle_polling() {
     let fixture = fixture("Device");
-    let config = ConnectionRequest { enabled: false, ..Default::default() };
+    let config = ConnectionRequest {
+        enabled: false,
+        ..Default::default()
+    };
     poll(&fixture, &config);
-    fixture.0.state.lock().unwrap().devices.get_mut(DEVICE).unwrap().last_inform += 1;
+    fixture
+        .0
+        .state
+        .lock()
+        .unwrap()
+        .devices
+        .get_mut(DEVICE)
+        .unwrap()
+        .last_inform += 1;
     values(&fixture, "Device", true, 180);
     poll(&fixture, &config);
     let id = fixture.0.state.lock().unwrap().next_id;
-    for _ in 0..3 { poll(&fixture, &config); }
+    for _ in 0..3 {
+        poll(&fixture, &config);
+    }
     assert_eq!(fixture.0.state.lock().unwrap().next_id, id);
 }
 
@@ -99,9 +180,12 @@ fn interval_policy_uses_real_cwmp_capability_write_and_independent_readback() {
             assert_eq!(poll(&fixture, &config)["state"], "setting");
 
             let request = dispatch(&fixture, "SetParameterValues");
-            let parameters = request.data["parameters"].as_array().unwrap();
+            let parameters = request.data.rows().unwrap();
             assert_eq!(parameters.len(), 1);
-            assert_eq!(parameters[0]["name"], format!("{root}.ManagementServer.PeriodicInformInterval"));
+            assert_eq!(
+                parameters[0]["name"],
+                format!("{root}.ManagementServer.PeriodicInformInterval")
+            );
             assert_eq!(parameters[0]["value"], "43200");
             assert_eq!(parameters[0]["type"], "xsd:unsignedInt");
             respond(&fixture, &request, &format!("<cwmp:SetParameterValuesResponse><Status>{status}</Status></cwmp:SetParameterValuesResponse>"));
@@ -118,26 +202,60 @@ fn interval_policy_uses_real_cwmp_capability_write_and_independent_readback() {
 
 #[test]
 fn disabled_policy_only_reads_and_requires_manual_enabled_short_interval() {
-    for (enabled, interval, expected) in [(true, 1, "verified"), (true, 180, "verified"), (true, 181, "manual_required"), (false, 5, "manual_required")] {
+    for (enabled, interval, expected) in [
+        (true, 1, "verified"),
+        (true, 180, "verified"),
+        (true, 181, "manual_required"),
+        (false, 5, "manual_required"),
+    ] {
         let fixture = fixture("Device");
-        let config = ConnectionRequest { enabled: false, ..Default::default() };
+        let config = ConnectionRequest {
+            enabled: false,
+            ..Default::default()
+        };
         poll(&fixture, &config);
         values(&fixture, "Device", enabled, interval);
 
         assert_eq!(poll(&fixture, &config)["state"], expected);
-        assert!(fixture.0.state.lock().unwrap().tasks.values().all(|task| task.method == "GetParameterValues"));
+        assert!(fixture
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .tasks
+            .values()
+            .all(|task| task.method == "GetParameterValues"));
     }
 }
 
 #[test]
 fn unavailable_factory_or_missing_credentials_never_raise_interval() {
-    for (config, expected) in [(ConnectionRequest::default(), "default_credentials_unavailable"), (ConnectionRequest { defaults: false, ..Default::default() }, "missing_credentials")] {
+    for (config, expected) in [
+        (
+            ConnectionRequest::default(),
+            "default_credentials_unavailable",
+        ),
+        (
+            ConnectionRequest {
+                defaults: false,
+                ..Default::default()
+            },
+            "missing_credentials",
+        ),
+    ] {
         let fixture = fixture("Device");
         poll(&fixture, &config);
         values(&fixture, "Device", true, 5);
 
         assert_eq!(poll(&fixture, &config)["state"], expected);
-        assert!(fixture.0.state.lock().unwrap().tasks.values().all(|task| task.method != "SetParameterValues"));
+        assert!(fixture
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .tasks
+            .values()
+            .all(|task| task.method != "SetParameterValues"));
     }
 }
 
@@ -159,14 +277,23 @@ fn unsupported_interval_is_not_written_and_readback_mismatch_is_not_verified() {
             assert_eq!(poll(&fixture, &config)["state"], "unknown");
         } else {
             assert_eq!(result["state"], "unsupported");
-            assert!(fixture.0.state.lock().unwrap().tasks.values().all(|task| task.method != "SetParameterValues"));
+            assert!(fixture
+                .0
+                .state
+                .lock()
+                .unwrap()
+                .tasks
+                .values()
+                .all(|task| task.method != "SetParameterValues"));
         }
     }
 }
 
 #[test]
 fn internal_grant_is_exact_revocable_and_not_restored_from_persisted_json() {
-    for scenario in ["mutate", "revoke", "restart", "target", "endpoint", "config"] {
+    for scenario in [
+        "mutate", "revoke", "restart", "target", "endpoint", "config",
+    ] {
         let fixture = fixture("Device");
         let config = probe(&fixture, "Device");
         poll(&fixture, &config);
@@ -177,16 +304,34 @@ fn internal_grant_is_exact_revocable_and_not_restored_from_persisted_json() {
         let mut state = fixture.0.state.lock().unwrap();
         let id = state.next_id;
         match scenario {
-            "mutate" => state.tasks.get_mut(&id).unwrap().args["parameters"][0]["name"] = json!("Device.ManagementServer.Password"),
+            "mutate" => {
+                state.tasks.get_mut(&id).unwrap().args["parameters"][0]["name"] =
+                    json!("Device.ManagementServer.Password")
+            }
             "revoke" => config.authorization.store(false, Ordering::Release),
             "restart" => *state = State::load(&fixture.0.state_file).unwrap(),
-            "target" => state.devices.get_mut(DEVICE).unwrap().inform["parameters"][0]["value"] = json!("http://127.0.0.1/different"),
-            "endpoint" => state.devices.get_mut(DEVICE).unwrap().endpoint_id = "another-endpoint".into(),
-            "config" => state.connection_request_proofs.get_mut(DEVICE).unwrap().config.password = "different".into(),
+            "target" => {
+                state.devices.get_mut(DEVICE).unwrap().inform["parameters"][0]["value"] =
+                    json!("http://127.0.0.1/different")
+            }
+            "endpoint" => {
+                state.devices.get_mut(DEVICE).unwrap().endpoint_id = "another-endpoint".into()
+            }
+            "config" => {
+                state
+                    .connection_request_proofs
+                    .get_mut(DEVICE)
+                    .unwrap()
+                    .config
+                    .password = "different".into()
+            }
             _ => unreachable!(),
         }
 
-        assert!(state.next(DEVICE, NS).unwrap().is_none(), "scenario: {scenario}");
+        assert!(
+            state.next(DEVICE, NS).unwrap().is_none(),
+            "scenario: {scenario}"
+        );
         assert_eq!(state.tasks[&id].state, TaskState::Fault);
     }
 }

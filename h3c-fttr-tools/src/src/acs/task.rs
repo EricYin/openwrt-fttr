@@ -1,11 +1,9 @@
-//! Task records retain their existing wire/persistence representation.
+//! Task records share response ownership with internal consumers.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use serde_json::value::{to_raw_value, RawValue};
 
-pub(super) fn error_result(message: &str) -> Box<RawValue> {
-    #[expect(clippy::expect_used, reason = "serializing a string-only JSON error cannot fail")]
-    to_raw_value(&super::error(message)).expect("string-only JSON error is serializable")
+pub(super) fn error_result(message: &str) -> super::resources::Response {
+    super::resources::Response::uncharged(super::error(message))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -36,7 +34,7 @@ pub(super) struct Task {
     pub(super) created: u64,
     pub(super) sent: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) result: Option<Box<RawValue>>,
+    pub(super) result: Option<super::resources::Response>,
 }
 
 #[cfg(test)]
@@ -58,7 +56,10 @@ mod tests {
             assert_eq!(serialized, format!("\"{expected_str}\""));
             let deserialized: TaskState = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, state);
-            assert_eq!(state.is_active(), matches!(state, TaskState::Queued | TaskState::Sent));
+            assert_eq!(
+                state.is_active(),
+                matches!(state, TaskState::Queued | TaskState::Sent)
+            );
         }
     }
 }

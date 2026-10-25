@@ -2,15 +2,32 @@
 //! controller so execution can mutate its operation without exposing internals.
 use super::super::model::{ItemOutcome, TaskOutcome};
 use super::{acs, now, Item, ItemKind, Operation, OperationPhase, Parameter, ParameterKind};
+use crate::devices::cwmp::transport::Command;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
 fn queue(op: &mut Operation, method: &str, args: Value, stage: OperationPhase) {
-    let reply = acs(json!({"op":"queue","device":op.device.cwmp_id,"method":method,"args":args}));
+    op.submission = Some(crate::devices::cwmp::transport::Pending {
+        method: method.into(),
+        args,
+        stage,
+    });
+    submit(op);
+}
+fn submit(op: &mut Operation) {
+    let pending = op.submission.as_ref().unwrap();
+    let reply = acs(Command::queue(
+        &op.device.cwmp_id,
+        &pending.method,
+        pending.args.clone(),
+    ));
     if let Some(id) = reply["id"].as_u64() {
         op.task = Some(id);
-        op.stage = stage;
+        op.stage = op.submission.take().unwrap().stage;
+    } else if crate::devices::cwmp::transport::backpressure(&reply) {
+        op.task = None;
     } else {
+        op.submission = None;
         op.finish_item(
             ItemOutcome::Failed,
             reply["error"].as_str().unwrap_or("cannot queue RPC"),
@@ -32,6 +49,12 @@ fn roots(item: &Item) -> Vec<String> {
     roots.into_iter().collect()
 }
 pub(super) fn advance(op: &mut Operation, reachable: bool) {
+    if op.submission.is_some() {
+        if reachable {
+            submit(op);
+        }
+        return;
+    }
     if op.stage == OperationPhase::Settling {
         if reachable && now() >= op.verify_after {
             queue_read(op, OperationPhase::Verifying);
@@ -42,7 +65,11 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
         if !reachable {
             return;
         }
-        if acs(json!({"op":"busy","device":op.device.cwmp_id}))["busy"] == true {
+        if acs(Command::Busy {
+            device: op.device.cwmp_id.clone(),
+        })["busy"]
+            == true
+        {
             return;
         }
         if op.apply
@@ -104,21 +131,30 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
     let Some(id) = op.task else {
         return;
     };
-    let task = acs(json!({"op":"task","id":id}));
+    let task = acs(Command::Task { id });
     let state = TaskOutcome::from_task(&task);
     if matches!(state, TaskOutcome::Queued | TaskOutcome::Sent) {
         return;
     }
     if op.stage == OperationPhase::Disabling {
-        if matches!(state, TaskOutcome::Completed | TaskOutcome::AcceptedPendingApply | TaskOutcome::Unknown) {
+        if matches!(
+            state,
+            TaskOutcome::Completed | TaskOutcome::AcceptedPendingApply | TaskOutcome::Unknown
+        ) {
             queue_read(op, OperationPhase::DisablingRead);
         } else {
-            op.finish_item(ItemOutcome::Failed, "cannot disable WAN before configuration");
+            op.finish_item(
+                ItemOutcome::Failed,
+                "cannot disable WAN before configuration",
+            );
         }
         return;
     }
     if op.stage == OperationPhase::Writing {
-        if matches!(state, TaskOutcome::Completed | TaskOutcome::AcceptedPendingApply | TaskOutcome::Unknown) {
+        if matches!(
+            state,
+            TaskOutcome::Completed | TaskOutcome::AcceptedPendingApply | TaskOutcome::Unknown
+        ) {
             op.uncertain = state == TaskOutcome::Unknown;
             op.pending = state == TaskOutcome::AcceptedPendingApply;
             op.written = state != TaskOutcome::Unknown;
@@ -134,8 +170,9 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             // HL202 rejects the standard PreSharedKey.1.KeyPassphrase on some
             // WLAN instances (fault 9007) but accepts the vendor's top-level
             // KeyPassphrase parameter on the same object.
-            let parameter_faults: Vec<String> = task["result"]["parameters"]
-                .as_array()
+            let parameter_faults: Vec<String> = task
+                .result()
+                .rows()
                 .map(|a| {
                     a.iter()
                         .filter(|p| p["fault_code"].as_str().is_some_and(|f| !f.is_empty()))
@@ -191,17 +228,14 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             &format!(
                 "{}: {state}, fault {}",
                 op.stage,
-                task["result"]["fault_code"].as_str().unwrap_or("")
+                task.result()["fault_code"].as_str().unwrap_or("")
             ),
         );
         return;
     }
-    let values = task["result"]["parameters"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let values = task.result().rows().unwrap_or_default();
     if op.stage == OperationPhase::Discovering {
-        for p in &values {
+        for p in values {
             if matches!(p["writable"].as_str(), Some("1" | "true")) {
                 if let Some(name) = p["name"].as_str() {
                     op.writable.insert(name.into());
@@ -357,7 +391,10 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
                 "write outcome unknown; readback differs, no automatic replay",
             );
         } else {
-            op.finish_item(ItemOutcome::Failed, "SetParameterValues accepted but readback differs");
+            op.finish_item(
+                ItemOutcome::Failed,
+                "SetParameterValues accepted but readback differs",
+            );
         }
         return;
     }

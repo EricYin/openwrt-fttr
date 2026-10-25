@@ -1,4 +1,5 @@
 //! Controller-driven, read-only capability discovery. RPC transport is injected.
+use super::transport::{Command, Reply};
 use super::{
     discovery::{Evidence, Resolution, ScalarType},
     identity::Identity,
@@ -7,6 +8,11 @@ use super::{
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
+const DISCOVERY_ROOTS: [&str; 3] = [
+    "InternetGatewayDevice.DeviceInfo.",
+    "InternetGatewayDevice.WANDevice.",
+    "InternetGatewayDevice.LANDevice.",
+];
 
 #[derive(Clone)]
 pub struct Discovery {
@@ -14,6 +20,7 @@ pub struct Discovery {
     stage: &'static str,
     task: Option<u64>,
     names: BTreeMap<String, bool>,
+    names_scope: usize,
     values: BTreeMap<String, (ScalarType, String)>,
     pending: VecDeque<Vec<String>>,
     awaited: Vec<String>,
@@ -27,12 +34,19 @@ pub struct Discovery {
     retry_at: u64,
 }
 impl Discovery {
+    pub(crate) fn progress(&self) -> (&'static str, Option<u64>, usize, u64) {
+        (self.stage, self.task, self.pending.len(), self.retry_at)
+    }
+    pub(crate) fn deadline(&self) -> u64 {
+        self.retry_at
+    }
     pub fn new(requested: &str) -> Self {
         Self {
             requested: requested.into(),
             stage: "pending",
             task: None,
             names: BTreeMap::new(),
+            names_scope: 0,
             values: BTreeMap::new(),
             pending: VecDeque::new(),
             awaited: Vec::new(),
@@ -197,6 +211,7 @@ impl Discovery {
         self.reason = reason.into();
         self.task = None;
         self.names.clear();
+        self.names_scope = 0;
         self.values.clear();
         self.pending.clear();
         self.awaited.clear();
@@ -207,7 +222,7 @@ impl Discovery {
         identity: Identity,
         epoch: u64,
         reachable: bool,
-        mut rpc: impl FnMut(Value) -> Value,
+        mut rpc: impl FnMut(Command) -> Reply,
     ) {
         if !reachable {
             return;
@@ -237,7 +252,7 @@ impl Discovery {
             self.stage = "pending";
         }
         if let Some(id) = self.task {
-            let result = rpc(json!({"op":"task","id":id}));
+            let result = rpc(Command::Task { id });
             match result["state"].as_str() {
                 Some("queued" | "sent") => return,
                 Some("completed") => (),
@@ -251,9 +266,8 @@ impl Discovery {
                 }
             }
             self.task = None;
-            let Some(rows) = result["result"]["parameters"].as_array() else {
-                if result.get("result").is_none() || result["result_status"] == "resource_exhausted"
-                {
+            let Some(rows) = result.result().rows() else {
+                if result["result_status"] == "resource_exhausted" {
                     self.retry("missing discovery response or resource_exhausted");
                 } else {
                     self.invalidate("malformed discovery response: missing parameter evidence");
@@ -274,6 +288,10 @@ impl Discovery {
                     return;
                 };
                 if self.stage == "names" {
+                    if !name.starts_with(DISCOVERY_ROOTS[self.names_scope]) {
+                        self.invalidate("parameter name outside requested discovery scope");
+                        return;
+                    }
                     let writable = matches!(row["writable"].as_str(), Some("1" | "true"))
                         || row["writable"] == true;
                     if self
@@ -321,44 +339,49 @@ impl Discovery {
                 }
             }
             if self.stage == "names" {
-                let selected: Vec<_> = self
-                    .names
-                    .keys()
-                    .filter(|name| self.is_signature(name))
-                    .cloned()
-                    .collect();
-                self.pending = selected.chunks(32).map(|c| c.to_vec()).collect();
-                self.stage = "values";
+                if self.names_scope + 1 < DISCOVERY_ROOTS.len() {
+                    self.names_scope += 1;
+                    self.stage = "pending";
+                } else {
+                    let selected: Vec<_> = self
+                        .names
+                        .keys()
+                        .filter(|name| self.is_signature(name))
+                        .cloned()
+                        .collect();
+                    self.pending = selected.chunks(32).map(|c| c.to_vec()).collect();
+                    self.stage = "values";
+                }
             }
         }
         if self.stage == "pending" {
-            let reply = rpc(
-                json!({"op":"queue","device":device,"method":"GetParameterNames","args":{"path":"InternetGatewayDevice.","next_level":false}}),
-            );
+            let reply = rpc(Command::queue(
+                device,
+                "GetParameterNames",
+                json!({"path":DISCOVERY_ROOTS[self.names_scope],"next_level":false}),
+            ));
             self.task = reply["id"].as_u64();
             self.stage = "names";
             if self.task.is_none() {
-                if reply["error"]
-                    .as_str()
-                    .is_some_and(|e| e.contains("resource_exhausted") || e.contains("queue full"))
-                {
-                    self.retry("temporary discovery capacity exhausted");
+                if super::transport::backpressure(&reply) {
+                    self.stage = "pending";
+                    self.reason = "waiting for task ingress capacity".into();
                 } else {
                     self.invalidate("cannot queue parameter tree discovery");
                 }
             }
         } else if let Some(names) = self.pending.pop_front() {
             self.awaited = names.clone();
-            let reply = rpc(
-                json!({"op":"queue","device":device,"method":"GetParameterValues","args":{"names":names}}),
-            );
+            let reply = rpc(Command::queue(
+                device,
+                "GetParameterValues",
+                json!({"names":names}),
+            ));
             self.task = reply["id"].as_u64();
             if self.task.is_none() {
-                if reply["error"]
-                    .as_str()
-                    .is_some_and(|e| e.contains("resource_exhausted") || e.contains("queue full"))
-                {
-                    self.retry("temporary discovery capacity exhausted");
+                if super::transport::backpressure(&reply) {
+                    self.pending.push_front(std::mem::take(&mut self.awaited));
+                    self.reason = "waiting for task ingress capacity".into();
                 } else {
                     self.invalidate("cannot queue capability value discovery");
                 }
@@ -560,25 +583,17 @@ fn discovery_now() -> u64 {
 mod tests {
     use super::*;
     #[test]
-    fn transient_discovery_retries_are_bounded_and_never_queue_writes() {
+    fn ingress_backpressure_does_not_consume_discovery_retry_budget() {
         let mut probe = Discovery::new("auto");
-        for attempt in 0..4 {
+        for _ in 0..20 {
             probe.retry_at = 0;
             probe.tick("test", identity(90), 1, true, |request| {
-                assert_eq!(request["method"], "GetParameterNames");
-                json!({"error":"resource_exhausted"})
+                assert_eq!(request.wire()["method"], "GetParameterNames");
+                json!({"error":"queue full", "code":"backpressure"}).into()
             });
-            if attempt < 3 {
-                assert_eq!(probe.stage, "retrying");
-                assert!(!probe.blocked());
-                assert_eq!(probe.retries, attempt + 1);
-                probe.tick("test", identity(90), 1, true, |_| {
-                    panic!("backoff must not queue")
-                });
-            } else {
-                assert!(probe.blocked());
-                assert!(probe.reason.contains("retry_exhausted"));
-            }
+            assert_eq!(probe.stage, "pending");
+            assert!(!probe.blocked());
+            assert_eq!(probe.retries, 0);
         }
     }
     #[cfg(feature = "device-hwtc")]
@@ -670,18 +685,25 @@ mod tests {
             .map(|(name, _, _)| json!({"name":name,"writable":"1"}))
             .collect();
         let values: Vec<_>=fields.iter().enumerate().map(|(i,(name,kind,value))|json!({"name":name,"type":if bad_type && i==1 {""} else {kind},"value":value})).collect();
-        let mut replies: VecDeque<_> = [
-            json!({"id":1}),
-            json!({"state":"completed","result":{"parameters":names}}),
-            json!({"id":2}),
-            json!({"state":"completed","result":{"parameters":values}}),
-        ]
-        .into();
+        let mut replies = VecDeque::new();
+        for (index, root) in DISCOVERY_ROOTS.iter().enumerate() {
+            replies.push_back(json!({"id":index+1}));
+            let scoped: Vec<_> = names
+                .iter()
+                .filter(|row| row["name"].as_str().unwrap().starts_with(root))
+                .collect();
+            replies.push_back(json!({"state":"completed","result":{"parameters":scoped}}));
+        }
+        replies.push_back(json!({"id":4}));
+        replies.push_back(json!({"state":"completed","result":{"parameters":values}}));
         let mut requests = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..5 {
             discovery.tick("test-child", identity.clone(), 7, true, |v| {
-                requests.push(v);
-                replies.pop_front().expect("unexpected discovery RPC")
+                requests.push(v.wire());
+                replies
+                    .pop_front()
+                    .expect("unexpected discovery RPC")
+                    .into()
             });
         }
         assert!(replies.is_empty());

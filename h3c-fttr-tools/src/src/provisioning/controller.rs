@@ -20,6 +20,7 @@ mod scheduler;
 #[cfg(test)]
 #[path = "controller/scheduling_tests.rs"]
 mod scheduling_tests;
+use crate::devices::cwmp::transport::Command;
 use config::{Config, Device, Item, Parameter};
 use parameters::advance;
 #[cfg(test)]
@@ -39,26 +40,51 @@ fn error(s: &str) -> Value {
     json!({"error":s})
 }
 #[cfg(all(feature = "acs", not(test)))]
-pub(super) fn acs(v: Value) -> Value {
-    crate::acs::control_value(v)
+pub(super) fn acs(v: Command) -> crate::devices::cwmp::transport::Reply {
+    crate::acs::transact(v)
 }
 #[cfg(all(not(feature = "acs"), not(test)))]
-pub(super) fn acs(_: Value) -> Value {
-    error("ACS adapter not compiled")
+pub(super) fn acs(_: Command) -> crate::devices::cwmp::transport::Reply {
+    error("ACS adapter not compiled").into()
 }
 #[cfg(test)]
 thread_local! { pub(super) static RPC: std::cell::RefCell<(std::collections::VecDeque<Value>,Vec<Value>)> = std::cell::RefCell::new((std::collections::VecDeque::new(),Vec::new())); }
 #[cfg(test)]
-pub(super) fn acs(v: Value) -> Value {
+pub(super) fn acs(v: Command) -> crate::devices::cwmp::transport::Reply {
     RPC.with(|r| {
         let mut r = r.borrow_mut();
-        r.1.push(v);
-        r.0.pop_front().expect("unexpected RPC")
+        r.1.push(v.wire());
+        r.0.pop_front().expect("unexpected RPC").into()
     })
+}
+
+static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+#[derive(Default)]
+struct Ready {
+    all: bool,
+    devices: BTreeSet<String>,
+}
+static READY: OnceLock<Mutex<Ready>> = OnceLock::new();
+fn ready() -> &'static Mutex<Ready> {
+    READY.get_or_init(Mutex::default)
+}
+pub(crate) fn wake() {
+    ready().lock().unwrap().all = true;
+    WAKE.notify_one();
+}
+pub(crate) fn wake_device(device: &str) {
+    let mut r = ready().lock().unwrap();
+    if r.devices.len() < 128 {
+        r.devices.insert(device.to_owned());
+    } else {
+        r.all = true;
+    }
+    WAKE.notify_one();
 }
 
 #[derive(Clone)]
 struct Operation {
+    submission: Option<crate::devices::cwmp::transport::Pending<OperationPhase>>,
     verify_after: u64,
     compiled: bool,
     capabilities: crate::devices::cwmp::runtime::Discovery,
@@ -450,8 +476,22 @@ pub(crate) fn connection_request_devices() -> BTreeMap<String, super::model::Con
         .collect()
 }
 pub fn control(request: &str) -> String {
+    let mut changed = false;
     let reply = (|| -> Result<Value, String> {
         let v: Value = serde_json::from_str(request).map_err(|_| "invalid provisioning request")?;
+        changed = matches!(
+            v["op"].as_str(),
+            Some(
+                "reload"
+                    | "reset_state"
+                    | "management_plan"
+                    | "management_apply"
+                    | "plan"
+                    | "apply"
+                    | "reconcile"
+                    | "retry"
+            )
+        );
         match v["op"].as_str().unwrap_or("") {
             "check" => {
                 let cfg = config::load()?;
@@ -526,6 +566,9 @@ pub fn control(request: &str) -> String {
         }
     })()
     .unwrap_or_else(|e| error(&e));
+    if changed {
+        wake();
+    }
     reply.to_string()
 }
 
@@ -576,15 +619,24 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
         }
     }
     crate::runtime::spawn_service("provisioning", async move {
+        wake();
         while !crate::runtime::is_stopping() {
             let engine = engine.clone();
-            if let Err(error) =
-                crate::runtime::spawn_blocking(move || scheduler::tick(&engine)).await
-            {
-                eprintln!("[provisioning] scheduler failed: {error}");
-                break;
+            let batch = std::mem::take(&mut *ready().lock().unwrap());
+            let delay =
+                match crate::runtime::spawn_blocking(move || scheduler::tick(&engine, batch)).await
+                {
+                    Ok(delay) => delay,
+                    Err(error) => {
+                        eprintln!("[provisioning] scheduler failed: {error}");
+                        break;
+                    }
+                };
+            tokio::select! {
+                _ = WAKE.notified() => (),
+                _ = tokio::time::sleep(delay) => wake(),
+                _ = crate::runtime::cancelled() => break,
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 }
@@ -925,6 +977,23 @@ mod tests {
         advance(&mut o, true);
         assert_eq!(o.results["wan__activation"]["state"], "blocked");
         assert_eq!(o.results["wan"]["state"], "blocked");
+    }
+    #[test]
+    #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 contract")]
+    fn activation_does_not_replace_original_wan_failure() {
+        let mut o = operation(OperationPhase::Waiting, false);
+        o.device.items[0].kind = ItemKind::WanActivation;
+        o.device.items[0].wan_ref = Some("wan".into());
+        for state in ["failed", "blocked", "unknown"] {
+            o.index = 0;
+            let original = json!({"state":state,"reason":"WAN write requires a fresh non-TR069 service readback","task_id":7898,"revision":"rev"});
+            o.results.insert("wan".into(), original.clone());
+            o.finish_item(
+                ItemOutcome::Blocked,
+                "verify the referenced WAN service first",
+            );
+            assert_eq!(o.results["wan"], original);
+        }
     }
     #[test]
     #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 contract")]

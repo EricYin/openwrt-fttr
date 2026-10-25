@@ -155,7 +155,9 @@ impl Controller {
             .map_err(|e| format!("persist reset intent: {e}"))?;
         #[cfg(feature = "acs")]
         {
-            let reply = acs(json!({"op":"reset_device_tasks","device":intent.cwmp_id}));
+            let reply = acs(super::Command::ResetDeviceTasks {
+                device: intent.cwmp_id.clone(),
+            });
             if reply["reset"] != true {
                 return Err(reply["error"]
                     .as_str()

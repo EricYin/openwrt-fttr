@@ -10,7 +10,10 @@ impl ObservedWan {
             || self.services.iter().any(|s| s == "INTERNET") && self.tagged != Some(true)
     }
 }
-pub fn decode(values: &[Value], connection: &str) -> Vec<ObservedWan> {
+pub fn decode<T: for<'a> std::ops::Index<&'a str, Output = Value>>(
+    values: &[T],
+    connection: &str,
+) -> Vec<ObservedWan> {
     let Some((parent, _)) = connection
         .rsplit_once(".WANIPConnection.")
         .or_else(|| connection.rsplit_once(".WANPPPConnection."))
@@ -56,7 +59,10 @@ pub fn decode(values: &[Value], connection: &str) -> Vec<ObservedWan> {
     }
     result
 }
-pub fn protected(values: &[Value], connection: &str) -> bool {
+pub fn protected<T: for<'a> std::ops::Index<&'a str, Output = Value>>(
+    values: &[T],
+    connection: &str,
+) -> bool {
     decode(values, connection)
         .iter()
         .any(ObservedWan::protected)
