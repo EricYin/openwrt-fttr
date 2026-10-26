@@ -2,7 +2,7 @@
  * H3C HM2004-DU Micro-OLT Virtual Network Interfaces:
  * - molt_omci: OMCI control channel
  * - molt_ploam: PLOAM control channel
- * - fttr1 ~ fttr16: Downstream DSA switch ports (1:1 mapped to ONU 1~16)
+ * - fttr1 ~ fttr16: Downstream switch ports mapped to ONU-ID 0~15
  */
 
 #include <linux/netdevice.h>
@@ -203,8 +203,8 @@ static netdev_tx_t fmcs_fttr_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	dst_dev = dev_get_by_name(&init_net, "fttr0");
 	if (dst_dev) {
-		/* The priority-0 envelope identifies GEM port 0x100 + ONU-ID. */
-		vlan_tci = (u16)((0x100 + port_priv->port_idx) & 0x0fff);
+		/* port N maps to ONU-ID N-1 and GEM 0x100 + ONU-ID. */
+		vlan_tci = (u16)(0x100 + port_priv->port_idx - 1);
 		skb = vlan_insert_tag(skb, htons(ETH_P_8021Q), vlan_tci);
 		if (skb && !skb_put_padto(skb, 68)) {
 			skb->dev = dst_dev;
@@ -373,9 +373,9 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 		goto out;
 	}
 
-	/* Priority 0: GEM 0x101..0x10f for the verified ONU-ID 1..15 slots. */
-	if (priority == 0 && vlan_id >= 0x101 && vlan_id <= 0x10f) {
-		struct net_device *sub_dev = priv->fttr_devs[vlan_id - 0x101];
+	/* Priority 0: GEM 0x100..0x10f maps to fttr1..fttr16. */
+	if (priority == 0 && vlan_id >= 0x100 && vlan_id <= 0x10f) {
+		struct net_device *sub_dev = priv->fttr_devs[vlan_id - 0x100];
 		if (sub_dev && (sub_dev->flags & IFF_UP)) {
 			if (!skb_vlan_tag_present(skb) && total_len < VLAN_ETH_HLEN)
 				goto out;

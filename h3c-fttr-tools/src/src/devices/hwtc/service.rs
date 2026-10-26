@@ -10,7 +10,7 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
 /// First-stage V152 provisioning: a transparent, untagged Ethernet path to
 /// the non-OMCI domain. Internal WAN allocation still requires device evidence.
 pub(super) fn configure_profile(id: u8, cancellation: Option<Arc<AtomicBool>>, profile: super::Profile) -> io::Result<()> {
-    if !(1..=15).contains(&id) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "ONU ID must be 1..15")); }
+    if id >= crate::pon_engine::ONU_SLOTS { return Err(io::Error::new(io::ErrorKind::InvalidInput, "ONU ID must be 0..15")); }
     let _lock = lock_onu(id)?;
     let mut session = OmciSession::new(FmcsTransport::open(id)?);
     session.guard_registration(move || crate::controller::service::operation_confirmed(id));

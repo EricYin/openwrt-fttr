@@ -12,10 +12,10 @@ use std::{
 };
 
 pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {
-    if !(1..=15).contains(&id) {
+    if id >= crate::pon_engine::ONU_SLOTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ONU ID must be 1..15",
+            "ONU ID must be 0..15",
         ));
     }
     let _lock = lock_onu(id)?;

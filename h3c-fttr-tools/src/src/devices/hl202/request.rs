@@ -49,7 +49,7 @@ pub fn parse(input: &str) -> io::Result<Request> {
     }
     if request.target.optical_sn.is_empty()
         || request.target.binding_generation.is_empty()
-        || !(1..=16).contains(&request.target.onu_id)
+        || !(0..=15).contains(&request.target.onu_id)
     {
         return Err(invalid("invalid HL202 device selection"));
     }
@@ -90,7 +90,7 @@ mod tests {
         let script = "printf '%s\\n' \"猫\"\n$(touch /tmp/never-local); `id` | cat";
         let input = serde_json::json!({
             "schema_version": 1,
-            "target": {"optical_sn":"H3CT12345678","onu_id":2,"binding_generation":"epoch"},
+            "target": {"optical_sn":"H3CT12345678","onu_id":0,"binding_generation":"epoch"},
             "action": {"kind":"exec","script":script,"timeout_seconds":20}
         });
         let request = parse(&input.to_string()).unwrap();
@@ -103,6 +103,18 @@ mod tests {
                 assert_eq!(timeout_seconds, 20);
             }
             _ => panic!("wrong action"),
+        }
+    }
+
+    #[test]
+    fn hl202_request_accepts_protocol_slot_boundaries() {
+        for (id, valid) in [(0, true), (15, true), (16, false)] {
+            let input = serde_json::json!({
+                "schema_version": 1,
+                "target": {"optical_sn":"H3CT12345678","onu_id":id,"binding_generation":"epoch"},
+                "action": {"kind":"accounts_read"}
+            });
+            assert_eq!(parse(&input.to_string()).is_ok(), valid);
         }
     }
 

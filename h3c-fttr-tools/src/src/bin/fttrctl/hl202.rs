@@ -64,7 +64,7 @@ fn parse(args: &[String]) -> Result<Query, String> {
                 onu_id: onu.ok_or(usage)?.parse::<u16>().map_err(|_| usage)?,
                 binding_generation: generation.filter(|value| !value.is_empty()).ok_or(usage)?,
             };
-            if !(1..=16).contains(&target.onu_id) {
+            if !(0..=15).contains(&target.onu_id) {
                 return Err(usage.into());
             }
             Ok(Query::Report { target })

@@ -9,9 +9,15 @@ pub mod ploam;
 
 use self::ploam::{GponOnu, OnuState, PloamFrame};
 
+pub const ONU_SLOTS: u8 = 16;
+
+/// Protocol IDs/FPGA slots are zero-based; Linux downstream ports are one-based.
+pub fn onu_interface(id: u8) -> String {
+    format!("fttr{}", u16::from(id) + 1)
+}
+
 pub struct PonEngine {
     pub active_onus: Vec<GponOnu>,
-    next_onu_id: u8,
 }
 
 #[cfg(test)]
@@ -19,9 +25,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn all_sixteen_slots_are_unique_and_full_table_preserves_assignments() {
+        let mut engine = PonEngine::new();
+        for id in 0..ONU_SLOTS {
+            let onu = engine.register_onu(*b"TEST", [0, 0, 0, id]).unwrap();
+            assert_eq!(onu.onu_id, id);
+            assert_eq!(onu_interface(id), format!("fttr{}", id + 1));
+            let assign = engine.activate_onu(id);
+            assert_eq!(assign[0].payload[0], id);
+            assert_eq!(1u32 << (16 + id), 0x10000u32 << id);
+        }
+        assert!(engine.register_onu(*b"TEST", [0, 0, 0, 16]).is_none());
+        for id in 0..ONU_SLOTS {
+            assert_eq!(engine.register_onu(*b"TEST", [0, 0, 0, id]).unwrap().onu_id, id);
+        }
+        assert_eq!(engine.active_onus.len(), 16);
+        engine.mark_offline(15);
+        assert!(engine.register_onu(*b"TEST", [0, 0, 0, 16]).is_none());
+        assert_eq!(engine.register_onu(*b"TEST", [0, 0, 0, 15]).unwrap().onu_id, 15);
+    }
+
+    #[test]
     fn serial_and_assignment_do_not_claim_operation() {
         let mut engine = PonEngine::new();
-        let onu = engine.register_onu(*b"TEST", [0x12, 0x34, 0x56, 0x78]);
+        let onu = engine.register_onu(*b"TEST", [0x12, 0x34, 0x56, 0x78]).unwrap();
         assert_eq!(onu.state, OnuState::O3SerialNumber);
         let frames = engine.activate_onu(onu.onu_id);
         assert_eq!(frames.len(), 1);
@@ -62,7 +89,7 @@ mod tests {
     #[test]
     fn retry_discards_previous_eqd_and_operation_state() {
         let mut engine = PonEngine::new();
-        let onu = engine.register_onu(*b"TEST", [1, 2, 3, 4]);
+        let onu = engine.register_onu(*b"TEST", [1, 2, 3, 4]).unwrap();
         engine.active_onus[0].eq_delay = Some(248248);
         engine.active_onus[0].state = OnuState::O5Operation;
         engine.activate_onu(onu.onu_id);
@@ -73,13 +100,13 @@ mod tests {
     #[test]
     fn offline_retains_identity_but_requires_new_activation_evidence() {
         let mut engine = PonEngine::new();
-        let old = engine.register_onu(*b"TEST", [1,2,3,4]);
+        let old = engine.register_onu(*b"TEST", [1,2,3,4]).unwrap();
         engine.active_onus[0].state = OnuState::O5Operation;
         engine.active_onus[0].eq_delay = Some(248248);
         engine.mark_offline(old.onu_id);
         assert_eq!(engine.active_onus[0].state, OnuState::O1Initial);
         assert_eq!(engine.active_onus[0].eq_delay, None);
-        let again = engine.register_onu(old.vendor_id, old.serial_number);
+        let again = engine.register_onu(old.vendor_id, old.serial_number).unwrap();
         assert_eq!(again.onu_id, old.onu_id);
         assert_eq!(engine.active_onus.len(), 1);
         engine.activate_onu(again.onu_id);
@@ -92,7 +119,6 @@ impl PonEngine {
     pub fn new() -> Self {
         Self {
             active_onus: Vec::new(),
-            next_onu_id: 1,
         }
     }
 
@@ -105,16 +131,16 @@ impl PonEngine {
     }
 
     /// Processes an ONU discovered on the PON link (from upstream PLOAM or auto-ranging)
-    pub fn register_onu(&mut self, vendor: [u8; 4], sn: [u8; 4]) -> GponOnu {
+    pub fn register_onu(&mut self, vendor: [u8; 4], sn: [u8; 4]) -> Option<GponOnu> {
         // Check if already registered
         for onu in &self.active_onus {
             if onu.vendor_id == vendor && onu.serial_number == sn {
-                return onu.clone();
+                return Some(onu.clone());
             }
         }
 
-        let id = self.next_onu_id;
-        self.next_onu_id = (self.next_onu_id % 16) + 1;
+        let id = (0..ONU_SLOTS)
+            .find(|id| !self.active_onus.iter().any(|onu| onu.onu_id == *id))?;
 
         let mut onu = GponOnu::new(id, vendor, sn);
         println!(
@@ -126,7 +152,7 @@ impl PonEngine {
 
         onu.state = OnuState::O3SerialNumber;
         self.active_onus.push(onu.clone());
-        onu
+        Some(onu)
     }
 
     /// Forget activation evidence while retaining the serial-to-slot assignment.

@@ -215,8 +215,8 @@ fn print_status_table(status: &FttrSystemStatus) {
                 sg.onu_id, sg.serial_number, sg.vendor, sg.model
             );
             println!(
-                "    Switch Port:    fttr{} (VLAN Tag: {}, State: {:?})",
-                sg.onu_id, sg.onu_id, sg.state
+                "    Switch Port:    {} (GEM: 0x{:03x}, State: {:?})",
+                h3c_fttr_tools::pon_engine::onu_interface(sg.onu_id), 0x100u16 + u16::from(sg.onu_id), sg.state
             );
             println!("    Business:       {}", sg.business_status);
             if !sg.provisioning.is_null() {
@@ -655,7 +655,7 @@ fn main() {
             let id = args
                 .get(2)
                 .and_then(|value| value.parse::<u8>().ok())
-                .filter(|id| (1..=15).contains(id));
+                .filter(|id| (0..=15).contains(id));
             let summary = args.iter().any(|arg| arg == "--summary");
             let mut progress_id = None;
             let Some(id) = id else {

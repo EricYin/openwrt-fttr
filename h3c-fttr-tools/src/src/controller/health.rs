@@ -120,14 +120,13 @@ fn run(
     let watch = args.iter().any(|arg| arg == "--watch");
     let mut observations = policy::Observations::new(watch);
     if watch
-        && (id == 0
-            || args
+        && args
                 .iter()
-                .any(|arg| arg == "--mapped-omcc" || arg == "--stock-padding"))
+                .any(|arg| arg == "--mapped-omcc" || arg == "--stock-padding")
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "watch requires ONU 1..15 and the driver OMCI transport",
+            "watch requires ONU 0..15 and the driver OMCI transport",
         ));
     }
     let _operation_lock = lock_onu(id)?;
@@ -156,7 +155,7 @@ fn run(
     let omci = PacketSocket::open("molt_omci")?;
     let physical = PacketSocket::open("fttr0")?;
     let data = if args.iter().any(|arg| arg == "--arp" || arg == "--1905") {
-        Some(PacketSocket::open(&format!("fttr{id}"))?)
+        Some(PacketSocket::open(&crate::pon_engine::onu_interface(id))?)
     } else {
         None
     };
@@ -213,7 +212,7 @@ fn run(
         println!("TX accepted by socket; awaiting response (not proof of delivery)");
     }
     if data.is_some() {
-        let mac = std::fs::read_to_string(format!("/sys/class/net/fttr{id}/address"))?;
+        let mac = std::fs::read_to_string(format!("/sys/class/net/{}/address", crate::pon_engine::onu_interface(id)))?;
         let mac: Vec<u8> = mac
             .trim()
             .split(':')
@@ -414,7 +413,7 @@ fn run(
                     && carrier_lease.is_none()
                 {
                     let previous = !watch
-                        && std::fs::read_to_string(format!("/sys/class/net/fttr{id}/carrier"))?
+                        && std::fs::read_to_string(format!("/sys/class/net/{}/carrier", crate::pon_engine::onu_interface(id)))?
                             .trim()
                             == "1";
                     bosa::set_fttr_carrier(id as u32, true)?;

@@ -153,7 +153,7 @@ fn rate(current: Option<u64>, previous: Option<u64>, elapsed: Duration) -> Optio
 
 fn collect(root: &Path, id: u8, registration: &str) -> DataPathStatus {
     static SAMPLES: OnceLock<Mutex<BTreeMap<String, Counters>>> = OnceLock::new();
-    let interface = format!("fttr{id}");
+    let interface = crate::pon_engine::onu_interface(id);
     let base = root.join(&interface).join("statistics");
     let mut measurements = Measurements::new();
     let (tx_bytes, tx) = counter(&base.join("tx_bytes"));
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn data_path_verifies_hardware_forwarding_when_gem_matches_and_rx_traffic_present() {
         let root = std::env::temp_dir().join(format!("network-test-ok-{}", std::process::id()));
-        let stat_dir = root.join("fttr1").join("statistics");
+        let stat_dir = root.join("fttr2").join("statistics");
         fs::create_dir_all(&stat_dir).unwrap();
         fs::write(stat_dir.join("tx_bytes"), "1000\n").unwrap();
         fs::write(stat_dir.join("rx_bytes"), "2000\n").unwrap();
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn data_path_withholds_verification_when_no_rx_traffic_received() {
         let root = std::env::temp_dir().join(format!("network-test-norx-{}", std::process::id()));
-        let stat_dir = root.join("fttr1").join("statistics");
+        let stat_dir = root.join("fttr2").join("statistics");
         fs::create_dir_all(&stat_dir).unwrap();
         fs::write(stat_dir.join("tx_bytes"), "500\n").unwrap();
         fs::write(stat_dir.join("rx_bytes"), "0\n").unwrap();
@@ -329,7 +329,7 @@ mod tests {
     fn data_path_rejects_verification_when_gem_mismatches_olt_channel() {
         let root =
             std::env::temp_dir().join(format!("network-test-mismatch-{}", std::process::id()));
-        let stat_dir = root.join("fttr1").join("statistics");
+        let stat_dir = root.join("fttr2").join("statistics");
         fs::create_dir_all(&stat_dir).unwrap();
         fs::write(stat_dir.join("tx_bytes"), "1000\n").unwrap();
         fs::write(stat_dir.join("rx_bytes"), "2000\n").unwrap();

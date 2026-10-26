@@ -658,7 +658,7 @@ fn initialize_hardware(stopping: &AtomicBool) -> io::Result<OpticalState> {
         || {
             bosa::configure_discovery_timing()?;
             setup_bridge();
-            for id in 1..=15 {
+            for id in 0..crate::pon_engine::ONU_SLOTS {
                 clear_offline_hardware(id)?;
             }
             Ok(())
@@ -930,18 +930,12 @@ async fn run_async() {
                             );
 
                             let mut engine = pon_engine_ploam.lock().unwrap();
-                            if engine.active_onus.len() >= 15
-                                && !engine
-                                    .active_onus
-                                    .iter()
-                                    .any(|onu| onu.vendor_id == vendor && onu.serial_number == sn)
-                            {
+                            let Some(onu) = engine.register_onu(vendor, sn) else {
                                 eprintln!(
                                     "[-] No free verified ONU slot; preserving existing identities"
                                 );
                                 continue;
-                            }
-                            let onu = engine.register_onu(vendor, sn);
+                            };
                             let onu_id = onu.onu_id;
                             if online.contains_key(&onu_id) || pending_cleanup.contains(&onu_id) {
                                 drop(engine);

@@ -28,7 +28,7 @@ fn retire_previous_ani(session: &mut OmciSession, current: u16) -> io::Result<()
     // ONU-ID can change across daemon/main restarts while the child retains
     // its MIB. Two ANI bridge entries with the same port number leave the
     // old GEM selected. Retire ONLY entities matching our verified profile.
-    for old in 0x101u16..=0x10f {
+    for old in 0x100u16..=0x10f {
         if old == current { continue; }
         let entry = match session.get(47, old, 0xf000) {
             Ok(entry) => entry,
@@ -65,7 +65,7 @@ fn retire_previous_ani(session: &mut OmciSession, current: u16) -> io::Result<()
 }
 pub fn configure(id: u8, seconds: Option<u64>, transparent: bool, supervised: bool, restore_initial: bool,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> io::Result<()> {
-    if id == 0 || id > 15 || seconds.is_some_and(|s| s > 600) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "ONU_ID must be 1..15 and hold seconds <=600")); }
+    if id > 15 || seconds.is_some_and(|s| s > 600) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "ONU_ID must be 0..15 and hold seconds <=600")); }
     if supervised && cancellation.is_none() { wait_for_operation(id); }
     if cancellation.as_ref().is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire)) {
         return Err(io::Error::new(io::ErrorKind::NotConnected, "registration cancelled before configuration"));

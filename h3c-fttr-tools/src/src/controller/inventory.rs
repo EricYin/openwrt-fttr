@@ -167,10 +167,10 @@ pub fn read_with_progress(
     tables: bool,
     progress_id: Option<String>,
 ) -> io::Result<()> {
-    if !(1..=15).contains(&id) {
+    if id >= crate::pon_engine::ONU_SLOTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ONU_ID must be 1..15",
+            "ONU_ID must be 0..15",
         ));
     }
     let command = serde_json::to_string(&MibCommand {
@@ -317,10 +317,10 @@ pub(super) fn control(
     progress: Option<MibProgressReporter>,
     states: &super::service::States,
 ) -> io::Result<MibReport> {
-    if !(1..=15).contains(&id) {
+    if id >= crate::pon_engine::ONU_SLOTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ONU_ID must be 1..15",
+            "ONU_ID must be 0..15",
         ));
     }
     if !super::service::operation_confirmed(id) {

@@ -9,7 +9,7 @@ pub(super) fn snapshot(engine: &PonEngine, services: &super::service::States,
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let switch_ports = (1..=16u8).map(|port| {
         let interface = format!("fttr{port}");
-        let onu = engine.active_onus.iter().find(|onu| onu.onu_id == port);
+        let onu = engine.active_onus.iter().find(|onu| onu.onu_id == port - 1);
         let carrier = onu.is_some_and(|onu| onu.state == OnuState::O5Operation)
             && fs::read_to_string(format!("/sys/class/net/{interface}/carrier"))
                 .is_ok_and(|value| value.trim() == "1");
@@ -25,7 +25,7 @@ pub(super) fn snapshot(engine: &PonEngine, services: &super::service::States,
                     OnuState::O6IntermittentLODS => "O6IntermittentLODS",
                     OnuState::O7EmergencyStop => "O7EmergencyStop",
                 };
-                (Some(port), Some(onu.full_sn_str()), state.to_string())
+                (Some(onu.onu_id), Some(onu.full_sn_str()), state.to_string())
             }
             None => (None, None, "Offline".into()),
         };
@@ -63,7 +63,7 @@ pub(super) fn snapshot(engine: &PonEngine, services: &super::service::States,
             ssids: desired["ssids"].as_array().cloned().unwrap_or_default(),
             wifi_sync: desired["wifi_sync"].as_str().unwrap_or("not_configured").into(),
             business_status: services.lock().unwrap().get(&onu.onu_id).map(|state| {
-                let verified = fs::read_to_string(format!("/sys/class/net/fttr{}/carrier", onu.onu_id)).is_ok_and(|value| value.trim() == "1");
+                let verified = fs::read_to_string(format!("/sys/class/net/{}/carrier", crate::pon_engine::onu_interface(onu.onu_id))).is_ok_and(|value| value.trim() == "1");
                 state.business_status(verified, onu.state == OnuState::O5Operation && desired["management"]["state"] == "online")
             }).unwrap_or_default(),
             identity: identity.clone(),

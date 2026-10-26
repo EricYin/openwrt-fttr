@@ -13,7 +13,9 @@ pub(super) fn discover(onus: &BTreeMap<u16, String>) -> Result<BTreeMap<String, 
 fn read_links(onus: &BTreeMap<u16, String>) -> io::Result<BTreeMap<String, String>> {
     let mut bridges: BTreeMap<String, BTreeMap<u16, String>> = BTreeMap::new();
     for (onu, sn) in onus {
-        let base = format!("/sys/class/net/fttr{onu}");
+        let id = u8::try_from(*onu).ok().filter(|id| *id < crate::pon_engine::ONU_SLOTS)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid ONU ID"))?;
+        let base = format!("/sys/class/net/{}", crate::pon_engine::onu_interface(id));
         let port = match std::fs::read_to_string(format!("{base}/brport/port_no")) {
             Ok(value) => value,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
