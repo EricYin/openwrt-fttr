@@ -35,6 +35,14 @@ fn configuration(addresses: &[SocketAddr]) -> rumqttd::Config {
             max_outgoing_packet_count: 16,
             max_segment_size: 4_194_304,
             max_segment_count: 2,
+            // Probes only need a few recent messages, not hours of history.
+            custom_segment: Some(HashMap::from([(
+                "/fttr/health/#".into(),
+                rumqttd::SegmentConfig {
+                    max_segment_size: 1024,
+                    max_segment_count: 2,
+                },
+            )])),
             ..Default::default()
         },
         v4: Some(
@@ -190,7 +198,9 @@ async fn cross_listener_probe(addresses: &[SocketAddr]) -> Result<(), String> {
     // Reuse the process topic: generating a new topic per check would grow
     // rumqttd's topic registry even after subscribers disconnect.
     let topic = format!("/fttr/health/{}", std::process::id());
-    let (subscriber, mut receiving) = probe_client(addresses[0], &format!("fttr-health-r-{nonce}"));
+    // Checks are serialized by the broker owner. Stable IDs also reuse the
+    // disconnected-client metrics; freshness belongs in the payload only.
+    let (subscriber, mut receiving) = probe_client(addresses[0], "fttr-health-r");
     match receiving.poll().await.map_err(|e| e.to_string())? {
         Event::Incoming(Packet::ConnAck(_)) => (),
         _ => return Err("health subscriber missing CONNACK".into()),
@@ -214,7 +224,7 @@ async fn cross_listener_probe(addresses: &[SocketAddr]) -> Result<(), String> {
         }
     }
     for (i, addr) in addresses.iter().enumerate() {
-        let (publisher, mut sending) = probe_client(*addr, &format!("fttr-health-w-{i}-{nonce}"));
+        let (publisher, mut sending) = probe_client(*addr, &format!("fttr-health-w-{i}"));
         match sending.poll().await.map_err(|e| e.to_string())? {
             Event::Incoming(Packet::ConnAck(_)) => (),
             _ => return Err("health publisher missing CONNACK".into()),

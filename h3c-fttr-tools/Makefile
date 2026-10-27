@@ -52,12 +52,19 @@ define Package/h3c-fttr-tools/config
 endef
 
 RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC),device-hwtc) $(if $(CONFIG_FTTR_ACS),acs) $(if $(CONFIG_FTTR_MQTT),mqtt) $(if $(CONFIG_FTTR_MIMALLOC),allocator-mimalloc)
-CARGO_PKG_ARGS+= --no-default-features
+CARGO_PKG_ARGS+= --no-default-features --frozen
 
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./src/Cargo.toml ./src/Cargo.lock $(PKG_BUILD_DIR)/
 	$(CP) ./src/src $(PKG_BUILD_DIR)/
+endef
+
+# Populate the shared $(DL_DIR)/cargo registry and Git caches before compilation.
+# --frozen above keeps the compile phase offline and enforces Cargo.lock.
+define Build/Configure
+	$(CARGO_PKG_VARS) cargo fetch --locked \
+		--manifest-path $(PKG_BUILD_DIR)/Cargo.toml --target $(RUSTC_TARGET_ARCH)
 endef
 
 define Package/h3c-fttr-tools/install

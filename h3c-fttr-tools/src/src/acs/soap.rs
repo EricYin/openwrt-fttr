@@ -39,7 +39,7 @@ pub(super) async fn parse_stream<R: tokio::io::AsyncBufRead + Unpin>(
     input: R,
     mut limit: impl FnMut(&str) -> usize,
 ) -> io::Result<Message> {
-    use quick_xml::{events::Event, name::ResolveResult, NsReader};
+    use quick_xml::{events::Event, name::ResolveResult, NsReader, XmlVersion};
     use serde_json::{json, Value};
     let mut reader = NsReader::from_reader(input);
     reader.config_mut().expand_empty_elements = true;
@@ -66,6 +66,7 @@ pub(super) async fn parse_stream<R: tokio::io::AsyncBufRead + Unpin>(
     let mut body = false;
     let mut header = false;
     let mut id_seen = false;
+    let mut xml_version = XmlVersion::Implicit1_0;
     loop {
         let (namespace, event) = reader
             .read_resolved_event_into_async(&mut buffer)
@@ -77,11 +78,9 @@ pub(super) async fn parse_stream<R: tokio::io::AsyncBufRead + Unpin>(
                 if nodes > 120_000 || stack.len() >= 64 {
                     return Err(bad("SOAP structure exceeds bound"));
                 }
-                let name = std::str::from_utf8(e.local_name().as_ref())
-                    .map_err(|_| bad("invalid element name"))?
-                    .to_owned();
+                let name = e.local_name().as_ref().to_owned();
                 let ns = match &namespace {
-                    ResolveResult::Bound(ns) => std::str::from_utf8(ns.as_ref()).unwrap_or(""),
+                    ResolveResult::Bound(ns) => ns.as_ref(),
                     _ => "",
                 };
                 if stack.is_empty() {
@@ -159,15 +158,15 @@ pub(super) async fn parse_stream<R: tokio::io::AsyncBufRead + Unpin>(
                 if name == "Value" {
                     for attr in e.attributes() {
                         let attr = attr.map_err(|_| bad("invalid XML attribute"))?;
-                        let (ns, local) = reader.resolve_attribute(attr.key);
-                        if local.as_ref() == b"type"
-                            && matches!(ns, ResolveResult::Bound(n) if n.as_ref() == b"http://www.w3.org/2001/XMLSchema-instance")
+                        let (ns, local) = reader.resolver().resolve_attribute(attr.key);
+                        if local.as_ref() == "type"
+                            && matches!(ns, ResolveResult::Bound(n) if n.as_ref() == "http://www.w3.org/2001/XMLSchema-instance")
                         {
                             if let Some(row) = &mut row {
                                 row.insert(
                                     "type".into(),
                                     Value::String(
-                                        attr.decode_and_unescape_value(reader.decoder())
+                                        attr.normalized_value(xml_version)
                                             .map_err(|_| bad("invalid XML type"))?
                                             .into_owned(),
                                     ),
@@ -180,7 +179,7 @@ pub(super) async fn parse_stream<R: tokio::io::AsyncBufRead + Unpin>(
                 text.clear();
             }
             Event::Text(e) => {
-                let decoded = e.xml_content().map_err(|_| bad("invalid XML text"))?;
+                let decoded = e.xml_content(xml_version);
                 if stack.is_empty() && !decoded.trim().is_empty() {
                     return Err(bad("text outside SOAP envelope"));
                 }
@@ -196,13 +195,13 @@ pub(super) async fn parse_stream<R: tokio::io::AsyncBufRead + Unpin>(
                 if stack.is_empty() {
                     return Err(bad("CDATA outside SOAP envelope"));
                 }
-                text.push_str(&e.xml_content().map_err(|_| bad("invalid CDATA"))?);
+                text.push_str(&e.xml_content(xml_version));
                 if text.len() > 16 * 1024 {
                     return Err(bad("SOAP field exceeds bound"));
                 }
             }
             Event::GeneralRef(e) => {
-                let name = e.decode().map_err(|_| bad("invalid XML reference"))?;
+                let name = e.into_inner();
                 let escaped = format!("&{name};");
                 text.push_str(
                     &quick_xml::escape::unescape(&escaped)
@@ -316,6 +315,9 @@ pub(super) async fn parse_stream<R: tokio::io::AsyncBufRead + Unpin>(
                     }
                 }
                 text.clear();
+            }
+            Event::Decl(e) => {
+                xml_version = e.xml_version().map_err(|_| bad("invalid XML version"))?;
             }
             Event::DocType(_) => return Err(bad("DTD is disabled")),
             Event::Eof => break,
