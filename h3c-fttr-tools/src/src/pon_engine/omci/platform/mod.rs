@@ -2,3 +2,4 @@
 pub mod fmcs;
 mod capture;
 pub mod leases;
+pub(crate) mod wake;

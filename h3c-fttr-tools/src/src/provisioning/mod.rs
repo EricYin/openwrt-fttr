@@ -10,6 +10,7 @@ pub(crate) use config::words as uci_words;
 pub(crate) mod controller;
 mod link_identity;
 mod management_network;
+pub(crate) mod health_watch;
 pub mod model;
 mod policy;
 mod storage;
@@ -26,7 +27,6 @@ pub(crate) use controller::connection_request_devices;
 use controller::RPC;
 pub(crate) use controller::{
     allows_generic_bridge, is_device_adapter, management_desired, management_result,
-    management_version,
 };
 pub use controller::{control, snapshot, start};
 pub(crate) use policy::contains_service_token;

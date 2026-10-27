@@ -343,11 +343,11 @@ pub(super) fn control(
             read_owned(id, tables, None, deadline, progress)
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            let sender = states
+            let (sender, wake) = states
                 .lock()
                 .unwrap()
                 .get(&id)
-                .and_then(|s| s.mib.clone())
+                .and_then(|s| Some((s.mib.clone()?, s.wake.clone()?)))
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::WouldBlock, "ONU busy; no active monitor")
                 })?;
@@ -362,6 +362,7 @@ pub(super) fn control(
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::WouldBlock, "MIB queue busy or stopped")
                 })?;
+            wake.notify();
             receive
                 .recv_timeout(Duration::from_secs(125))
                 .map_err(|e| io::Error::other(format!("MIB worker unavailable: {e}")))?

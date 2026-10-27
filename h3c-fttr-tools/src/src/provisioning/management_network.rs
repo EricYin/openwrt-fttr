@@ -260,16 +260,17 @@ pub(super) fn active() -> Option<Management> {
         })
         .flatten()
 }
-pub(super) fn version() -> String {
-    let c = coordinator().lock().unwrap();
-    if c.ready {
-        c.journal
-            .applied
-            .as_ref()
-            .map(|d| format!("{}-{}", d.version(), c.journal.applied_epoch))
-            .unwrap_or_default()
-    } else {
-        String::new()
+impl Coordinator {
+    fn set_ready(&mut self, ready: bool) {
+        self.ready = ready;
+        let version = if ready {
+            self.journal.applied.as_ref()
+                .map(|d| format!("{}-{}", d.version(), self.journal.applied_epoch))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        super::health_watch::network(version);
     }
 }
 pub(super) fn matches_desired(d: &Desired) -> bool {
@@ -378,7 +379,7 @@ fn start(desired: Desired, apply: bool, fresh_grant: bool) -> Result<Value, Stri
             }
         }
         if fresh_grant || changed {
-            c.ready = false;
+            c.set_ready(false);
         }
         c.requires_apply = false;
     }
@@ -488,7 +489,7 @@ fn restore(d: Desired) {
     c.busy = false;
     match result.and_then(|_| persist(&c)) {
         Ok(()) => {
-            c.ready = true;
+            c.set_ready(true);
             c.state = if c.journal.previous.is_some() {
                 Phase::WaitingDevices
             } else {
@@ -497,7 +498,7 @@ fn restore(d: Desired) {
             c.error = None;
         }
         Err(e) => {
-            c.ready = false;
+            c.set_ready(false);
             c.state = Phase::AwaitingApply;
             c.error = Some(e);
             c.next_retry = now() + 15;
@@ -1165,7 +1166,7 @@ fn execute(d: Desired, apply_authorized: bool) {
             .collect();
         if !actions.is_empty() {
             let mut c = coordinator().lock().unwrap();
-            c.ready = false;
+            c.set_ready(false);
             c.journal.pending = true;
             persist(&c)?;
             drop(c);
@@ -1196,7 +1197,7 @@ fn execute(d: Desired, apply_authorized: bool) {
             c.journal.pending = false;
             match if save { persist(&c) } else { Ok(()) } {
                 Ok(()) => {
-                    c.ready = true;
+                    c.set_ready(true);
                     c.state = if c.journal.previous.is_some() {
                         Phase::WaitingDevices
                     } else {
@@ -1207,7 +1208,7 @@ fn execute(d: Desired, apply_authorized: bool) {
                     c.attempts = 0;
                 }
                 Err(e) => {
-                    c.ready = false;
+                    c.set_ready(false);
                     c.state = Phase::Blocked;
                     c.error = Some(e);
                 }
@@ -1227,7 +1228,7 @@ fn execute(d: Desired, apply_authorized: bool) {
         }
         Err(e) => {
             if apply_authorized {
-                c.ready = false;
+                c.set_ready(false);
             }
             c.attempts = c.attempts.saturating_add(1);
             c.next_retry = now() + 5u64.saturating_mul(1u64 << c.attempts.min(6)).min(300);
@@ -1293,11 +1294,11 @@ fn cleanup_previous(d: Desired) {
             c.journal.previous = None;
             c.journal.cleanup_pending = false;
             if let Err(e) = persist(&c) {
-                c.ready = false;
+                c.set_ready(false);
                 c.state = Phase::Blocked;
                 c.error = Some(e);
             } else {
-                c.ready = true;
+                c.set_ready(true);
                 c.state = Phase::Ready;
                 c.error = None;
                 c.next_retry = 0;

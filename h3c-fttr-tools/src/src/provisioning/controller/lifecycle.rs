@@ -180,6 +180,8 @@ impl Controller {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         self.config = config;
+        super::super::health_watch::config(self.config.devices.iter()
+            .filter(|d| d.omci_management).map(|d| d.optical_sn.clone()).collect());
         self.load_reset_intents();
         self.retain_configured_state();
         Ok(())
