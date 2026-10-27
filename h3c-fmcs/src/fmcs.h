@@ -140,6 +140,9 @@ struct fmcs_priv {
 	u16 omci_channel[16];
 	struct net_device *ploam_dev;
 	struct net_device *fttr_devs[FMCS_MAX_FTTR_PORTS];
+	/* Published after all lower/upper links exist; protected by RTNL/RCU. */
+	struct net_device __rcu *fttr_lower;
+	struct notifier_block fttr_netdev_nb;
 
 	/* Synchronization */
 	struct mutex lock;
@@ -158,7 +161,6 @@ struct fmcs_priv {
 	int fpga_error;
 
 	/* Packet RX Hook on fttr0 */
-	struct packet_type fttr_pt;
 	struct sk_buff_head ploam_tx_queue;
 	struct work_struct ploam_tx_work;
 };

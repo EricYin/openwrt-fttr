@@ -11,12 +11,115 @@
 #include <linux/if_vlan.h>
 #include <linux/if_arp.h>
 #include <linux/of_net.h>
+#include <linux/rtnetlink.h>
 #include "fmcs.h"
 
 struct fmcs_fttr_port_priv {
 	struct fmcs_priv *priv;
 	u32 port_idx; /* 1-based port index: 1..16 */
 };
+
+static rx_handler_result_t fmcs_handle_frame(struct sk_buff **pskb);
+
+/* Binding is by name only at discovery. Once bound, identity survives rename. */
+static struct net_device *fmcs_lower_get(struct fmcs_priv *priv)
+{
+	struct net_device *lower;
+
+	rcu_read_lock();
+	lower = rcu_dereference(priv->fttr_lower);
+	if (lower)
+		dev_hold(lower);
+	rcu_read_unlock();
+	return lower;
+}
+
+static void fmcs_lower_unlink(struct fmcs_priv *priv)
+{
+	struct net_device *lower = rtnl_dereference(priv->fttr_lower);
+	int i;
+
+	ASSERT_RTNL();
+	if (!lower)
+		return;
+	rcu_assign_pointer(priv->fttr_lower, NULL);
+	netdev_rx_handler_unregister(lower);
+	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++)
+		netdev_upper_dev_unlink(lower, priv->fttr_devs[i]);
+	dev_put(lower);
+}
+
+static int fmcs_lower_link(struct fmcs_priv *priv, struct net_device *lower)
+{
+	int i, ret;
+
+	ASSERT_RTNL();
+	if (lower->type != ARPHRD_ETHER || lower->mtu < ETH_MIN_MTU)
+		return -EINVAL;
+	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
+		ret = netdev_upper_dev_link(lower, priv->fttr_devs[i], NULL);
+		if (ret)
+			goto rollback;
+	}
+	/* All ports are registered before the notifier's initial replay. */
+	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
+		struct net_device *port = priv->fttr_devs[i];
+
+		if (port->mtu > lower->mtu) {
+			ret = dev_set_mtu(port, lower->mtu);
+			if (ret) {
+				i = FMCS_MAX_FTTR_PORTS;
+				goto rollback;
+			}
+		}
+		port->needed_headroom = lower->needed_headroom + VLAN_HLEN;
+		port->needed_tailroom = lower->needed_tailroom;
+	}
+	ret = netdev_rx_handler_register(lower, fmcs_handle_frame, priv);
+	if (ret) {
+		i = FMCS_MAX_FTTR_PORTS;
+		goto rollback;
+	}
+	dev_hold(lower);
+	rcu_assign_pointer(priv->fttr_lower, lower);
+	return 0;
+
+rollback:
+	while (--i >= 0)
+		netdev_upper_dev_unlink(lower, priv->fttr_devs[i]);
+	return ret;
+}
+
+static int fmcs_netdev_event(struct notifier_block *nb,
+			     unsigned long event, void *ptr)
+{
+	struct fmcs_priv *priv = container_of(nb, struct fmcs_priv, fttr_netdev_nb);
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+	struct net_device *lower = rtnl_dereference(priv->fttr_lower);
+	int i, ret;
+
+	if (dev == lower) {
+		if (event == NETDEV_UNREGISTER)
+			fmcs_lower_unlink(priv);
+		if (event == NETDEV_PRECHANGEMTU) {
+			struct netdev_notifier_info_ext *info = ptr;
+
+			/* Reject, rather than leave ports with an unusable MTU. */
+			for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++)
+				if (priv->fttr_devs[i]->mtu > info->ext.mtu)
+					return notifier_from_errno(-EBUSY);
+		}
+		return NOTIFY_OK;
+	}
+	if (!lower && (event == NETDEV_REGISTER || event == NETDEV_CHANGENAME) &&
+	    net_eq(dev_net(dev), &init_net) && !strcmp(dev->name, "fttr0")) {
+		ret = fmcs_lower_link(priv, dev);
+		if (ret)
+			dev_warn(priv->dev, "cannot bind fttr0 lower device: %d\n", ret);
+		/* An optional late lower must not prevent its own registration. */
+	}
+	return NOTIFY_DONE;
+}
 
 /* Fallback prefix used only when the DT supplies no mac-address cell.
  * Locally administered (0x02) and identical on every unit, so it must not
@@ -108,8 +211,8 @@ static netdev_tx_t fmcs_omci_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	if (msg_type == 3 && onu_id <= 15 && skb->len == 56 &&
 	    !skb_linearize(skb)) {
-		/* Find destination master ethernet interface: fttr0 is the FPGA SerDes link */
-		dst_dev = dev_get_by_name(&init_net, "fttr0");
+		/* The bound lower is the FPGA SerDes link, including after rename. */
+		dst_dev = fmcs_lower_get(priv);
 
 		if (dst_dev) {
 			/* Allocate fresh skb with headroom for 16-byte header */
@@ -201,19 +304,30 @@ static netdev_tx_t fmcs_fttr_xmit(struct sk_buff *skb, struct net_device *dev)
 	dev->stats.tx_packets++;
 	dev->stats.tx_bytes += skb->len;
 
-	dst_dev = dev_get_by_name(&init_net, "fttr0");
+	dst_dev = fmcs_lower_get(port_priv->priv);
 	if (dst_dev) {
+		/* A business VLAN in metadata must remain INSIDE the FPGA tag. */
+		if (skb_vlan_tag_present(skb)) {
+			skb = __vlan_hwaccel_push_inside(skb);
+			if (!skb)
+				goto drop_put;
+		}
 		/* port N maps to ONU-ID N-1 and GEM 0x100 + ONU-ID. */
 		vlan_tci = (u16)(0x100 + port_priv->port_idx - 1);
-		skb = vlan_insert_tag(skb, htons(ETH_P_8021Q), vlan_tci);
+		skb = vlan_insert_tag_set_proto(skb, htons(ETH_P_8021Q), vlan_tci);
 		if (skb && !skb_put_padto(skb, 68)) {
 			skb->dev = dst_dev;
 			dev_queue_xmit(skb);
+			dev_put(dst_dev);
+			return NETDEV_TX_OK;
 		}
+	drop_put:
 		dev_put(dst_dev);
+		dev->stats.tx_dropped++;
 		return NETDEV_TX_OK;
 	}
 
+	dev->stats.tx_dropped++;
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
 }
@@ -226,6 +340,31 @@ static int fmcs_fttr_open(struct net_device *dev)
 
 static int fmcs_fttr_stop(struct net_device *dev)
 {
+	return 0;
+}
+
+static int fmcs_fttr_get_iflink(const struct net_device *dev)
+{
+	const struct fmcs_fttr_port_priv *port = netdev_priv(dev);
+	struct net_device *lower;
+	int iflink = 0;
+
+	rcu_read_lock();
+	lower = rcu_dereference(port->priv->fttr_lower);
+	if (lower)
+		iflink = lower->ifindex;
+	rcu_read_unlock();
+	return iflink;
+}
+
+static int fmcs_fttr_change_mtu(struct net_device *dev, int mtu)
+{
+	struct fmcs_fttr_port_priv *port = netdev_priv(dev);
+	struct net_device *lower = rtnl_dereference(port->priv->fttr_lower);
+
+	if (lower && mtu > lower->mtu)
+		return -ERANGE;
+	WRITE_ONCE(dev->mtu, mtu);
 	return 0;
 }
 
@@ -243,6 +382,8 @@ static const struct net_device_ops fmcs_fttr_ops = {
 	.ndo_start_xmit = fmcs_fttr_xmit,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr   = eth_validate_addr,
+	.ndo_get_iflink      = fmcs_fttr_get_iflink,
+	.ndo_change_mtu      = fmcs_fttr_change_mtu,
 };
 
 void fmcs_rx_omci_frame(struct fmcs_priv *priv, const u8 *data, size_t len)
@@ -289,45 +430,20 @@ void fmcs_rx_ploam_frame(struct fmcs_priv *priv, const u8 *data, size_t len)
 	netif_rx(skb);
 }
 
-static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
-			   struct packet_type *pt, struct net_device *orig_dev)
+static rx_handler_result_t fmcs_handle_frame(struct sk_buff **pskb)
 {
-	struct fmcs_priv *priv = (struct fmcs_priv *)pt->af_packet_priv;
+	struct sk_buff *skb = *pskb;
+	struct fmcs_priv *priv = rcu_dereference(skb->dev->rx_handler_data);
 	u16 vlan_tci, vlan_id, priority;
 	u16 onu_id;
-	const u8 *eth_hdr;
-	u8 eth_buf[VLAN_ETH_HLEN];
 	int mac_len;
-	size_t total_len;
 
-	if (!dev || strcmp(dev->name, "fttr0") != 0)
-		goto out;
-
-	if (!priv)
-		goto out;
-
-	if (!skb_mac_header_was_set(skb))
-		goto out;
-	eth_hdr = skb_mac_header(skb);
-	if (eth_hdr < skb->head || eth_hdr > skb->data)
-		goto out;
-	mac_len = skb->data - eth_hdr;
-	total_len = mac_len + skb->len;
-	if (total_len < ETH_HLEN)
-		goto out;
-	eth_hdr = skb_header_pointer(skb, -mac_len,
-				     min_t(size_t, total_len, sizeof(eth_buf)),
-				     eth_buf);
-	if (!eth_hdr)
-		goto out;
-
-	if (skb_vlan_tag_present(skb)) {
-		vlan_tci = skb_vlan_tag_get(skb);
-	} else if (total_len >= 16 && eth_hdr[12] == 0x81 && eth_hdr[13] == 0x00) {
-		vlan_tci = (eth_hdr[14] << 8) | eth_hdr[15];
-	} else {
-		goto out;
-	}
+	/* __netif_receive_skb_core() has already moved an inline outer VLAN
+	 * into metadata. Do not claim unrelated lower-device traffic.
+	 */
+	if (!skb_vlan_tag_present(skb) || skb->vlan_proto != htons(ETH_P_8021Q))
+		return RX_HANDLER_PASS;
+	vlan_tci = skb_vlan_tag_get(skb);
 
 	priority = (vlan_tci >> 13) & 0x07;
 	vlan_id = vlan_tci & 0x0fff;
@@ -338,23 +454,18 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 
 	/* Priority 1 (0x2000): OMCI response frame from sub-gateway */
 	if (priority == 1 && onu_id <= 15) {
-		int omci_offset;
 		u8 omci_buf[56];
 
-		if (skb_vlan_tag_present(skb)) {
-			/* This FPGA envelope has no inner Ethernet EtherType: OMCI
-			 * starts immediately after TCI at byte 16. VLAN untagging
-			 * removes four bytes, leaving the first two OMCI bytes in
-			 * the Ethernet h_proto field, before skb->data.
-			 */
-			if (total_len < 12 + 48)
-				goto out;
-			omci_offset = 12;
-		} else {
-			if (total_len < 16 + 48)
-				goto out;
-			omci_offset = 16;
-		}
+		/* No inner EtherType: the first two OMCI bytes occupy h_proto
+		 * after VLAN untagging, i.e. two bytes before skb->data.
+		 */
+		if (!skb_mac_header_was_set(skb) ||
+		    skb_mac_header(skb) < skb->head ||
+		    skb_mac_header(skb) > skb->data)
+			goto consumed;
+		mac_len = skb->data - skb_mac_header(skb);
+		if (mac_len != ETH_HLEN || skb->len < 46)
+			goto consumed;
 
 		/*
 		 * Deliver 56-byte frame to molt_omci:
@@ -364,45 +475,53 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 		 */
 		*(__be32 *)&omci_buf[0] = cpu_to_be32(3);
 		*(__be32 *)&omci_buf[4] = cpu_to_be32(onu_id);
-		if (skb_copy_bits(skb, omci_offset - mac_len,
+		if (skb_copy_bits(skb, 12 - mac_len,
 				  &omci_buf[8], 48))
-			goto out;
+			goto consumed;
 
 		pr_debug("fmcs: OMCI RX fttr0 onu_id %u len %zu\n", onu_id, sizeof(omci_buf));
 		fmcs_rx_omci_frame(priv, omci_buf, sizeof(omci_buf));
-		goto out;
+		goto consumed;
 	}
 
 	/* Priority 0: GEM 0x100..0x10f maps to fttr1..fttr16. */
 	if (priority == 0 && vlan_id >= 0x100 && vlan_id <= 0x10f) {
 		struct net_device *sub_dev = priv->fttr_devs[vlan_id - 0x100];
+
 		if (sub_dev && (sub_dev->flags & IFF_UP)) {
-			if (!skb_vlan_tag_present(skb) && total_len < VLAN_ETH_HLEN)
-				goto out;
-			/* Packet taps share the skb with the original RX path. Only
-			 * clone its descriptor; keep GRO/GSO fragments and metadata.
-			 */
+			if (!skb_mac_header_was_set(skb) ||
+			    skb_mac_header(skb) < skb->head ||
+			    skb_mac_header(skb) > skb->data)
+				goto consumed;
+			mac_len = skb->data - skb_mac_header(skb);
+			if (mac_len != ETH_HLEN)
+				goto consumed;
+			/* AF_PACKET listeners may still hold a reference. */
 			skb = skb_share_check(skb, GFP_ATOMIC);
+			*pskb = skb;
 			if (!skb)
-				return NET_RX_DROP;
+				return RX_HANDLER_CONSUMED;
+			/* Remove ONLY the FPGA tag. The next receive round handles
+			 * any business VLAN on the logical port, including VID 0.
+			 */
+			__vlan_hwaccel_clear_tag(skb);
 			skb_push_rcsum(skb, mac_len);
-			if (skb_vlan_pop(skb))
-				goto out;
 			skb_scrub_packet(skb, false);
 			skb->dev = sub_dev;
 			skb->protocol = eth_type_trans(skb, sub_dev);
 			skb_postpull_rcsum(skb, skb_mac_header(skb), ETH_HLEN);
 			sub_dev->stats.rx_packets++;
 			sub_dev->stats.rx_bytes += skb->len;
-			netif_rx(skb);
-			return NET_RX_SUCCESS;
+			return RX_HANDLER_ANOTHER;
 		}
+		goto consumed;
 	}
+	return RX_HANDLER_PASS;
 
-out:
-	/* Packet taps own a reference even when the frame is ignored. */
+consumed:
 	dev_kfree_skb_any(skb);
-	return NET_RX_SUCCESS;
+	*pskb = NULL;
+	return RX_HANDLER_CONSUMED;
 }
 
 int fmcs_netdevs_init(struct fmcs_priv *priv)
@@ -497,6 +616,11 @@ int fmcs_netdevs_init(struct fmcs_priv *priv)
 
 		dev->netdev_ops = &fmcs_fttr_ops;
 		dev->priv_flags &= ~IFF_TX_SKB_SHARING;
+		/* The transport and its receive handler live in init_net. */
+		dev->netns_immutable = true;
+		dev->min_mtu = ETH_MIN_MTU;
+		dev->max_mtu = ETH_MAX_MTU;
+		dev->needed_headroom = VLAN_HLEN;
 		port_priv = netdev_priv(dev);
 		port_priv->priv = priv;
 		port_priv->port_idx = i + 1;
@@ -518,14 +642,14 @@ int fmcs_netdevs_init(struct fmcs_priv *priv)
 		priv->fttr_devs[i] = dev;
 	}
 
-	/* Hook RX packets from fttr0 */
-	priv->fttr_pt.type = htons(ETH_P_ALL);
-	priv->fttr_pt.dev = NULL;
-	priv->fttr_pt.af_packet_net = &init_net;
-	priv->fttr_pt.ignore_outgoing = true;
-	priv->fttr_pt.func = fmcs_rcv_packet;
-	priv->fttr_pt.af_packet_priv = priv;
-	dev_add_pack(&priv->fttr_pt);
+	priv->fttr_netdev_nb.notifier_call = fmcs_netdev_event;
+	ret = register_netdevice_notifier(&priv->fttr_netdev_nb);
+	if (ret) {
+		rtnl_lock();
+		fmcs_lower_unlink(priv);
+		rtnl_unlock();
+		goto err_unreg_fttr;
+	}
 
 	return 0;
 
@@ -550,7 +674,10 @@ void fmcs_netdevs_exit(struct fmcs_priv *priv)
 {
 	int i;
 
-	dev_remove_pack(&priv->fttr_pt);
+	unregister_netdevice_notifier(&priv->fttr_netdev_nb);
+	rtnl_lock();
+	fmcs_lower_unlink(priv);
+	rtnl_unlock();
 
 	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
 		if (priv->fttr_devs[i]) {
