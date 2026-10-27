@@ -159,6 +159,7 @@ struct fmcs_priv {
 
 	/* Packet RX Hook on fttr0 */
 	struct packet_type fttr_pt;
+	struct notifier_block fttr_nb;
 	struct sk_buff_head ploam_tx_queue;
 	struct work_struct ploam_tx_work;
 };

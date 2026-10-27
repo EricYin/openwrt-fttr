@@ -9,6 +9,7 @@
 #include <linux/etherdevice.h>
 #include <linux/skbuff.h>
 #include <linux/if_vlan.h>
+#include <linux/rtnetlink.h>
 #include <linux/if_arp.h>
 #include <linux/of_net.h>
 #include "fmcs.h"
@@ -300,7 +301,7 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 	int mac_len;
 	size_t total_len;
 
-	if (!dev || strcmp(dev->name, "fttr0") != 0)
+	if (!dev || dev != pt->dev)
 		goto out;
 
 	if (!priv)
@@ -403,6 +404,46 @@ out:
 	/* Packet taps own a reference even when the frame is ignored. */
 	dev_kfree_skb_any(skb);
 	return NET_RX_SUCCESS;
+}
+
+/* All hook changes run under RTNL, including notifier replay during registration.
+ * Keep the netdev alive until dev_remove_pack() has drained in-flight callbacks.
+ */
+static void fmcs_unhook_rx(struct fmcs_priv *priv)
+{
+	struct net_device *dev = priv->fttr_pt.dev;
+
+	ASSERT_RTNL();
+	if (!dev)
+		return;
+	dev_remove_pack(&priv->fttr_pt);
+	priv->fttr_pt.dev = NULL;
+	dev_put(dev);
+}
+
+static int fmcs_netdev_event(struct notifier_block *nb,
+			     unsigned long event, void *data)
+{
+	struct fmcs_priv *priv = container_of(nb, struct fmcs_priv, fttr_nb);
+	struct net_device *dev = netdev_notifier_info_to_dev(data);
+
+	if (event == NETDEV_UNREGISTER) {
+		if (priv->fttr_pt.dev == dev)
+			fmcs_unhook_rx(priv);
+		return NOTIFY_DONE;
+	}
+	if (event != NETDEV_REGISTER && event != NETDEV_CHANGENAME)
+		return NOTIFY_DONE;
+
+	if (priv->fttr_pt.dev == dev && strcmp(dev->name, "fttr0"))
+		fmcs_unhook_rx(priv);
+	if (!priv->fttr_pt.dev && net_eq(dev_net(dev), &init_net) &&
+	    dev->reg_state == NETREG_REGISTERED && !strcmp(dev->name, "fttr0")) {
+		dev_hold(dev);
+		priv->fttr_pt.dev = dev;
+		dev_add_pack(&priv->fttr_pt);
+	}
+	return NOTIFY_DONE;
 }
 
 int fmcs_netdevs_init(struct fmcs_priv *priv)
@@ -520,12 +561,19 @@ int fmcs_netdevs_init(struct fmcs_priv *priv)
 
 	/* Hook RX packets from fttr0 */
 	priv->fttr_pt.type = htons(ETH_P_ALL);
-	priv->fttr_pt.dev = NULL;
+	priv->fttr_pt.dev = NULL; /* no hook until a matching init_net device exists */
 	priv->fttr_pt.af_packet_net = &init_net;
 	priv->fttr_pt.ignore_outgoing = true;
 	priv->fttr_pt.func = fmcs_rcv_packet;
 	priv->fttr_pt.af_packet_priv = priv;
-	dev_add_pack(&priv->fttr_pt);
+	priv->fttr_nb.notifier_call = fmcs_netdev_event;
+	ret = register_netdevice_notifier(&priv->fttr_nb);
+	if (ret) {
+		rtnl_lock();
+		fmcs_unhook_rx(priv);
+		rtnl_unlock();
+		goto err_unreg_fttr;
+	}
 
 	return 0;
 
@@ -550,7 +598,10 @@ void fmcs_netdevs_exit(struct fmcs_priv *priv)
 {
 	int i;
 
-	dev_remove_pack(&priv->fttr_pt);
+	unregister_netdevice_notifier(&priv->fttr_nb);
+	rtnl_lock();
+	fmcs_unhook_rx(priv);
+	rtnl_unlock();
 
 	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
 		if (priv->fttr_devs[i]) {
