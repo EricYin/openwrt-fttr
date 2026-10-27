@@ -18,11 +18,61 @@ pub fn onu_interface(id: u8) -> String {
 
 pub struct PonEngine {
     pub active_onus: Vec<GponOnu>,
+    pub(crate) onu_pins: std::collections::BTreeMap<String, u8>,
+    pub(crate) pin_error: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pins_reserve_offline_slots_and_survive_reordered_discovery_after_restart() {
+        let pins = std::collections::BTreeMap::from([
+            ("TEST00000001".into(), 0),
+            ("TEST00000002".into(), 15),
+        ]);
+        for order in [[1, 2], [2, 1]] {
+            let mut engine = PonEngine::new();
+            engine.onu_pins = pins.clone();
+            assert!(engine.active_onus.is_empty());
+            // An automatic ONU arriving first cannot steal either reservation.
+            assert_eq!(
+                engine.register_onu(*b"TEST", [0, 0, 0, 3]).unwrap().onu_id,
+                1
+            );
+            for serial in order {
+                let id = if serial == 1 { 0 } else { 15 };
+                assert_eq!(
+                    engine.register_onu(*b"TEST", [0, 0, 0, serial]).unwrap().onu_id,
+                    id
+                );
+                engine.mark_offline(id);
+                assert_eq!(
+                    engine.register_onu(*b"TEST", [0, 0, 0, serial]).unwrap().onu_id,
+                    id
+                );
+            }
+            assert_eq!(engine.active_onus.len(), 3);
+        }
+    }
+
+    #[test]
+    fn all_reserved_slots_reject_unpinned_identity_and_bad_startup_blocks_allocation() {
+        let mut engine = PonEngine::new();
+        engine.onu_pins = (0..ONU_SLOTS)
+            .map(|id| (format!("TEST000000{id:02X}"), id))
+            .collect();
+        assert!(engine.register_onu(*b"FREE", [0; 4]).is_none());
+        for id in (0..ONU_SLOTS).rev() {
+            assert_eq!(
+                engine.register_onu(*b"TEST", [0, 0, 0, id]).unwrap().onu_id,
+                id
+            );
+        }
+        engine.pin_error = Some("invalid startup configuration".into());
+        assert!(engine.register_onu(*b"TEST", [0; 4]).is_none());
+    }
 
     #[test]
     fn all_sixteen_slots_are_unique_and_full_table_preserves_assignments() {
@@ -119,6 +169,8 @@ impl PonEngine {
     pub fn new() -> Self {
         Self {
             active_onus: Vec::new(),
+            onu_pins: Default::default(),
+            pin_error: None,
         }
     }
 
@@ -132,15 +184,33 @@ impl PonEngine {
 
     /// Processes an ONU discovered on the PON link (from upstream PLOAM or auto-ranging)
     pub fn register_onu(&mut self, vendor: [u8; 4], sn: [u8; 4]) -> Option<GponOnu> {
+        self.try_register_onu(vendor, sn).ok()
+    }
+
+    pub(crate) fn try_register_onu(&mut self, vendor: [u8; 4], sn: [u8; 4]) -> Result<GponOnu, String> {
+        if let Some(error) = &self.pin_error {
+            return Err(format!("allocation blocked by startup configuration: {error}"));
+        }
         // Check if already registered
         for onu in &self.active_onus {
             if onu.vendor_id == vendor && onu.serial_number == sn {
-                return Some(onu.clone());
+                return Ok(onu.clone());
             }
         }
 
-        let id = (0..ONU_SLOTS)
-            .find(|id| !self.active_onus.iter().any(|onu| onu.onu_id == *id))?;
+        let identity = GponOnu::new(0, vendor, sn).full_sn_str().to_ascii_uppercase();
+        let id = match self.onu_pins.get(&identity) {
+            Some(&id) => id,
+            None => (0..ONU_SLOTS)
+                .find(|id| {
+                    !self.onu_pins.values().any(|reserved| reserved == id)
+                        && !self.active_onus.iter().any(|onu| onu.onu_id == *id)
+                })
+                .ok_or_else(|| format!("{identity}: all {ONU_SLOTS} slots are occupied or reserved"))?,
+        };
+        if self.active_onus.iter().any(|onu| onu.onu_id == id) {
+            return Err(format!("{identity}: reserved ONU-ID {id} is already occupied"));
+        }
 
         let mut onu = GponOnu::new(id, vendor, sn);
         println!(
@@ -152,7 +222,7 @@ impl PonEngine {
 
         onu.state = OnuState::O3SerialNumber;
         self.active_onus.push(onu.clone());
-        Some(onu)
+        Ok(onu)
     }
 
     /// Forget activation evidence while retaining the serial-to-slot assignment.

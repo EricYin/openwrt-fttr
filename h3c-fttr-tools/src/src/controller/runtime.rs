@@ -930,11 +930,12 @@ async fn run_async() {
                             );
 
                             let mut engine = pon_engine_ploam.lock().unwrap();
-                            let Some(onu) = engine.register_onu(vendor, sn) else {
-                                eprintln!(
-                                    "[-] No free verified ONU slot; preserving existing identities"
-                                );
-                                continue;
+                            let onu = match engine.try_register_onu(vendor, sn) {
+                                Ok(onu) => onu,
+                                Err(error) => {
+                                    eprintln!("[-] ONU allocation rejected: {error}");
+                                    continue;
+                                }
                             };
                             let onu_id = onu.onu_id;
                             if online.contains_key(&onu_id) || pending_cleanup.contains(&onu_id) {

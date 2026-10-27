@@ -226,6 +226,22 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
         {
             return Err(format!("{id}: missing/duplicate device identity"));
         }
+        if let Some(values) = s.options.get("onu_id") {
+            let value = s.get("onu_id");
+            if values.len() != 1 || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("{id}: onu_id must be a single decimal number 0..15"));
+            }
+            let slot = value
+                .parse::<u8>()
+                .ok()
+                .filter(|n| *n < crate::pon_engine::ONU_SLOTS)
+                .ok_or_else(|| format!("{id}: onu_id must be 0..15"))?;
+            if let Some((sn, _)) = cfg.onu_pins.iter().find(|(_, n)| **n == slot) {
+                return Err(format!("{id}: onu_id {slot} already reserved for {sn}"));
+            }
+            cfg.onu_pins
+                .insert(s.get("optical_sn").to_ascii_uppercase(), slot);
+        }
         let adapter = match s.get("adapter") {
             "hl202" if cfg!(feature = "device-hl202") => "hl202",
             "hwtc" | "k155" if cfg!(feature = "device-hwtc") => "hwtc",

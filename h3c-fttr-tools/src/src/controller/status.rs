@@ -30,7 +30,8 @@ pub(super) fn snapshot(engine: &PonEngine, services: &super::service::States,
             None => (None, None, "Offline".into()),
         };
         SwitchPortStatus { port, interface, carrier, status: if carrier { "UP" } else { "DOWN" }.into(),
-            onu_id, onu_sn, link_state }
+            onu_id, onu_sn, link_state,
+            reserved_sn: engine.onu_pins.iter().find(|(_, id)| **id == port - 1).map(|(sn, _)| sn.clone()) }
     }).collect();
     let sub_gateways = engine.active_onus.iter().map(|onu| {
         let service = services.lock().unwrap().get(&onu.onu_id).cloned();
@@ -94,6 +95,48 @@ pub(super) fn snapshot(engine: &PonEngine, services: &super::service::States,
     let telemetry_gateways = devs.iter().map(|dev| TelemetryGatewayInfo {
         id: dev.id.clone(), last_seen_sec_ago: now.saturating_sub(dev.last_seen), last_payload_bytes: dev.payload_bytes,
     }).collect();
-    FttrSystemStatus { provisioning, fpga_status: fpga::get_fpga_status().to_string(),
+    let onu_pinning = pinning_status(engine, &provisioning);
+    FttrSystemStatus { onu_pinning, provisioning, fpga_status: fpga::get_fpga_status().to_string(),
         optical_transceiver: bosa::get_optical_status(), switch_ports, sub_gateways, telemetry_gateways }
+}
+
+fn pinning_status(engine: &PonEngine, provisioning: &serde_json::Value) -> serde_json::Value {
+    let desired = &provisioning["onu_pins"];
+    let active = serde_json::json!(engine.onu_pins);
+    serde_json::json!({
+        "desired": desired,
+        "active": active,
+        "pending_restart": engine.pin_error.is_some() || *desired != active,
+        "allocation_blocked": engine.pin_error.is_some(),
+        "startup_error": engine.pin_error,
+        "config_error": provisioning["config_error"],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn pin_reload_reports_pending_without_reassigning_or_inventing_onus() {
+        let mut engine = PonEngine::new();
+        engine.onu_pins.insert("TEST00000001".into(), 0);
+        let original = json!({"onu_pins":{"TEST00000001":0}});
+        assert_eq!(pinning_status(&engine, &original)["pending_restart"], false);
+        for desired in [json!({}), json!({"TEST00000001":15}), json!({"TEST00000002":0})] {
+            let status = pinning_status(&engine, &json!({"onu_pins":desired}));
+            assert_eq!(status["pending_restart"], true);
+            assert_eq!(status["active"], original["onu_pins"]);
+            assert!(engine.active_onus.is_empty());
+        }
+        // Reverting the desired configuration cancels the pending change.
+        assert_eq!(pinning_status(&engine, &original)["pending_restart"], false);
+        let invalid = json!({"onu_pins":original["onu_pins"],"config_error":"duplicate slot"});
+        assert_eq!(pinning_status(&engine, &invalid)["config_error"], "duplicate slot");
+        assert_eq!(pinning_status(&engine, &invalid)["active"], original["onu_pins"]);
+        engine.pin_error = Some("unreadable UCI at startup".into());
+        assert_eq!(pinning_status(&engine, &original)["allocation_blocked"], true);
+        assert_eq!(pinning_status(&engine, &original)["pending_restart"], true);
+    }
 }

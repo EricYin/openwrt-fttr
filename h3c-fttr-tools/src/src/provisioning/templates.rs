@@ -77,6 +77,12 @@ pub fn compile(text: &str) -> Result<Config, String> {
             }
             "option" | "list" if w.len() == 3 => {
                 let s = &mut all.last_mut().ok_or("option without section")?.1;
+                if s.kind == "device"
+                    && w[1] == "onu_id"
+                    && (w[0] != "option" || s.options.contains_key("onu_id"))
+                {
+                    return Err("device onu_id requires one scalar option".into());
+                }
                 if s.kind == "management" && w[1] == "vlan" && w[0] != "list" {
                     return Err(
                         "management VLAN requires list vlan; scalar option vlan is unsupported"
@@ -105,6 +111,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
             "device" => &[
                 "name",
                 "optical_sn",
+                "onu_id",
                 "adapter",
                 "cwmp_contract",
                 "group",
@@ -449,7 +456,11 @@ pub fn compile(text: &str) -> Result<Config, String> {
     let mut canonical = String::new();
     for (id, s) in &all {
         if s.kind != "acs" {
-            emit(&mut canonical, &s.kind, id, s);
+            let mut business = s.clone();
+            if business.kind == "device" {
+                business.options.remove("onu_id");
+            }
+            emit(&mut canonical, &s.kind, id, &business);
         }
     }
     cfg.revision = format!(
@@ -465,6 +476,37 @@ pub fn compile(text: &str) -> Result<Config, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn onu_pins_are_strict_unique_and_independent_of_business_revision() {
+        let base = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'TESTabcdef01'\n option adapter 'generic'\n option group 'g'\n";
+        let automatic = super::compile(base).unwrap();
+        for id in [0, 15] {
+            let pinned = super::compile(&format!("{base} option onu_id '{id}'\n")).unwrap();
+            assert_eq!(pinned.onu_pins["TESTABCDEF01"], id);
+            assert_eq!(pinned.revision, automatic.revision);
+        }
+        for option in [
+            "option onu_id '16'",
+            "option onu_id '-1'",
+            "option onu_id '+1'",
+            "option onu_id '0x0f'",
+            "option onu_id ''",
+            "list onu_id '0'",
+            "option onu_id ' 1'",
+            "option onu_id '0'\n option onu_id '1'",
+        ] {
+            assert!(
+                super::compile(&format!("{base}{option}\n")).is_err(),
+                "{option}"
+            );
+        }
+        let duplicate = format!("{base} option onu_id '0'\nconfig device 'other'\n option optical_sn 'TEST12345678'\n option adapter 'generic'\n option group 'g'\n option onu_id '0'\n");
+        assert!(super::compile(&duplicate)
+            .err()
+            .unwrap()
+            .contains("already reserved"));
+    }
     // Existing end-to-end expectations now cross the intent/compiler boundary
     // explicitly, using a known HL202/HWTC object-map fixture.
     fn plan(mut cfg: Config) -> Result<Config, String> {

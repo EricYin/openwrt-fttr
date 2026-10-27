@@ -115,6 +115,7 @@ struct Controller {
     resets: reset::Resets,
     config: Config,
     failure: Option<String>,
+    config_error: Option<String>,
     next_id: u64,
     operations: BTreeMap<String, Operation>,
     management: BTreeMap<String, Value>,
@@ -349,6 +350,13 @@ impl Controller {
         Ok(ids)
     }
     fn snapshot(&self) -> Value {
+        let mut status = self.business_snapshot();
+        status["onu_pins"] = json!(self.config.onu_pins);
+        status["config_error"] = json!(self.config_error);
+        status
+    }
+
+    fn business_snapshot(&self) -> Value {
         let devices: Vec<_> = self.config.devices.iter().map(|d| {
             let mut operation = self.operations.get(&d.id).map(Operation::view).or_else(|| self.recovered.get(&d.id).cloned()).unwrap_or_else(|| json!({"state":"not_started","items":d.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":"not_started"})).collect::<Vec<_>>() }));
             operation["current_revision"] = json!(operation["revision"] == self.config.revision);
@@ -498,10 +506,16 @@ pub fn control(request: &str) -> String {
                 Ok(json!({"valid":true,"revision":cfg.revision,"devices":cfg.devices.len()}))
             }
             "reload" => {
-                let cfg = config::load()?;
+                let cfg = config::load().inspect_err(|error| {
+                    controller().lock().unwrap().config_error = Some(error.clone());
+                })?;
                 let mut c = controller().lock().unwrap();
                 let changed = cfg.revision != c.config.revision;
-                c.replace_config(cfg)?;
+                if let Err(error) = c.replace_config(cfg) {
+                    c.config_error = Some(error.clone());
+                    return Err(error);
+                }
+                c.config_error = None;
                 c.failure = None;
                 if changed
                     && c.config.enabled
@@ -577,11 +591,18 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
         let mut c = controller().lock().unwrap();
         match config::load() {
             Ok(cfg) => {
+                engine.lock().unwrap().onu_pins = cfg.onu_pins.clone();
                 if let Err(e) = c.replace_config(cfg) {
+                    engine.lock().unwrap().pin_error = Some(e.clone());
+                    c.config_error = Some(e.clone());
                     c.failure = Some(e);
                 }
             }
-            Err(e) => c.failure = Some(e),
+            Err(e) => {
+                engine.lock().unwrap().pin_error = Some(e.clone());
+                c.config_error = Some(e.clone());
+                c.failure = Some(e);
+            }
         }
         c.load_reset_intents();
         if let Ok(data) = std::fs::read("/var/lib/fttr/provisioning-state.json") {

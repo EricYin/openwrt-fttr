@@ -42,6 +42,8 @@ pub struct SwitchPortStatus {
     pub onu_sn: Option<String>,
     #[serde(default = "default_link_state")]
     pub link_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_sn: Option<String>,
 }
 
 fn default_link_state() -> String {
@@ -148,6 +150,8 @@ pub struct TelemetryGatewayInfo {
 /// Aggregated system status model returned by fttrd daemon on STATUS request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FttrSystemStatus {
+    #[serde(default)]
+    pub onu_pinning: serde_json::Value,
     #[serde(default)]
     pub provisioning: serde_json::Value,
     #[serde(default = "default_fpga_status")]

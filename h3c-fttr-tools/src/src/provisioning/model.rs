@@ -281,6 +281,7 @@ impl Device {
 
 #[derive(Clone, Default)]
 pub struct Config {
+    pub onu_pins: BTreeMap<String, u8>,
     pub revision: String,
     pub enabled: bool,
     pub automatic: bool,
