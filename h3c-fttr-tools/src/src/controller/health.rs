@@ -152,9 +152,11 @@ fn run(
     } else {
         None
     };
-    let omci = PacketSocket::open("molt_omci")?;
-    let physical = PacketSocket::open("fttr0")?;
-    let data = if args.iter().any(|arg| arg == "--arp" || arg == "--1905") {
+    let omci = if watch { PacketSocket::health_omci(id)? } else { PacketSocket::open("molt_omci")? };
+    let physical = if watch { PacketSocket::health_gem(id)? } else { PacketSocket::open("fttr0")? };
+    let discovery = args.iter().any(|arg| arg == "--arp" || arg == "--1905");
+    // Watch only consumes physical GEM evidence, not this diagnostic capture.
+    let data = if discovery && !watch {
         Some(PacketSocket::open(&crate::pon_engine::onu_interface(id))?)
     } else {
         None
@@ -211,7 +213,7 @@ fn run(
     if accepted {
         println!("TX accepted by socket; awaiting response (not proof of delivery)");
     }
-    if data.is_some() {
+    if discovery {
         let mac = std::fs::read_to_string(format!("/sys/class/net/{}/address", crate::pon_engine::onu_interface(id)))?;
         let mac: Vec<u8> = mac
             .trim()
@@ -344,7 +346,7 @@ fn run(
         }
         let captures = [
             Some(("molt_omci", &omci)),
-            Some(("fttr0", &physical)),
+            (!watch || last_data.is_none()).then_some(("fttr0", &physical)),
             data.as_ref().map(|d| ("data", d)),
         ];
         let mut rx_buf = [0u8; 2048];
@@ -400,6 +402,11 @@ fn run(
                 if name == "fttr0" && data_gem_rx(id, &bytes, kind, vlan) {
                     gem_received += 1;
                     last_data = Some(Instant::now());
+                    if watch && gem_received == 1 {
+                        // GEM is session evidence, not a periodic liveness probe.
+                        // Once proved, no subsequent business packet is needed.
+                        physical.stop_capture()?;
+                    }
                     if !watch || gem_received == 1 {
                         println!(
                             "DATA_GEM_RX_CONFIRMED source={:02X?} ethertype={:02X?}",

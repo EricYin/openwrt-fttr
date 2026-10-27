@@ -57,13 +57,27 @@ impl Drop for PacketSocket {
     }
 }
 impl PacketSocket {
+    pub(crate) fn raw_fd(&self) -> i32 { self.fd }
+    pub(crate) fn stop_capture(&self) -> io::Result<()> {
+        super::capture::Capture::Closed.attach(self.fd)
+    }
     pub fn open(name: &str) -> io::Result<Self> {
+        Self::open_capture(name, None)
+    }
+    pub(crate) fn health_omci(id: u8) -> io::Result<Self> {
+        Self::open_capture("molt_omci", Some(super::capture::Capture::Omci(id)))
+    }
+    pub(crate) fn health_gem(id: u8) -> io::Result<Self> {
+        Self::open_capture("fttr0", Some(super::capture::Capture::Gem(id)))
+    }
+    fn open_capture(name: &str, capture: Option<super::capture::Capture>) -> io::Result<Self> {
         let name = CString::new(name).map_err(io::Error::other)?;
         let index = unsafe { if_nametoindex(name.as_ptr()) } as i32;
         if index == 0 {
             return Err(io::Error::last_os_error());
         }
-        let fd = unsafe { socket(17, 3, 3u16.to_be() as i32) };
+        // Protocol zero prevents reception before binding and installing the filter.
+        let fd = unsafe { socket(17, 3 | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -71,6 +85,14 @@ impl PacketSocket {
         let enabled = 1;
         if unsafe { setsockopt(fd, 263, 8, &enabled, 4) } < 0 {
             return Err(io::Error::last_os_error());
+        }
+        if let Some(capture) = capture {
+            // PACKET_IGNORE_OUTGOING avoids the tap work; the filter also rejects
+            // echoes, independently of this packet-socket optimization.
+            if unsafe { setsockopt(fd, 263, 23, &enabled, 4) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            capture.attach(fd)?;
         }
         let address = Address {
             family: 17,
@@ -170,7 +192,12 @@ impl PacketSocket {
         } else {
             None
         };
-        Ok(Some((&buffer[..valid_len], address.kind, vlan)))
+        let bytes = &buffer[..valid_len];
+        let vlan = vlan.or_else(|| {
+            (bytes.len() >= 16 && bytes[12..14] == [0x81, 0])
+                .then(|| u16::from_be_bytes([bytes[14], bytes[15]]))
+        });
+        Ok(Some((bytes, address.kind, vlan)))
     }
 
     pub fn receive(&self) -> io::Result<Option<(Vec<u8>, u8, Option<u16>)>> {
