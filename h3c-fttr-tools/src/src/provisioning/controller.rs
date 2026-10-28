@@ -176,21 +176,6 @@ pub(crate) fn management_result(serial: &str, result: Value) {
         c.omci_management.insert(serial.into(), result);
     }
 }
-pub(crate) fn management_version(serial: &str) -> String {
-    let enabled = controller()
-        .lock()
-        .unwrap()
-        .config
-        .devices
-        .iter()
-        .any(|device| device.optical_sn == serial && device.omci_management);
-    // Disabled devices do not restart their monitor when global management changes.
-    if enabled {
-        format!("{}:enabled", super::management_network::version())
-    } else {
-        "disabled".into()
-    }
-}
 impl Controller {
     fn omci_management_view(&self, device: &Device) -> Value {
         if !device.omci_management {

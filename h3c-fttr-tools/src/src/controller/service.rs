@@ -10,6 +10,7 @@ pub(super) struct State {
     pub identity: Option<crate::model::OnuIdentity>,
     pub identity_at: Option<std::time::Instant>,
     pub mib: Option<std::sync::mpsc::SyncSender<super::inventory::MibRequest>>,
+    pub wake: Option<Arc<crate::pon_engine::omci::platform::wake::Wake>>,
 }
 impl State {
     pub fn business_status(&self, carrier: bool, management_ready: bool) -> BusinessStatus {
@@ -33,7 +34,11 @@ impl Services {
     pub fn new(states: States) -> Self { Self { states, tokens: BTreeMap::new() } }
     pub fn stop(&mut self, id: u8) {
         if let Some(token) = self.tokens.remove(&id) { token.store(true, Ordering::Release); }
-        if let Some(state) = self.states.lock().unwrap().get_mut(&id) { state.phase = BusinessPhase::Offline; }
+        if let Some(state) = self.states.lock().unwrap().get_mut(&id) {
+            state.phase = BusinessPhase::Offline;
+            state.mib = None;
+            if let Some(wake) = state.wake.take() { wake.notify(); }
+        }
     }
     pub fn start(&mut self, id: u8, vendor: String) {
         self.stop(id);
@@ -83,16 +88,29 @@ impl Services {
                     state.phase = phase; state.error = error;
                 }
             };
+            let mut wake = None;
             while !token.load(Ordering::Acquire) {
                 set(BusinessPhase::Configuring, None);
-                let result = adapter.configure(id, token.clone())
+                let result = (|| {
+                    // Notification allocation failures use the normal supervisor retry.
+                    if wake.is_none() {
+                        let notification = Arc::new(crate::pon_engine::omci::platform::wake::Wake::new()?);
+                        let mut states = states.lock().unwrap();
+                        if token.load(Ordering::Acquire) { return Ok(()); }
+                        if let Some(state) = states.get_mut(&id).filter(|state| state.generation == generation) {
+                            state.wake = Some(notification.clone());
+                        }
+                        wake = Some(notification);
+                    }
+                    adapter.configure(id, token.clone())
                     .and_then(|()| {
                         if token.load(Ordering::Acquire) { return Ok(()); }
                         let phase = adapter.verification_status();
                         println!("[+] ONU {id} generation={generation}: OMCI profile readback complete; {phase}; starting evidence monitor");
                         set(phase, None);
-                        super::health::watch(id, token.clone(), vendor.as_bytes().try_into().map_err(|_| std::io::Error::other("invalid vendor ID"))?, &requests)
-                    });
+                        super::health::watch(id, token.clone(), vendor.as_bytes().try_into().map_err(|_| std::io::Error::other("invalid vendor ID"))?, &requests, wake.as_ref().unwrap().clone())
+                    })
+                })();
                 if token.load(Ordering::Acquire) { break; }
                 if let Err(error) = result {
                     eprintln!("[-] ONU {id} generation={generation} service retry: {error}");
@@ -187,11 +205,21 @@ mod tests {
 
     #[test]
     fn stopping_worker_preserves_generation_and_error() {
+        let wake = std::sync::Arc::new(crate::pon_engine::omci::platform::wake::Wake::new().unwrap());
+        let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sender, _requests) = std::sync::mpsc::sync_channel(1);
         let states = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::from([
-            (1, State { phase: BusinessPhase::Retrying, generation: 7, error: Some("readback failed".into()), ..State::default() }),
+            (1, State { phase: BusinessPhase::Retrying, generation: 7, error: Some("readback failed".into()),
+                wake: Some(wake.clone()), mib: Some(sender), ..State::default() }),
         ])));
         let mut services = super::Services::new(states.clone());
+        services.tokens.insert(1, token.clone());
         services.stop(1);
+        // A stopped worker wakes even with no packet traffic, and cannot accept new MIB work.
+        wake.wait(&[], std::time::Instant::now() + std::time::Duration::from_secs(30)).unwrap();
+        assert!(token.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(states.lock().unwrap()[&1].wake.is_none());
+        assert!(states.lock().unwrap()[&1].mib.is_none());
         let status = states.lock().unwrap()[&1].business_status(true, true);
         assert_eq!(serde_json::to_value(status).unwrap(), serde_json::json!({
             "phase": "offline", "generation": 7, "error": "readback failed"

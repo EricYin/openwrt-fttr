@@ -160,7 +160,7 @@ struct fmcs_priv {
 	atomic_t fpga_status;
 	int fpga_error;
 
-	/* Packet RX Hook on fttr0 */
+	/* Deferred PLOAM transmission */
 	struct sk_buff_head ploam_tx_queue;
 	struct work_struct ploam_tx_work;
 };

@@ -6,6 +6,7 @@ use crate::pon_engine::omci::{
     platform::{
         fmcs::{decode_envelope, PacketSocket},
         leases::{lock_onu, ChannelLease, StockOmccLease},
+        wake::Wake,
     },
     wire::BaselineFrame,
 };
@@ -64,13 +65,14 @@ pub fn diagnostic() -> io::Result<()> {
                 "live ONU vendor identity unavailable",
             )
         })?;
-    run(args, None, vendor, None)
+    run(args, None, vendor, None, None)
 }
 pub(super) fn watch(
     id: u8,
     cancellation: std::sync::Arc<AtomicBool>,
     vendor: [u8; 4],
     requests: &std::sync::mpsc::Receiver<super::inventory::MibRequest>,
+    wake: std::sync::Arc<Wake>,
 ) -> io::Result<()> {
     run(
         vec![
@@ -84,6 +86,7 @@ pub(super) fn watch(
         Some(cancellation),
         vendor,
         Some(requests),
+        Some(wake),
     )
 }
 fn run(
@@ -91,6 +94,7 @@ fn run(
     cancellation: Option<std::sync::Arc<AtomicBool>>,
     vendor: [u8; 4],
     requests: Option<&std::sync::mpsc::Receiver<super::inventory::MibRequest>>,
+    wake: Option<std::sync::Arc<Wake>>,
 ) -> io::Result<()> {
     if args.len() < 3
         || args[3..].iter().any(|arg| {
@@ -152,9 +156,11 @@ fn run(
     } else {
         None
     };
-    let omci = PacketSocket::open("molt_omci")?;
-    let physical = PacketSocket::open("fttr0")?;
-    let data = if args.iter().any(|arg| arg == "--arp" || arg == "--1905") {
+    let omci = if watch { PacketSocket::health_omci(id)? } else { PacketSocket::open("molt_omci")? };
+    let physical = if watch { PacketSocket::health_gem(id)? } else { PacketSocket::open("fttr0")? };
+    let discovery = args.iter().any(|arg| arg == "--arp" || arg == "--1905");
+    // Watch only consumes physical GEM evidence, not this diagnostic capture.
+    let data = if discovery && !watch {
         Some(PacketSocket::open(&crate::pon_engine::onu_interface(id))?)
     } else {
         None
@@ -211,7 +217,7 @@ fn run(
     if accepted {
         println!("TX accepted by socket; awaiting response (not proof of delivery)");
     }
-    if data.is_some() {
+    if discovery {
         let mac = std::fs::read_to_string(format!("/sys/class/net/{}/address", crate::pon_engine::onu_interface(id)))?;
         let mac: Vec<u8> = mac
             .trim()
@@ -279,7 +285,11 @@ fn run(
     } else {
         String::new()
     };
-    let management_version = crate::provisioning::management_version(&optical_sn);
+    let wake = match wake {
+        Some(wake) => wake,
+        None => std::sync::Arc::new(Wake::new()?),
+    };
+    let management = watch.then(|| crate::provisioning::health_watch::subscribe(&optical_sn, wake.clone()));
     let mut watchdog_start = start;
     let mut telemetry = cancellation
         .clone()
@@ -288,7 +298,8 @@ fn run(
     let mut next_telemetry = start;
     while !STOP.load(Ordering::Relaxed) && (watch || start.elapsed() < Duration::from_secs(seconds))
     {
-        if watch && crate::provisioning::management_version(&optical_sn) != management_version {
+        wake.drain();
+        if management.as_ref().is_some_and(|state| state.changed()) {
             return Err(io::Error::other("OMCI management configuration changed"));
         }
         if cancellation
@@ -344,7 +355,7 @@ fn run(
         }
         let captures = [
             Some(("molt_omci", &omci)),
-            Some(("fttr0", &physical)),
+            (!watch || last_data.is_none()).then_some(("fttr0", &physical)),
             data.as_ref().map(|d| ("data", d)),
         ];
         let mut rx_buf = [0u8; 2048];
@@ -400,6 +411,11 @@ fn run(
                 if name == "fttr0" && data_gem_rx(id, &bytes, kind, vlan) {
                     gem_received += 1;
                     last_data = Some(Instant::now());
+                    if watch && gem_received == 1 {
+                        // GEM is session evidence, not a periodic liveness probe.
+                        // Once proved, no subsequent business packet is needed.
+                        physical.stop_capture()?;
+                    }
                     if !watch || gem_received == 1 {
                         println!(
                             "DATA_GEM_RX_CONFIRMED source={:02X?} ethertype={:02X?}",
@@ -436,7 +452,26 @@ fn run(
                 "OMCI watch lost ONU; supervisor must revalidate service configuration",
             ));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        let mut sockets = [omci.raw_fd(), -1, -1];
+        let mut count = 1;
+        if !watch || last_data.is_none() {
+            sockets[count] = physical.raw_fd();
+            count += 1;
+        }
+        if let Some(data) = &data {
+            sockets[count] = data.raw_fd();
+            count += 1;
+        }
+        let deadline = if watch {
+            let expiry = last_get.map(|at| at + Duration::from_secs(15))
+                .filter(|_| carrier_lease.is_some());
+            [Some(next_get), Some(next_state), Some(next_telemetry), expiry,
+                Some(last_get.unwrap_or(watchdog_start) + Duration::from_secs(30))]
+                .into_iter().flatten().min().unwrap()
+        } else {
+            (start + Duration::from_secs(seconds)).min(Instant::now() + Duration::from_secs(1))
+        };
+        wake.wait(&sockets[..count], deadline)?;
     }
     println!("RESULT OMCI incoming={received} CRC-valid matched GET responses={matched} data_GEM_received={gem_received}; no OMCI ME configuration was written");
     Ok(())
