@@ -22,6 +22,52 @@ struct fmcs_fttr_port_priv {
 
 static rx_handler_result_t fmcs_handle_frame(struct sk_buff **pskb);
 
+/* Explicit opt-in, bit 0 = fttr1. Carrier loss revokes the affected bit. */
+static unsigned int routed_offload_mask;
+static struct fmcs_priv *fmcs_offload_priv; /* protected by RTNL */
+
+static void fmcs_offload_cleanup(struct fmcs_priv *priv)
+{
+	struct net_device *lower = rtnl_dereference(priv->fttr_lower);
+	int i;
+
+	ASSERT_RTNL();
+	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++)
+		if (priv->fttr_devs[i])
+			nf_flow_table_cleanup(priv->fttr_devs[i]);
+	if (lower)
+		nf_flow_table_cleanup(lower);
+}
+
+static int fmcs_offload_mask_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int mask;
+	int ret = kstrtouint(val, 0, &mask);
+
+	if (ret)
+		return ret;
+	if (mask & ~GENMASK(FMCS_MAX_FTTR_PORTS - 1, 0))
+		return -ERANGE;
+	rtnl_lock();
+	WRITE_ONCE(routed_offload_mask, 0);
+	/* Finish path users before deleting the old logical/physical keys. */
+	synchronize_net();
+	if (fmcs_offload_priv)
+		fmcs_offload_cleanup(fmcs_offload_priv);
+	WRITE_ONCE(routed_offload_mask, mask);
+	rtnl_unlock();
+	return 0;
+}
+
+static const struct kernel_param_ops fmcs_offload_mask_ops = {
+	.set = fmcs_offload_mask_set,
+	.get = param_get_uint,
+};
+module_param_cb(routed_offload_mask, &fmcs_offload_mask_ops,
+		&routed_offload_mask, 0644);
+MODULE_PARM_DESC(routed_offload_mask,
+	"Experimental routed VLAN path: bit 0=fttr1; default 0; carrier-off revokes bit");
+
 /* Binding is by name only at discovery. Once bound, identity survives rename. */
 static struct net_device *fmcs_lower_get(struct fmcs_priv *priv)
 {
@@ -51,7 +97,10 @@ int fmcs_fttr_set_carrier(struct fmcs_priv *priv, unsigned int port, bool carrie
 	if (carrier) {
 		netif_carrier_on(dev);
 	} else {
+		WRITE_ONCE(routed_offload_mask,
+			   routed_offload_mask & ~BIT(port - 1));
 		netif_carrier_off(dev);
+		synchronize_net();
 		/* carrier_off does not emit NETDEV_DOWN. Clean both possible
 		 * ingress keys and wait for the flowtable's hardware work to drain.
 		 * Repeat even when already off: this is an explicit cleanup request.
@@ -74,8 +123,12 @@ static void fmcs_lower_unlink(struct fmcs_priv *priv)
 	ASSERT_RTNL();
 	if (!lower)
 		return;
+	WRITE_ONCE(routed_offload_mask, 0);
 	rcu_assign_pointer(priv->fttr_lower, NULL);
 	netdev_rx_handler_unregister(lower);
+	/* unregister above waits for path readers; retain lower for cleanup. */
+	fmcs_offload_cleanup(priv);
+	nf_flow_table_cleanup(lower);
 	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++)
 		netdev_upper_dev_unlink(lower, priv->fttr_devs[i]);
 	dev_put(lower);
@@ -131,6 +184,12 @@ static int fmcs_netdev_event(struct notifier_block *nb,
 	int i, ret;
 
 	if (dev == lower) {
+		if ((event == NETDEV_DOWN || event == NETDEV_CHANGEADDR ||
+		     event == NETDEV_CHANGEMTU) && routed_offload_mask) {
+			WRITE_ONCE(routed_offload_mask, 0);
+			synchronize_net();
+			fmcs_offload_cleanup(priv);
+		}
 		if (event == NETDEV_UNREGISTER)
 			fmcs_lower_unlink(priv);
 		if (event == NETDEV_PRECHANGEMTU) {
@@ -142,6 +201,19 @@ static int fmcs_netdev_event(struct notifier_block *nb,
 					return notifier_from_errno(-EBUSY);
 		}
 		return NOTIFY_OK;
+	}
+	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
+		if (dev != priv->fttr_devs[i] ||
+		    !(routed_offload_mask & BIT(i)))
+			continue;
+		if (event == NETDEV_DOWN || event == NETDEV_CHANGEUPPER ||
+		    event == NETDEV_CHANGEADDR || event == NETDEV_CHANGEMTU) {
+			WRITE_ONCE(routed_offload_mask,
+				   routed_offload_mask & ~BIT(i));
+			synchronize_net();
+			fmcs_offload_cleanup(priv);
+		}
+		break;
 	}
 	if (!lower && (event == NETDEV_REGISTER || event == NETDEV_CHANGENAME) &&
 	    net_eq(dev_net(dev), &init_net) && !strcmp(dev->name, "fttr0")) {
@@ -400,6 +472,41 @@ static int fmcs_fttr_change_mtu(struct net_device *dev, int mtu)
 	return 0;
 }
 
+static int fmcs_fttr_fill_forward_path(struct net_device_path_ctx *ctx,
+				      struct net_device_path *path)
+{
+	const struct net_device *dev = ctx->dev;
+	const struct fmcs_fttr_port_priv *port = netdev_priv(dev);
+	struct net_device *lower = rcu_dereference(port->priv->fttr_lower);
+	unsigned int mask = READ_ONCE(routed_offload_mask);
+	int i;
+
+	if (!(mask & BIT(port->port_idx - 1)) || !lower ||
+	    !netif_running(dev) || !netif_carrier_ok(dev) ||
+	    !netif_running(lower) || !netif_carrier_ok(lower))
+		return -ENODEV;
+	if (!lower->netdev_ops->ndo_setup_tc ||
+	    !(lower->features & NETIF_F_HW_TC))
+		return -EOPNOTSUPP;
+	if (ctx->num_vlans >= ARRAY_SIZE(ctx->vlan))
+		return -ENOSPC;
+	/* One transport tag plus at most one C-tag; no S-tag or VID 0. */
+	for (i = 0; i < ctx->num_vlans; i++)
+		if (ctx->vlan[i].proto != htons(ETH_P_8021Q) ||
+		    !ctx->vlan[i].id)
+			return -EOPNOTSUPP;
+
+	path->type = DEV_PATH_VLAN;
+	path->dev = dev;
+	path->encap.id = 0x100 + port->port_idx - 1;
+	path->encap.proto = htons(ETH_P_8021Q);
+	ctx->vlan[ctx->num_vlans].id = path->encap.id;
+	ctx->vlan[ctx->num_vlans].proto = path->encap.proto;
+	ctx->num_vlans++;
+	ctx->dev = lower;
+	return 0;
+}
+
 static const struct net_device_ops fmcs_omci_ops = {
 	.ndo_start_xmit = fmcs_omci_xmit,
 };
@@ -416,6 +523,7 @@ static const struct net_device_ops fmcs_fttr_ops = {
 	.ndo_validate_addr   = eth_validate_addr,
 	.ndo_get_iflink      = fmcs_fttr_get_iflink,
 	.ndo_change_mtu      = fmcs_fttr_change_mtu,
+	.ndo_fill_forward_path = fmcs_fttr_fill_forward_path,
 };
 
 void fmcs_rx_omci_frame(struct fmcs_priv *priv, const u8 *data, size_t len)
@@ -682,6 +790,9 @@ int fmcs_netdevs_init(struct fmcs_priv *priv)
 		rtnl_unlock();
 		goto err_unreg_fttr;
 	}
+	rtnl_lock();
+	fmcs_offload_priv = priv;
+	rtnl_unlock();
 
 	return 0;
 
@@ -708,6 +819,7 @@ void fmcs_netdevs_exit(struct fmcs_priv *priv)
 
 	unregister_netdevice_notifier(&priv->fttr_netdev_nb);
 	rtnl_lock();
+	fmcs_offload_priv = NULL;
 	fmcs_lower_unlink(priv);
 	rtnl_unlock();
 
