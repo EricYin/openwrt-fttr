@@ -12,6 +12,7 @@
 #include <linux/if_arp.h>
 #include <linux/of_net.h>
 #include <linux/rtnetlink.h>
+#include <net/netfilter/nf_flow_table.h>
 #include "fmcs.h"
 
 struct fmcs_fttr_port_priv {
@@ -32,6 +33,37 @@ static struct net_device *fmcs_lower_get(struct fmcs_priv *priv)
 		dev_hold(lower);
 	rcu_read_unlock();
 	return lower;
+}
+
+int fmcs_fttr_set_carrier(struct fmcs_priv *priv, unsigned int port, bool carrier)
+{
+	struct net_device *dev, *lower;
+	int ret = 0;
+
+	if (port < 1 || port > FMCS_MAX_FTTR_PORTS)
+		return -EINVAL;
+	rtnl_lock();
+	dev = priv->fttr_devs[port - 1];
+	if (!dev) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	if (carrier) {
+		netif_carrier_on(dev);
+	} else {
+		netif_carrier_off(dev);
+		/* carrier_off does not emit NETDEV_DOWN. Clean both possible
+		 * ingress keys and wait for the flowtable's hardware work to drain.
+		 * Repeat even when already off: this is an explicit cleanup request.
+		 */
+		nf_flow_table_cleanup(dev);
+		lower = rtnl_dereference(priv->fttr_lower);
+		if (lower)
+			nf_flow_table_cleanup(lower);
+	}
+unlock:
+	rtnl_unlock();
+	return ret;
 }
 
 static void fmcs_lower_unlink(struct fmcs_priv *priv)

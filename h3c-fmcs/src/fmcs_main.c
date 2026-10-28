@@ -262,19 +262,7 @@ static long fmcs_dev_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 			ret = -EFAULT;
 			break;
 		}
-		if (req.port < 1 || req.port > FMCS_MAX_FTTR_PORTS) {
-			ret = -EINVAL;
-			break;
-		}
-		if (!priv->fttr_devs[req.port - 1]) {
-			ret = -ENODEV;
-			break;
-		}
-		if (req.carrier)
-			netif_carrier_on(priv->fttr_devs[req.port - 1]);
-		else
-			netif_carrier_off(priv->fttr_devs[req.port - 1]);
-		ret = 0;
+		ret = fmcs_fttr_set_carrier(priv, req.port, !!req.carrier);
 		break;
 	}
 	default:

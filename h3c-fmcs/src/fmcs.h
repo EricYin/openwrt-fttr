@@ -175,6 +175,7 @@ int fmcs_spi_recv_ploam(struct fmcs_priv *priv, u8 *data, size_t *len);
 
 int fmcs_netdevs_init(struct fmcs_priv *priv);
 void fmcs_netdevs_exit(struct fmcs_priv *priv);
+int fmcs_fttr_set_carrier(struct fmcs_priv *priv, unsigned int port, bool carrier);
 void fmcs_rx_omci_frame(struct fmcs_priv *priv, const u8 *data, size_t len);
 void fmcs_rx_ploam_frame(struct fmcs_priv *priv, const u8 *data, size_t len);
 
