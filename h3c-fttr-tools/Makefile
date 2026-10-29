@@ -61,10 +61,12 @@ define Build/Prepare
 endef
 
 # Populate the shared $(DL_DIR)/cargo registry and Git caches before compilation.
+# Fetch every platform in Cargo.lock: cargo install --frozen can require sources
+# excluded by fetch --target (e.g. encoding_rs -> core_detect on aarch64).
 # --frozen above keeps the compile phase offline and enforces Cargo.lock.
 define Build/Configure
 	$(CARGO_PKG_VARS) cargo fetch --locked \
-		--manifest-path $(PKG_BUILD_DIR)/Cargo.toml --target $(RUSTC_TARGET_ARCH)
+		--manifest-path $(PKG_BUILD_DIR)/Cargo.toml
 endef
 
 define Package/h3c-fttr-tools/install
