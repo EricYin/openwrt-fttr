@@ -23,6 +23,25 @@ impl fmt::Display for OmciResultError {
     }
 }
 impl std::error::Error for OmciResultError {}
+/// Result 4 (unknown managed entity) and 5 (unknown instance/attribute) both
+/// report "no such entity here". Result 9 is deliberately excluded: shipping
+/// ONUs also use it for an entity that exists but whose mask they refuse to
+/// report, so it must not be read as "absent".
+pub fn is_absent(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<OmciResultError>())
+        .is_some_and(|e| matches!(e.result, 4 | 5))
+}
+
+/// Raw G.988 result code of an OMCI result error, for caller-side policy.
+pub fn result_code(error: &io::Error) -> Option<u8> {
+    error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<OmciResultError>())
+        .map(|e| e.result)
+}
+
 pub fn is_unknown_instance(error: &io::Error) -> bool {
     error
         .get_ref()

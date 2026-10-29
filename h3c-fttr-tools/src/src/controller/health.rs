@@ -272,6 +272,12 @@ fn run(
     let start = Instant::now();
     let mut received = 0;
     let mut matched = 0;
+    // ONU-G VendorId is an OMCI value and need not equal the PLOAM vendor, e.g.
+    // a "SPGA" ONU registered with the serial vendor "SPTC". Liveness is
+    // credited to the vendor observed in the first validated response, which
+    // the FMCS envelope's ONU-ID and our transaction ID already bind to this
+    // session; comparing against the PLOAM vendor alone stalled the watchdog.
+    let mut observed_vendor: Option<[u8; 4]> = None;
     let mut gem_received = 0;
     let mut carrier_lease = None;
     let activate = args.iter().any(|arg| arg == "--activate-verified-link");
@@ -385,9 +391,11 @@ fn run(
                                     && frame.class_id == 256
                                     && frame.instance_id == 0 =>
                             {
+                                let reported = [frame.payload[3], frame.payload[4], frame.payload[5], frame.payload[6]];
                                 if frame.payload[0] == 0
                                     && frame.payload[1..3] == [0x80, 0]
-                                    && frame.payload[3..7] == vendor
+                                    && (reported == vendor
+                                        || *observed_vendor.get_or_insert(reported) == reported)
                                 {
                                     matched += 1;
                                     last_get = Some(Instant::now());
@@ -425,7 +433,7 @@ fn run(
                     }
                 }
                 if (activate || watch)
-                    && policy::link_ready(last_get, last_data, Instant::now())
+                    && policy::carrier_ready(last_get, Instant::now())
                     && carrier_lease.is_none()
                 {
                     let previous = !watch
@@ -434,13 +442,13 @@ fn run(
                             == "1";
                     bosa::set_fttr_carrier(id as u32, true)?;
                     carrier_lease = Some(CarrierLease { id, previous });
-                    println!("VERIFIED_LINK_ENABLED OMCI_GET=true GEM_RX=true watch={watch}; management/Wi-Fi requires separate verification");
+                    println!("VERIFIED_LINK_ENABLED OMCI_GET=true GEM_RX={} watch={watch}; management/Wi-Fi requires separate verification", last_data.is_some());
                 }
             }
         }
         if watch
             && carrier_lease.is_some()
-            && !policy::link_ready(last_get, last_data, Instant::now())
+            && !policy::carrier_ready(last_get, Instant::now())
         {
             drop(carrier_lease.take());
             println!("VERIFIED_LINK_DISABLED stale OMCI evidence");

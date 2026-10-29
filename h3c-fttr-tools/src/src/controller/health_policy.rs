@@ -1,5 +1,13 @@
 use std::{io, time::{Duration, Instant}};
 
+/// Carrier admission for a transparent bridge. A down fttrN port makes the
+/// kernel drop every downstream frame, so requiring the first packet to come
+/// from the ONU side deadlocks an idle LAN. Raise the port as soon as OMCI is
+/// alive; the business state still waits for GEM evidence separately.
+pub(super) fn carrier_ready(last_get: Option<Instant>, now: Instant) -> bool {
+    last_get.is_some_and(|time| now.duration_since(time) < Duration::from_secs(15))
+}
+
 pub(super) fn link_ready(last_get: Option<Instant>, last_data: Option<Instant>, now: Instant) -> bool {
     last_get.is_some_and(|time| now.duration_since(time) < Duration::from_secs(15))
         && last_data.is_some()

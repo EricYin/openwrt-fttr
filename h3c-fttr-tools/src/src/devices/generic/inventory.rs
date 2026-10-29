@@ -1,10 +1,34 @@
-//! Bridge endpoints and an available T-CONT from a complete ONU inventory.
+//! Bridge endpoints, a usable T-CONT and factory bridge/EVTO instances.
+//!
+//! A vendor-neutral profile cannot assume a fixed topology: ONTs arrive either
+//! virgin (no bridge at all) or half provisioned by another OLT (bridge port
+//! and EVTO already bound to the UNI). Everything the profile needs is read
+//! from the uploaded MIB instead of being guessed.
 use crate::pon_engine::omci::{attributes::AttributeValue, mib::MibReport};
-use std::io;
+use std::{collections::BTreeMap, io};
+
+/// MAC bridge port already present in the ONU MIB.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ExistingPort {
+    pub instance: u16,
+    pub bridge: u16,
+    pub port_num: u8,
+}
 
 pub(super) struct BridgeInventory {
     pub tcont: u16,
     pub endpoints: Vec<(u16, bool)>,
+    /// Endpoint (UNI/VEIP) that already has a MAC bridge port in the ONU MIB.
+    pub ports: BTreeMap<u16, ExistingPort>,
+    /// Endpoint whose EVTO is already associated with it.
+    pub evtos: BTreeMap<u16, u16>,
+    /// Bridge port numbers already in use, so a new port never collides.
+    pub used_port_numbers: Vec<u8>,
+    /// GEM-side (TpType 5) bridge ports as (bridge port instance, GEM instance,
+    /// PortNum). A binding that is not our own slot's GEM port is a leftover
+    /// from a previous ONU-ID assignment; our own binding's PortNum is reused so
+    /// reconfiguration is idempotent.
+    pub gem_side: Vec<(u16, u16, u8)>,
 }
 
 impl BridgeInventory {
@@ -18,23 +42,71 @@ impl BridgeInventory {
         let mut tconts = Vec::new();
         let mut unis = Vec::new();
         let mut veips = Vec::new();
+        let mut ports: BTreeMap<u16, ExistingPort> = BTreeMap::new();
+        let mut evtos: BTreeMap<u16, u16> = BTreeMap::new();
+        let mut used_port_numbers = Vec::new();
+        let mut gem_side = Vec::new();
         for entity in &mib.entities {
+            let attribute = |index: u8| {
+                entity
+                    .attributes
+                    .iter()
+                    .find(|attr| attr.definition.index == index)
+                    .and_then(|attr| attr.value.as_ref())
+                    .and_then(AttributeValue::unsigned)
+            };
             match entity.class_id {
                 262 => {
-                    let allocation = entity
-                        .attributes
-                        .iter()
-                        .find(|attr| attr.definition.index == 1)
-                        .and_then(|attr| attr.value.as_ref())
-                        .and_then(AttributeValue::unsigned);
-                    if let Some(value) = allocation {
-                        if value == u32::from(alloc) || value == 0xff || value == 0xffff {
+                    if let Some(value) = attribute(1) {
+                        // This host owns data Alloc-IDs 0x100..=0x10f, one per
+                        // ONU slot. Any other value is free or was assigned by
+                        // another OLT and is therefore available: only our own
+                        // range can belong to another FTTR service.
+                        if value == u32::from(alloc) || !(0x100..=0x10f).contains(&value) {
                             tconts.push((value != u32::from(alloc), entity.entity_id));
                         }
                     }
                 }
                 11 => unis.push(entity.entity_id),
                 329 => veips.push(entity.entity_id),
+                47 => {
+                    let (Some(tp), Some(bridge), Some(kind)) =
+                        (attribute(4), attribute(1), attribute(3))
+                    else {
+                        continue;
+                    };
+                    let (Ok(tp), Ok(bridge)) = (u16::try_from(tp), u16::try_from(bridge)) else {
+                        continue;
+                    };
+                    let port_num = attribute(2).and_then(|value| u8::try_from(value).ok());
+                    if let Some(port_num) = port_num {
+                        used_port_numbers.push(port_num);
+                    }
+                    if kind == 5 {
+                        gem_side.push((entity.entity_id, tp, port_num.unwrap_or(0)));
+                    } else {
+                        ports.insert(
+                            tp,
+                            ExistingPort {
+                                instance: entity.entity_id,
+                                bridge,
+                                port_num: port_num.unwrap_or(0),
+                            },
+                        );
+                    }
+                }
+                171 => {
+                    let (Some(kind), Some(pointer)) = (attribute(1), attribute(7)) else {
+                        continue;
+                    };
+                    // 2 = PPTP Ethernet UNI, 10 = VEIP.
+                    if !matches!(kind, 2 | 10) {
+                        continue;
+                    }
+                    if let Ok(pointer) = u16::try_from(pointer) {
+                        evtos.entry(pointer).or_insert(entity.entity_id);
+                    }
+                }
                 _ => {}
             }
         }
@@ -76,7 +148,16 @@ impl BridgeInventory {
             let index = order.iter().position(|candidate| *candidate == id);
             (index.is_none(), veip, index.unwrap_or(usize::MAX), id)
         });
-        Ok(Self { tcont, endpoints })
+        used_port_numbers.sort_unstable();
+        used_port_numbers.dedup();
+        Ok(Self {
+            tcont,
+            endpoints,
+            ports,
+            evtos,
+            used_port_numbers,
+            gem_side,
+        })
     }
 }
 
@@ -168,12 +249,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_busy_tconts_when_no_matching_assignment_exists() {
-        // Given: only a T-CONT allocated to a different service.
+    fn foreign_allocation_is_available_but_another_slot_is_not() {
+        // Given: one T-CONT from another OLT (Alloc-ID 0x0001) and one owned by slot 3.
+        let mib = inventory(&[(262, 0x8001, 0x103), (262, 0x8002, 1), (329, 0x501, 0)]);
+        // When: planning for slot 2.
+        let plan = BridgeInventory::from_mib(&mib, 0x102).unwrap();
+        // Then: the foreign allocation is reused, the other slot's is untouched.
+        assert_eq!(plan.tcont, 0x8002);
         let mib = inventory(&[(262, 0x8001, 0x103), (329, 0x501, 0)]);
-        // When: planning another allocation.
         let result = BridgeInventory::from_mib(&mib, 0x102);
-        // Then: no existing allocation is repurposed.
         assert_eq!(result.err().unwrap().kind(), io::ErrorKind::NotFound);
     }
 

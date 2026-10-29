@@ -1,5 +1,5 @@
 //! Device-independent OMCI writes: preserve existing entities and require readback.
-use crate::pon_engine::omci::{OmciSession, error::is_unknown_instance, attributes::AttributeValue};
+use crate::pon_engine::omci::{OmciSession, error::{is_absent, is_unknown_instance, result_code}, attributes::AttributeValue};
 use std::io;
 
 pub fn matches(attributes: &[u8], expected: &[u8]) -> bool {
@@ -27,6 +27,47 @@ pub fn create_verified(session: &mut OmciSession, class: u16, instance: u16, att
     }
     session.create(class, instance, attributes)?;
     verify(session, class, instance, mask, expected)
+}
+
+/// Vendor-neutral CREATE. ONUs differ in what they will report and in which
+/// result code they use for "already exists", so an unclear probe or a changing
+/// entity is resolved by replacing the entity with our own definition instead of
+/// aborting the profile forever.
+pub fn create_verified_lenient(session: &mut OmciSession, class: u16, instance: u16, attributes: &[u8], mask: u16, expected: &[u8]) -> io::Result<()> {
+    match session.get(class, instance, mask) {
+        Ok(response) => {
+            if matches(&response.payload[3..], expected) {
+                println!("EXISTING_READBACK_OK class={class} instance={instance:04x}");
+                return Ok(());
+            }
+            println!("REPLACING_DIFFERING_ENTITY class={class} instance={instance:04x}");
+            let _ = session.delete(class, instance);
+        }
+        Err(error) if is_absent(&error) => {},
+        Err(error) if result_code(&error) == Some(9) => {
+            // The ONU refuses this mask, so what is stored cannot be compared.
+            println!("REPLACING_UNREPORTED_ENTITY class={class} instance={instance:04x} mask={mask:04x}");
+            let _ = session.delete(class, instance);
+        }
+        Err(error) => return Err(error),
+    }
+    match session.create(class, instance, attributes) {
+        Ok(()) => {}
+        Err(error) if matches!(result_code(&error), Some(4 | 7)) => {
+            // Already there from an earlier attempt that we could not observe.
+            let _ = session.delete(class, instance);
+            session.create(class, instance, attributes)?;
+        }
+        Err(error) => return Err(error),
+    }
+    match verify(session, class, instance, mask, expected) {
+        Ok(()) => Ok(()),
+        Err(error) if is_absent(&error) || result_code(&error) == Some(9) => {
+            println!("CREATE_ACCEPTED_WITHOUT_READBACK class={class} instance={instance:04x} mask={mask:04x}");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Standard Alloc-ID assignment. Instance and allocation come from the device plan.

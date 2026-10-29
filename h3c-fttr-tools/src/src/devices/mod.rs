@@ -231,7 +231,15 @@ pub fn select_with_serial(
     }
     #[cfg(feature = "device-hwtc")]
     if vendor == "HWTC" {
-        return Adapter::Hwtc(hwtc::profile(equipment));
+        // Only the two verified Huawei models keep the fixed vendor topology.
+        // Any other Huawei ONT (e.g. HG8010C) has a different MIB and goes
+        // through the vendor-neutral generic bridge instead.
+        match hwtc::profile(equipment) {
+            profile @ (hwtc::Profile::K155 | hwtc::Profile::V152) => {
+                return Adapter::Hwtc(profile)
+            }
+            hwtc::Profile::Standard => {}
+        }
     }
     let _ = (vendor, equipment);
     if serial.is_some_and(crate::provisioning::allows_generic_bridge)
@@ -318,23 +326,14 @@ mod tests {
     fn selection_respects_vendor_model_rules_and_whole_device_features() {
         let mut identity = crate::model::OnuIdentity::default();
         assert_eq!(select("H3CT", &identity), Adapter::Unavailable);
-        assert_eq!(
-            select("HWTC", &identity).capabilities().business,
-            cfg!(feature = "device-hwtc")
-        );
-        #[cfg(feature = "device-hwtc")]
-        assert_eq!(
-            select("HWTC", &identity),
-            Adapter::Hwtc(hwtc::Profile::Standard)
-        );
+        // A Huawei ONT without a verified model is not pushed into the fixed
+        // vendor topology; selection falls through to the generic-bridge gate,
+        // which needs the live serial number.
+        assert_eq!(select("HWTC", &identity), Adapter::Unavailable);
         identity.equipment_id = Some("HL202-DU-C".into());
         assert_eq!(
             select("H3CT", &identity).capabilities().business,
             cfg!(feature = "device-hl202")
-        );
-        assert_eq!(
-            select("HWTC", &identity).capabilities().business,
-            cfg!(feature = "device-hwtc")
         );
         assert_eq!(select("OTHER", &identity), Adapter::Unavailable);
         identity.equipment_id = Some("K155-11".into());
@@ -372,10 +371,7 @@ mod tests {
                 BusinessPhase::WanBootstrapPending
             );
             identity.equipment_id = Some("OTHER-HWTC".into());
-            assert_eq!(
-                select("HWTC", &identity),
-                Adapter::Hwtc(hwtc::Profile::Standard)
-            );
+            assert_eq!(select("HWTC", &identity), Adapter::Unavailable);
         }
         #[cfg(not(feature = "device-hwtc"))]
         assert_eq!(select("HWTC", &identity), Adapter::Unavailable);
