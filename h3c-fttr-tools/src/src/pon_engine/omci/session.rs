@@ -87,7 +87,15 @@ impl OmciSession {
         for _ in 0..3 {
             self.check_active()?;
             self.transport.send(&request)?;
-            let end = Instant::now() + Duration::from_secs(2);
+            // Building a MIB snapshot can take much longer than an ordinary
+            // attribute operation. Keep the same TCI while awaiting that reply;
+            // rapidly starting another upload can restart the ONU's snapshot.
+            let timeout = if message_type == Action::MibUpload.request_type() {
+                Duration::from_secs(20)
+            } else {
+                Duration::from_secs(2)
+            };
+            let end = Instant::now() + timeout;
             while Instant::now() < end {
                 self.check_active()?;
                 match self.transport.receive()? {
@@ -200,7 +208,7 @@ impl OmciSession {
         let frame = self.request(Action::MibUpload, 2, 0, RequestBody::Empty)?;
         let count = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
         if count == 0 || count > 2048 {
-            return Err(invalid("invalid/beyond supported MIB upload count"));
+            return Err(invalid(format!("invalid/beyond supported MIB upload count: {count} (raw {:02x}{:02x})", frame.payload[0], frame.payload[1])));
         }
         let mut mib = MibAssembler::new(count);
         progress(0, usize::from(count))?;

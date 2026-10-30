@@ -245,7 +245,7 @@ impl FmcsTransport {
     pub fn open(id: u8) -> io::Result<Self> {
         Ok(Self {
             id,
-            socket: PacketSocket::open("molt_omci")?,
+            socket: PacketSocket::health_omci(id)?,
         })
     }
 }

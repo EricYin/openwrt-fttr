@@ -1,5 +1,6 @@
 //! Production controller: one daemon owns activation and per-ONU business workers.
 mod activation;
+mod attribute_probe;
 mod lifetime;
 pub mod business;
 pub mod health;

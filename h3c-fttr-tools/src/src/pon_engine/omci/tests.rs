@@ -247,6 +247,39 @@ fn table_segments_cross_rows_and_trim_padding() {
     assert!(TableAssembler::new(1).unwrap().finish().is_err());
 }
 
+struct SlowUpload {
+    script: Script,
+    ready: Option<Instant>,
+}
+impl OmciTransport for SlowUpload {
+    fn send(&mut self, request: &BaselineFrame) -> io::Result<()> {
+        if request.message_type == 0x4d {
+            assert!(self.ready.is_none(), "snapshot must not be restarted after two seconds");
+            self.ready = Some(Instant::now() + std::time::Duration::from_millis(2100));
+        }
+        self.script.send(request)
+    }
+    fn receive(&mut self) -> io::Result<Option<BaselineFrame>> {
+        if self.ready.is_some_and(|ready| Instant::now() < ready) {
+            return Ok(None);
+        }
+        self.script.receive()
+    }
+}
+
+#[test]
+fn slow_snapshot_waits_without_restarting_and_still_obeys_total_deadline() {
+    let transport = || SlowUpload {
+        script: Script { responses: VecDeque::new() },
+        ready: None,
+    };
+    let mut session = OmciSession::new(transport());
+    assert!(session.upload_mib().unwrap().uploaded_complete);
+    let mut session = OmciSession::new(transport());
+    session.finish_before(Instant::now() + std::time::Duration::from_millis(10));
+    assert_eq!(session.upload_mib().unwrap_err().kind(), io::ErrorKind::TimedOut);
+}
+
 struct Script {
     responses: VecDeque<BaselineFrame>,
 }

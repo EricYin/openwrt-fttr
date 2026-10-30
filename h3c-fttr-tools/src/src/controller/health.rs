@@ -71,7 +71,7 @@ pub(super) fn watch(
     id: u8,
     cancellation: std::sync::Arc<AtomicBool>,
     vendor: [u8; 4],
-    requests: &std::sync::mpsc::Receiver<super::inventory::MibRequest>,
+    requests: &std::sync::mpsc::Receiver<super::inventory::WorkerRequest>,
     wake: std::sync::Arc<Wake>,
 ) -> io::Result<()> {
     run(
@@ -93,7 +93,7 @@ fn run(
     args: Vec<String>,
     cancellation: Option<std::sync::Arc<AtomicBool>>,
     vendor: [u8; 4],
-    requests: Option<&std::sync::mpsc::Receiver<super::inventory::MibRequest>>,
+    requests: Option<&std::sync::mpsc::Receiver<super::inventory::WorkerRequest>>,
     wake: Option<std::sync::Arc<Wake>>,
 ) -> io::Result<()> {
     if args.len() < 3
@@ -315,6 +315,14 @@ fn run(
             return Ok(());
         }
         if let Some(request) = requests.and_then(|requests| requests.try_recv().ok()) {
+            match request {
+            super::inventory::WorkerRequest::Attribute(request) => {
+                let result = super::attribute_probe::run(&request, cancellation.clone());
+                let responsive = result.is_ok();
+                let _ = request.reply.send(result);
+                next_get = resume_after_omci(&mut last_get, &mut watchdog_start, responsive);
+            }
+            super::inventory::WorkerRequest::Mib(request) => {
             let result = if Instant::now() >= request.deadline {
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -335,8 +343,13 @@ fn run(
             // Resume with fresh evidence, without rerunning business provisioning.
             // A completed, validated upload is fresh OMCI liveness evidence.
             next_get = resume_after_omci(&mut last_get, &mut watchdog_start, complete);
+            }
+            }
         }
-        if Instant::now() >= next_telemetry {
+        // Establish the link using the bounded health GET before starting a
+        // potentially slow full MIB upload. Otherwise an ONU needing DHCP can
+        // remain closed for the entire inventory collection.
+        if carrier_lease.is_some() && Instant::now() >= next_telemetry {
             if let Some(collector) = telemetry.as_mut() {
                 let responsive = collector.refresh();
                 next_get = resume_after_omci(&mut last_get, &mut watchdog_start, responsive);
@@ -473,7 +486,7 @@ fn run(
         let deadline = if watch {
             let expiry = last_get.map(|at| at + Duration::from_secs(15))
                 .filter(|_| carrier_lease.is_some());
-            [Some(next_get), Some(next_state), Some(next_telemetry), expiry,
+            [Some(next_get), Some(next_state), carrier_lease.as_ref().map(|_| next_telemetry), expiry,
                 Some(last_get.unwrap_or(watchdog_start) + Duration::from_secs(30))]
                 .into_iter().flatten().min().unwrap()
         } else {

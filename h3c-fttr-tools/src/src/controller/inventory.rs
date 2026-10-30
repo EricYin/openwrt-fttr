@@ -155,6 +155,10 @@ pub(super) struct MibRequest {
     pub progress: Option<MibProgressReporter>,
     pub reply: std::sync::mpsc::Sender<io::Result<MibReport>>,
 }
+pub(super) enum WorkerRequest {
+    Mib(MibRequest),
+    Attribute(super::attribute_probe::Request),
+}
 
 /// Default output is one JSON document; human-readable summary is a client view.
 pub fn read(id: u8, summary: bool, tables: bool) -> io::Result<()> {
@@ -329,7 +333,9 @@ pub(super) fn control(
             "MIB requires a currently registered ONU",
         ));
     }
-    let deadline = Instant::now() + Duration::from_secs(120);
+    // Some baseline ONUs pace Upload-NEXT responses at roughly one per second.
+    // A complete, ~200-record MIB must still fit within the bounded diagnostic.
+    let deadline = Instant::now() + Duration::from_secs(600);
     match lock_onu(id) {
         Ok(_lock) => {
             if !super::service::operation_confirmed(id) {
@@ -353,18 +359,18 @@ pub(super) fn control(
                 })?;
             let (reply, receive) = std::sync::mpsc::channel();
             sender
-                .try_send(MibRequest {
+                .try_send(WorkerRequest::Mib(MibRequest {
                     tables,
                     deadline,
                     progress,
                     reply,
-                })
+                }))
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::WouldBlock, "MIB queue busy or stopped")
                 })?;
             wake.notify();
             receive
-                .recv_timeout(Duration::from_secs(125))
+                .recv_timeout(Duration::from_secs(605))
                 .map_err(|e| io::Error::other(format!("MIB worker unavailable: {e}")))?
         }
         Err(error) => Err(error),

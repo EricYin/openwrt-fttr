@@ -9,7 +9,7 @@ pub(super) struct State {
     pub error: Option<String>,
     pub identity: Option<crate::model::OnuIdentity>,
     pub identity_at: Option<std::time::Instant>,
-    pub mib: Option<std::sync::mpsc::SyncSender<super::inventory::MibRequest>>,
+    pub mib: Option<std::sync::mpsc::SyncSender<super::inventory::WorkerRequest>>,
     pub wake: Option<Arc<crate::pon_engine::omci::platform::wake::Wake>>,
 }
 impl State {

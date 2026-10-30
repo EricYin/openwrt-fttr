@@ -116,11 +116,11 @@ impl Collector {
                 self.id,
                 true,
                 Some(self.token.clone()),
-                started + Duration::from_secs(60),
+                started + Duration::from_secs(600),
                 None,
             ) {
                 Ok(report) => {
-                    self.inventory = inventory::InventorySample::from_report(&report, started);
+                    self.inventory = inventory::InventorySample::from_report(&report, Instant::now());
                     let entities: Vec<_> = report
                         .entities
                         .iter()

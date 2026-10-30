@@ -478,6 +478,13 @@ fn ipc_handler(
                 let _ = request;
                 let _ = stream.write_all(b"{\"schema_version\":1,\"error\":{\"code\":\"adapter_disabled\",\"message\":\"HL202 adapter not compiled\"}}");
             }
+        } else if let Some(request) = line.strip_prefix("OMCI_ATTRIBUTE ") {
+            let result = serde_json::from_str::<super::attribute_probe::Command>(request)
+                .map_err(std::io::Error::other)
+                .and_then(|command| super::attribute_probe::control(command, &services));
+            let response = result.unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+            let _ = serde_json::to_writer(&mut stream, &response);
+            let _ = stream.write_all(b"\n");
         } else if let Some(request) = line.strip_prefix("MIB ") {
             let request = request.to_string();
             let result = serde_json::from_str::<super::inventory::MibCommand>(&request)
