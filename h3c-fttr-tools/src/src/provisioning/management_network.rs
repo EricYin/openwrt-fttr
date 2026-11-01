@@ -585,12 +585,16 @@ fn parse_export(text: &str, package: &str) -> Result<Sections, String> {
     Ok(sections)
 }
 fn discover() -> Result<Sections, String> {
+    let mut uci = match openwrt_uci::Uci::new() {
+        Ok(u) => u,
+        Err(e) => return Err(format!("cannot initialize UCI context: {e}")),
+    };
     let mut all = Sections::new();
     for package in ["network", "dhcp", "firewall"] {
-        all.extend(parse_export(
-            &run("uci", &["-q", "export", package])?,
-            package,
-        )?);
+        let text = uci
+            .export_package(package)
+            .map_err(|e| format!("cannot export {package}: {e}"))?;
+        all.extend(parse_export(&text, package)?);
     }
     Ok(all)
 }
@@ -1026,31 +1030,58 @@ fn plan_resources(
     Ok(actions)
 }
 fn apply(actions: &[Action]) -> Result<(), String> {
+    let mut uci = match openwrt_uci::Uci::new() {
+        Ok(u) => u,
+        Err(e) => return Err(format!("cannot initialize UCI context for apply: {e}")),
+    };
+
     for a in actions {
+        let parts: Vec<&str> = a.key.splitn(3, '.').collect();
         match a.operation.as_str() {
             "set" => {
-                run("uci", &["set", &format!("{}={}", a.key, a.value[0])])?;
+                if parts.len() == 2 {
+                    uci.set(parts[0], parts[1], "", &a.value[0])
+                        .map_err(|e| format!("uci set {} failed: {e}", a.key))?;
+                } else if parts.len() == 3 {
+                    uci.set(parts[0], parts[1], parts[2], &a.value[0])
+                        .map_err(|e| format!("uci set {} failed: {e}", a.key))?;
+                } else {
+                    return Err(format!("invalid UCI key format: {}", a.key));
+                }
             }
             "replace_list" => {
-                let _ = run("uci", &["-q", "delete", &a.key]);
-                for value in &a.value {
-                    run("uci", &["add_list", &format!("{}={value}", a.key)])?;
+                if parts.len() == 3 {
+                    uci.replace_list(parts[0], parts[1], parts[2], &a.value)
+                        .map_err(|e| format!("uci replace_list {} failed: {e}", a.key))?;
+                } else {
+                    return Err(format!("invalid UCI list key format: {}", a.key));
                 }
             }
             "delete" => {
-                run("uci", &["-q", "delete", &a.key])?;
+                if parts.len() == 2 {
+                    uci.delete(parts[0], parts[1], None)
+                        .map_err(|e| format!("uci delete {} failed: {e}", a.key))?;
+                } else if parts.len() == 3 {
+                    uci.delete(parts[0], parts[1], Some(parts[2]))
+                        .map_err(|e| format!("uci delete {} failed: {e}", a.key))?;
+                } else {
+                    return Err(format!("invalid UCI key format: {}", a.key));
+                }
             }
             "reload_runtime" => (),
             _ => return Err("invalid management plan action".into()),
         }
     }
     for package in ["network", "dhcp", "firewall"] {
-        run("uci", &["commit", package])?;
+        uci.commit(package)
+            .map_err(|e| format!("uci commit {package} failed: {e}"))?;
     }
     // Validate and install isolation before activating the new interface.
     run("fw4", &["check"])?;
     run("/etc/init.d/firewall", &["reload"])?;
-    run("ubus", &["call", "network", "reload"])?;
+    let mut ubus = openwrt_ubus::Ubus::connect(None)
+        .map_err(|e| format!("cannot connect to ubus for network reload: {e}"))?;
+    crate::platform::openwrt::NetifdClient::new(&mut ubus).reload()?;
     run("/etc/init.d/dnsmasq", &["reload"])?;
     Ok(())
 }
@@ -1072,15 +1103,18 @@ fn runtime_plan(d: &Desired, previous: Option<&Desired>, actions: &mut Vec<Actio
     if !d.enabled {
         return;
     }
-    let ready = run("ubus", &["call", "network.interface.fttr_tr069", "status"])
+    let ready = openwrt_ubus::Ubus::connect(None)
         .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|mut ubus| {
+            crate::platform::openwrt::NetifdClient::new(&mut ubus)
+                .status("fttr_tr069")
+                .ok()
+        })
         .is_some_and(|s| {
-            s["up"] == true
-                && s["ipv4-address"].as_array().is_some_and(|a| {
-                    a.iter()
-                        .any(|a| a["address"] == d.address && a["mask"] == d.prefix)
-                })
+            s.up && s
+                .ipv4_address
+                .iter()
+                .any(|a| a.address == d.address && a.mask == d.prefix)
         });
     let firewall = run("nft", &["-j", "list", "table", "inet", "fw4"])
         .ok()
