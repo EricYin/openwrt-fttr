@@ -10,6 +10,7 @@ fn connection_request_toggle_rechecks_verified_settings_when_only_flag_changes()
                 optical_sn: "H3CT12345678".into(),
                 cwmp_id: "interval".into(),
                 adapter: "hl202".into(),
+                provisioning_method: "acs".into(),
                 connection_request: Default::default(),
                 cwmp_contract: "auto".into(),
                 omci_management: false,

@@ -220,6 +220,7 @@ pub struct Device {
     pub optical_sn: String,
     pub cwmp_id: String,
     pub adapter: String,
+    pub provisioning_method: String,
     pub cwmp_contract: String,
     pub omci_management: bool,
     pub connection_request: ConnectionRequest,
@@ -270,6 +271,21 @@ impl ConnectionRequest {
 }
 
 impl Device {
+    pub fn backend(&self) -> &'static str {
+        if self.provisioning_method != "acs" && crate::devices::supports_command_provisioning(&self.adapter) {
+            "command"
+        } else {
+            "acs"
+        }
+    }
+
+    pub fn backend_view(&self) -> serde_json::Value {
+        let command = crate::devices::supports_command_provisioning(&self.adapter);
+        serde_json::json!({"configured":if self.provisioning_method.is_empty() {"auto"} else {&self.provisioning_method},
+            "effective":self.backend(), "available":(if command {vec!["command"]} else {vec![]}).into_iter().chain(if cfg!(feature="acs") {vec!["acs"]} else {vec![]}).collect::<Vec<_>>(),
+            "reason":if self.provisioning_method == "command" && !command {"command backend not compiled; using ACS"} else if self.backend() == "acs" && !cfg!(feature="acs") {"ACS backend not compiled"} else {""}})
+    }
+
     pub fn contract(&self) -> &'static crate::devices::cwmp::contract::Contract {
         crate::devices::cwmp::configuration_contract(
             &self.cwmp_contract,
@@ -303,4 +319,29 @@ pub struct Management {
     pub vlan: u32,
     pub priority: u32,
     pub acs_url: String,
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+
+    #[test]
+    fn per_device_selection_respects_compiled_backends() {
+        let mut device = Device {
+            id: "child".into(), optical_sn: "H3CT00000001".into(), cwmp_id: "pending:H3CT00000001".into(),
+            adapter: "hl202".into(), provisioning_method: String::new(), cwmp_contract: "auto".into(),
+            omci_management: false, connection_request: ConnectionRequest::default(), items: vec![],
+            wifi_cleanup: "preserve".into(), wifi_preserve: BTreeSet::new(),
+        };
+        let expected = if cfg!(all(feature = "device-hl202", feature = "mqtt")) { "command" } else { "acs" };
+        assert_eq!(device.backend(), expected);
+        device.provisioning_method = "command".into();
+        assert_eq!(device.backend(), expected);
+        assert_eq!(device.backend_view()["configured"], "command");
+        device.provisioning_method = "acs".into();
+        assert_eq!(device.backend(), "acs");
+        device.adapter = "hwtc".into();
+        device.provisioning_method.clear();
+        assert_eq!(device.backend(), "acs");
+    }
 }

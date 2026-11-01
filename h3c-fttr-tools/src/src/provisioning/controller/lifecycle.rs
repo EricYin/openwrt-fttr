@@ -6,6 +6,8 @@ use serde::Deserialize;
 struct Recovered {
     operations: Vec<Value>,
     #[serde(default)]
+    retired: Vec<Value>,
+    #[serde(default)]
     owned: BTreeMap<String, BTreeMap<String, wan::Owned>>,
 }
 
@@ -74,6 +76,7 @@ impl Controller {
         #[derive(serde::Serialize)]
         struct History<'a> {
             operations: Operations<'a>,
+            retired: &'a Vec<Value>,
             owned: &'a BTreeMap<String, BTreeMap<String, wan::Owned>>,
         }
         #[expect(
@@ -82,6 +85,7 @@ impl Controller {
         )]
         serde_json::to_string(&History {
             operations: Operations(self),
+            retired: &self.retired,
             owned: &self.owned,
         })
         .expect("controller history is serializable")
@@ -89,6 +93,7 @@ impl Controller {
 
     pub(super) fn recover(&mut self, data: &[u8]) {
         if let Ok(recovered) = serde_json::from_slice::<Recovered>(data) {
+            self.retired = recovered.retired;
             self.owned = recovered.owned;
             for mut operation in recovered.operations {
                 self.next_id = self
@@ -194,9 +199,19 @@ impl Controller {
             self.owned.len(),
         );
         let devices = &self.config.devices;
+        for (id, view) in self.operations.iter().map(|(id,op)|(id,op.view())).chain(self.recovered.iter().map(|(id,op)|(id,op.clone()))) {
+            if devices.iter().any(|d| &d.id == id && view["optical_sn"] == d.optical_sn && view["backend"]["effective"].as_str().unwrap_or("acs") != d.backend()) {
+                let mut retired = view;
+                retired["retired_reason"] = json!("provisioning backend changed; rediscovery required");
+                self.retired.push(retired);
+            }
+        }
+        if self.retired.len() > 32 {self.retired.drain(..self.retired.len()-32);}
         self.operations.retain(|id, op| {
             devices.iter().any(|d| {
                 &d.id == id
+                    && d.backend() == op.device.backend()
+                    && d.provisioning_method == op.device.provisioning_method
                     && d.optical_sn == op.device.optical_sn
                     && (d.cwmp_id.starts_with("pending:")
                         || op.device.cwmp_id.starts_with("pending:")
@@ -208,6 +223,7 @@ impl Controller {
                 && devices.iter().any(|d| {
                     &d.id == id
                         && op["optical_sn"] == d.optical_sn
+                        && op["backend"]["effective"].as_str().unwrap_or("acs") == d.backend()
                         && (d.cwmp_id.starts_with("pending:") || op["cwmp_id"] == d.cwmp_id)
                 })
         });

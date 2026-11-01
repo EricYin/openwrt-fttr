@@ -131,6 +131,8 @@ pub async fn ensure_async<F: std::future::Future<Output = bool>>(
         return Err("invalid management VLAN/priority".into());
     }
     let target = mqtt_target(target).ok_or("invalid MQTT management target")?;
+    let _transaction = command::lock_target(&format!("transaction-{target}"))
+        .map_err(|_| "device command transaction active")?;
     let (parents, connections) = parse(execute(&target, INVENTORY).await?.trim())?;
     let tr069: Vec<_> = connections
         .iter()

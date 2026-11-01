@@ -221,7 +221,7 @@ fn program_start_trigger_is_pending_only_for_configured_devices() {
 
 fn template_config() -> Config {
     crate::provisioning::templates::compile(
-        "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'child'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\n",
+        "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'child'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option provisioning_method 'acs'\n option group 'g'\n",
     ).unwrap()
 }
 

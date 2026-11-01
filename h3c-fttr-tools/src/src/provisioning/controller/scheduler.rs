@@ -58,6 +58,28 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
         if c.resets.blocks(&d.optical_sn) {
             continue;
         }
+        if d.backend() == "command" {
+            let reachable = crate::mqtt_identity::shared().lock().unwrap().snapshots(time).iter()
+                .any(|s| s.optical_sn.as_deref() == Some(&d.optical_sn) && s.reason == "ready");
+            c.management.insert(d.id.clone(), json!({"state":if reachable {"online"} else {"waiting_transport"},"optical_online":online.contains(&d.optical_sn),"cwmp_id":d.cwmp_id,"last_inform":null,"age_seconds":null,"backend":d.backend_view()}));
+            if reachable { fresh.insert(d.id.clone()); }
+            schedule(&mut c, d, reachable, false, time);
+            if let Some(op) = c.operations.get_mut(&d.id) {
+                if let Some(job) = &op.command_job {
+                    if let Some(outcome) = job.take() {
+                        op.command_result = Some(outcome.unwrap_or_else(|reason| json!({"items":op.device.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":"blocked","reason":reason})).collect::<Vec<_>>()})));
+                        op.command_job = None;
+                        op.complete(time);
+                        history_changed = true;
+                    }
+                } else if op.stage != OperationPhase::Completed && reachable {
+                    op.command_job = Some(crate::devices::command_provisioning::Job::start(op.device.clone(), op.apply, op.full_sync, op.revision.clone(), op.id));
+                    op.stage = OperationPhase::Reading;
+                    history_changed = true;
+                }
+            }
+            continue;
+        }
         let observed = &devices["devices"][&d.cwmp_id];
         let at = (observed["endpoint_id"] == c.acs_status["endpoint_id"]
             && c.acs_status["endpoint_id"]

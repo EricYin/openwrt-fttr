@@ -7,6 +7,8 @@ pub mod telemetry;
 mod command_transport;
 #[cfg(feature = "mqtt")]
 pub mod command_binding;
+#[cfg(feature = "mqtt")]
+pub mod provisioning;
 pub mod script;
 #[cfg(feature = "mqtt")]
 pub mod mqtt_lifecycle;

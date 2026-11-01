@@ -350,7 +350,7 @@ impl Coordinator {
         // currently authorized ACS credentials have been written to the CPE.
         // Require a post-readback Inform before declaring the bootstrap ready.
         let settings_verified = device.adapter != "hl202"
-            || !cfg!(feature = "device-hl202")
+            || !cfg!(all(feature = "device-hl202", feature = "mqtt"))
             || r.settings_verified_at
                 .is_some_and(|verified| at.is_some_and(|at| at >= verified));
         let fresh = acs_available
@@ -748,6 +748,7 @@ mod tests {
             optical_sn: "H3CT12345678".into(),
             cwmp_id: id.into(),
             adapter: adapter.into(),
+            provisioning_method: "acs".into(),
             cwmp_contract: "auto".into(),
             omci_management: false,
             connection_request: Default::default(),

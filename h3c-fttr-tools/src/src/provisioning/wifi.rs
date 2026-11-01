@@ -30,6 +30,7 @@ mod tests {
             optical_sn: "H3CT12345678".into(),
             cwmp_id: "id".into(),
             adapter: "hl202".into(),
+            provisioning_method: "acs".into(),
             cwmp_contract: "hl202-cu".into(),
             omci_management: false,
             connection_request: Default::default(),

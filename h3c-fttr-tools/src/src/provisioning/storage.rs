@@ -11,7 +11,7 @@ pub(super) fn registry_path(directory: &str, id: &str) -> String {
     format!("{directory}/{hash:016x}.json")
 }
 
-pub(super) fn remove_registry(path: &str) -> Result<(), String> {
+pub(crate) fn remove_registry(path: &str) -> Result<(), String> {
     match fs::remove_file(path) {
         Ok(()) => fs::File::open(
             Path::new(path)
@@ -38,7 +38,7 @@ pub(super) fn remove_registry(path: &str) -> Result<(), String> {
 
 /// Preserve the existing file-fsync/rename sequence. Ownership registries also
 /// fsync their directory; controller history intentionally retains its policy.
-pub(super) fn write_atomic(path: &str, data: &[u8], sync_directory: bool) -> io::Result<()> {
+pub(crate) fn write_atomic(path: &str, data: &[u8], sync_directory: bool) -> io::Result<()> {
     let directory = Path::new(path).parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "state path has no directory")
     })?;

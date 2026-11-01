@@ -13,7 +13,7 @@ mod management_network;
 pub(crate) mod health_watch;
 pub mod model;
 mod policy;
-mod storage;
+pub(crate) mod storage;
 mod templates;
 mod wan;
 mod wifi;

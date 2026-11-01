@@ -307,11 +307,18 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
             port,
             ..Default::default()
         };
+        if !matches!(s.get("provisioning_method"), "" | "command" | "acs") {
+            return Err(format!("{id}: provisioning_method must be command or acs"));
+        }
+        if s.get("provisioning_method") == "command" && adapter != "hl202" {
+            return Err(format!("{id}: command provisioning is only supported by HL202"));
+        }
         cfg.devices.push(Device {
             id: id.clone(),
             optical_sn: s.get("optical_sn").to_ascii_uppercase(),
             cwmp_id: s.get("cwmp_id").into(),
             adapter: adapter.into(),
+            provisioning_method: s.get("provisioning_method").into(),
             cwmp_contract: cwmp_contract.into(),
             omci_management: boolean(s.get("omci_management"), false)
                 .map_err(|error| format!("{id}: omci_management: {error}"))?,

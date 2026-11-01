@@ -1,5 +1,6 @@
 //! Whole-device compile-time registry. Core activation/inventory never depend on adapters.
 pub mod cwmp;
+pub mod command_provisioning;
 use crate::model::BusinessPhase;
 
 pub fn observe_mqtt_report(source: &str, payload: Vec<u8>, received: u64) -> bool {
@@ -477,4 +478,7 @@ mod tests {
         }
         assert!(!matches_cwmp_adapter("unknown", "TEST12345678", "CLASS", "SERIAL"));
     }
+}
+pub fn supports_command_provisioning(adapter: &str) -> bool {
+    cfg!(all(feature = "device-hl202", feature = "mqtt")) && adapter == "hl202"
 }

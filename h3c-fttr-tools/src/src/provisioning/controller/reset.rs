@@ -71,7 +71,7 @@ impl Controller {
                     serde_json::from_slice(&data).map_err(|_| "invalid reset intent")?;
                 if intent.optical_sn != device.optical_sn
                     || intent.cwmp_id.is_empty()
-                    || intent.cwmp_id.starts_with("pending:")
+                    || (intent.cwmp_id.starts_with("pending:") && device.backend() != "command")
                     || (!device.cwmp_id.starts_with("pending:") && intent.cwmp_id != device.cwmp_id)
                 {
                     return Err("reset intent identity mismatch".into());
@@ -109,11 +109,14 @@ impl Controller {
             .find(|d| d.id == target || d.optical_sn == target)
             .cloned()
             .ok_or("select one configured device to reset")?;
+        if self.operations.get(&device.id).is_some_and(|op| op.command_job.is_some()) {
+            return Err("command transaction active; wait for completion before resetting state".into());
+        }
         if !self.resets.pending.contains_key(&device.optical_sn) {
             if self.resets.blocks(&device.optical_sn) {
                 return Err("reset pending: invalid intent requires operator repair".into());
             }
-            let cwmp_id = if device.cwmp_id.starts_with("pending:") {
+            let cwmp_id = if device.cwmp_id.starts_with("pending:") && device.backend() != "command" {
                 self.recovered
                     .get(&device.id)
                     .and_then(|op| op["cwmp_id"].as_str())
@@ -122,7 +125,7 @@ impl Controller {
             } else {
                 device.cwmp_id.clone()
             };
-            if cwmp_id.starts_with("pending:") {
+            if cwmp_id.starts_with("pending:") && device.backend() != "command" {
                 return Err("resolve device identity before reset".into());
             }
             let intent = Intent {
@@ -166,6 +169,8 @@ impl Controller {
             }
         }
         self.forget_device(serial, &intent.cwmp_id);
+        #[cfg(not(test))]
+        storage::remove_registry(&format!("/etc/fttr/command-owned/{serial}.json"))?;
         let saved = self.history();
         storage::write_atomic(&self.resets.history, saved.as_bytes(), true)
             .map_err(|e| format!("persist reset history: {e}"))?;

@@ -1122,6 +1122,7 @@ mod tests {
             optical_sn: "HWTC12345678".into(),
             cwmp_id: "id".into(),
             adapter: "hwtc".into(),
+            provisioning_method: "acs".into(),
             cwmp_contract: "hwtc-hw".into(),
             omci_management: false,
             connection_request: Default::default(),

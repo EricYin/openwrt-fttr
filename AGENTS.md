@@ -7,3 +7,4 @@
 - 修改持久化服务时核查 `files/fttr.init`、`files/fttr.config` 和 OpenWrt Makefile。
 - OMCI 回读、真实 GEM 数据和真实 CWMP RPC 分别验证；不得互相替代。
 - 未经用户明确要求，不提交或推送，不覆盖现场账号、密码及已有配置。
+- 在代码和测试中，对 SN 等信息进行脱敏处理。

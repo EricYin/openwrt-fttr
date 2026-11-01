@@ -113,6 +113,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 "optical_sn",
                 "onu_id",
                 "adapter",
+                "provisioning_method",
                 "cwmp_contract",
                 "group",
                 "wifi_cleanup",

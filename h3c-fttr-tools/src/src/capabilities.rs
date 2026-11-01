@@ -31,6 +31,7 @@ pub fn compiled() -> Capabilities {
             ("mqtt_telemetry", mqtt),
             ("hl202_management", hl202 && mqtt),
             ("cwmp", acs),
+            ("command_provisioning", hl202 && mqtt),
         ]),
         // Configuration and synchronization are the ACS/CWMP workflow in LuCI.
         pages: BTreeMap::from([
@@ -38,8 +39,8 @@ pub fn compiled() -> Capabilities {
             ("hardware", true),
             ("calibration", true),
             ("about", true),
-            ("config", acs),
-            ("sync", acs),
+            ("config", acs || (hl202 && mqtt)),
+            ("sync", acs || (hl202 && mqtt)),
             ("hl202", hl202 && mqtt),
         ]),
     }

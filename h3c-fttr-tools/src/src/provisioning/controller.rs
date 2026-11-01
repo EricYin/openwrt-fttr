@@ -84,6 +84,9 @@ pub(crate) fn wake_device(device: &str) {
 
 #[derive(Clone)]
 struct Operation {
+    command_job: Option<crate::devices::command_provisioning::Job>,
+    command_result: Option<Value>,
+    full_sync: bool,
     submission: Option<crate::devices::cwmp::transport::Pending<OperationPhase>>,
     verify_after: u64,
     compiled: bool,
@@ -124,6 +127,7 @@ struct Controller {
     last_boot: BTreeMap<String, u64>,
     optical_epochs: BTreeMap<String, (u16, u64)>,
     recovered: BTreeMap<String, Value>,
+    retired: Vec<Value>,
     saved: String,
     owned: BTreeMap<String, BTreeMap<String, wan::Owned>>,
     wifi_owned: BTreeMap<String, wifi::Registry>,
@@ -274,15 +278,18 @@ impl Controller {
         if devices.is_empty() {
             return Err("no configured device matches target".into());
         }
+        if !cfg!(any(feature = "acs", test)) && devices.iter().any(|d| d.backend() == "acs") {
+            return Err("ACS backend not compiled; select an available per-device backend".into());
+        }
         if devices.iter().any(|d| self.resets.blocks(&d.optical_sn)) {
             return Err("device reset pending; retry reset before synchronization".into());
         }
         if apply
             && self.config.management_network.as_ref().is_some_and(|d| {
-                !super::management_network::matches_desired(d)
+                (devices.iter().any(|device| device.backend() == "acs") && !super::management_network::matches_desired(d))
                     || devices
                         .iter()
-                        .any(|device| !super::bootstrap::is_ready(&device.id))
+                        .any(|device| device.backend() == "acs" && !super::bootstrap::is_ready(&device.id))
             })
         {
             return Err("apply and verify management configuration and fresh device Inform before business synchronization".into());
@@ -305,10 +312,13 @@ impl Controller {
                 apply,
                 management,
             );
-            let owned = wan::load(&d.cwmp_id)?
-                .unwrap_or_else(|| self.owned.get(&d.cwmp_id).cloned().unwrap_or_default());
-            op.wan = wan::Reconciler::new(&d, owned, item.is_none());
-            op.wifi = wifi::Reconciler::new(&d, wifi::load(&d.cwmp_id)?, item.is_none());
+            op.full_sync = item.is_none();
+            if d.backend() == "acs" {
+                let owned = wan::load(&d.cwmp_id)?
+                    .unwrap_or_else(|| self.owned.get(&d.cwmp_id).cloned().unwrap_or_default());
+                op.wan = wan::Reconciler::new(&d, owned, item.is_none());
+                op.wifi = wifi::Reconciler::new(&d, wifi::load(&d.cwmp_id)?, item.is_none());
+            }
             if item.is_some() {
                 let previous = self.operations.get(&d.id).map(Operation::view);
                 if let Some(items) = previous
@@ -768,6 +778,7 @@ mod tests {
                 optical_sn: "H3CT12345678".into(),
                 cwmp_id: "id".into(),
                 adapter: "hl202".into(),
+                provisioning_method: "acs".into(),
                 cwmp_contract: "hl202-cu".into(),
                 omci_management: false,
                 connection_request: Default::default(),
