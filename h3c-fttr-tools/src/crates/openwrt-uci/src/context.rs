@@ -78,9 +78,12 @@ impl Uci {
                 self.lib
                     .uci_lookup_ptr(self.ctx, &mut ptr, buf.as_mut_ptr() as *mut c_char, true);
             if ret != UCI_OK {
-                return Ok(None);
+                if ret == UCI_ERR_NOTFOUND {
+                    return Ok(None);
+                }
+                return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
             }
-            if ptr.o.is_null() {
+            if ptr.o.is_null() || (ptr.flags & UCI_LOOKUP_COMPLETE == 0) {
                 return Ok(None);
             }
 
@@ -129,7 +132,13 @@ impl Uci {
             let ret =
                 self.lib
                     .uci_lookup_ptr(self.ctx, &mut ptr, buf.as_mut_ptr() as *mut c_char, true);
-            if ret != UCI_OK || ptr.o.is_null() {
+            if ret != UCI_OK {
+                if ret == UCI_ERR_NOTFOUND {
+                    return Ok(None);
+                }
+                return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+            }
+            if ptr.o.is_null() || (ptr.flags & UCI_LOOKUP_COMPLETE == 0) {
                 return Ok(None);
             }
 
@@ -297,31 +306,59 @@ impl Uci {
                 self.lib
                     .uci_lookup_ptr(self.ctx, &mut ptr, buf.as_mut_ptr() as *mut c_char, true);
             if ret != UCI_OK {
-                return Ok(()); // Already absent
+                if ret == UCI_ERR_NOTFOUND {
+                    return Ok(()); // Already absent
+                }
+                return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+            }
+
+            // Check if the target actually exists in the lookup result
+            let exists = if option.is_some() {
+                !ptr.o.is_null() && (ptr.flags & UCI_LOOKUP_COMPLETE != 0)
+            } else {
+                !ptr.s.is_null()
+            };
+
+            if !exists {
+                return Ok(()); // Idempotent: target does not exist, nothing to delete
             }
 
             let ret = self.lib.uci_delete(self.ctx, &mut ptr);
-            if ret != UCI_OK {
+            if ret != UCI_OK && ret != UCI_ERR_NOTFOUND {
                 return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
             }
 
-            let ret = self.lib.uci_save(self.ctx, ptr.p);
-            if ret != UCI_OK {
-                return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+            if !ptr.p.is_null() {
+                let ret = self.lib.uci_save(self.ctx, ptr.p);
+                if ret != UCI_OK {
+                    return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+                }
             }
         }
         Ok(())
     }
 
     pub fn commit(&mut self, package: &str) -> Result<(), UciError> {
-        let c_pkg = CString::new(package)?;
-        let mut p: *mut uci_package = std::ptr::null_mut();
+        let mut ptr = uci_ptr::default();
+        let mut buf = package.as_bytes().to_vec();
+        buf.push(0);
 
         unsafe {
-            let ret = self.lib.uci_load(self.ctx, c_pkg.as_ptr(), &mut p);
-            if ret != UCI_OK || p.is_null() {
-                return Err(UciError::PackageNotFound(package.to_string()));
-            }
+            let ret =
+                self.lib
+                    .uci_lookup_ptr(self.ctx, &mut ptr, buf.as_mut_ptr() as *mut c_char, true);
+
+            let mut p = if ret == UCI_OK && !ptr.p.is_null() {
+                ptr.p
+            } else {
+                let c_pkg = CString::new(package)?;
+                let mut loaded: *mut uci_package = std::ptr::null_mut();
+                let ret = self.lib.uci_load(self.ctx, c_pkg.as_ptr(), &mut loaded);
+                if (ret != UCI_OK && ret != UCI_ERR_DUPLICATE) || loaded.is_null() {
+                    return Err(UciError::PackageNotFound(package.to_string()));
+                }
+                loaded
+            };
 
             let ret = self.lib.uci_commit(self.ctx, &mut p, false);
             if ret != UCI_OK {
@@ -355,28 +392,27 @@ impl Uci {
 
     /// Export a loaded UCI package into canonical OpenWrt UCI text format.
     pub fn export_package(&mut self, package: &str) -> Result<String, UciError> {
-        let c_pkg = CString::new(package)?;
-        let mut p: *mut uci_package = std::ptr::null_mut();
+        let mut ptr = uci_ptr::default();
+        let mut buf = package.as_bytes().to_vec();
+        buf.push(0);
 
         unsafe {
-            let ret = self.lib.uci_load(self.ctx, c_pkg.as_ptr(), &mut p);
-            if ret != UCI_OK && ret != UCI_ERR_DUPLICATE {
-                return Err(UciError::PackageNotFound(package.to_string()));
-            }
-            if p.is_null() {
-                let mut ptr = uci_ptr::default();
-                let mut buf = package.as_bytes().to_vec();
-                buf.push(0);
-                if self.lib.uci_lookup_ptr(
-                    self.ctx,
-                    &mut ptr,
-                    buf.as_mut_ptr() as *mut c_char,
-                    true,
-                ) == UCI_OK
-                {
-                    p = ptr.p;
+            let ret =
+                self.lib
+                    .uci_lookup_ptr(self.ctx, &mut ptr, buf.as_mut_ptr() as *mut c_char, true);
+
+            let p = if ret == UCI_OK && !ptr.p.is_null() {
+                ptr.p
+            } else {
+                let c_pkg = CString::new(package)?;
+                let mut loaded: *mut uci_package = std::ptr::null_mut();
+                let ret = self.lib.uci_load(self.ctx, c_pkg.as_ptr(), &mut loaded);
+                if (ret != UCI_OK && ret != UCI_ERR_DUPLICATE) || loaded.is_null() {
+                    return Err(UciError::PackageNotFound(package.to_string()));
                 }
-            }
+                loaded
+            };
+
             if p.is_null() {
                 return Err(UciError::PackageNotFound(package.to_string()));
             }

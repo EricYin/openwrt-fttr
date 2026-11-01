@@ -1035,6 +1035,8 @@ fn apply(actions: &[Action]) -> Result<(), String> {
         Err(e) => return Err(format!("cannot initialize UCI context for apply: {e}")),
     };
 
+    let mut touched_packages = std::collections::BTreeSet::new();
+
     for a in actions {
         let parts: Vec<&str> = a.key.splitn(3, '.').collect();
         match a.operation.as_str() {
@@ -1048,6 +1050,7 @@ fn apply(actions: &[Action]) -> Result<(), String> {
                 } else {
                     return Err(format!("invalid UCI key format: {}", a.key));
                 }
+                touched_packages.insert(parts[0].to_string());
             }
             "replace_list" => {
                 if parts.len() == 3 {
@@ -1056,6 +1059,7 @@ fn apply(actions: &[Action]) -> Result<(), String> {
                 } else {
                     return Err(format!("invalid UCI list key format: {}", a.key));
                 }
+                touched_packages.insert(parts[0].to_string());
             }
             "delete" => {
                 if parts.len() == 2 {
@@ -1067,12 +1071,13 @@ fn apply(actions: &[Action]) -> Result<(), String> {
                 } else {
                     return Err(format!("invalid UCI key format: {}", a.key));
                 }
+                touched_packages.insert(parts[0].to_string());
             }
             "reload_runtime" => (),
             _ => return Err("invalid management plan action".into()),
         }
     }
-    for package in ["network", "dhcp", "firewall"] {
+    for package in &touched_packages {
         uci.commit(package)
             .map_err(|e| format!("uci commit {package} failed: {e}"))?;
     }

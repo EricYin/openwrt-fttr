@@ -29,8 +29,9 @@ fn verify_abi() {
     assert_eq!(uci_type::UCI_TYPE_SECTION as i32, 3);
     assert_eq!(uci_type::UCI_TYPE_OPTION as i32, 4);
     assert_eq!(uci_type::UCI_TYPE_PATH as i32, 5);
-    assert_eq!(uci_type::UCI_TYPE_HOOK as i32, 6);
+    assert_eq!(uci_type::UCI_TYPE_BACKEND as i32, 6);
     assert_eq!(uci_type::UCI_TYPE_ITEM as i32, 7);
+    assert_eq!(uci_type::UCI_TYPE_HOOK as i32, 8);
 
     assert_eq!(uci_option_type::UCI_TYPE_STRING as i32, 0);
     assert_eq!(uci_option_type::UCI_TYPE_LIST as i32, 1);

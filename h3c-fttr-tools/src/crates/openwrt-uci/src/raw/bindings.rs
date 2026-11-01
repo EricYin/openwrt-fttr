@@ -32,8 +32,9 @@ pub enum uci_type {
     UCI_TYPE_SECTION = 3,
     UCI_TYPE_OPTION = 4,
     UCI_TYPE_PATH = 5,
-    UCI_TYPE_HOOK = 6,
+    UCI_TYPE_BACKEND = 6,
     UCI_TYPE_ITEM = 7,
+    UCI_TYPE_HOOK = 8,
 }
 
 #[repr(C)]

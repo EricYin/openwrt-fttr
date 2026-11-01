@@ -171,15 +171,80 @@ fn test_memory_leak() -> Result<(), String> {
     Ok(())
 }
 
+fn test_uci_isolated_write() -> Result<(), String> {
+    println!("[PROBE] Testing isolated UCI write, list replace & commit semantics...");
+    let tmp_dir = "/tmp/test_uci_probe";
+    let save_dir = "/tmp/test_uci_probe/savedir";
+    let _ = fs::remove_dir_all(tmp_dir);
+    fs::create_dir_all(save_dir).map_err(|e| e.to_string())?;
+
+    // Create an initial test package file
+    let initial_conf = "config test_sec 'main'\n\toption name 'initial_val'\n";
+    fs::write(format!("{tmp_dir}/testpkg"), initial_conf).map_err(|e| e.to_string())?;
+
+    // Context 1: Modify and Commit
+    {
+        let mut uci = openwrt_uci::Uci::new().map_err(|e| e.to_string())?;
+        uci.set_confdir(tmp_dir).map_err(|e| e.to_string())?;
+        uci.set_savedir(save_dir).map_err(|e| e.to_string())?;
+
+        // 1. replace_list on a non-existent option (P1 test)
+        uci.replace_list(
+            "testpkg",
+            "main",
+            "ports",
+            &["port1".into(), "port2".into()],
+        )
+        .map_err(|e| format!("replace_list on non-existent option failed: {e}"))?;
+
+        // 2. set an option
+        uci.set("testpkg", "main", "updated_key", "hello_fttr")
+            .map_err(|e| format!("set failed: {e}"))?;
+
+        // 3. commit in the SAME context (P1 duplicate package load test)
+        uci.commit("testpkg")
+            .map_err(|e| format!("commit in same context failed: {e}"))?;
+    }
+
+    // Context 2: Read back from fresh context to verify persisted changes
+    {
+        let mut uci = openwrt_uci::Uci::new().map_err(|e| e.to_string())?;
+        uci.set_confdir(tmp_dir).map_err(|e| e.to_string())?;
+        uci.set_savedir(save_dir).map_err(|e| e.to_string())?;
+
+        let val = uci
+            .get("testpkg", "main", "updated_key")
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "updated_key not found".to_string())?;
+        if val != "hello_fttr" {
+            return Err(format!("expected 'hello_fttr', got '{val}'"));
+        }
+
+        let list = uci
+            .get_list("testpkg", "main", "ports")
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ports list not found".to_string())?;
+        if list != vec!["port1", "port2"] {
+            return Err(format!("expected ['port1', 'port2'], got {:?}", list));
+        }
+
+        println!("  [+] Isolated write, non-existent replace_list, and single-context commit verified successfully.");
+    }
+
+    let _ = fs::remove_dir_all(tmp_dir);
+    Ok(())
+}
+
 fn main() {
     println!("=== FTTR Native Platform Capability & Memory Leak Test ===");
     let uci_ok = test_uci().is_ok();
+    let uci_write_ok = test_uci_isolated_write().is_ok();
     let ubus_ok = test_ubus_typed().is_ok();
     let leak_ok = test_memory_leak().is_ok();
 
     println!("============================================================");
-    println!("Summary: UCI={uci_ok}, UBUS_TYPED={ubus_ok}, MEMORY_STABLE={leak_ok}");
-    if uci_ok && ubus_ok && leak_ok {
+    println!("Summary: UCI={uci_ok}, UCI_WRITE={uci_write_ok}, UBUS_TYPED={ubus_ok}, MEMORY_STABLE={leak_ok}");
+    if uci_ok && uci_write_ok && ubus_ok && leak_ok {
         println!("All verifications passed with zero memory leaks!");
         process::exit(0);
     } else {
