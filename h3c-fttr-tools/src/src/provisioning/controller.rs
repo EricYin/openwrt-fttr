@@ -409,6 +409,9 @@ fn discovered_identity(devices: &Value, optical_sn: &str, adapter: &str) -> Opti
             match adapter {
                 "hl202" => d["product_class"] == "HL202-DU-C" && serial.contains(optical_sn),
                 "hwtc" => optical_sn.starts_with("HWTC") && serial.eq_ignore_ascii_case(&hex),
+                "generic" => crate::devices::matches_cwmp_identity(
+                    optical_sn, d["product_class"].as_str().unwrap_or(""), serial,
+                ),
                 _ => false,
             }
         })
@@ -685,6 +688,27 @@ mod tests {
         assert_eq!(history["operations"].as_array().unwrap().len(), 1);
         assert_eq!(history["operations"][0]["device"], "other");
         assert!(c.reset_device("all").is_err());
+    }
+    #[test]
+    fn sg631_identity_requires_feature_vendor_model_full_serial_and_unique_match() {
+        let devices = json!({"devices":{
+            "child":{"product_class":"SG631Z-C","serial":"MODEL-STAR1234ABCD-SUFFIX"}
+        }});
+        assert_eq!(discovered_identity(&devices, "STAR1234ABCD", "generic"),
+            cfg!(feature = "device-star").then(|| "child".into()));
+        for serial in ["STAR1234ABCE", "STAR1234ABC0", "HWTC1234ABCD"] {
+            assert_eq!(discovered_identity(&devices, serial, "generic"), None);
+        }
+        assert_eq!(discovered_identity(&devices, "STAR1234ABCD", "hl202"), None);
+        let wrong_model = json!({"devices":{
+            "child":{"product_class":"OTHER","serial":"MODEL-STAR1234ABCD-SUFFIX"}
+        }});
+        assert_eq!(discovered_identity(&wrong_model, "STAR1234ABCD", "generic"), None);
+        let ambiguous = json!({"devices":{
+            "one":{"product_class":"SG631Z-C","serial":"MODEL-STAR1234ABCD-SUFFIX"},
+            "two":{"product_class":"SG631Z-C","serial":"OTHER-STAR1234ABCD-SUFFIX"}
+        }});
+        assert_eq!(discovered_identity(&ambiguous, "STAR1234ABCD", "generic"), None);
     }
     #[test]
     fn hwtc_identity_matches_serial_across_models() {

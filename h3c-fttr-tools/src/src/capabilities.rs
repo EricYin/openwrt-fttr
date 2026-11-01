@@ -23,6 +23,7 @@ pub fn compiled() -> Capabilities {
             ("mqtt", mqtt),
             ("device-hl202", hl202),
             ("device-hwtc", cfg!(feature = "device-hwtc")),
+            ("device-star", cfg!(feature = "device-star")),
         ]),
         functions: BTreeMap::from([
             ("optical", true),

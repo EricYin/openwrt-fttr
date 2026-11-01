@@ -35,11 +35,12 @@ make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
 | --- | --- | --- | --- |
 | `CONFIG_FTTR_DEVICE_HL202` | `device-hl202` | 开 | 开 |
 | `CONFIG_FTTR_DEVICE_HWTC` | `device-hwtc` | 开 | 关 |
+| `CONFIG_FTTR_DEVICE_STAR` | `device-star` | 开 | 关 |
 | `CONFIG_FTTR_ACS` | `acs` | 开 | 关 |
 | `CONFIG_FTTR_MQTT` | `mqtt` | 开 | 开 |
 
 OpenWrt 使用 `--no-default-features`，逐项显式映射上述选项。设备及 ACS
-feature 不会隐式开启 MQTT；`all-devices` 只组合两类设备。Linux 下在
+feature 不会隐式开启 MQTT；`all-devices` 组合上述全部设备模块。Linux 下在
 `h3c-fttr-tools/src` 验证全部目标：
 
 ```sh

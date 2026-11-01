@@ -18,6 +18,21 @@ pub mod generic;
 pub mod hl202;
 #[cfg(feature = "device-hwtc")]
 pub mod hwtc;
+#[cfg(feature = "device-star")]
+pub(crate) mod star;
+
+/// Optional device identity rules, independent of the shared OMCI bridge implementation.
+pub(crate) fn matches_cwmp_identity(optical_sn: &str, product_class: &str, serial: &str) -> bool {
+    #[cfg(feature = "device-star")]
+    {
+        star::matches_cwmp(optical_sn, product_class, serial)
+    }
+    #[cfg(not(feature = "device-star"))]
+    {
+        let _ = (optical_sn, product_class, serial);
+        false
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Adapter {

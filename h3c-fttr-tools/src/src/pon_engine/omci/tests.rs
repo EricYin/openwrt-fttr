@@ -130,6 +130,22 @@ fn necessary_masks_widths_and_access_match_g988() {
 }
 
 #[test]
+fn ip_host_upload_separates_manual_and_current_addresses_and_rejects_current_writes() {
+    let def = MeRegistry::get(134).unwrap();
+    let mut bytes = [0u8; 24];
+    bytes[..4].copy_from_slice(&[192, 0, 2, 10]);
+    bytes[20..24].copy_from_slice(&[192, 0, 2, 20]);
+    let block = AttributeCodec::decode(def, 0x1f80, &bytes, AttributeContext::MibUpload);
+    assert_eq!(block.consumed, 24);
+    assert_eq!(block.undecoded_mask, 0);
+    assert_eq!(block.attributes[0].definition.name, "IpAddress");
+    assert_eq!(block.attributes[5].definition.name, "CurrentAddress");
+    assert_eq!(block.attributes[5].value.unsigned(), Some(0xc0000214));
+    assert!(AttributeCodec::encode(def, &[(9, AttributeValue::number(1))], AttributeContext::SetRequest).is_err());
+    assert_eq!(AttributeCodec::encode(def, &[(1, AttributeValue::number(9))], AttributeContext::SetRequest).unwrap(), (0x8000, vec![9]));
+}
+
+#[test]
 fn strings_signed_optics_and_table_context_preserve_raw() {
     let mut bytes = [0xff; 14];
     bytes[..5].copy_from_slice(b"K155 ");
