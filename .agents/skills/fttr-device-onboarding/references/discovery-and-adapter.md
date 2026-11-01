@@ -1,6 +1,6 @@
 # 能力发现与适配决策
 
-本参考按 2026-10-25 工作区核对，"通用 profile 的最小充分集"一节按 2026-10-28 现场适配补充。执行时重读当前源码；这里的源码行为不代表现场已部署。
+本参考按 2026-10-25 工作区核对，"通用 profile 的最小充分集"一节按 2026-10-28 现场适配补充；2026-11-01 补充厂商/型号分层和管理身份发现。执行时重读当前源码；这里的源码行为不代表现场已部署。
 下列路径均相对仓库根目录。
 
 ## 当前源码地图
@@ -9,6 +9,8 @@
 | --- | --- |
 | 项目约定与构建 | `AGENTS.md`、`README.md`、`EVIDENCE/ENV.md` |
 | 设备选择、feature 裁剪 | `h3c-fttr-tools/src/src/devices/mod.rs`、`h3c-fttr-tools/src/Cargo.toml` |
+| 设备代码分层约定 | `h3c-fttr-tools/src/src/devices/AGENTS.md` |
+| STAR 厂商入口、SG631Z-C 身份规则 | `h3c-fttr-tools/src/src/devices/star/mod.rs`、`h3c-fttr-tools/src/src/devices/star/sg631/mod.rs` |
 | 通用发现与配置 | `h3c-fttr-tools/src/src/devices/generic/inventory.rs`、`h3c-fttr-tools/src/src/devices/generic/service.rs` |
 | 业务对象与管理关联 | `h3c-fttr-tools/src/src/controller/business.rs`、`h3c-fttr-tools/src/src/controller/management.rs` |
 | 注册、调度和健康 | `h3c-fttr-tools/src/src/controller/runtime.rs`、`h3c-fttr-tools/src/src/controller/service.rs`、`h3c-fttr-tools/src/src/controller/health.rs` |
@@ -30,7 +32,7 @@
 
 - **标准实体布局差异：**改善通用发现，使用现场实际实例；无可用资源时明确失败，不虚构 UNI 或抢占他人 T-CONT。
 - **标准流程/参数差异：**用最小受控实验建立证据，再引入明确策略。检查旧实例排序、固定上联端口号、重试及部分配置恢复的兼容性。
-- **厂商特有行为：**确认型号/版本及复现条件后新增 `devices/<device>/` 适配，并核对选择逻辑、Cargo feature 和 OpenWrt 映射。
+- **厂商特有行为：**确认型号/版本及复现条件后按 `devices/AGENTS.md` 新增 `devices/<vendor>/<model>/`，由厂商入口分派，并核对厂商级 Cargo feature 和 OpenWrt 映射。通用桥接可以复用，专属身份或参数规则不能放进 `generic/`。
 - **WAN/ACS 配置未知：**先建立管理入口和读回能力；不能用重置、盲扫 VLAN 或硬编码网上默认值代替发现。
 
 选择逻辑的边界：**厂商码相同不代表拓扑相同**。只对已验证型号保留固定拓扑的厂商 profile，其余型号应落到通用 profile；否则一个新型号就会以"固定实例不存在"的形式失败（见[HWTC 案例](hwtc-hg8010c-spgmac-case.md)）。

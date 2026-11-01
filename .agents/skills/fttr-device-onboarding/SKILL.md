@@ -9,11 +9,11 @@ description: Use when onboarding a new FTTR ONU or sub-gateway in openwrt-fttr, 
 
 ## 开始前
 
-1. 阅读仓库根目录 `AGENTS.md`、`README.md`、`EVIDENCE/ENV.md`，核实本轮源码、构建 feature、服务归属和现场版本。环境文件含私有信息，只在授权环境使用，禁止复制进共享记录。
+1. 阅读仓库根目录 `AGENTS.md`、`README.md`、`EVIDENCE/ENV.md`，核实本轮源码、构建 feature、服务归属和现场版本。修改设备代码前再读 `h3c-fttr-tools/src/src/devices/AGENTS.md`，按注册层、厂商层、型号层组织代码。环境文件含私有信息，只在授权环境使用，禁止复制进共享记录。
 2. 检查已有工作区变更并保留；确认本轮目标是发现、实现还是现场部署，以及用户允许的操作。独占窗口不自动等于允许恢复出厂、覆盖配置或固件升级。
 3. 从[记录模板](templates/onboarding-record.md)建立本轮记录。以完整设备身份定位，但共享记录只使用 `<ONU_A_SN>` 等稳定别名。
 4. 开始发现/适配前读[能力发现与适配决策](references/discovery-and-adapter.md)；开始现场实验前读[现场验证](references/field-validation.md)；出现重试循环或"配置成功但不通"时读[OMCI 结果码与数据面定位](references/omci-failure-triage.md)。
-5. 需要只改 userspace 就上机验证（不整包刷机）时读[本地交叉构建与部署](references/local-build-and-deploy.md)；需要案例时读[STAR 脱敏案例](references/star-sg631z-c-case.md)与[HWTC/SPGMAC 脱敏案例](references/hwtc-hg8010c-spgmac-case.md)。
+5. 需要只改 userspace 就上机验证（不整包刷机）时读[Linux 本地交叉构建与部署](references/local-build-and-deploy-for-linux.md)，Windows 构建另见仓库 `README.md`；需要案例时读[STAR 脱敏案例](references/star-sg631z-c-case.md)与[HWTC/SPGMAC 脱敏案例](references/hwtc-hg8010c-spgmac-case.md)。
 
 ## 执行阶段
 
@@ -40,6 +40,9 @@ description: Use when onboarding a new FTTR ONU or sub-gateway in openwrt-fttr, 
 - O5、配置回读、历史计数、carrier 或 UI 的 verified 标志均不能单独证明当前双向转发。
 - 不把业务 VLAN、管理 VLAN、内部 GEM 封装标签和 ONU ID 当成同一个概念。
 - 原生 CWMP ACS URL、OMCI ACS 关联、Connection Request URL 分别记录；当前配置不等于出厂默认值。
+- ME 134 的地址字段不能独立证明厂商管理 WAN 的状态；先确认其关联，以设备 WAN、租约和实际请求响应交叉验证，不向任意 IP Host 实例盲写开关。
+- `waiting_inform` 要区分传输、HTTP/SOAP 会话与身份关联：真实 Inform 可能已到 ACS，但光侧与 CWMP 标识尚未匹配。只对有证据的厂商/型号建立规则，并拒绝歧义匹配。
+- 抓包点的静默不是设备未发包的充分证据；核查管理桥路径，按当前目标过滤并记录窗口。配置的上报周期也不等于已测量的实际节奏。
 - 不根据一次报文、安静窗口或代码推测宣布根因；受控复现不足时明确标为假设。
 - 对现场配置决策确有阻塞时说明最小下一步及影响；对能通过只读证据回答的问题继续调查。
 
