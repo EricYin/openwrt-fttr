@@ -69,6 +69,8 @@ define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./src/Cargo.toml ./src/Cargo.lock $(PKG_BUILD_DIR)/
 	$(CP) ./src/src $(PKG_BUILD_DIR)/
+	[ -d ./src/crates ] && $(CP) ./src/crates $(PKG_BUILD_DIR)/ || true
+	[ -d ./src/tools ] && $(CP) ./src/tools $(PKG_BUILD_DIR)/ || true
 endef
 
 # Populate the shared $(DL_DIR)/cargo registry and Git caches before compilation.

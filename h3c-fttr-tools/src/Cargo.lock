@@ -600,6 +600,8 @@ dependencies = [
  "hyper-util",
  "libc",
  "mold-mimalloc",
+ "openwrt-ubus",
+ "openwrt-uci",
  "quick-xml",
  "rumqttc",
  "rumqttd",
@@ -1047,6 +1049,24 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "openwrt-ubus"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "openwrt-uci"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "ordered-multimap"
