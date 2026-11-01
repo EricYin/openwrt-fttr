@@ -146,6 +146,83 @@ fn ip_host_upload_separates_manual_and_current_addresses_and_rejects_current_wri
 }
 
 #[test]
+fn management_association_layouts_decode_and_encode_standard_links() {
+    let server = MeRegistry::get(340).unwrap();
+    let block = AttributeCodec::decode(
+        server, 0xe000, &[0, 0x80, 1, 0, 46], AttributeContext::GetResponse,
+    );
+    assert_eq!((block.consumed, block.undecoded_mask), (5, 0));
+    for (attr, (name, value)) in block.attributes.iter().zip([
+        ("AdministrativeState", 0), ("AcsNetworkAddress", 0x8001), ("AssociatedTag", 46),
+    ]) {
+        assert_eq!(attr.definition.name, name);
+        assert_eq!(attr.value.unsigned(), Some(value));
+    }
+    assert_eq!(AttributeCodec::encode(
+        MeRegistry::get(137).unwrap(),
+        &[(1, AttributeValue::number(0)), (2, AttributeValue::number(0x200))],
+        AttributeContext::CreateRequest,
+    ).unwrap(), (0xc000, vec![0, 0, 2, 0]));
+}
+
+#[test]
+fn large_string_upload_decodes_count_and_parts_without_consuming_padding() {
+    let def = MeRegistry::get(157).unwrap();
+    let mut bytes = [0u8; 26];
+    bytes[0] = 1;
+    bytes[1..8].copy_from_slice(b"example");
+    let block = AttributeCodec::decode(def, 0xc000, &bytes, AttributeContext::MibUpload);
+    assert_eq!((block.consumed, block.undecoded_mask), (26, 0));
+    assert_eq!(block.attributes[0].definition.name, "NumberOfParts");
+    assert_eq!(block.attributes[0].value.unsigned(), Some(1));
+    assert_eq!(block.attributes[1].definition.name, "Part1");
+    assert_eq!(block.attributes[1].raw_hex, "6578616d706c65000000000000000000000000000000000000");
+    let last = AttributeCodec::decode(def, 0x0001, &[0; 26], AttributeContext::GetResponse);
+    assert_eq!(last.attributes[0].definition.name, "Part15");
+    assert_eq!((last.consumed, last.undecoded_mask), (25, 0));
+    assert_eq!(last.remaining_hex, "00");
+}
+
+#[test]
+fn ip_host_diagnostics_decode_mixed_width_counters_and_transport_binding() {
+    let counters = MeRegistry::get(135).unwrap();
+    let block = AttributeCodec::decode(
+        counters,
+        0x3f00,
+        &[0, 0, 0, 3, 0, 0, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8],
+        AttributeContext::GetResponse,
+    );
+    assert_eq!((block.consumed, block.undecoded_mask), (16, 0));
+    assert_eq!(block.attributes[0].definition.name, "IcmpErrors");
+    assert_eq!(block.attributes[2].definition.name, "DhcpTimeouts");
+    assert_eq!(block.attributes[5].value.unsigned(), Some(8));
+    assert!(AttributeCodec::encode(
+        counters,
+        &[(3, AttributeValue::number(0))],
+        AttributeContext::SetRequest,
+    ).is_err());
+
+    let binding = AttributeCodec::decode(
+        MeRegistry::get(136).unwrap(),
+        0xf000,
+        &[0x1d, 0x7b, 6, 0, 0, 9],
+        AttributeContext::GetResponse,
+    );
+    assert_eq!((binding.consumed, binding.undecoded_mask), (6, 0));
+    assert_eq!(binding.attributes[0].value.unsigned(), Some(7547));
+    assert_eq!(binding.attributes[3].definition.name, "IpHostPointer");
+    assert_eq!(binding.attributes[3].value.unsigned(), Some(9));
+
+    let auth = MeRegistry::get(148).unwrap();
+    assert!(auth.layout_supported);
+    let truncated = AttributeCodec::decode(
+        auth, 0x2000, &[0; 24], AttributeContext::GetResponse,
+    );
+    assert_eq!(truncated.consumed, 0);
+    assert_eq!(truncated.diagnostics[0].code, "truncated_attribute");
+}
+
+#[test]
 fn strings_signed_optics_and_table_context_preserve_raw() {
     let mut bytes = [0xff; 14];
     bytes[..5].copy_from_slice(b"K155 ");
