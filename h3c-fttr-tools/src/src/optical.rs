@@ -4,8 +4,6 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 pub const OWNER_LOCK: &str = "/var/run/fttr-optical.lock";
 
@@ -36,11 +34,11 @@ struct UciSession {
     dir: PathBuf,
     package: String,
     original: Vec<u8>,
+    uci: openwrt_uci::Uci,
 }
 impl UciSession {
     fn new(config: &std::path::Path) -> io::Result<Self> {
-        // -t alone retains /tmp/.uci in libuci's delta search path. A private
-        // snapshot with a unique package name cannot consume fttr's pending edits.
+        // A private snapshot with a unique package name cannot consume fttr's pending edits.
         let original = fs::read(config)?;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -51,13 +49,20 @@ impl UciSession {
                 std::env::temp_dir().join(format!("fttr-optical-{}-{nonce}", std::process::id()));
             match fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => {
-                    let session = Self {
+                    let package = format!("optical_{}_{stamp}_{nonce}", std::process::id());
+                    fs::write(path.join(&package), &original)?;
+                    let mut uci =
+                        openwrt_uci::Uci::new().map_err(|e| io::Error::other(e.to_string()))?;
+                    uci.set_confdir(&path)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    uci.set_savedir(&path)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    return Ok(Self {
                         dir: path,
-                        package: format!("optical_{}_{stamp}_{nonce}", std::process::id()),
+                        package,
                         original,
-                    };
-                    fs::write(session.dir.join(&session.package), &session.original)?;
-                    return Ok(session);
+                        uci,
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -65,44 +70,31 @@ impl UciSession {
         }
         Err(io::Error::other("cannot allocate optical UCI savedir"))
     }
-    fn run(&self, args: &[&str]) -> io::Result<String> {
-        // File-backed stdout avoids blocking on a full pipe for larger configs.
-        let output_path = self.dir.join("output");
-        let output = File::create(&output_path)?;
-        let mut child = Command::new("uci")
-            .arg("-q")
-            .arg("-c")
-            .arg(&self.dir)
-            .arg("-t")
-            .arg(&self.dir)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(output))
-            .stderr(Stdio::null())
-            .spawn()?;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10))
-                }
-                result => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(result.err().unwrap_or_else(|| {
-                        io::Error::new(io::ErrorKind::TimedOut, "optical UCI command timed out")
-                    }));
-                }
-            }
-        };
-        if !status.success() {
-            return Err(io::Error::other(format!("optical UCI {} failed", args[0])));
-        }
-        fs::read_to_string(output_path)
+
+    fn load(&mut self) -> io::Result<bool> {
+        let text = self
+            .uci
+            .export_package(&self.package)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        parse_export(&text)
     }
-    fn load(&self) -> io::Result<bool> {
-        parse_export(&self.run(&["export", &self.package])?)
+
+    fn set_optical(&mut self, enabled: bool) -> io::Result<()> {
+        self.uci
+            .ensure_section(&self.package, "optical", "optical")
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.uci
+            .set(
+                &self.package,
+                "optical",
+                "enabled",
+                if enabled { "1" } else { "0" },
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.uci
+            .commit(&self.package)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(())
     }
 }
 impl Drop for UciSession {
@@ -112,7 +104,15 @@ impl Drop for UciSession {
 }
 
 pub fn load_enabled() -> io::Result<bool> {
-    UciSession::new(std::path::Path::new(CONFIG))?.load()
+    let mut uci = openwrt_uci::Uci::new().map_err(|e| io::Error::other(e.to_string()))?;
+    let text = match uci.export_package("fttr") {
+        Ok(t) => t,
+        Err(openwrt_uci::UciError::PackageNotFound(_)) => {
+            return Ok(true);
+        }
+        Err(e) => return Err(io::Error::other(e.to_string())),
+    };
+    parse_export(&text)
 }
 
 pub fn save_enabled(enabled: bool) -> io::Result<()> {
@@ -127,17 +127,12 @@ fn save_at(config: &std::path::Path, enabled: bool) -> io::Result<()> {
             "FTTR configuration is being edited; retry",
         ));
     }
-    let session = UciSession::new(config)?;
+    let mut session = UciSession::new(config)?;
     let current = session.load()?;
     if current == enabled {
         return Ok(());
     }
-    session.run(&["set", &format!("{}.optical=optical", session.package)])?;
-    session.run(&[
-        "set",
-        &format!("{}.optical.enabled={}", session.package, u8::from(enabled)),
-    ])?;
-    session.run(&["commit", &session.package])?;
+    session.set_optical(enabled)?;
     if session.load()? != enabled {
         return Err(io::Error::other("optical configuration readback mismatch"));
     }

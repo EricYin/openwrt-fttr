@@ -258,8 +258,40 @@ async fn command(program: &str, args: &[&str]) -> io::Result<String> {
 }
 
 async fn reconcile(admission: &Mutex<Admission>, state: &mut Reconciler) -> io::Result<()> {
-    let config = command("uci", &["-q", "show", "fttr"]).await?;
-    let firewall = command("uci", &["-q", "show", "firewall"]).await?;
+    let (config, firewall) = {
+        let mut uci = openwrt_uci::Uci::new().map_err(|e| io::Error::other(e.to_string()))?;
+        let bridge = uci
+            .get("fttr", "offload", "bridge")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "br-lan".into());
+        let offload_enabled = uci
+            .get("fttr", "offload", "enabled")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "1".into());
+        let hw_offload = uci
+            .get("firewall", "@defaults[0]", "flow_offloading_hw")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("1")
+            && uci
+                .get("firewall", "@defaults[0]", "flow_offloading")
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("1");
+
+        let config =
+            format!("fttr.offload.bridge={bridge}\nfttr.offload.enabled={offload_enabled}\n");
+        let firewall = if hw_offload {
+            "firewall.@defaults[0]=defaults\nfirewall.@defaults[0].flow_offloading='1'\nfirewall.@defaults[0].flow_offloading_hw='1'\n".to_string()
+        } else {
+            "firewall.@defaults[0]=defaults\n".to_string()
+        };
+        (config, firewall)
+    };
     let topology = topology(&config, &firewall, Path::new(NET), Path::new(MASK))?;
     let current = admission.lock().unwrap().current()?;
     if !state.observe(topology, current) {

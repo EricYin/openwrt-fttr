@@ -161,34 +161,34 @@ fn handle_offload(args: &[String]) {
                         return Err(std::io::Error::other("Invalid bridge interface"));
                     }
                 }
-                let uci = |args: &[&str]| -> std::io::Result<()> {
-                    let output = Command::new("uci").args(args).output()?;
-                    if output.status.success() {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::other(format!("uci {} failed", args[0])))
-                    }
-                };
                 // Do not commit unrelated staged edits from another LuCI session.
-                let pending = Command::new("uci").args(["changes", "fttr"]).output()?;
-                if !pending.status.success() || !pending.stdout.is_empty() {
+                let delta_path = std::path::Path::new("/tmp/.uci/fttr");
+                if delta_path.exists()
+                    && std::fs::metadata(delta_path)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false)
+                {
                     return Err(std::io::Error::other(
                         "FTTR has pending UCI changes; apply or revert them first",
                     ));
                 }
-                uci(&["set", "fttr.offload=offload"])?;
-                uci(&[
-                    "set",
-                    if enabled {
-                        "fttr.offload.enabled=1"
-                    } else {
-                        "fttr.offload.enabled=0"
-                    },
-                ])?;
+                let mut uci =
+                    openwrt_uci::Uci::new().map_err(|e| std::io::Error::other(e.to_string()))?;
+                uci.ensure_section("fttr", "offload", "offload")
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                uci.set(
+                    "fttr",
+                    "offload",
+                    "enabled",
+                    if enabled { "1" } else { "0" },
+                )
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
                 if let Some(bridge) = bridge {
-                    uci(&["set", &format!("fttr.offload.bridge={bridge}")])?;
+                    uci.set("fttr", "offload", "bridge", bridge)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
                 }
-                uci(&["commit", "fttr"])?;
+                uci.commit("fttr")
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 if !enabled {
                     std::fs::write("/sys/module/h3c_fmcs/parameters/bridge_offload_mask", "0\n")?;
                     if std::fs::read_to_string(
