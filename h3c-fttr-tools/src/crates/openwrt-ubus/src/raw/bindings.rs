@@ -8,7 +8,7 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-use std::os::raw::{c_char, c_int, c_ulong, c_void};
+use std::os::raw::{c_char, c_int, c_uint, c_ulong, c_void};
 
 pub const UBUS_STATUS_OK: c_int = 0;
 pub const UBUS_STATUS_INVALID_COMMAND: c_int = 1;
@@ -42,12 +42,45 @@ pub struct list_head {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct avl_node {
+    pub list: list_head,
+    pub parent: *mut avl_node,
     pub left: *mut avl_node,
     pub right: *mut avl_node,
-    pub parent: *mut avl_node,
     pub key: *const c_void,
     pub balance: i8,
     pub leader: bool,
+}
+
+pub type avl_tree_comp =
+    Option<unsafe extern "C" fn(k1: *const c_void, k2: *const c_void, ptr: *mut c_void) -> c_int>;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct avl_tree {
+    pub list_head: list_head,
+    pub root: *mut avl_node,
+    pub count: c_uint,
+    pub allow_dups: bool,
+    pub comp: avl_tree_comp,
+    pub cmp_ptr: *mut c_void,
+}
+
+pub type uloop_fd_handler = Option<unsafe extern "C" fn(u: *mut uloop_fd, events: c_uint)>;
+
+pub const ULOOP_READ: u8 = 1 << 0;
+pub const ULOOP_WRITE: u8 = 1 << 1;
+pub const ULOOP_EDGE_TRIGGER: u8 = 1 << 2;
+pub const ULOOP_BLOCKING: u8 = 1 << 3;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct uloop_fd {
+    pub cb: uloop_fd_handler,
+    pub fd: c_int,
+    pub eof: bool,
+    pub error: bool,
+    pub registered: bool,
+    pub flags: u8,
 }
 
 #[repr(C)]
@@ -72,14 +105,31 @@ pub struct blobmsg_policy {
 }
 
 #[repr(C)]
-pub struct ubus_request_data {
-    pub num: u32,
-    pub deferred: bool,
-    pub req: *mut c_void,
+#[derive(Debug, Copy, Clone)]
+pub struct ubus_acl_key {
+    pub user: *const c_char,
+    pub group: *const c_char,
+    pub object: *const c_char,
 }
 
-// Opaque context for callers
-pub enum ubus_context {}
+#[repr(C)]
+pub struct ubus_request_data {
+    pub object: u32,
+    pub peer: u32,
+    pub seq: u16,
+    pub acl: ubus_acl_key,
+    pub deferred: bool,
+    pub fd: c_int,
+    pub req_fd: c_int,
+}
+
+#[repr(C)]
+pub struct ubus_context {
+    pub requests: list_head,
+    pub objects: avl_tree,
+    pub pending: list_head,
+    pub sock: uloop_fd,
+}
 
 #[repr(C)]
 pub struct ubus_request {
@@ -109,6 +159,8 @@ pub type ubus_handler_t = unsafe extern "C" fn(
     msg: *mut blob_attr,
 ) -> c_int;
 
+pub type ubus_state_handler_t = unsafe extern "C" fn(ctx: *mut ubus_context, obj: *mut ubus_object);
+
 pub type ubus_data_handler_t =
     unsafe extern "C" fn(req: *mut ubus_request, type_: c_int, msg: *mut blob_attr);
 
@@ -118,6 +170,7 @@ pub struct ubus_method {
     pub name: *const c_char,
     pub handler: Option<ubus_handler_t>,
     pub mask: c_ulong,
+    pub tags: c_ulong,
     pub policy: *const blobmsg_policy,
     pub n_policy: c_int,
 }
@@ -125,7 +178,7 @@ pub struct ubus_method {
 #[repr(C)]
 pub struct ubus_object_type {
     pub name: *const c_char,
-    pub id: c_int,
+    pub id: u32,
     pub methods: *const ubus_method,
     pub n_methods: c_int,
 }
@@ -133,11 +186,12 @@ pub struct ubus_object_type {
 #[repr(C)]
 pub struct ubus_object {
     pub avl: avl_node,
-    pub type_: *mut ubus_object_type,
-    pub subscribe_cb: Option<ubus_handler_t>,
-    pub has_subscribers: bool,
     pub name: *const c_char,
     pub id: u32,
+    pub path: *const c_char,
+    pub type_: *mut ubus_object_type,
+    pub subscribe_cb: Option<ubus_state_handler_t>,
+    pub has_subscribers: bool,
     pub methods: *const ubus_method,
     pub n_methods: c_int,
 }

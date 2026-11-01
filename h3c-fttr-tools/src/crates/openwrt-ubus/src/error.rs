@@ -21,6 +21,8 @@ pub enum UbusError {
     Timeout,
     #[error("Serialization error: {0}")]
     Serialization(String),
+    #[error("Ubus backend error: {0}")]
+    Backend(String),
     #[error("String contains null byte: {0}")]
     NullByte(#[from] std::ffi::NulError),
 }

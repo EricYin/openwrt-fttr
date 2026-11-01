@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 use super::activation::{clear_offline_hardware, RangingSession};
 use crate::bosa;
 use crate::fpga;
@@ -102,6 +104,7 @@ struct OpticalRequest {
     deadline: Instant,
 }
 
+#[derive(Clone)]
 struct OpticalClient {
     requests: SyncSender<OpticalRequest>,
     hardware_ready: Arc<AtomicBool>,
@@ -458,6 +461,237 @@ fn start_ipc_server(
     ipc_server::start(listener, ipc_handler(devices, pon_engine, services, optics));
 }
 
+fn start_ubus_server(
+    devices: Arc<Mutex<Vec<SubDevice>>>,
+    pon_engine: Arc<Mutex<PonEngine>>,
+    services: super::service::States,
+    optics: OpticalClient,
+) -> Option<std::thread::JoinHandle<()>> {
+    let mut server = match openwrt_ubus::UbusServer::new(None) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[-] Native ubus server not available: {e}");
+            return None;
+        }
+    };
+
+    let create_methods = |devices: Arc<Mutex<Vec<SubDevice>>>,
+                          pon_engine: Arc<Mutex<PonEngine>>,
+                          services: super::service::States,
+                          optics: OpticalClient|
+     -> Vec<(String, openwrt_ubus::MethodHandler)> {
+        let mut m: Vec<(String, openwrt_ubus::MethodHandler)> = Vec::new();
+
+        m.push((
+            "get_capabilities".into(),
+            Box::new(|_, _| {
+                let caps_str = crate::capabilities::json();
+                let caps_val: Value = serde_json::from_str(&caps_str).unwrap_or(Value::Null);
+                Ok(caps_val)
+            }),
+        ));
+
+        let d = devices.clone();
+        let p = pon_engine.clone();
+        let s = services.clone();
+        let status_fn = move |_: &str, _: Option<&Value>| {
+            let provisioning = crate::provisioning::snapshot();
+            let devs = d.lock().unwrap();
+            let engine = p.lock().unwrap();
+            let sys_status = super::status::snapshot(&engine, &s, (&devs, provisioning));
+
+            #[derive(serde::Serialize)]
+            struct Status<'a> {
+                #[serde(flatten)]
+                system: &'a FttrSystemStatus,
+                ipc: ipc_server::metrics::Snapshot,
+            }
+            let status = Status {
+                system: &sys_status,
+                ipc: ipc_server::metrics::snapshot(),
+            };
+            serde_json::to_value(&status).map_err(|_| 9)
+        };
+        m.push(("get_status".into(), Box::new(status_fn)));
+
+        let d = devices.clone();
+        let p = pon_engine.clone();
+        let s = services.clone();
+        m.push((
+            "status".into(),
+            Box::new(move |_, _| {
+                let provisioning = crate::provisioning::snapshot();
+                let devs = d.lock().unwrap();
+                let engine = p.lock().unwrap();
+                let sys_status = super::status::snapshot(&engine, &s, (&devs, provisioning));
+
+                #[derive(serde::Serialize)]
+                struct Status<'a> {
+                    #[serde(flatten)]
+                    system: &'a FttrSystemStatus,
+                    ipc: ipc_server::metrics::Snapshot,
+                }
+                let status = Status {
+                    system: &sys_status,
+                    ipc: ipc_server::metrics::snapshot(),
+                };
+                serde_json::to_value(&status).map_err(|_| 9)
+            }),
+        ));
+
+        m.push((
+            "get_sync".into(),
+            Box::new(|_, _| {
+                let resp = crate::provisioning::control("{\"op\":\"status\"}");
+                serde_json::from_str(&resp).map_err(|_| 9)
+            }),
+        ));
+
+        m.push((
+            "config_check".into(),
+            Box::new(|_, _| {
+                let resp = crate::provisioning::control("{\"op\":\"check\"}");
+                serde_json::from_str(&resp).map_err(|_| 9)
+            }),
+        ));
+
+        m.push((
+            "config_reload".into(),
+            Box::new(|_, _| {
+                let resp = crate::provisioning::control("{\"op\":\"reload\"}");
+                serde_json::from_str(&resp).map_err(|_| 9)
+            }),
+        ));
+
+        m.push((
+            "sync".into(),
+            Box::new(|_, msg| {
+                let req_json = msg.cloned().unwrap_or_else(|| serde_json::json!({}));
+                let action = req_json
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("plan");
+                let target = req_json
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("all");
+                let management = req_json
+                    .get("management")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let item = req_json.get("item").and_then(|v| v.as_str());
+
+                let payload = serde_json::json!({
+                    "op": action,
+                    "target": target,
+                    "management": management,
+                    "item": item
+                });
+                let resp = crate::provisioning::control(&payload.to_string());
+                serde_json::from_str(&resp).map_err(|_| 9)
+            }),
+        ));
+
+        let opt = optics.clone();
+        m.push((
+            "optical_status".into(),
+            Box::new(move |_, _| {
+                let response = match opt.request(OpticalCommand::Status) {
+                    Ok(resp) => resp,
+                    Err(error) => OpticalReply::unavailable(
+                        OpticalCommand::Status,
+                        opt.hardware_ready.load(Ordering::Acquire),
+                        error,
+                    ),
+                };
+                serde_json::to_value(&response).map_err(|_| 9)
+            }),
+        ));
+
+        let opt = optics.clone();
+        m.push((
+            "optical_set".into(),
+            Box::new(move |_, msg| {
+                let enabled = msg
+                    .and_then(|v| v.get("enabled"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let cmd = if enabled {
+                    OpticalCommand::On
+                } else {
+                    OpticalCommand::Off
+                };
+                let response = match opt.request(cmd) {
+                    Ok(resp) => resp,
+                    Err(error) => OpticalReply::unavailable(
+                        cmd,
+                        opt.hardware_ready.load(Ordering::Acquire),
+                        error,
+                    ),
+                };
+                serde_json::to_value(&response).map_err(|_| 9)
+            }),
+        ));
+
+        #[cfg(feature = "npu")]
+        m.push((
+            "npu_status".into(),
+            Box::new(|_, _| {
+                let status = crate::npu::status_from(
+                    std::path::Path::new("/etc/config/fttr"),
+                    std::path::Path::new("/sys/kernel/debug/ppe0/entries"),
+                    std::path::Path::new("/sys/module/h3c_fmcs/parameters"),
+                );
+                serde_json::to_value(&status).map_err(|_| 9)
+            }),
+        ));
+
+        m.push((
+            "restart_service".into(),
+            Box::new(|_, _| {
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let _ = std::process::Command::new("/etc/init.d/fttr")
+                        .arg("restart")
+                        .spawn();
+                });
+                Ok(serde_json::json!({ "restarting": true }))
+            }),
+        ));
+
+        m
+    };
+
+    let methods_luci = create_methods(
+        devices.clone(),
+        pon_engine.clone(),
+        services.clone(),
+        optics.clone(),
+    );
+    if let Err(e) = server.add_object("luci.fttr", methods_luci) {
+        eprintln!("[-] Failed to register 'luci.fttr' ubus object: {e}");
+    } else {
+        println!("[+] Registered native ubus object 'luci.fttr'");
+    }
+
+    let methods_fttr = create_methods(devices, pon_engine, services, optics);
+    if let Err(e) = server.add_object("fttr", methods_fttr) {
+        eprintln!("[-] Failed to register 'fttr' ubus object: {e}");
+    } else {
+        println!("[+] Registered native ubus object 'fttr'");
+    }
+
+    std::thread::Builder::new()
+        .name("ubus-server".into())
+        .spawn(move || {
+            println!("[+] Native ubus event loop started.");
+            if let Err(e) = server.run_loop() {
+                eprintln!("[-] ubus server run_loop exited with error: {e}");
+            }
+        })
+        .ok()
+}
+
 fn ipc_handler(
     devices: Arc<Mutex<Vec<SubDevice>>>,
     pon_engine: Arc<Mutex<PonEngine>>,
@@ -722,13 +956,24 @@ async fn run_async() {
             pon_engine.clone(),
             service_states.clone(),
             OpticalClient {
-                requests: optical_requests,
+                requests: optical_requests.clone(),
                 hardware_ready: hardware_ready.clone(),
                 stopping: stopping.clone(),
             },
         );
         println!("[+] IPC socket server listening on {}", ipc::SOCKET_PATH);
     }
+
+    let _ubus_thread = start_ubus_server(
+        devices.clone(),
+        pon_engine.clone(),
+        service_states.clone(),
+        OpticalClient {
+            requests: optical_requests,
+            hardware_ready: hardware_ready.clone(),
+            stopping: stopping.clone(),
+        },
+    );
 
     // One hardware owner performs initialization, transitions and PLOAM reception.
     {

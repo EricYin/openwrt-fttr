@@ -30,6 +30,25 @@ fn verify_abi() {
     assert_eq!(BLOBMSG_TYPE_INT16, 6);
     assert_eq!(BLOBMSG_TYPE_INT8, 7);
     assert_eq!(BLOBMSG_TYPE_DOUBLE, 8);
+
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert_eq!(std::mem::size_of::<list_head>(), 16);
+        assert_eq!(std::mem::size_of::<avl_node>(), 56);
+        assert_eq!(std::mem::size_of::<avl_tree>(), 48);
+        assert_eq!(std::mem::size_of::<uloop_fd>(), 16);
+        assert_eq!(std::mem::size_of::<blob_attr>(), 4);
+        assert_eq!(std::mem::size_of::<blob_buf>(), 32);
+        assert_eq!(std::mem::size_of::<blobmsg_policy>(), 16);
+        assert_eq!(std::mem::size_of::<ubus_acl_key>(), 24);
+        assert_eq!(std::mem::size_of::<ubus_request_data>(), 56);
+        #[cfg(windows)]
+        assert_eq!(std::mem::size_of::<ubus_method>(), 40);
+        #[cfg(not(windows))]
+        assert_eq!(std::mem::size_of::<ubus_method>(), 48);
+        assert_eq!(std::mem::size_of::<ubus_object_type>(), 32);
+        assert_eq!(std::mem::size_of::<ubus_object>(), 120);
+    }
 }
 
 fn main() {

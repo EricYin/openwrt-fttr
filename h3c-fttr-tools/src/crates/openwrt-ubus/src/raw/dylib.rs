@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::Arc;
 
 use super::bindings::*;
@@ -81,6 +81,12 @@ type FnBlobmsgFormatJsonWithCb = unsafe extern "C" fn(
 type FnBlobmsgAddJsonFromString =
     unsafe extern "C" fn(b: *mut blob_buf, str_: *const c_char) -> bool;
 
+type FnUloopInit = unsafe extern "C" fn() -> c_int;
+type FnUloopRunTimeout = unsafe extern "C" fn(timeout: c_int) -> c_int;
+type FnUloopDone = unsafe extern "C" fn();
+type FnUloopFdAdd = unsafe extern "C" fn(fd: *mut uloop_fd, flags: c_uint) -> c_int;
+type FnUloopFdDelete = unsafe extern "C" fn(fd: *mut uloop_fd) -> c_int;
+
 #[derive(Clone)]
 pub struct LibUbus {
     inner: Arc<LibUbusInner>,
@@ -106,6 +112,13 @@ struct LibUbusInner {
     pub blob_buf_free: FnBlobBufFree,
     pub blobmsg_format_json_with_cb: Option<FnBlobmsgFormatJsonWithCb>,
     pub blobmsg_add_json_from_string: Option<FnBlobmsgAddJsonFromString>,
+
+    pub uloop_init: FnUloopInit,
+    pub uloop_run_timeout: FnUloopRunTimeout,
+    pub uloop_done: FnUloopDone,
+    pub uloop_fd_add: FnUloopFdAdd,
+    pub uloop_fd_delete: FnUloopFdDelete,
+    pub uloop_cancelled: *mut bool,
 }
 
 unsafe impl Send for LibUbusInner {}
@@ -281,6 +294,20 @@ impl LibUbus {
                     FnBlobmsgAddJsonFromString
                 ),
 
+                uloop_init: resolve!(handle_ubox.raw(), uloop_init, FnUloopInit),
+                uloop_run_timeout: resolve!(
+                    handle_ubox.raw(),
+                    uloop_run_timeout,
+                    FnUloopRunTimeout
+                ),
+                uloop_done: resolve!(handle_ubox.raw(), uloop_done, FnUloopDone),
+                uloop_fd_add: resolve!(handle_ubox.raw(), uloop_fd_add, FnUloopFdAdd),
+                uloop_fd_delete: resolve!(handle_ubox.raw(), uloop_fd_delete, FnUloopFdDelete),
+                uloop_cancelled: {
+                    let c_sym = CString::new("uloop_cancelled").unwrap();
+                    dlsym(handle_ubox.raw(), c_sym.as_ptr()) as *mut bool
+                },
+
                 handle_ubus: handle_ubus.into_raw(),
                 handle_ubox: handle_ubox.into_raw(),
                 handle_json: handle_json.into_raw(),
@@ -416,5 +443,43 @@ impl LibUbus {
             }
         }
         format!("ubus error {code}")
+    }
+
+    #[inline]
+    pub unsafe fn uloop_init(&self) -> c_int {
+        (self.inner.uloop_init)()
+    }
+
+    #[inline]
+    pub unsafe fn uloop_run(&self) -> c_int {
+        (self.inner.uloop_run_timeout)(-1)
+    }
+
+    #[inline]
+    pub unsafe fn uloop_end(&self) {
+        if !self.inner.uloop_cancelled.is_null() {
+            *self.inner.uloop_cancelled = true;
+        }
+    }
+
+    #[inline]
+    pub unsafe fn uloop_done(&self) {
+        (self.inner.uloop_done)()
+    }
+
+    #[inline]
+    pub unsafe fn uloop_fd_add(&self, fd: *mut uloop_fd, flags: c_uint) -> c_int {
+        (self.inner.uloop_fd_add)(fd, flags)
+    }
+
+    #[inline]
+    pub unsafe fn uloop_fd_delete(&self, fd: *mut uloop_fd) -> c_int {
+        (self.inner.uloop_fd_delete)(fd)
+    }
+
+    #[inline]
+    pub unsafe fn ubus_add_uloop(&self, ctx: *mut ubus_context) -> c_int {
+        let flags = (ULOOP_BLOCKING | ULOOP_READ) as c_uint;
+        self.uloop_fd_add(&mut (*ctx).sock, flags)
     }
 }
