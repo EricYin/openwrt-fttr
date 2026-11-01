@@ -7,7 +7,7 @@ PKG_URL:=https://github.com/LazuliKao/openwrt-fttr/tree/main/h3c-fttr-tools
 
 PKG_BUILD_DEPENDS:=rust/host
 PKG_BUILD_PARALLEL:=1
-PKG_CONFIG_DEPENDS:=CONFIG_FTTR_DEVICE_HL202 CONFIG_FTTR_DEVICE_HWTC CONFIG_FTTR_DEVICE_STAR CONFIG_FTTR_ACS CONFIG_FTTR_MQTT CONFIG_FTTR_NPU CONFIG_FTTR_MIMALLOC
+PKG_CONFIG_DEPENDS:=CONFIG_FTTR_DEVICE_HL202 CONFIG_FTTR_DEVICE_HWTC CONFIG_FTTR_DEVICE_STAR CONFIG_FTTR_DEVICE_ZTE CONFIG_FTTR_ACS CONFIG_FTTR_MQTT CONFIG_FTTR_NPU CONFIG_FTTR_MIMALLOC
 
 include $(INCLUDE_DIR)/package.mk
 include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk
@@ -38,6 +38,10 @@ define Package/h3c-fttr-tools/config
     bool "Compile STAR adapter (SG631Z-C identity, generic OMCI bridge)"
     depends on PACKAGE_h3c-fttr-tools
     default y
+  config FTTR_DEVICE_ZTE
+    bool "Compile ZTE adapter (ZXHN G1612 identity, generic OMCI bridge)"
+    depends on PACKAGE_h3c-fttr-tools
+    default y
   config FTTR_ACS
     bool "Compile embedded minimal CWMP ACS (runtime UCI switch)"
     depends on PACKAGE_h3c-fttr-tools
@@ -62,7 +66,7 @@ define Package/h3c-fttr-tools/config
       Disable to build without the NPU control service; software bridging remains available.
 endef
 
-RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC),device-hwtc) $(if $(CONFIG_FTTR_DEVICE_STAR),device-star) $(if $(CONFIG_FTTR_ACS),acs) $(if $(CONFIG_FTTR_MQTT),mqtt) $(if $(CONFIG_FTTR_NPU),npu) $(if $(CONFIG_FTTR_MIMALLOC),allocator-mimalloc)
+RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC),device-hwtc) $(if $(CONFIG_FTTR_DEVICE_STAR),device-star) $(if $(CONFIG_FTTR_DEVICE_ZTE),device-zte) $(if $(CONFIG_FTTR_ACS),acs) $(if $(CONFIG_FTTR_MQTT),mqtt) $(if $(CONFIG_FTTR_NPU),npu) $(if $(CONFIG_FTTR_MIMALLOC),allocator-mimalloc)
 CARGO_PKG_ARGS+= --no-default-features --frozen
 
 define Build/Prepare

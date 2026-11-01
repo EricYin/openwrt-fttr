@@ -24,6 +24,7 @@ pub fn compiled() -> Capabilities {
     let hl202 = cfg!(feature = "device-hl202");
     let hwtc = cfg!(feature = "device-hwtc");
     let star = cfg!(feature = "device-star");
+    let zte = cfg!(feature = "device-zte");
     let mut adapters = Vec::new();
     if hl202 {
         adapters.push(AdapterCapability {
@@ -43,6 +44,12 @@ pub fn compiled() -> Capabilities {
             name: "STAR SG631",
         });
     }
+    if zte {
+        adapters.push(AdapterCapability {
+            id: "zte",
+            name: "ZTE G1612",
+        });
+    }
     adapters.push(AdapterCapability {
         id: "generic",
         name: "Generic G.988 Bridge",
@@ -57,6 +64,7 @@ pub fn compiled() -> Capabilities {
             ("device-hl202", hl202),
             ("device-hwtc", hwtc),
             ("device-star", star),
+            ("device-zte", zte),
         ]),
         functions: BTreeMap::from([
             ("optical", true),

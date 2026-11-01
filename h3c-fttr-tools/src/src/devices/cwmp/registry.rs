@@ -11,6 +11,8 @@ pub fn available() -> Vec<&'static Contract> {
         &crate::devices::hwtc::cwmp::V152_CONTRACT,
         #[cfg(feature = "device-hwtc")]
         &crate::devices::hwtc::cwmp::K155_CONTRACT,
+        #[cfg(feature = "device-zte")]
+        &crate::devices::zte::g1612::cwmp::CONTRACT,
     ];
     vendor::candidates()
         .into_iter()

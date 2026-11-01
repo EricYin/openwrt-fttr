@@ -99,8 +99,11 @@ impl OmciSession {
             while Instant::now() < end {
                 self.check_active()?;
                 match self.transport.receive()? {
-                    Some(frame) if frame.answers(&request) => return Ok(frame),
-                    Some(_) => (),
+                    Some(frame) if frame.answers(&request) => {
+                        std::thread::sleep(Duration::from_millis(25));
+                        return Ok(frame);
+                    }
+                    Some(_) => std::thread::sleep(Duration::from_millis(2)),
                     None => std::thread::sleep(Duration::from_millis(2)),
                 }
             }
