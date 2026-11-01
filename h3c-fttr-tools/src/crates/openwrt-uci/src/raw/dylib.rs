@@ -70,6 +70,12 @@ type FnUciSave = unsafe extern "C" fn(ctx: *mut uci_context, p: *mut uci_package
 type FnUciCommit =
     unsafe extern "C" fn(ctx: *mut uci_context, p: *mut *mut uci_package, overwrite: bool) -> c_int;
 type FnUciRevert = unsafe extern "C" fn(ctx: *mut uci_context, ptr: *mut uci_ptr) -> c_int;
+type FnUciExport = unsafe extern "C" fn(
+    ctx: *mut uci_context,
+    stream: *mut libc::FILE,
+    p: *mut uci_package,
+    header: bool,
+) -> c_int;
 type FnUciGetErrorstr = unsafe extern "C" fn(
     ctx: *mut uci_context,
     dest: *mut *mut c_char,
@@ -97,6 +103,7 @@ struct LibUciInner {
     pub uci_save: FnUciSave,
     pub uci_commit: FnUciCommit,
     pub uci_revert: FnUciRevert,
+    pub uci_export: FnUciExport,
     pub uci_get_errorstr: Option<FnUciGetErrorstr>,
 }
 
@@ -217,6 +224,7 @@ impl LibUci {
                 uci_save: resolve!(uci_save, FnUciSave),
                 uci_commit: resolve!(uci_commit, FnUciCommit),
                 uci_revert: resolve!(uci_revert, FnUciRevert),
+                uci_export: resolve!(uci_export, FnUciExport),
                 uci_get_errorstr: resolve_opt!(uci_get_errorstr, FnUciGetErrorstr),
             };
 
@@ -316,6 +324,17 @@ impl LibUci {
     #[inline]
     pub unsafe fn uci_revert(&self, ctx: *mut uci_context, ptr: *mut uci_ptr) -> c_int {
         (self.inner.uci_revert)(ctx, ptr)
+    }
+
+    #[inline]
+    pub unsafe fn uci_export(
+        &self,
+        ctx: *mut uci_context,
+        stream: *mut libc::FILE,
+        p: *mut uci_package,
+        header: bool,
+    ) -> c_int {
+        (self.inner.uci_export)(ctx, stream, p, header)
     }
 
     pub unsafe fn get_error_message(&self, ctx: *mut uci_context) -> String {

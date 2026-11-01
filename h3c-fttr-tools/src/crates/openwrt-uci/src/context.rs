@@ -237,6 +237,71 @@ impl Uci {
         }
         Ok(())
     }
+
+    /// Export a loaded UCI package into canonical OpenWrt UCI text format.
+    pub fn export_package(&mut self, package: &str) -> Result<String, UciError> {
+        let c_pkg = CString::new(package)?;
+        let mut p: *mut uci_package = std::ptr::null_mut();
+
+        unsafe {
+            let ret = self.lib.uci_load(self.ctx, c_pkg.as_ptr(), &mut p);
+            if ret != UCI_OK && ret != UCI_ERR_DUPLICATE {
+                return Err(UciError::PackageNotFound(package.to_string()));
+            }
+            if p.is_null() {
+                let mut ptr = uci_ptr::default();
+                let mut buf = package.as_bytes().to_vec();
+                buf.push(0);
+                if self.lib.uci_lookup_ptr(
+                    self.ctx,
+                    &mut ptr,
+                    buf.as_mut_ptr() as *mut c_char,
+                    true,
+                ) == UCI_OK
+                {
+                    p = ptr.p;
+                }
+            }
+            if p.is_null() {
+                return Err(UciError::PackageNotFound(package.to_string()));
+            }
+
+            #[cfg(unix)]
+            {
+                let mut buf_ptr: *mut c_char = std::ptr::null_mut();
+                let mut buf_size: libc::size_t = 0;
+                let stream = libc::open_memstream(&mut buf_ptr, &mut buf_size);
+                if stream.is_null() {
+                    return Err(UciError::Backend("open_memstream failed".into()));
+                }
+
+                let ret = self.lib.uci_export(self.ctx, stream, p, true);
+                libc::fclose(stream);
+
+                if ret != UCI_OK {
+                    if !buf_ptr.is_null() {
+                        libc::free(buf_ptr as *mut std::ffi::c_void);
+                    }
+                    return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+                }
+
+                if buf_ptr.is_null() {
+                    return Ok(String::new());
+                }
+
+                let res = CStr::from_ptr(buf_ptr).to_string_lossy().into_owned();
+                libc::free(buf_ptr as *mut std::ffi::c_void);
+                Ok(res)
+            }
+
+            #[cfg(not(unix))]
+            {
+                Err(UciError::Backend(
+                    "export_package not supported on non-unix target".into(),
+                ))
+            }
+        }
+    }
 }
 
 impl Drop for Uci {

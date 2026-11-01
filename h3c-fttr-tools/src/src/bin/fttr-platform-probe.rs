@@ -62,6 +62,18 @@ fn test_uci() -> Result<(), String> {
         }
     }
 
+    println!("[PROBE] Testing in-process native UCI package export on 'system'...");
+    match uci.export_package("system") {
+        Ok(text) => {
+            let line_count = text.lines().count();
+            println!("  [+] Successfully exported 'system' via libuci C API ({line_count} lines, {} bytes)", text.len());
+        }
+        Err(e) => {
+            println!("  [-] UCI export failed: {e}");
+            return Err(e.to_string());
+        }
+    }
+
     Ok(())
 }
 

@@ -1,7 +1,6 @@
 use super::model::ItemKind;
 pub(super) use super::model::{Config, Device, Item, Management, Parameter};
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::Command;
 
 pub(super) const CUSTOM_VLAN_SERVICE_LIST_ALLOWED: &[&str] = &["INTERNET", "OTHER", "IPTV", "VOIP"];
 
@@ -95,14 +94,17 @@ pub(crate) fn words(line: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 pub fn load() -> Result<Config, String> {
-    let output = Command::new("uci")
-        .args(["-q", "-n", "export", "fttr"])
-        .output()
-        .map_err(|e| format!("uci: {e}"))?;
-    if !output.status.success() {
-        return Err("cannot export /etc/config/fttr".into());
-    }
-    parse(std::str::from_utf8(&output.stdout).map_err(|_| "UCI is not UTF-8")?)
+    let text = match openwrt_uci::Uci::new() {
+        Ok(mut uci) => uci
+            .export_package("fttr")
+            .map_err(|e| format!("uci: {e}"))?,
+        Err(_) => {
+            // Direct file fallback when running outside standard OpenWrt environment
+            std::fs::read_to_string("/etc/config/fttr")
+                .map_err(|e| format!("cannot load /etc/config/fttr: {e}"))?
+        }
+    };
+    parse(&text)
 }
 pub fn parse(text: &str) -> Result<Config, String> {
     super::templates::compile(text)
