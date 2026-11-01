@@ -58,7 +58,7 @@ cargo check --locked --all-targets --no-default-features --features all-devices,
 ```powershell
 $previous = $env:RUSTFLAGS
 try {
-    $env:RUSTFLAGS = '-C target-feature=+crt-static'
+    $env:RUSTFLAGS = '-C target-feature=-crt-static -C link-arg=-dynamic'
     cargo zigbuild --release --locked --target aarch64-unknown-linux-musl --no-default-features --features all-devices,acs,mqtt,npu --bin fttrd --bin fttrctl
 } finally {
     $env:RUSTFLAGS = $previous
