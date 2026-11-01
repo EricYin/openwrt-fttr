@@ -53,12 +53,14 @@ pub fn compiled() -> Capabilities {
         features: BTreeMap::from([
             ("acs", acs),
             ("mqtt", mqtt),
+            ("npu", cfg!(feature = "npu")),
             ("device-hl202", hl202),
             ("device-hwtc", hwtc),
             ("device-star", star),
         ]),
         functions: BTreeMap::from([
             ("optical", true),
+            ("bridge_offload", cfg!(feature = "npu")),
             ("omci_mib", true),
             ("mqtt_telemetry", mqtt),
             ("hl202_management", hl202 && mqtt),

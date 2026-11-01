@@ -143,6 +143,7 @@ struct fmcs_priv {
 	/* Published after all lower/upper links exist; protected by RTNL/RCU. */
 	struct net_device __rcu *fttr_lower;
 	struct notifier_block fttr_netdev_nb;
+	struct fmcs_bridge_offload *bridge_offload;
 
 	/* Synchronization */
 	struct mutex lock;
@@ -176,6 +177,12 @@ int fmcs_spi_recv_ploam(struct fmcs_priv *priv, u8 *data, size_t *len);
 int fmcs_netdevs_init(struct fmcs_priv *priv);
 void fmcs_netdevs_exit(struct fmcs_priv *priv);
 int fmcs_fttr_set_carrier(struct fmcs_priv *priv, unsigned int port, bool carrier);
+int fmcs_bridge_init(struct fmcs_priv *priv);
+void fmcs_bridge_exit(struct fmcs_priv *priv);
+void fmcs_bridge_unbind(struct fmcs_priv *priv, struct net_device *lower);
+int fmcs_bridge_setup_tc(struct fmcs_priv *priv, enum tc_setup_type type, void *data);
+bool fmcs_bridge_port_enabled(struct fmcs_priv *priv, unsigned int port);
+bool fmcs_bridge_pair_enabled(struct fmcs_priv *priv, unsigned int src, unsigned int dst);
 void fmcs_rx_omci_frame(struct fmcs_priv *priv, const u8 *data, size_t len);
 void fmcs_rx_ploam_frame(struct fmcs_priv *priv, const u8 *data, size_t len);
 

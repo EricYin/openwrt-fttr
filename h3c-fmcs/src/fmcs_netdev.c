@@ -13,6 +13,7 @@
 #include <linux/of_net.h>
 #include <linux/rtnetlink.h>
 #include <net/netfilter/nf_flow_table.h>
+#include <net/switchdev.h>
 #include "fmcs.h"
 
 struct fmcs_fttr_port_priv {
@@ -24,6 +25,9 @@ static rx_handler_result_t fmcs_handle_frame(struct sk_buff **pskb);
 
 /* Explicit opt-in, bit 0 = fttr1. Carrier loss revokes the affected bit. */
 static unsigned int routed_offload_mask;
+static unsigned int bridge_offload_mask;
+static DEFINE_SPINLOCK(fmcs_bridge_gate_lock);
+static unsigned int fmcs_bridge_epoch;
 static struct fmcs_priv *fmcs_offload_priv; /* protected by RTNL */
 
 static void fmcs_offload_cleanup(struct fmcs_priv *priv)
@@ -49,6 +53,10 @@ static int fmcs_offload_mask_set(const char *val, const struct kernel_param *kp)
 	if (mask & ~GENMASK(FMCS_MAX_FTTR_PORTS - 1, 0))
 		return -ERANGE;
 	rtnl_lock();
+	if (mask & READ_ONCE(bridge_offload_mask)) {
+		rtnl_unlock();
+		return -EBUSY;
+	}
 	WRITE_ONCE(routed_offload_mask, 0);
 	/* Finish path users before deleting the old logical/physical keys. */
 	synchronize_net();
@@ -68,6 +76,132 @@ module_param_cb(routed_offload_mask, &fmcs_offload_mask_ops,
 MODULE_PARM_DESC(routed_offload_mask,
 	"Experimental routed VLAN path: bit 0=fttr1; default 0; carrier-off revokes bit");
 
+static void fmcs_bridge_revoke(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&fmcs_bridge_gate_lock, flags);
+	WRITE_ONCE(bridge_offload_mask, 0);
+	fmcs_bridge_epoch++;
+	spin_unlock_irqrestore(&fmcs_bridge_gate_lock, flags);
+}
+
+static void fmcs_bridge_gc(struct work_struct *work)
+{
+	rtnl_lock();
+	if (fmcs_offload_priv)
+		fmcs_offload_cleanup(fmcs_offload_priv);
+	rtnl_unlock();
+}
+static DECLARE_WORK(fmcs_bridge_gc_work, fmcs_bridge_gc);
+
+/* Software FDB moves and bridge STP/VLAN changes must revoke the pair too.
+ * Switchdev's atomic notifications cannot synchronously drain flow workers.
+ */
+static int fmcs_bridge_event(struct notifier_block *nb, unsigned long event, void *ptr)
+{
+	struct fmcs_priv *priv = READ_ONCE(fmcs_offload_priv);
+	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
+	unsigned int mask = READ_ONCE(bridge_offload_mask);
+	bool relevant = false;
+	int i;
+
+	if (!mask || !priv)
+		return NOTIFY_DONE;
+	rcu_read_lock();
+	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
+		struct net_device *port = priv->fttr_devs[i];
+
+		if ((mask & BIT(i)) && port &&
+		    (dev == port || dev == netdev_master_upper_dev_get_rcu(port))) {
+			relevant = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	if (!relevant)
+		return NOTIFY_DONE;
+	switch (event) {
+	case SWITCHDEV_FDB_ADD_TO_DEVICE:
+	case SWITCHDEV_FDB_DEL_TO_DEVICE:
+	case SWITCHDEV_PORT_ATTR_SET:
+	case SWITCHDEV_PORT_OBJ_ADD:
+	case SWITCHDEV_PORT_OBJ_DEL:
+		if (READ_ONCE(bridge_offload_mask)) {
+			pr_info_ratelimited("fmcs bridge: revoke mask=%x switchdev_event=%lu dev=%s\n",
+					    mask, event, dev->name);
+			fmcs_bridge_revoke();
+			schedule_work(&fmcs_bridge_gc_work);
+		}
+		break;
+	}
+	return NOTIFY_DONE;
+}
+static struct notifier_block fmcs_bridge_nb = { .notifier_call = fmcs_bridge_event };
+static struct notifier_block fmcs_bridge_blocking_nb = { .notifier_call = fmcs_bridge_event };
+
+static int fmcs_bridge_mask_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned long flags;
+	unsigned int mask, epoch;
+	int ret = kstrtouint(val, 0, &mask);
+
+	if (ret)
+		return ret;
+	if (mask & ~GENMASK(FMCS_MAX_FTTR_PORTS - 1, 0))
+		return -ERANGE;
+	if (mask && hweight32(mask) < 2)
+		return -EINVAL;
+	rtnl_lock();
+	if (mask & routed_offload_mask) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	fmcs_bridge_revoke();
+	spin_lock_irqsave(&fmcs_bridge_gate_lock, flags);
+	epoch = fmcs_bridge_epoch;
+	spin_unlock_irqrestore(&fmcs_bridge_gate_lock, flags);
+	synchronize_net();
+	if (fmcs_offload_priv)
+		fmcs_offload_cleanup(fmcs_offload_priv);
+	spin_lock_irqsave(&fmcs_bridge_gate_lock, flags);
+	if (epoch == fmcs_bridge_epoch)
+		WRITE_ONCE(bridge_offload_mask, mask);
+	else
+		ret = -EAGAIN;
+	spin_unlock_irqrestore(&fmcs_bridge_gate_lock, flags);
+unlock:
+	rtnl_unlock();
+	return ret;
+}
+
+static const struct kernel_param_ops fmcs_bridge_mask_ops = {
+	.set = fmcs_bridge_mask_set,
+	.get = param_get_uint,
+};
+module_param_cb(bridge_offload_mask, &fmcs_bridge_mask_ops, &bridge_offload_mask, 0644);
+MODULE_PARM_DESC(bridge_offload_mask,
+	"Untagged IPv4 bridge ports: at least two port bits or 0; topology changes revoke");
+
+bool fmcs_bridge_port_enabled(struct fmcs_priv *priv, unsigned int port)
+{
+	struct net_device *dev = priv->fttr_devs[port - 1];
+
+	return (READ_ONCE(bridge_offload_mask) & BIT(port - 1)) && dev &&
+	       netif_running(dev) && netif_carrier_ok(dev);
+}
+
+bool fmcs_bridge_pair_enabled(struct fmcs_priv *priv, unsigned int src, unsigned int dst)
+{
+	unsigned int pair = BIT(src - 1) | BIT(dst - 1);
+
+	return (READ_ONCE(bridge_offload_mask) & pair) == pair &&
+	       netif_running(priv->fttr_devs[src - 1]) &&
+	       netif_carrier_ok(priv->fttr_devs[src - 1]) &&
+	       netif_running(priv->fttr_devs[dst - 1]) &&
+	       netif_carrier_ok(priv->fttr_devs[dst - 1]);
+}
+
 /* Binding is by name only at discovery. Once bound, identity survives rename. */
 static struct net_device *fmcs_lower_get(struct fmcs_priv *priv)
 {
@@ -83,7 +217,7 @@ static struct net_device *fmcs_lower_get(struct fmcs_priv *priv)
 
 int fmcs_fttr_set_carrier(struct fmcs_priv *priv, unsigned int port, bool carrier)
 {
-	struct net_device *dev, *lower;
+	struct net_device *dev;
 	int ret = 0;
 
 	if (port < 1 || port > FMCS_MAX_FTTR_PORTS)
@@ -97,18 +231,17 @@ int fmcs_fttr_set_carrier(struct fmcs_priv *priv, unsigned int port, bool carrie
 	if (carrier) {
 		netif_carrier_on(dev);
 	} else {
+		if (READ_ONCE(bridge_offload_mask) & BIT(port - 1))
+			fmcs_bridge_revoke();
 		WRITE_ONCE(routed_offload_mask,
 			   routed_offload_mask & ~BIT(port - 1));
 		netif_carrier_off(dev);
 		synchronize_net();
-		/* carrier_off does not emit NETDEV_DOWN. Clean both possible
-		 * ingress keys and wait for the flowtable's hardware work to drain.
+		/* carrier_off does not emit NETDEV_DOWN. Revoking bridge admission
+		 * invalidates every selected pair, including pairs on other ports.
 		 * Repeat even when already off: this is an explicit cleanup request.
 		 */
-		nf_flow_table_cleanup(dev);
-		lower = rtnl_dereference(priv->fttr_lower);
-		if (lower)
-			nf_flow_table_cleanup(lower);
+		fmcs_offload_cleanup(priv);
 	}
 unlock:
 	rtnl_unlock();
@@ -124,11 +257,13 @@ static void fmcs_lower_unlink(struct fmcs_priv *priv)
 	if (!lower)
 		return;
 	WRITE_ONCE(routed_offload_mask, 0);
+	fmcs_bridge_revoke();
 	rcu_assign_pointer(priv->fttr_lower, NULL);
 	netdev_rx_handler_unregister(lower);
 	/* unregister above waits for path readers; retain lower for cleanup. */
 	fmcs_offload_cleanup(priv);
 	nf_flow_table_cleanup(lower);
+	fmcs_bridge_unbind(priv, lower);
 	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++)
 		netdev_upper_dev_unlink(lower, priv->fttr_devs[i]);
 	dev_put(lower);
@@ -185,8 +320,11 @@ static int fmcs_netdev_event(struct notifier_block *nb,
 
 	if (dev == lower) {
 		if ((event == NETDEV_DOWN || event == NETDEV_CHANGEADDR ||
-		     event == NETDEV_CHANGEMTU) && routed_offload_mask) {
+		     event == NETDEV_CHANGEMTU ||
+		     (event == NETDEV_CHANGE && !netif_carrier_ok(dev))) &&
+		    (routed_offload_mask || READ_ONCE(bridge_offload_mask))) {
 			WRITE_ONCE(routed_offload_mask, 0);
+			fmcs_bridge_revoke();
 			synchronize_net();
 			fmcs_offload_cleanup(priv);
 		}
@@ -204,12 +342,13 @@ static int fmcs_netdev_event(struct notifier_block *nb,
 	}
 	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
 		if (dev != priv->fttr_devs[i] ||
-		    !(routed_offload_mask & BIT(i)))
+		    !((routed_offload_mask | READ_ONCE(bridge_offload_mask)) & BIT(i)))
 			continue;
 		if (event == NETDEV_DOWN || event == NETDEV_CHANGEUPPER ||
 		    event == NETDEV_CHANGEADDR || event == NETDEV_CHANGEMTU) {
 			WRITE_ONCE(routed_offload_mask,
 				   routed_offload_mask & ~BIT(i));
+			fmcs_bridge_revoke();
 			synchronize_net();
 			fmcs_offload_cleanup(priv);
 		}
@@ -481,6 +620,18 @@ static int fmcs_fttr_fill_forward_path(struct net_device_path_ctx *ctx,
 	unsigned int mask = READ_ONCE(routed_offload_mask);
 	int i;
 
+	/* This logical endpoint owns its TC adapter. Keep software bridge tuples
+	 * on fttrN; only the hardware rule gets transport VLAN/physical redirect.
+	 */
+	if (fmcs_bridge_port_enabled(port->priv, port->port_idx)) {
+		if (ctx->num_vlans || !lower || !netif_running(lower) ||
+		    !netif_carrier_ok(lower))
+			return -EOPNOTSUPP;
+		path->type = DEV_PATH_ETHERNET;
+		path->dev = dev;
+		ctx->dev = NULL;
+		return 0;
+	}
 	if (!(mask & BIT(port->port_idx - 1)) || !lower ||
 	    !netif_running(dev) || !netif_carrier_ok(dev) ||
 	    !netif_running(lower) || !netif_carrier_ok(lower))
@@ -507,6 +658,13 @@ static int fmcs_fttr_fill_forward_path(struct net_device_path_ctx *ctx,
 	return 0;
 }
 
+static int fmcs_fttr_setup_tc(struct net_device *dev, enum tc_setup_type type, void *data)
+{
+	struct fmcs_fttr_port_priv *port = netdev_priv(dev);
+
+	return fmcs_bridge_setup_tc(port->priv, type, data);
+}
+
 static const struct net_device_ops fmcs_omci_ops = {
 	.ndo_start_xmit = fmcs_omci_xmit,
 };
@@ -524,6 +682,7 @@ static const struct net_device_ops fmcs_fttr_ops = {
 	.ndo_get_iflink      = fmcs_fttr_get_iflink,
 	.ndo_change_mtu      = fmcs_fttr_change_mtu,
 	.ndo_fill_forward_path = fmcs_fttr_fill_forward_path,
+	.ndo_setup_tc        = fmcs_fttr_setup_tc,
 };
 
 void fmcs_rx_omci_frame(struct fmcs_priv *priv, const u8 *data, size_t len)
@@ -739,6 +898,11 @@ int fmcs_netdevs_init(struct fmcs_priv *priv)
 		i = 0; /* err_unreg_fttr walks the already-registered ports back */
 		goto err_unreg_fttr;
 	}
+	ret = fmcs_bridge_init(priv);
+	if (ret) {
+		i = 0;
+		goto err_unreg_fttr;
+	}
 
 	/* Create downstream DSA-style switch ports fttr1 ~ fttr16 */
 	for (i = 0; i < FMCS_MAX_FTTR_PORTS; i++) {
@@ -790,12 +954,26 @@ int fmcs_netdevs_init(struct fmcs_priv *priv)
 		rtnl_unlock();
 		goto err_unreg_fttr;
 	}
+	ret = register_switchdev_notifier(&fmcs_bridge_nb);
+	if (ret)
+		goto err_notifier;
+	ret = register_switchdev_blocking_notifier(&fmcs_bridge_blocking_nb);
+	if (ret) {
+		unregister_switchdev_notifier(&fmcs_bridge_nb);
+		goto err_notifier;
+	}
 	rtnl_lock();
 	fmcs_offload_priv = priv;
 	rtnl_unlock();
 
 	return 0;
 
+err_notifier:
+	unregister_netdevice_notifier(&priv->fttr_netdev_nb);
+	rtnl_lock();
+	fmcs_lower_unlink(priv);
+	rtnl_unlock();
+	i = FMCS_MAX_FTTR_PORTS;
 err_unreg_fttr:
 	while (--i >= 0) {
 		if (priv->fttr_devs[i]) {
@@ -804,6 +982,8 @@ err_unreg_fttr:
 			priv->fttr_devs[i] = NULL;
 		}
 	}
+	if (priv->bridge_offload)
+		fmcs_bridge_exit(priv);
 	unregister_netdev(priv->ploam_dev);
 	free_netdev(priv->ploam_dev);
 	priv->ploam_dev = NULL;
@@ -817,6 +997,10 @@ void fmcs_netdevs_exit(struct fmcs_priv *priv)
 {
 	int i;
 
+	unregister_switchdev_blocking_notifier(&fmcs_bridge_blocking_nb);
+	unregister_switchdev_notifier(&fmcs_bridge_nb);
+	fmcs_bridge_revoke();
+	cancel_work_sync(&fmcs_bridge_gc_work);
 	unregister_netdevice_notifier(&priv->fttr_netdev_nb);
 	rtnl_lock();
 	fmcs_offload_priv = NULL;
@@ -830,6 +1014,7 @@ void fmcs_netdevs_exit(struct fmcs_priv *priv)
 			priv->fttr_devs[i] = NULL;
 		}
 	}
+	fmcs_bridge_exit(priv);
 
 	if (priv->ploam_dev) {
 		unregister_netdev(priv->ploam_dev);

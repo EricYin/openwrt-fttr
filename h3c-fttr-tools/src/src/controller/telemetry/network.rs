@@ -1,4 +1,6 @@
-use crate::model::{DataPathStatus, MeasurementEvidence, Measurements, OnuOmciInventory};
+use crate::model::{
+    DataPathOffloadStatus, DataPathStatus, MeasurementEvidence, Measurements, OnuOmciInventory,
+};
 use std::{
     collections::BTreeMap,
     fs,
@@ -18,7 +20,15 @@ pub(in crate::controller) fn data_path(
     registration: &str,
     inventory: Option<OnuOmciInventory>,
 ) -> DataPathStatus {
-    data_path_from(Path::new("/sys/class/net"), id, registration, inventory)
+    let mut status = data_path_from(Path::new("/sys/class/net"), id, registration, inventory);
+    collect_offload(
+        &mut status,
+        id,
+        Path::new("/sys/module/h3c_fmcs/parameters/routed_offload_mask"),
+        Path::new("/sys/module/h3c_fmcs/parameters/bridge_offload_mask"),
+        Path::new("/sys/kernel/debug/ppe/config"),
+    );
+    status
 }
 
 pub(in crate::controller) fn data_path_from(
@@ -77,7 +87,7 @@ pub(in crate::controller) fn data_path_from(
                     format!("{}/statistics", status.interface),
                     "forwarding_proof",
                     format!(
-                        "hardware_forwarding_verified: rx_bytes={}, tx_bytes={}, gem_port=0x{:04x}",
+                        "gem_rx_observed_not_ppe_proof: rx_bytes={}, tx_bytes={}, gem_port=0x{:04x}",
                         status.rx_bytes.unwrap_or(0),
                         status.tx_bytes.unwrap_or(0),
                         expected_gem
@@ -141,6 +151,75 @@ fn counter(path: &Path) -> (Option<u64>, MeasurementEvidence) {
             MeasurementEvidence::unavailable(source, unit, format!("read_failed: {error}")),
         ),
     }
+}
+
+fn collect_offload(
+    status: &mut DataPathStatus,
+    id: u8,
+    mask_path: &Path,
+    bridge_path: &Path,
+    ppe_path: &Path,
+) {
+    let enabled = |path: &Path| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u16>().ok())
+            .and_then(|mask| (id < 16).then(|| mask & (1u16 << id) != 0))
+    };
+    let attached = fs::read_to_string(ppe_path).ok().and_then(|raw| {
+        raw.lines().find_map(|line| match line.split_once(':') {
+            Some(("npu_attached", value)) => match value.trim() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            },
+            _ => None,
+        })
+    });
+    status.offload.routed_enabled = enabled(mask_path);
+    status.offload.bridge_enabled = enabled(bridge_path);
+    status.offload.enabled = match (status.offload.routed_enabled, status.offload.bridge_enabled) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    };
+    status.offload.engine_attached = attached;
+    for (field, value, path) in [
+        (
+            "offload_routed_enabled",
+            status.offload.routed_enabled,
+            mask_path,
+        ),
+        (
+            "offload_bridge_enabled",
+            status.offload.bridge_enabled,
+            bridge_path,
+        ),
+        ("offload_engine_attached", attached, ppe_path),
+    ] {
+        let evidence = match value {
+            Some(value) => MeasurementEvidence::observed(
+                path.display().to_string(),
+                "boolean",
+                value.to_string(),
+            ),
+            None => MeasurementEvidence::unavailable(
+                path.display().to_string(),
+                "boolean",
+                "unreadable_or_invalid_offload_state",
+            ),
+        };
+        status.measurements.insert(field.into(), evidence);
+    }
+    status.offload.forwarding_verified = None;
+    status.measurements.insert(
+        "offload_forwarding_proof".into(),
+        MeasurementEvidence::unavailable(
+            "per-flow PPE hardware hit evidence",
+            "forwarding_proof",
+            "not_verified; policy_and_global_engine_state_do_not_prove_per_onu_hardware_forwarding",
+        ),
+    );
 }
 
 fn rate(current: Option<u64>, previous: Option<u64>, elapsed: Duration) -> Option<f64> {
@@ -231,6 +310,7 @@ fn collect(root: &Path, id: u8, registration: &str) -> DataPathStatus {
         current_rx_kbps,
         olt_channel_gem: None,
         forwarding_verified: None,
+        offload: DataPathOffloadStatus::default(),
         measurements,
     }
 }
@@ -261,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn data_path_verifies_hardware_forwarding_when_gem_matches_and_rx_traffic_present() {
+    fn data_path_observes_gem_rx_without_claiming_ppe_forwarding() {
         let root = std::env::temp_dir().join(format!("network-test-ok-{}", std::process::id()));
         let stat_dir = root.join("fttr2").join("statistics");
         fs::create_dir_all(&stat_dir).unwrap();
@@ -291,7 +371,8 @@ mod tests {
             .raw
             .as_ref()
             .unwrap()
-            .contains("hardware_forwarding_verified"));
+            .contains("gem_rx_observed_not_ppe_proof"));
+        assert_eq!(status.offload.forwarding_verified, None);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -370,5 +451,43 @@ mod tests {
             proof.reason.as_deref(),
             Some("verified_inventory_unavailable")
         );
+    }
+
+    #[test]
+    fn offload_policy_and_attachment_are_not_hardware_hit_proof() {
+        let root = std::env::temp_dir().join(format!("network-offload-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mask = root.join("mask");
+        let bridge = root.join("bridge");
+        fs::write(&bridge, "0\n").unwrap();
+        let ppe = root.join("ppe");
+        let mut status = collect(&root, 1, "test");
+        collect_offload(&mut status, 1, &mask, &bridge, &ppe);
+        assert_eq!(status.offload.enabled, None);
+        assert_eq!(status.offload.engine_attached, None);
+        fs::write(&mask, "2\n").unwrap();
+        fs::write(&ppe, "npu_attached: 1\nppe0_flow_cfg: ffffffff\n").unwrap();
+        collect_offload(&mut status, 1, &mask, &bridge, &ppe);
+        assert_eq!(status.offload.enabled, Some(true));
+        assert_eq!(status.offload.engine_attached, Some(true));
+        assert_eq!(status.offload.forwarding_verified, None);
+        assert!(status.measurements["offload_forwarding_proof"]
+            .reason
+            .is_some());
+        collect_offload(&mut status, 2, &mask, &bridge, &ppe);
+        assert_eq!(status.offload.enabled, Some(false));
+        fs::write(&bridge, "4\n").unwrap();
+        collect_offload(&mut status, 2, &mask, &bridge, &ppe);
+        assert_eq!(status.offload.routed_enabled, Some(false));
+        assert_eq!(status.offload.bridge_enabled, Some(true));
+        assert_eq!(status.offload.enabled, Some(true));
+        collect_offload(&mut status, 16, &mask, &bridge, &ppe);
+        assert_eq!(status.offload.enabled, None);
+        fs::write(&mask, "65536\n").unwrap();
+        fs::write(&ppe, "npu_attached: invalid\n").unwrap();
+        collect_offload(&mut status, 1, &mask, &bridge, &ppe);
+        assert_eq!(status.offload.enabled, None);
+        assert_eq!(status.offload.engine_attached, None);
+        fs::remove_dir_all(&root).unwrap();
     }
 }

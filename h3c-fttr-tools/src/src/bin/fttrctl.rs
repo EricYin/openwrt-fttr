@@ -25,6 +25,7 @@ Commands:\n  \
   load-fpga [path]     Program FPGA bitstream (default: /lib/firmware/FTTR_TOP.sbit)\n  \
   bosa-init            Initialize BOSA optical transceiver registers\n  \
   bridge-setup         Ensure downstream FTTR switch ports (fttr1~16) are bridged to br-lan\n  \
+  offload on|off|status [--json]  Control or query NPU / PPE hardware offload\n  \
   optical on|off|status|reload|shutdown|shutdown-offline [--json]\n  \
   status [--json|-j]   Display active FTTR optical link and DSA switch ports (table or JSON)\n  \
   mib ONU_ID [--summary|--json] [--tables]  Read structured OMCI inventory (default: JSON)\n  \
@@ -70,6 +71,170 @@ fn setup_bridge() {
             .status();
     }
     println!("[+] Downstream switch ports fttr1 ~ fttr16 configured and bridged to br-lan.");
+}
+
+fn handle_offload(args: &[String]) {
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("status");
+    let is_json = args.iter().any(|a| a == "--json" || a == "-j");
+    match sub {
+        "status" => {
+            let status = h3c_fttr_tools::npu::status();
+            if is_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&status).unwrap_or_default()
+                );
+            } else {
+                println!("[*] NPU & Hardware Offload Status:");
+                println!(
+                    "    Engine attached: {} | Bridge offload enabled: {}",
+                    if status.engine_attached {
+                        "YES (Ready)"
+                    } else {
+                        "NO"
+                    },
+                    if status.bridge_offload_enabled {
+                        "YES"
+                    } else {
+                        "NO"
+                    }
+                );
+                println!(
+                    "    Bridge: {} | Mask: 0x{:04x} ({}) | Active ports: {}",
+                    status.bridge,
+                    status.bridge_offload_mask,
+                    status.bridge_offload_mask,
+                    if status.active_ports.is_empty() {
+                        "none".into()
+                    } else {
+                        status.active_ports.join(", ")
+                    }
+                );
+                println!(
+                    "    Routed mask: 0x{:04x} | Driver debug: {} | Hooks ready: {}",
+                    status.routed_offload_mask,
+                    if status.bridge_offload_debug {
+                        "YES"
+                    } else {
+                        "NO"
+                    },
+                    if status.fw4_hooks_ready { "YES" } else { "NO" }
+                );
+                println!(
+                    "    FOE Entries: total {} | bound {} | Offload traffic: {} pkts, {} bytes",
+                    status.total_entries,
+                    status.bound_entries,
+                    status.total_packets,
+                    status.total_bytes
+                );
+                if !status.bound_flows.is_empty() {
+                    println!("    Active Bound Flows ({}):", status.bound_flows.len());
+                    for flow in &status.bound_flows {
+                        println!(
+                            "      [{}] {} orig={} eth={} vlan={} pkts={} bytes={}",
+                            flow.index,
+                            flow.pkt_type,
+                            flow.orig_tuple,
+                            flow.eth,
+                            flow.vlan,
+                            flow.packets,
+                            flow.bytes
+                        );
+                    }
+                }
+            }
+        }
+        "on" | "off" => {
+            let enabled = sub == "on";
+            let bridge = args
+                .iter()
+                .position(|a| a == "--bridge")
+                .map(|i| args.get(i + 1).map(String::as_str).unwrap_or(""));
+            let result = (|| -> std::io::Result<()> {
+                if let Some(bridge) = bridge {
+                    if bridge.is_empty()
+                        || bridge.len() > 15
+                        || !bridge
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+                    {
+                        return Err(std::io::Error::other("Invalid bridge interface"));
+                    }
+                }
+                let uci = |args: &[&str]| -> std::io::Result<()> {
+                    let output = Command::new("uci").args(args).output()?;
+                    if output.status.success() {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::other(format!("uci {} failed", args[0])))
+                    }
+                };
+                // Do not commit unrelated staged edits from another LuCI session.
+                let pending = Command::new("uci").args(["changes", "fttr"]).output()?;
+                if !pending.status.success() || !pending.stdout.is_empty() {
+                    return Err(std::io::Error::other(
+                        "FTTR has pending UCI changes; apply or revert them first",
+                    ));
+                }
+                uci(&["set", "fttr.offload=offload"])?;
+                uci(&[
+                    "set",
+                    if enabled {
+                        "fttr.offload.enabled=1"
+                    } else {
+                        "fttr.offload.enabled=0"
+                    },
+                ])?;
+                if let Some(bridge) = bridge {
+                    uci(&["set", &format!("fttr.offload.bridge={bridge}")])?;
+                }
+                uci(&["commit", "fttr"])?;
+                if !enabled {
+                    std::fs::write("/sys/module/h3c_fmcs/parameters/bridge_offload_mask", "0\n")?;
+                    if std::fs::read_to_string(
+                        "/sys/module/h3c_fmcs/parameters/bridge_offload_mask",
+                    )?
+                    .trim()
+                        != "0"
+                    {
+                        return Err(std::io::Error::other(
+                            "Saved, but driver withdrawal is not confirmed",
+                        ));
+                    }
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    if is_json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"status":"success","enabled":enabled})
+                        );
+                    } else {
+                        println!(
+                            "[+] NPU configuration saved; query status for admission readback."
+                        );
+                    }
+                }
+                Err(error) => {
+                    if is_json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"status":"error","error":error.to_string()})
+                        );
+                    } else {
+                        eprintln!("[-] {error}");
+                    }
+                    exit(1);
+                }
+            }
+        }
+        _ => {
+            eprintln!("Usage: fttrctl offload [on|off|status] [--json]");
+            exit(1);
+        }
+    }
 }
 
 fn print_status_table(status: &FttrSystemStatus) {
@@ -858,6 +1023,9 @@ fn main() {
                 Ok(_) => println!("BOSA [0x{:02X}] <= 0x{:02X}", reg, val),
                 Err(e) => eprintln!("[-] Error writing BOSA register: {e}"),
             }
+        }
+        "offload" => {
+            handle_offload(&args);
         }
         "help" | "--help" | "-h" => {
             print_usage();

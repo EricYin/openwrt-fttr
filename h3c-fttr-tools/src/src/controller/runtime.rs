@@ -685,10 +685,14 @@ async fn run_async() {
         eprintln!("[-] Optical ownership failed: {error}");
         std::process::exit(1);
     });
+    #[cfg(feature = "npu")]
+    let npu = crate::npu::Service::start();
     let lifetime = super::lifetime::Lifetime::start()
         .await
         .unwrap_or_else(|error| {
             eprintln!("[-] MQTT startup failed: {error}");
+            #[cfg(feature = "npu")]
+            npu.stop();
             std::process::exit(1);
         });
     #[cfg(feature = "acs")]
@@ -1126,6 +1130,8 @@ async fn run_async() {
     tokio::select! {
         result = lifetime.wait(devices) => {
             eprintln!("[-] Controller supervision stopped: {result:?}");
+            #[cfg(feature = "npu")]
+            npu.stop();
             std::process::exit(1);
         }
         result = crate::runtime::termination() => {
@@ -1133,6 +1139,8 @@ async fn run_async() {
             }
             #[cfg(feature = "acs")]
             crate::acs::shutdown();
+            #[cfg(feature = "npu")]
+            npu.stop();
             crate::runtime::request_stop();
             let optical = crate::runtime::spawn_blocking(move || shutdown.request(OpticalCommand::Shutdown));
             let (optical, ()) = tokio::join!(

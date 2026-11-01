@@ -38,12 +38,14 @@ make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
 | `CONFIG_FTTR_DEVICE_STAR` | `device-star` | 开 | 关 |
 | `CONFIG_FTTR_ACS` | `acs` | 开 | 关 |
 | `CONFIG_FTTR_MQTT` | `mqtt` | 开 | 开 |
+| `CONFIG_FTTR_NPU` | `npu` | 开 | 开 |
 
 OpenWrt 使用 `--no-default-features`，逐项显式映射上述选项。设备及 ACS
 feature 不会隐式开启 MQTT；`all-devices` 组合上述全部设备模块。Linux 下在
 `h3c-fttr-tools/src` 验证全部目标：
 
 ```sh
+cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt,npu
 cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt
 cargo check --locked --all-targets --no-default-features --features all-devices,acs
 ```
@@ -57,7 +59,7 @@ cargo check --locked --all-targets --no-default-features --features all-devices,
 $previous = $env:RUSTFLAGS
 try {
     $env:RUSTFLAGS = '-C target-feature=+crt-static'
-    cargo zigbuild --release --locked --target aarch64-unknown-linux-musl --no-default-features --features all-devices,acs,mqtt --bin fttrd --bin fttrctl
+    cargo zigbuild --release --locked --target aarch64-unknown-linux-musl --no-default-features --features all-devices,acs,mqtt,npu --bin fttrd --bin fttrctl
 } finally {
     $env:RUSTFLAGS = $previous
 }

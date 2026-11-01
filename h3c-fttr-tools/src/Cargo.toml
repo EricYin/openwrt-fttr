@@ -6,7 +6,8 @@ description = "H3C HM2004-DU FTTR Micro-OLT utilities and controller daemon"
 repository = "https://github.com/LazuliKao/openwrt-fttr"
 
 [features]
-default = ["device-hl202", "mqtt"]
+default = ["device-hl202", "mqtt", "npu"]
+npu = ["tokio/process"]
 device-hl202 = ["dep:flate2", "dep:tar"]
 device-hwtc = []
 device-star = []

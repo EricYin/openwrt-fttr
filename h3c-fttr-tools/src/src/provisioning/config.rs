@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn hwtc_and_legacy_k155_names_select_the_hwtc_adapter() {
         let config = |adapter: &str| {
-            format!("config device 'child'\n option optical_sn 'HWTC3C6DE5B3'\n option cwmp_id 'child-id'\n option adapter '{adapter}'")
+            format!("config device 'child'\n option optical_sn 'HWTC1234ABCD'\n option cwmp_id 'child-id'\n option adapter '{adapter}'")
         };
         assert_eq!(
             parse_expanded(&config("hwtc")).is_ok(),

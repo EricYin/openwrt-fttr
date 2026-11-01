@@ -61,6 +61,70 @@ pub struct MeshClientStatus {
     pub tx_rate_mbps: Option<u32>,
 }
 
+/// Offload policy and system engine state, distinct from per-ONU hardware hits.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DataPathOffloadStatus {
+    /// Either driver opt-in bit; unknown unless both modes are known or one is enabled.
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub routed_enabled: Option<bool>,
+    #[serde(default)]
+    pub bridge_enabled: Option<bool>,
+    /// Global Ethernet PPE attachment; does not prove this ONU has a bound flow.
+    pub engine_attached: Option<bool>,
+    /// Unknown until per-flow hardware evidence is available.
+    pub forwarding_verified: Option<bool>,
+}
+
+/// An active or recorded PPE hardware flow entry from debugfs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PpeFlowEntry {
+    pub index: String,
+    pub state: String,
+    pub pkt_type: String,
+    pub orig_tuple: String,
+    pub new_tuple: String,
+    pub eth: String,
+    pub vlan: String,
+    pub packets: u64,
+    pub bytes: u64,
+    pub counters_valid: bool,
+    pub packets_exact: String,
+    pub bytes_exact: String,
+}
+
+/// Aggregated real-time NPU / PPE hardware offload status and statistics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NpuStatus {
+    pub sampled_at_ms: u64,
+    pub errors: Vec<String>,
+    pub config_valid: bool,
+    pub engine_valid: bool,
+    pub mask_valid: bool,
+    pub routed_mask_valid: bool,
+    pub debug_valid: bool,
+    pub flows_valid: bool,
+    pub entries_valid: bool,
+    pub counters_valid: bool,
+    pub hooks_valid: bool,
+    pub total_packets_exact: String,
+    pub total_bytes_exact: String,
+    pub supported: bool,
+    pub engine_attached: bool,
+    pub bridge_offload_enabled: bool,
+    pub bridge_offload_mask: u16,
+    pub routed_offload_mask: u16,
+    pub bridge_offload_debug: bool,
+    pub bridge: String,
+    pub active_ports: Vec<String>,
+    pub fw4_hooks_ready: bool,
+    pub total_entries: u32,
+    pub bound_entries: u32,
+    pub total_packets: u64,
+    pub total_bytes: u64,
+    pub bound_flows: Vec<PpeFlowEntry>,
+}
+
 /// Data path statistics and provisioning parameters for an ONU.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataPathStatus {
@@ -74,8 +138,11 @@ pub struct DataPathStatus {
     pub current_rx_kbps: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub olt_channel_gem: Option<u16>,
+    /// Matching ONU GEM configuration and observed software RX; not PPE hit proof.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_verified: Option<bool>,
+    #[serde(default)]
+    pub offload: DataPathOffloadStatus,
     pub measurements: Measurements,
 }
 
@@ -160,6 +227,8 @@ pub struct FttrSystemStatus {
     pub switch_ports: Vec<SwitchPortStatus>,
     pub sub_gateways: Vec<SubGatewayStatus>,
     pub telemetry_gateways: Vec<TelemetryGatewayInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub npu: Option<NpuStatus>,
 }
 
 fn default_fpga_status() -> String {

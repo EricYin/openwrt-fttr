@@ -717,12 +717,12 @@ mod tests {
     fn hwtc_identity_matches_serial_across_models() {
         for model in ["K155-11", "V152", "OTHER-HWTC"] {
             let devices =
-                json!({"devices":{"child":{"product_class":model,"serial":"485754433c6de5b3"}}});
+                json!({"devices":{"child":{"product_class":model,"serial":"485754431234ABCD"}}});
             assert_eq!(
-                discovered_identity(&devices, "HWTC3C6DE5B3", "hwtc"),
+                discovered_identity(&devices, "HWTC1234ABCD", "hwtc"),
                 Some("child".into())
             );
-            assert_eq!(discovered_identity(&devices, "HWTC3E5E5EB6", "hwtc"), None);
+            assert_eq!(discovered_identity(&devices, "HWTC9999ABCD", "hwtc"), None);
         }
     }
     #[test]
@@ -731,10 +731,10 @@ mod tests {
             json!({"devices":{"child":{"product_class":"V152","serial":"483343543C6DE5B3"}}});
         assert_eq!(discovered_identity(&devices, "H3CT3C6DE5B3", "hwtc"), None);
         let devices = json!({"devices":{
-            "one":{"product_class":"V152","serial":"485754433C6DE5B3"},
-            "two":{"product_class":"K155-11","serial":"485754433C6DE5B3"}
+            "one":{"product_class":"V152","serial":"485754431234ABCD"},
+            "two":{"product_class":"K155-11","serial":"485754431234ABCD"}
         }});
-        assert_eq!(discovered_identity(&devices, "HWTC3C6DE5B3", "hwtc"), None);
+        assert_eq!(discovered_identity(&devices, "HWTC1234ABCD", "hwtc"), None);
     }
     #[test]
     #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 contract")]

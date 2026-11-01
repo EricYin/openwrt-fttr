@@ -225,6 +225,7 @@ pub(super) fn snapshot(
         switch_ports,
         sub_gateways,
         telemetry_gateways,
+        npu: Some(crate::npu::status()),
     }
 }
 

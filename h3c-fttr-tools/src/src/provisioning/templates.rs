@@ -64,6 +64,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
                         | "template"
                         | "network"
                         | "wifi"
+                        | "offload"
                 ) {
                     return Err(format!("unsupported section: {}", w[1]));
                 }
@@ -163,6 +164,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 "username",
                 "password",
             ],
+            "offload" => &["enabled", "bridge"],
             _ => &[],
         };
         if let Some(key) = s.options.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -606,7 +608,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC adapter")]
     fn configuration_outputs_only_business_intent_before_discovery() {
-        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'hwtc'\n option group 'g'\nconfig network 'n'\n option template 't'\n option vlan '66'\n list service_list 'OTHER'\n list port 'lan2'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '5g'";
+        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'HWTC1234ABCD'\n option adapter 'hwtc'\n option group 'g'\nconfig network 'n'\n option template 't'\n option vlan '66'\n list service_list 'OTHER'\n list port 'lan2'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '5g'";
         let cfg = super::compile(text).unwrap();
         assert!(cfg.devices[0]
             .items
@@ -637,7 +639,7 @@ mod tests {
         }
         let config = |option: &str| {
             format!(
-            "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h3c'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\n option omci_management '1'\nconfig device 'k155'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'k155'\n option group 'g'\n{option}"
+            "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h3c'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\n option omci_management '1'\nconfig device 'k155'\n option optical_sn 'HWTC12345678'\n option adapter 'k155'\n option group 'g'\n{option}"
         )
         };
         let default = compile(&config("")).unwrap();
@@ -677,7 +679,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
     fn hl202_internet_bridge_dhcp_and_second_radio_slots_compile_for_binding() {
-        let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'a2'\n option template 't'\n option ssid 'base2'\n option radio '2g'\nconfig wifi 'a5'\n option template 't'\n option ssid 'base5'\n option radio '5g'\nconfig wifi 'b2'\n option template 't'\n option ssid 'TTTT'\n option radio '2g'\nconfig wifi 'b5'\n option template 't'\n option ssid 'YYYY'\n option radio '5g'\nconfig network 'iot'\n option template 't'\n option vlan '66'\n list service_list 'INTERNET'\n option priority '6'\n list ssid 'b2'\n list ssid 'b5'";
+        let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'a2'\n option template 't'\n option ssid 'base2'\n option radio '2g'\nconfig wifi 'a5'\n option template 't'\n option ssid 'base5'\n option radio '5g'\nconfig wifi 'b2'\n option template 't'\n option ssid 'TTTT'\n option radio '2g'\nconfig wifi 'b5'\n option template 't'\n option ssid 'YYYY'\n option radio '5g'\nconfig network 'iot'\n option template 't'\n option vlan '66'\n list service_list 'INTERNET'\n option priority '6'\n list ssid 'b2'\n list ssid 'b5'";
         let cfg = compile(text).unwrap();
         let items = &cfg.devices[0].items;
         let service = items
@@ -706,7 +708,7 @@ mod tests {
         if !cfg!(feature = "device-hl202") {
             return;
         }
-        let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig network 'n'\n option template 't'\n option vlan '123'\n list service_list 'iptv,VOIP'\n list service_list 'OTHER'";
+        let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig network 'n'\n option template 't'\n option vlan '123'\n list service_list 'iptv,VOIP'\n list service_list 'OTHER'";
         let cfg = compile(text).unwrap();
         let item = cfg.devices[0]
             .items
@@ -723,7 +725,7 @@ mod tests {
         if !cfg!(feature = "device-hl202") {
             return;
         }
-        let head = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\n";
+        let head = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\n";
         let internet = format!(
             "{head}config network 'n'\n option template 't'\n option vlan '123'\n list service_list 'INTERNET,IPTV'"
         );
@@ -755,7 +757,7 @@ mod tests {
     }
     #[test]
     fn custom_vlan_service_list_rejects_tr069_and_untagged_internet_is_not_managed() {
-        let head = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\n";
+        let head = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT1234ABCD'\n option adapter 'hl202'\n option group 'g'\n";
         let tr069 = format!("{head}config network 'n'\n option template 't'\n option vlan '123'\n list service_list 'IPTV,TR069'");
         assert!(compile(&tr069).err().unwrap().contains("TR069"));
         let untagged = format!("{head}config network 'n'\n option template 't'\n option vlan '0'\n list service_list 'INTERNET'");
@@ -775,7 +777,7 @@ mod tests {
         ignore = "requires both device contracts"
     )]
     fn wpa2_uses_device_beacon_contract() {
-        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '2g'\n option security 'wpa2-psk'\n option key 'testpassword'";
+        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC12345678'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '2g'\n option security 'wpa2-psk'\n option key 'testpassword'";
         let cfg = compile(text).unwrap();
         for d in &cfg.devices {
             let beacon = d.items[0]
@@ -796,7 +798,7 @@ mod tests {
     )]
     fn wifi_security_modes_compile_expected_parameters() {
         // 1. None (Open)
-        let text_none = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'open_net'\n option radio '2g'\n option security 'none'";
+        let text_none = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'open_net'\n option radio '2g'\n option security 'none'";
         let cfg_none = compile(text_none).unwrap();
         let p_none = &cfg_none.devices[0].items[0].parameters;
         assert_eq!(
@@ -826,7 +828,7 @@ mod tests {
         assert!(p_none.iter().all(|p| !p.name.contains("PreSharedKey")));
 
         // 2. WPA3-SAE
-        let text_wpa3 = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'wpa3_net'\n option radio '5g'\n option security 'wpa3-sae'\n option key 'pass123456'";
+        let text_wpa3 = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC12345678'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'wpa3_net'\n option radio '5g'\n option security 'wpa3-sae'\n option key 'pass123456'";
         let cfg_wpa3 = compile(text_wpa3).unwrap();
         for d in &cfg_wpa3.devices {
             let p = &d.items[0].parameters;
@@ -861,7 +863,7 @@ mod tests {
         }
 
         // 3. WPA2-PSK / WPA3-SAE mixed
-        let text_wpa2_wpa3 = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'mixed_net'\n option radio '2g'\n option security 'wpa2-psk/wpa3-sae'\n option key 'pass123456'";
+        let text_wpa2_wpa3 = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC12345678'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'mixed_net'\n option radio '2g'\n option security 'wpa2-psk/wpa3-sae'\n option key 'pass123456'";
         let cfg_wpa2_wpa3 = compile(text_wpa2_wpa3).unwrap();
         for d in &cfg_wpa2_wpa3.devices {
             let p = &d.items[0].parameters;
@@ -889,7 +891,7 @@ mod tests {
         }
 
         // 4. WPA-PSK / WPA2-PSK mixed
-        let text_wpa_wpa2 = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC3C6DE5B3'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'legacy_net'\n option radio '2g'\n option security 'wpa-psk/wpa2-psk'\n option key 'pass123456'";
+        let text_wpa_wpa2 = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC12345678'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'legacy_net'\n option radio '2g'\n option security 'wpa-psk/wpa2-psk'\n option key 'pass123456'";
         let cfg_wpa_wpa2 = compile(text_wpa_wpa2).unwrap();
         for d in &cfg_wpa_wpa2.devices {
             let p = &d.items[0].parameters;
@@ -943,7 +945,7 @@ mod tests {
         }
 
         // 5. Keep current key (empty security)
-        let text_keep = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'keep_net'\n option radio '2g'\n option security ''";
+        let text_keep = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'keep_net'\n option radio '2g'\n option security ''";
         let cfg_keep = compile(text_keep).unwrap();
         let p_keep = &cfg_keep.devices[0].items[0].parameters;
         assert!(p_keep
@@ -958,7 +960,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC adapter")]
     fn enabled_ssid_requires_radio_but_disabled_ssid_does_not_disable_shared_radio() {
-        let text="config device 'd'\n option optical_sn 'HWTC3C6DE5B3'\n option cwmp_id 'test:hwtc'\n option adapter 'hwtc'\nconfig wifi_profile 'a'\n option ssid 'enabled'\n option enabled '1'\nconfig wifi_profile 'b'\n option ssid 'disabled'\n option enabled '0'\nconfig ssid 'a'\n option device 'd'\n option profile 'a'\n option radio '2g'\n option slot '1'\nconfig ssid 'b'\n option device 'd'\n option profile 'b'\n option radio '2g'\n option slot '2'";
+        let text="config device 'd'\n option optical_sn 'HWTC1234ABCD'\n option cwmp_id 'test:hwtc'\n option adapter 'hwtc'\nconfig wifi_profile 'a'\n option ssid 'enabled'\n option enabled '1'\nconfig wifi_profile 'b'\n option ssid 'disabled'\n option enabled '0'\nconfig ssid 'a'\n option device 'd'\n option profile 'a'\n option radio '2g'\n option slot '1'\nconfig ssid 'b'\n option device 'd'\n option profile 'b'\n option radio '2g'\n option slot '2'";
         let text = text
             .replace("config ssid 'a'", "config ssid 'ssid_a'")
             .replace("config ssid 'b'", "config ssid 'ssid_b'");
@@ -995,7 +997,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
     fn wlan_cleanup_defaults_to_disable_and_explicit_policy_is_preserved() {
-        let base="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'";
+        let base="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'";
         assert_eq!(compile(base).unwrap().devices[0].wifi_cleanup, "disable");
         for policy in ["preserve", "disable", "delete"] {
             let text = format!("{base}\n option wifi_cleanup '{policy}'");
@@ -1006,7 +1008,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
     fn group_expansion_keeps_creation_order_and_no_public_indices() {
-        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT685DF998'\n option adapter 'hl202'\n option group 'g'\nconfig network 'z'\n option template 't'\n option vlan '100'\n list service_list 'INTERNET'\nconfig network 'a'\n option template 't'\n option vlan '43'\n list service_list 'OTHER'\nconfig wifi 'w5'\n option template 't'\n option ssid 'five'\n option radio '5g'\nconfig wifi 'w2'\n option template 't'\n option ssid 'two'\n option radio '2g'";
+        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig network 'z'\n option template 't'\n option vlan '100'\n list service_list 'INTERNET'\nconfig network 'a'\n option template 't'\n option vlan '43'\n list service_list 'OTHER'\nconfig wifi 'w5'\n option template 't'\n option ssid 'five'\n option radio '5g'\nconfig wifi 'w2'\n option template 't'\n option ssid 'two'\n option radio '2g'";
         let cfg = compile(text).unwrap();
         let d = &cfg.devices[0];
         assert_eq!(

@@ -14,6 +14,15 @@ pub mod model;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
 pub mod mqtt_identity;
+#[cfg(feature = "npu")]
+pub mod npu;
+#[cfg(not(feature = "npu"))]
+pub mod npu {
+    use crate::model::NpuStatus;
+    pub fn status() -> NpuStatus {
+        NpuStatus::default()
+    }
+}
 #[cfg(any(feature = "mqtt", test))]
 mod mqtt_limits;
 pub mod optical;

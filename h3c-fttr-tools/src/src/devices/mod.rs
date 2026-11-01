@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn mqtt_connected_dispatch_reports_unsupported_identities() {
         assert!(configure_authenticated_cwmp_settings(
-            "HWTC3C6DE5B3/fttr_data.tar.gz",
+            "HWTC1234ABCD/fttr_data.tar.gz",
             "http://acs",
             &CwmpCredentials::default()
         )
