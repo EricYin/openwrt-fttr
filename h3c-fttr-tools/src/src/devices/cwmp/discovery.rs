@@ -41,6 +41,12 @@ pub fn specialization(optical_vendor: &str, product_class: &str) -> Option<&'sta
     if optical_vendor == "H3CT" && product_class == "HL202-DU-C" {
         return Some(&crate::devices::hl202::cwmp::CONTRACT);
     }
+    #[cfg(feature = "device-zte")]
+    if (optical_vendor == "9866" || optical_vendor == "ZTEG" || optical_vendor == "ZTE")
+        && (product_class == "ZXHN G1612" || product_class == "G1612")
+    {
+        return Some(&crate::devices::zte::g1612::cwmp::CONTRACT);
+    }
     let _ = (optical_vendor, product_class);
     None
 }

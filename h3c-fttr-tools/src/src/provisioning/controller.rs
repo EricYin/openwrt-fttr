@@ -691,17 +691,17 @@ mod tests {
         );
         assert_eq!(
             discovered_identity(&devices, "STAR1234ABCD", "generic"),
-            cfg!(feature = "device-star").then(|| "child".into())
+            None
         );
         for serial in ["STAR1234ABCE", "STAR1234ABC0", "HWTC1234ABCD"] {
-            assert_eq!(discovered_identity(&devices, serial, "generic"), None);
+            assert_eq!(discovered_identity(&devices, serial, "star"), None);
         }
         assert_eq!(discovered_identity(&devices, "STAR1234ABCD", "hl202"), None);
         let wrong_model = json!({"devices":{
             "child":{"product_class":"OTHER","serial":"MODEL-STAR1234ABCD-SUFFIX"}
         }});
         assert_eq!(
-            discovered_identity(&wrong_model, "STAR1234ABCD", "generic"),
+            discovered_identity(&wrong_model, "STAR1234ABCD", "star"),
             None
         );
         let ambiguous = json!({"devices":{
@@ -709,7 +709,7 @@ mod tests {
             "two":{"product_class":"SG631Z-C","serial":"OTHER-STAR1234ABCD-SUFFIX"}
         }});
         assert_eq!(
-            discovered_identity(&ambiguous, "STAR1234ABCD", "generic"),
+            discovered_identity(&ambiguous, "STAR1234ABCD", "star"),
             None
         );
     }

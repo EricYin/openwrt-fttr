@@ -21,18 +21,19 @@ pub mod hl202;
 pub mod hwtc;
 #[cfg(feature = "device-star")]
 pub(crate) mod star;
+#[cfg(feature = "device-zte")]
+pub(crate) mod zte;
 
 /// Optional device identity rules, independent of the shared OMCI bridge implementation.
 pub(crate) fn matches_cwmp_identity(optical_sn: &str, product_class: &str, serial: &str) -> bool {
-    #[cfg(feature = "device-star")]
+    #[cfg(feature = "device-zte")]
     {
-        star::matches_cwmp(optical_sn, product_class, serial)
+        if zte::matches_cwmp(optical_sn, product_class, serial) {
+            return true;
+        }
     }
-    #[cfg(not(feature = "device-star"))]
-    {
-        let _ = (optical_sn, product_class, serial);
-        false
-    }
+    let _ = (optical_sn, product_class, serial);
+    false
 }
 
 /// Match a CWMP device record against the expected optical serial and adapter.
@@ -62,6 +63,8 @@ pub fn matches_cwmp_adapter(
         }
         #[cfg(feature = "device-star")]
         "star" => star::matches_cwmp(optical_sn, product_class, serial),
+        #[cfg(feature = "device-zte")]
+        "zte" => zte::matches_cwmp(optical_sn, product_class, serial),
         "generic" => matches_cwmp_identity(optical_sn, product_class, serial),
         _ => false,
     }
@@ -75,6 +78,8 @@ pub enum Adapter {
     Hwtc(hwtc::Profile),
     #[cfg(feature = "device-star")]
     Star,
+    #[cfg(feature = "device-zte")]
+    Zte,
     GenericBridge,
     Unavailable,
 }
@@ -208,6 +213,11 @@ impl Adapter {
                 business: true,
                 shell_commands: false,
             },
+            #[cfg(feature = "device-zte")]
+            Self::Zte => Capabilities {
+                business: true,
+                shell_commands: false,
+            },
             Self::GenericBridge => Capabilities {
                 business: true,
                 shell_commands: false,
@@ -226,6 +236,8 @@ impl Adapter {
             Self::Hwtc(_) => BusinessPhase::Configuring,
             #[cfg(feature = "device-star")]
             Self::Star => BusinessPhase::Configuring,
+            #[cfg(feature = "device-zte")]
+            Self::Zte => BusinessPhase::Configuring,
             Self::GenericBridge => BusinessPhase::Configuring,
             Self::Unavailable => BusinessPhase::Unsupported,
         }
@@ -240,6 +252,8 @@ impl Adapter {
             Self::Hl202 => BusinessPhase::Verifying,
             #[cfg(feature = "device-star")]
             Self::Star => BusinessPhase::Verifying,
+            #[cfg(feature = "device-zte")]
+            Self::Zte => BusinessPhase::Verifying,
             Self::GenericBridge => BusinessPhase::Verifying,
             Self::Unavailable => BusinessPhase::Verifying,
         }
@@ -260,6 +274,8 @@ impl Adapter {
             },
             #[cfg(feature = "device-star")]
             Self::Star => generic::service::configure(id, Some(token)),
+            #[cfg(feature = "device-zte")]
+            Self::Zte => zte::configure(id, Some(token)),
             Self::GenericBridge => generic::service::configure(id, Some(token)),
             _ => {
                 let _ = (id, token);
@@ -289,6 +305,10 @@ pub fn select_with_serial(
         if crate::provisioning::is_device_adapter(sn, "star") {
             return Adapter::Star;
         }
+        #[cfg(feature = "device-zte")]
+        if crate::provisioning::is_device_adapter(sn, "zte") {
+            return Adapter::Zte;
+        }
     }
     #[cfg(feature = "device-hl202")]
     if hl202::matches(vendor, equipment) {
@@ -310,6 +330,10 @@ pub fn select_with_serial(
         || equipment == Some("SG631Z-C")
     {
         return Adapter::Star;
+    }
+    #[cfg(feature = "device-zte")]
+    if zte::matches(vendor, equipment, serial) {
+        return Adapter::Zte;
     }
     let _ = (vendor, equipment);
     if serial.is_some_and(crate::provisioning::allows_generic_bridge)
@@ -549,6 +573,27 @@ mod tests {
                 "STAR1234ABCD",
                 "SG631Z-C",
                 "MODEL-WRONG-01"
+            ));
+        }
+        #[cfg(feature = "device-zte")]
+        {
+            assert!(matches_cwmp_adapter(
+                "zte",
+                "98661024BB88",
+                "ZXHN G1612",
+                "98661024BB88"
+            ));
+            assert!(!matches_cwmp_adapter(
+                "zte",
+                "98661024BB88",
+                "OTHER-DEVICE",
+                "98661024BB88"
+            ));
+            assert!(!matches_cwmp_adapter(
+                "zte",
+                "98661024BB88",
+                "ZXHN G1612",
+                "OTHER-SERIAL"
             ));
         }
         assert!(!matches_cwmp_adapter(
