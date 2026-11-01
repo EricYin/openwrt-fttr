@@ -181,21 +181,49 @@ unsafe fn load_first_working(prefix: &str, env_var: &str) -> Result<(*mut c_void
     Err(errs.join("\n"))
 }
 
+struct DlHandle(*mut c_void);
+
+impl DlHandle {
+    fn new(ptr: *mut c_void) -> Self {
+        Self(ptr)
+    }
+
+    fn raw(&self) -> *mut c_void {
+        self.0
+    }
+
+    fn into_raw(mut self) -> *mut c_void {
+        let p = self.0;
+        self.0 = std::ptr::null_mut();
+        p
+    }
+}
+
+impl Drop for DlHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                dlclose(self.0);
+            }
+        }
+    }
+}
+
 impl LibUbus {
     pub fn load() -> Result<Self, String> {
         unsafe {
-            let (handle_ubox, _ubox_path) = load_first_working("libubox.so", "LIBUBOX_SO_PATH")
+            let (h_ubox, _ubox_path) = load_first_working("libubox.so", "LIBUBOX_SO_PATH")
                 .map_err(|e| format!("Failed to load libubox:\n{e}"))?;
+            let handle_ubox = DlHandle::new(h_ubox);
 
-            let (handle_ubus, _ubus_path) = load_first_working("libubus.so", "LIBUBUS_SO_PATH")
-                .map_err(|e| {
-                    dlclose(handle_ubox);
-                    format!("Failed to load libubus:\n{e}")
-                })?;
+            let (h_ubus, _ubus_path) = load_first_working("libubus.so", "LIBUBUS_SO_PATH")
+                .map_err(|e| format!("Failed to load libubus:\n{e}"))?;
+            let handle_ubus = DlHandle::new(h_ubus);
 
-            let handle_json = load_first_working("libblobmsg_json.so", "LIBBLOBMSG_JSON_SO_PATH")
+            let h_json = load_first_working("libblobmsg_json.so", "LIBBLOBMSG_JSON_SO_PATH")
                 .map(|(h, _)| h)
                 .unwrap_or(std::ptr::null_mut());
+            let handle_json = DlHandle::new(h_json);
 
             macro_rules! resolve {
                 ($handle:expr, $sym:ident, $type:ident) => {{
@@ -225,33 +253,37 @@ impl LibUbus {
             }
 
             let inner = LibUbusInner {
-                handle_ubus,
-                handle_ubox,
-                handle_json,
+                ubus_connect: resolve!(handle_ubus.raw(), ubus_connect, FnUbusConnect),
+                ubus_free: resolve!(handle_ubus.raw(), ubus_free, FnUbusFree),
+                ubus_reconnect: resolve!(handle_ubus.raw(), ubus_reconnect, FnUbusReconnect),
+                ubus_add_object: resolve!(handle_ubus.raw(), ubus_add_object, FnUbusAddObject),
+                ubus_remove_object: resolve!(
+                    handle_ubus.raw(),
+                    ubus_remove_object,
+                    FnUbusRemoveObject
+                ),
+                ubus_lookup_id: resolve!(handle_ubus.raw(), ubus_lookup_id, FnUbusLookupId),
+                ubus_invoke_fd: resolve!(handle_ubus.raw(), ubus_invoke_fd, FnUbusInvokeFd),
+                ubus_send_reply: resolve!(handle_ubus.raw(), ubus_send_reply, FnUbusSendReply),
+                ubus_send_event: resolve!(handle_ubus.raw(), ubus_send_event, FnUbusSendEvent),
+                ubus_strerror: resolve_opt!(handle_ubus.raw(), ubus_strerror, FnUbusStrerror),
 
-                ubus_connect: resolve!(handle_ubus, ubus_connect, FnUbusConnect),
-                ubus_free: resolve!(handle_ubus, ubus_free, FnUbusFree),
-                ubus_reconnect: resolve!(handle_ubus, ubus_reconnect, FnUbusReconnect),
-                ubus_add_object: resolve!(handle_ubus, ubus_add_object, FnUbusAddObject),
-                ubus_remove_object: resolve!(handle_ubus, ubus_remove_object, FnUbusRemoveObject),
-                ubus_lookup_id: resolve!(handle_ubus, ubus_lookup_id, FnUbusLookupId),
-                ubus_invoke_fd: resolve!(handle_ubus, ubus_invoke_fd, FnUbusInvokeFd),
-                ubus_send_reply: resolve!(handle_ubus, ubus_send_reply, FnUbusSendReply),
-                ubus_send_event: resolve!(handle_ubus, ubus_send_event, FnUbusSendEvent),
-                ubus_strerror: resolve_opt!(handle_ubus, ubus_strerror, FnUbusStrerror),
-
-                blob_buf_init: resolve!(handle_ubox, blob_buf_init, FnBlobBufInit),
-                blob_buf_free: resolve!(handle_ubox, blob_buf_free, FnBlobBufFree),
+                blob_buf_init: resolve!(handle_ubox.raw(), blob_buf_init, FnBlobBufInit),
+                blob_buf_free: resolve!(handle_ubox.raw(), blob_buf_free, FnBlobBufFree),
                 blobmsg_format_json_with_cb: resolve_opt!(
-                    handle_json,
+                    handle_json.raw(),
                     blobmsg_format_json_with_cb,
                     FnBlobmsgFormatJsonWithCb
                 ),
                 blobmsg_add_json_from_string: resolve_opt!(
-                    handle_json,
+                    handle_json.raw(),
                     blobmsg_add_json_from_string,
                     FnBlobmsgAddJsonFromString
                 ),
+
+                handle_ubus: handle_ubus.into_raw(),
+                handle_ubox: handle_ubox.into_raw(),
+                handle_json: handle_json.into_raw(),
             };
 
             Ok(LibUbus {

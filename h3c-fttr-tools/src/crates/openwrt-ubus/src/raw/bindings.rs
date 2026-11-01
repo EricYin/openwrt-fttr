@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Pinned OpenWrt libubus and libubox C ABI definitions.
+// Sourced from OpenWrt ubus.git commit da2d205a5cf3e877c45a2eec488218cbaf452e7d.
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
@@ -10,15 +11,16 @@
 use std::os::raw::{c_char, c_int, c_ulong, c_void};
 
 pub const UBUS_STATUS_OK: c_int = 0;
-pub const UBUS_STATUS_INVALID_ARGUMENT: c_int = 1;
-pub const UBUS_STATUS_METHOD_NOT_FOUND: c_int = 2;
-pub const UBUS_STATUS_NOT_FOUND: c_int = 3;
-pub const UBUS_STATUS_NO_DATA: c_int = 4;
-pub const UBUS_STATUS_PERMISSION_DENIED: c_int = 5;
-pub const UBUS_STATUS_TIMEOUT: c_int = 6;
-pub const UBUS_STATUS_NOT_SUPPORTED: c_int = 7;
-pub const UBUS_STATUS_UNKNOWN_ERROR: c_int = 8;
-pub const UBUS_STATUS_CONNECTION_FAILED: c_int = 9;
+pub const UBUS_STATUS_INVALID_COMMAND: c_int = 1;
+pub const UBUS_STATUS_INVALID_ARGUMENT: c_int = 2;
+pub const UBUS_STATUS_METHOD_NOT_FOUND: c_int = 3;
+pub const UBUS_STATUS_NOT_FOUND: c_int = 4;
+pub const UBUS_STATUS_NO_DATA: c_int = 5;
+pub const UBUS_STATUS_PERMISSION_DENIED: c_int = 6;
+pub const UBUS_STATUS_TIMEOUT: c_int = 7;
+pub const UBUS_STATUS_NOT_SUPPORTED: c_int = 8;
+pub const UBUS_STATUS_UNKNOWN_ERROR: c_int = 9;
+pub const UBUS_STATUS_CONNECTION_FAILED: c_int = 10;
 
 pub const BLOBMSG_TYPE_UNSPEC: c_int = 0;
 pub const BLOBMSG_TYPE_ARRAY: c_int = 1;

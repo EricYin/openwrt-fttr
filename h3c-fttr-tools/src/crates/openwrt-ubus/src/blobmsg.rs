@@ -12,25 +12,33 @@ pub struct BlobBuffer {
 }
 
 impl BlobBuffer {
-    pub fn new(lib: LibUbus) -> Self {
+    pub fn new(lib: LibUbus) -> Result<Self, UbusError> {
         let mut raw = blob_buf {
             head: std::ptr::null_mut(),
             grow: None,
             buflen: 0,
             buf: std::ptr::null_mut(),
         };
-        unsafe {
-            lib.blob_buf_init(&mut raw, 0);
+        let ret = unsafe { lib.blob_buf_init(&mut raw, 0) };
+        if ret != 0 {
+            return Err(UbusError::InvokeFailed(format!(
+                "blob_buf_init failed with error {ret}"
+            )));
         }
-        Self { lib, raw }
+        Ok(Self { lib, raw })
     }
 
     pub fn from_json_str(lib: LibUbus, json_str: &str) -> Result<Self, UbusError> {
-        let mut buf = Self::new(lib);
+        let mut buf = Self::new(lib)?;
         let c_str = CString::new(json_str)?;
-        unsafe {
+        let ok = unsafe {
             buf.lib
-                .blobmsg_add_json_from_string(&mut buf.raw, c_str.as_ptr());
+                .blobmsg_add_json_from_string(&mut buf.raw, c_str.as_ptr())
+        };
+        if !ok {
+            return Err(UbusError::Serialization(
+                "blobmsg_add_json_from_string failed for json payload".into(),
+            ));
         }
         Ok(buf)
     }

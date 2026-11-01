@@ -1,9 +1,47 @@
 //! Generator and verifier for OpenWrt libuci bindings.
 //! Sourced from OpenWrt uci.git commit 74f6277aabffc943d026f406df57c22595134c42.
 
+use openwrt_uci::raw::bindings::*;
 use std::{env, fs, path::PathBuf};
 
 const PINNED_COMMIT: &str = "74f6277aabffc943d026f406df57c22595134c42";
+
+fn verify_abi() {
+    // Assert error codes
+    assert_eq!(UCI_OK, 0);
+    assert_eq!(UCI_ERR_MEM, 1);
+    assert_eq!(UCI_ERR_INVAL, 2);
+    assert_eq!(UCI_ERR_NOTFOUND, 3);
+    assert_eq!(UCI_ERR_IO, 4);
+    assert_eq!(UCI_ERR_PARSE, 5);
+    assert_eq!(UCI_ERR_DUPLICATE, 6);
+    assert_eq!(UCI_ERR_UNKNOWN, 7);
+
+    // Assert lookup flags
+    assert_eq!(UCI_LOOKUP_DONE, 1 << 0);
+    assert_eq!(UCI_LOOKUP_COMPLETE, 1 << 1);
+    assert_eq!(UCI_LOOKUP_EXTENDED, 1 << 2);
+
+    // Assert enum representations
+    assert_eq!(uci_type::UCI_TYPE_UNSPEC as i32, 0);
+    assert_eq!(uci_type::UCI_TYPE_DELTA as i32, 1);
+    assert_eq!(uci_type::UCI_TYPE_PACKAGE as i32, 2);
+    assert_eq!(uci_type::UCI_TYPE_SECTION as i32, 3);
+    assert_eq!(uci_type::UCI_TYPE_OPTION as i32, 4);
+    assert_eq!(uci_type::UCI_TYPE_PATH as i32, 5);
+    assert_eq!(uci_type::UCI_TYPE_HOOK as i32, 6);
+    assert_eq!(uci_type::UCI_TYPE_ITEM as i32, 7);
+
+    assert_eq!(uci_option_type::UCI_TYPE_STRING as i32, 0);
+    assert_eq!(uci_option_type::UCI_TYPE_LIST as i32, 1);
+
+    // Assert pointer sizes (on 64-bit target)
+    if std::mem::size_of::<usize>() == 8 {
+        assert_eq!(std::mem::size_of::<uci_list>(), 16);
+        assert_eq!(std::mem::size_of::<uci_element>(), 32);
+        assert_eq!(std::mem::size_of::<uci_ptr>(), 72);
+    }
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -25,12 +63,14 @@ fn main() {
         "Bindings file is not based on pinned commit {PINNED_COMMIT}"
     );
 
+    verify_abi();
+
     match action {
         "--check" => {
-            println!("Verification passed: bindings are pinned and up to date.");
+            println!("Verification passed: ABI layout, constants, and commit hash are verified.");
         }
         "--generate" => {
-            println!("Bindings are already validated and up-to-date with commit {PINNED_COMMIT}.");
+            println!("Bindings are validated and up-to-date with commit {PINNED_COMMIT}.");
         }
         other => {
             eprintln!("Unknown action: {other}. Use --check or --generate.");

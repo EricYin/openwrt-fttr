@@ -76,11 +76,8 @@ type FnUciExport = unsafe extern "C" fn(
     p: *mut uci_package,
     header: bool,
 ) -> c_int;
-type FnUciGetErrorstr = unsafe extern "C" fn(
-    ctx: *mut uci_context,
-    dest: *mut *mut c_char,
-    prefix: *const c_char,
-) -> *const c_char;
+type FnUciGetErrorstr =
+    unsafe extern "C" fn(ctx: *mut uci_context, dest: *mut *mut c_char, prefix: *const c_char);
 
 #[derive(Clone)]
 pub struct LibUci {
@@ -341,11 +338,14 @@ impl LibUci {
         if let Some(err_fn) = self.inner.uci_get_errorstr {
             let mut dest: *mut c_char = std::ptr::null_mut();
             let prefix = CString::new("uci").unwrap();
-            let msg_ptr = err_fn(ctx, &mut dest, prefix.as_ptr());
-            if !msg_ptr.is_null() {
-                return CStr::from_ptr(msg_ptr).to_string_lossy().into_owned();
+            err_fn(ctx, &mut dest, prefix.as_ptr());
+            if !dest.is_null() {
+                let msg = CStr::from_ptr(dest).to_string_lossy().into_owned();
+                #[cfg(unix)]
+                libc::free(dest as *mut c_void);
+                return msg;
             }
         }
-        format!("UCI error code: {}", (*ctx).err)
+        "UCI operation failed".to_string()
     }
 }

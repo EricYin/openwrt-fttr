@@ -22,6 +22,7 @@ unsafe impl Send for Ubus {}
 struct InvokeState {
     lib: LibUbus,
     response: Option<Value>,
+    error: Option<String>,
 }
 
 unsafe extern "C" fn invoke_callback(req: *mut ubus_request, _type: c_int, msg: *mut blob_attr) {
@@ -33,9 +34,17 @@ unsafe extern "C" fn invoke_callback(req: *mut ubus_request, _type: c_int, msg: 
         return;
     }
     let state = &mut *(priv_ as *mut InvokeState);
-    if let Some(json_str) = state.lib.blobmsg_format_json(msg, true) {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&json_str) {
-            state.response = Some(parsed);
+    match state.lib.blobmsg_format_json(msg, true) {
+        Some(json_str) => match serde_json::from_str::<Value>(&json_str) {
+            Ok(parsed) => {
+                state.response = Some(parsed);
+            }
+            Err(e) => {
+                state.error = Some(format!("failed to parse ubus JSON response: {e}"));
+            }
+        },
+        None => {
+            state.error = Some("blobmsg_format_json failed to format response".into());
         }
     }
 }
@@ -107,6 +116,7 @@ impl Ubus {
             let mut state = InvokeState {
                 lib: self.lib.clone(),
                 response: None,
+                error: None,
             };
 
             let ret = self.lib.ubus_invoke(
@@ -122,6 +132,8 @@ impl Ubus {
             if ret != UBUS_STATUS_OK {
                 if ret == UBUS_STATUS_TIMEOUT {
                     return Err(UbusError::Timeout);
+                } else if ret == UBUS_STATUS_NOT_FOUND {
+                    return Err(UbusError::ObjectNotFound(object.to_string()));
                 } else if ret == UBUS_STATUS_METHOD_NOT_FOUND {
                     return Err(UbusError::MethodNotFound(method.to_string()));
                 } else {
@@ -132,6 +144,10 @@ impl Ubus {
                         self.lib.strerror(ret)
                     )));
                 }
+            }
+
+            if let Some(err) = state.error {
+                return Err(UbusError::InvalidResponse(err));
             }
 
             Ok(state.response.unwrap_or(Value::Null))
