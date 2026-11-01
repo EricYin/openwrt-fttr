@@ -112,6 +112,57 @@ impl Uci {
         }
     }
 
+    /// Read a list option directly as a `Vec<String>` preserving element boundaries
+    pub fn get_list(
+        &mut self,
+        package: &str,
+        section: &str,
+        option: &str,
+    ) -> Result<Option<Vec<String>>, UciError> {
+        let path_str = format!("{package}.{section}.{option}");
+        let mut buf = path_str.into_bytes();
+        buf.push(0);
+
+        let mut ptr = uci_ptr::default();
+
+        unsafe {
+            let ret =
+                self.lib
+                    .uci_lookup_ptr(self.ctx, &mut ptr, buf.as_mut_ptr() as *mut c_char, true);
+            if ret != UCI_OK || ptr.o.is_null() {
+                return Ok(None);
+            }
+
+            let opt = &*ptr.o;
+            match opt.type_ {
+                uci_option_type::UCI_TYPE_STRING => {
+                    let str_ptr = opt.v.string;
+                    if str_ptr.is_null() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(vec![CStr::from_ptr(str_ptr)
+                            .to_string_lossy()
+                            .into_owned()]))
+                    }
+                }
+                uci_option_type::UCI_TYPE_LIST => {
+                    let mut values = Vec::new();
+                    let head = &opt.v.list;
+                    let mut curr = head.next;
+                    while curr != (head as *const uci_list as *mut uci_list) && !curr.is_null() {
+                        let elem = curr as *mut uci_element;
+                        if !(*elem).name.is_null() {
+                            values
+                                .push(CStr::from_ptr((*elem).name).to_string_lossy().into_owned());
+                        }
+                        curr = (*curr).next;
+                    }
+                    Ok(Some(values))
+                }
+            }
+        }
+    }
+
     /// Read an option and parse directly into a typed primitive (e.g. u32, bool, IpAddr)
     pub fn get_parsed<T: FromStr>(
         &mut self,
@@ -135,7 +186,11 @@ impl Uci {
         option: &str,
         value: &str,
     ) -> Result<(), UciError> {
-        let path_str = format!("{package}.{section}.{option}={value}");
+        let path_str = if option.is_empty() {
+            format!("{package}.{section}={value}")
+        } else {
+            format!("{package}.{section}.{option}={value}")
+        };
         let mut buf = path_str.into_bytes();
         buf.push(0);
 
@@ -158,6 +213,66 @@ impl Uci {
             if ret != UCI_OK {
                 return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
             }
+        }
+        Ok(())
+    }
+
+    /// Ensure a section of the specified type exists (e.g. named section `network.fttr_tr069=interface`)
+    pub fn ensure_section(
+        &mut self,
+        package: &str,
+        section: &str,
+        section_type: &str,
+    ) -> Result<(), UciError> {
+        self.set(package, section, "", section_type)
+    }
+
+    /// Add an item to a list option (`uci add_list package.section.option=value`)
+    pub fn add_list(
+        &mut self,
+        package: &str,
+        section: &str,
+        option: &str,
+        value: &str,
+    ) -> Result<(), UciError> {
+        let path_str = format!("{package}.{section}.{option}={value}");
+        let mut buf = path_str.into_bytes();
+        buf.push(0);
+
+        let mut ptr = uci_ptr::default();
+
+        unsafe {
+            let ret =
+                self.lib
+                    .uci_lookup_ptr(self.ctx, &mut ptr, buf.as_mut_ptr() as *mut c_char, true);
+            if ret != UCI_OK {
+                return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+            }
+
+            let ret = self.lib.uci_add_list(self.ctx, &mut ptr);
+            if ret != UCI_OK {
+                return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+            }
+
+            let ret = self.lib.uci_save(self.ctx, ptr.p);
+            if ret != UCI_OK {
+                return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace all elements of a list option with the given slice
+    pub fn replace_list(
+        &mut self,
+        package: &str,
+        section: &str,
+        option: &str,
+        values: &[String],
+    ) -> Result<(), UciError> {
+        self.delete(package, section, Some(option))?;
+        for v in values {
+            self.add_list(package, section, option, v)?;
         }
         Ok(())
     }

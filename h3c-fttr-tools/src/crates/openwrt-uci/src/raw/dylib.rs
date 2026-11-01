@@ -65,6 +65,8 @@ type FnUciAddSection = unsafe extern "C" fn(
     res: *mut *mut uci_section,
 ) -> c_int;
 type FnUciDelete = unsafe extern "C" fn(ctx: *mut uci_context, ptr: *mut uci_ptr) -> c_int;
+type FnUciAddList = unsafe extern "C" fn(ctx: *mut uci_context, ptr: *mut uci_ptr) -> c_int;
+type FnUciDelList = unsafe extern "C" fn(ctx: *mut uci_context, ptr: *mut uci_ptr) -> c_int;
 type FnUciRename = unsafe extern "C" fn(ctx: *mut uci_context, ptr: *mut uci_ptr) -> c_int;
 type FnUciSave = unsafe extern "C" fn(ctx: *mut uci_context, p: *mut uci_package) -> c_int;
 type FnUciCommit =
@@ -96,6 +98,8 @@ struct LibUciInner {
     pub uci_set: FnUciSet,
     pub uci_add_section: FnUciAddSection,
     pub uci_delete: FnUciDelete,
+    pub uci_add_list: FnUciAddList,
+    pub uci_del_list: FnUciDelList,
     pub uci_rename: FnUciRename,
     pub uci_save: FnUciSave,
     pub uci_commit: FnUciCommit,
@@ -217,6 +221,8 @@ impl LibUci {
                 uci_set: resolve!(uci_set, FnUciSet),
                 uci_add_section: resolve!(uci_add_section, FnUciAddSection),
                 uci_delete: resolve!(uci_delete, FnUciDelete),
+                uci_add_list: resolve!(uci_add_list, FnUciAddList),
+                uci_del_list: resolve!(uci_del_list, FnUciDelList),
                 uci_rename: resolve!(uci_rename, FnUciRename),
                 uci_save: resolve!(uci_save, FnUciSave),
                 uci_commit: resolve!(uci_commit, FnUciCommit),
@@ -296,6 +302,16 @@ impl LibUci {
     #[inline]
     pub unsafe fn uci_delete(&self, ctx: *mut uci_context, ptr: *mut uci_ptr) -> c_int {
         (self.inner.uci_delete)(ctx, ptr)
+    }
+
+    #[inline]
+    pub unsafe fn uci_add_list(&self, ctx: *mut uci_context, ptr: *mut uci_ptr) -> c_int {
+        (self.inner.uci_add_list)(ctx, ptr)
+    }
+
+    #[inline]
+    pub unsafe fn uci_del_list(&self, ctx: *mut uci_context, ptr: *mut uci_ptr) -> c_int {
+        (self.inner.uci_del_list)(ctx, ptr)
     }
 
     #[inline]

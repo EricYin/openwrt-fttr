@@ -74,6 +74,20 @@ fn test_uci() -> Result<(), String> {
         }
     }
 
+    println!("[PROBE] Testing native list extraction on 'fttr.provisioning.trigger'...");
+    match uci.get_list("fttr", "provisioning", "trigger") {
+        Ok(Some(triggers)) => {
+            println!("  [+] Successfully extracted list elements: {:?}", triggers);
+        }
+        Ok(None) => {
+            println!("  [*] fttr.provisioning.trigger list not found.");
+        }
+        Err(e) => {
+            println!("  [-] get_list failed: {e}");
+            return Err(e.to_string());
+        }
+    }
+
     Ok(())
 }
 
