@@ -2,6 +2,12 @@
 use serde::Serialize;
 use std::{collections::BTreeMap, fs, io, path::Path};
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AdapterCapability {
+    pub id: &'static str,
+    pub name: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Capabilities {
     pub schema_version: u32,
@@ -9,12 +15,38 @@ pub struct Capabilities {
     pub features: BTreeMap<&'static str, bool>,
     pub functions: BTreeMap<&'static str, bool>,
     pub pages: BTreeMap<&'static str, bool>,
+    pub adapters: Vec<AdapterCapability>,
 }
 
 pub fn compiled() -> Capabilities {
     let acs = cfg!(feature = "acs");
     let mqtt = cfg!(feature = "mqtt");
     let hl202 = cfg!(feature = "device-hl202");
+    let hwtc = cfg!(feature = "device-hwtc");
+    let star = cfg!(feature = "device-star");
+    let mut adapters = Vec::new();
+    if hl202 {
+        adapters.push(AdapterCapability {
+            id: "hl202",
+            name: "H3C HL202",
+        });
+    }
+    if hwtc {
+        adapters.push(AdapterCapability {
+            id: "hwtc",
+            name: "Huawei HWTC",
+        });
+    }
+    if star {
+        adapters.push(AdapterCapability {
+            id: "star",
+            name: "STAR SG631",
+        });
+    }
+    adapters.push(AdapterCapability {
+        id: "generic",
+        name: "Generic G.988 Bridge",
+    });
     Capabilities {
         schema_version: 1,
         version: env!("CARGO_PKG_VERSION"),
@@ -22,8 +54,8 @@ pub fn compiled() -> Capabilities {
             ("acs", acs),
             ("mqtt", mqtt),
             ("device-hl202", hl202),
-            ("device-hwtc", cfg!(feature = "device-hwtc")),
-            ("device-star", cfg!(feature = "device-star")),
+            ("device-hwtc", hwtc),
+            ("device-star", star),
         ]),
         functions: BTreeMap::from([
             ("optical", true),
@@ -43,6 +75,7 @@ pub fn compiled() -> Capabilities {
             ("sync", acs || (hl202 && mqtt)),
             ("hl202", hl202 && mqtt),
         ]),
+        adapters,
     }
 }
 

@@ -32,9 +32,26 @@ fn capabilities_offline_queries_agree_without_controller_initialization() {
         cli["pages"]["hl202"],
         cfg!(all(feature = "device-hl202", feature = "mqtt"))
     );
-    assert_eq!(cli["pages"]["config"], cfg!(feature = "acs"));
-    assert_eq!(cli["pages"]["sync"], cfg!(feature = "acs"));
+    assert_eq!(
+        cli["pages"]["config"],
+        cfg!(feature = "acs") || (cfg!(feature = "device-hl202") && cfg!(feature = "mqtt"))
+    );
+    assert_eq!(
+        cli["pages"]["sync"],
+        cfg!(feature = "acs") || (cfg!(feature = "device-hl202") && cfg!(feature = "mqtt"))
+    );
     for page in ["status", "hardware", "calibration", "about"] {
         assert_eq!(cli["pages"][page], true);
+    }
+    let adapters = cli["adapters"].as_array().expect("adapters array");
+    assert!(adapters.iter().any(|a| a["id"] == "generic"));
+    if cfg!(feature = "device-hl202") {
+        assert!(adapters.iter().any(|a| a["id"] == "hl202"));
+    }
+    if cfg!(feature = "device-hwtc") {
+        assert!(adapters.iter().any(|a| a["id"] == "hwtc"));
+    }
+    if cfg!(feature = "device-star") {
+        assert!(adapters.iter().any(|a| a["id"] == "star"));
     }
 }

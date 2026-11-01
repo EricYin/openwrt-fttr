@@ -60,6 +60,8 @@ pub fn matches_cwmp_adapter(
             );
             serial.eq_ignore_ascii_case(&hex)
         }
+        #[cfg(feature = "device-star")]
+        "star" => star::matches_cwmp(optical_sn, product_class, serial),
         "generic" => matches_cwmp_identity(optical_sn, product_class, serial),
         _ => false,
     }
@@ -71,6 +73,8 @@ pub enum Adapter {
     Hl202,
     #[cfg(feature = "device-hwtc")]
     Hwtc(hwtc::Profile),
+    #[cfg(feature = "device-star")]
+    Star,
     GenericBridge,
     Unavailable,
 }
@@ -199,6 +203,11 @@ impl Adapter {
                 business: true,
                 shell_commands: false,
             },
+            #[cfg(feature = "device-star")]
+            Self::Star => Capabilities {
+                business: true,
+                shell_commands: false,
+            },
             Self::GenericBridge => Capabilities {
                 business: true,
                 shell_commands: false,
@@ -215,6 +224,8 @@ impl Adapter {
             Self::Hl202 => BusinessPhase::Configuring,
             #[cfg(feature = "device-hwtc")]
             Self::Hwtc(_) => BusinessPhase::Configuring,
+            #[cfg(feature = "device-star")]
+            Self::Star => BusinessPhase::Configuring,
             Self::GenericBridge => BusinessPhase::Configuring,
             Self::Unavailable => BusinessPhase::Unsupported,
         }
@@ -227,6 +238,8 @@ impl Adapter {
             Self::Hwtc(hwtc::Profile::K155 | hwtc::Profile::Standard) => BusinessPhase::Verifying,
             #[cfg(feature = "device-hl202")]
             Self::Hl202 => BusinessPhase::Verifying,
+            #[cfg(feature = "device-star")]
+            Self::Star => BusinessPhase::Verifying,
             Self::GenericBridge => BusinessPhase::Verifying,
             Self::Unavailable => BusinessPhase::Verifying,
         }
@@ -245,6 +258,8 @@ impl Adapter {
                 hwtc::Profile::V152 => hwtc::v152::service::configure(id, Some(token)),
                 hwtc::Profile::Standard => hwtc::service::configure(id, Some(token)),
             },
+            #[cfg(feature = "device-star")]
+            Self::Star => generic::service::configure(id, Some(token)),
             Self::GenericBridge => generic::service::configure(id, Some(token)),
             _ => {
                 let _ = (id, token);
@@ -270,6 +285,10 @@ pub fn select_with_serial(
         if crate::provisioning::is_device_adapter(sn, "generic") {
             return Adapter::GenericBridge;
         }
+        #[cfg(feature = "device-star")]
+        if crate::provisioning::is_device_adapter(sn, "star") {
+            return Adapter::Star;
+        }
     }
     #[cfg(feature = "device-hl202")]
     if hl202::matches(vendor, equipment) {
@@ -286,6 +305,13 @@ pub fn select_with_serial(
             }
             hwtc::Profile::Standard => {}
         }
+    }
+    #[cfg(feature = "device-star")]
+    if vendor == "STAR"
+        || serial.is_some_and(|sn| sn.starts_with("STAR"))
+        || equipment == Some("SG631Z-C")
+    {
+        return Adapter::Star;
     }
     let _ = (vendor, equipment);
     if serial.is_some_and(crate::provisioning::allows_generic_bridge)
@@ -475,6 +501,12 @@ mod tests {
             assert!(matches_cwmp_adapter("hwtc", "HWTC12345678", "K155-11", "4857544312345678"));
             assert!(!matches_cwmp_adapter("hwtc", "HWTC12345678", "K155-11", "WRONGSERIAL"));
             assert!(!matches_cwmp_adapter("hwtc", "OTHER12345678", "K155-11", "4857544312345678"));
+        }
+        #[cfg(feature = "device-star")]
+        {
+            assert!(matches_cwmp_adapter("star", "STAR1234ABCD", "SG631Z-C", "MODEL-STAR1234ABCD-01"));
+            assert!(!matches_cwmp_adapter("star", "STAR1234ABCD", "OTHER-DEVICE", "MODEL-STAR1234ABCD-01"));
+            assert!(!matches_cwmp_adapter("star", "STAR1234ABCD", "SG631Z-C", "MODEL-WRONG-01"));
         }
         assert!(!matches_cwmp_adapter("unknown", "TEST12345678", "CLASS", "SERIAL"));
     }

@@ -684,6 +684,8 @@ mod tests {
         let devices = json!({"devices":{
             "child":{"product_class":"SG631Z-C","serial":"MODEL-STAR1234ABCD-SUFFIX"}
         }});
+        assert_eq!(discovered_identity(&devices, "STAR1234ABCD", "star"),
+            cfg!(feature = "device-star").then(|| "child".into()));
         assert_eq!(discovered_identity(&devices, "STAR1234ABCD", "generic"),
             cfg!(feature = "device-star").then(|| "child".into()));
         for serial in ["STAR1234ABCE", "STAR1234ABC0", "HWTC1234ABCD"] {

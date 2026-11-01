@@ -245,6 +245,7 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
         let adapter = match s.get("adapter") {
             "hl202" if cfg!(feature = "device-hl202") => "hl202",
             "hwtc" | "k155" if cfg!(feature = "device-hwtc") => "hwtc",
+            "star" if cfg!(feature = "device-star") => "star",
             "generic" => "generic",
             _ => return Err(format!("{id}: adapter unknown or not compiled")),
         };
