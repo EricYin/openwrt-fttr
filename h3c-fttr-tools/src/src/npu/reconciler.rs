@@ -3,13 +3,14 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub const MASK: &str = "/sys/module/h3c_fmcs/parameters/bridge_offload_mask";
 pub const NET: &str = "/sys/class/net";
 pub const POLL_FAST: Duration = Duration::from_secs(2);
 pub const POLL_STEADY: Duration = Duration::from_secs(10);
+const FULL_CHECK: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Topology {
@@ -38,6 +39,7 @@ pub fn topology(config: &str, firewall: &str, net: &Path, mask: &Path) -> io::Re
         ports: Vec::new(),
     };
     let valid_bridge = !bridge.is_empty()
+        && bridge.len() <= 15
         && bridge
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
@@ -91,12 +93,33 @@ pub struct Reconciler {
     pub stable: u8,
     pub armed: bool,
     pub reload_requested: bool,
+    cache: Option<PolicyCache>,
+}
+
+struct PolicyCache {
+    config: String,
+    firewall: String,
+    files: Vec<Option<Vec<u8>>>,
+    verified: Instant,
+}
+
+// Include uncommitted UCI deltas: `uci show` observes these as well as /etc/config.
+fn policy_files(config: &Path, delta: &Path) -> io::Result<Vec<Option<Vec<u8>>>> {
+    [config, delta]
+        .into_iter()
+        .flat_map(|dir| ["fttr", "firewall", "network"].map(|name| dir.join(name)))
+        .map(|path| match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        })
+        .collect()
 }
 
 impl Reconciler {
     /// Two unchanged observations after withdrawal, also on kernel invalidation.
     pub fn observe(&mut self, topology: Topology, current: u16) -> bool {
-        if self.last.as_ref() != Some(&topology) || (self.armed && current == 0) {
+        if self.last.as_ref() != Some(&topology) || (self.armed && current != topology.mask) {
             self.last = Some(topology);
             self.stable = 0;
             self.armed = false;
@@ -105,6 +128,22 @@ impl Reconciler {
         }
         self.stable = self.stable.saturating_add(1);
         self.last.as_ref().unwrap().mask != 0 && self.stable >= 2
+    }
+
+    fn can_skip(
+        &self,
+        topology: &Topology,
+        current: u16,
+        files: &[Option<Vec<u8>>],
+        now: Instant,
+    ) -> bool {
+        self.armed
+            && current != 0
+            && current == topology.mask
+            && self.last.as_ref() == Some(topology)
+            && self.cache.as_ref().is_some_and(|cache| {
+                cache.files == files && now.duration_since(cache.verified) < FULL_CHECK
+            })
     }
 }
 
@@ -179,37 +218,6 @@ impl Admission {
     }
 }
 
-/// Lightweight sysfs port and carrier fingerprint for fast-path polling.
-#[derive(Debug, PartialEq, Eq)]
-struct SysfsFingerprint {
-    fttr0_carrier: bool,
-    bridge_vlan_filtering: bool,
-    port_carriers: u16,
-}
-
-fn fast_sysfs_probe(net: &Path, bridge: &str) -> SysfsFingerprint {
-    let fttr0_carrier = text(net.join("fttr0/carrier")).ok().as_deref() == Some("1");
-    let bridge_vlan_filtering = text(net.join(bridge).join("bridge/vlan_filtering"))
-        .ok()
-        .as_deref()
-        == Some("1");
-    let mut port_carriers = 0u16;
-    for port in 1..=16 {
-        if text(net.join(format!("fttr{port}/carrier")))
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
-            port_carriers |= 1 << (port - 1);
-        }
-    }
-    SysfsFingerprint {
-        fttr0_carrier,
-        bridge_vlan_filtering,
-        port_carriers,
-    }
-}
-
 /// Reconcile NPU admission state.
 /// Employs a Fast-Path check against sysfs to avoid expensive `uci` and `nft` forks
 /// when the physical topology and admission state remain in steady equilibrium.
@@ -220,20 +228,24 @@ pub async fn reconcile(
     let net = Path::new(NET);
     let mask_path = Path::new(MASK);
     let current_mask = admission.lock().unwrap().current()?;
+    let files = policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))?;
 
     // Fast-path: When already armed and the driver hasn't revoked the mask,
     // verify the physical link status before spawning any external processes.
-    if state.armed && current_mask != 0 {
-        if let Some(topo) = &state.last {
-            let fp = fast_sysfs_probe(net, &topo.bridge);
-            let expected_carrier_mask = topo.mask;
-            if fp.fttr0_carrier
-                && !fp.bridge_vlan_filtering
-                && (fp.port_carriers & expected_carrier_mask) == expected_carrier_mask
-            {
-                // Steady-state confirmed: stay armed and extend sleep interval
-                return Ok(POLL_STEADY);
-            }
+    if let Some(cache) = &state.cache {
+        // Reuse the complete topology predicate, including new ports, master,
+        // forwarding state and identity. Missing sysfs data is never healthy.
+        let live = topology(&cache.config, &cache.firewall, net, mask_path)?;
+        if state.can_skip(&live, current_mask, &files, Instant::now()) {
+            return Ok(POLL_STEADY);
+        }
+        if state.armed
+            && (state.last.as_ref() != Some(&live)
+                || current_mask != live.mask
+                || cache.files != files)
+        {
+            // Withdraw before waiting on UCI/nft when a known prerequisite changed.
+            admission.lock().unwrap().set(0)?;
         }
     }
 
@@ -242,6 +254,18 @@ pub async fn reconcile(
     let firewall =
         command::run_async("uci", &["-q", "show", "firewall"], Duration::from_secs(5)).await?;
     let topology = topology(&config, &firewall, net, mask_path)?;
+    // Timestamp is refreshed only after hooks pass, never by a cheap probe.
+    let verified = state
+        .cache
+        .as_ref()
+        .map(|cache| cache.verified)
+        .unwrap_or_else(Instant::now);
+    state.cache = Some(PolicyCache {
+        config,
+        firewall,
+        files,
+        verified,
+    });
     let current = admission.lock().unwrap().current()?;
 
     if !state.observe(topology, current) {
@@ -302,8 +326,22 @@ pub async fn reconcile(
     }
 
     state.reload_requested = false;
+    // Commands can suspend for seconds. Do not publish a snapshot invalidated
+    // during hook inspection (including a kernel withdrawal with the same mask).
+    let cache = state.cache.as_ref().unwrap();
+    if policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))? != cache.files
+        || self::topology(&cache.config, &cache.firewall, net, mask_path)? != *topology
+        || admission.lock().unwrap().current()? != current
+    {
+        admission.lock().unwrap().set(0)?;
+        state.last = None;
+        state.armed = false;
+        state.stable = 0;
+        return Ok(POLL_FAST);
+    }
     admission.lock().unwrap().set(topology.mask)?;
     state.armed = true;
+    state.cache.as_mut().unwrap().verified = Instant::now();
     Ok(POLL_STEADY)
 }
 
@@ -338,6 +376,55 @@ mod tests {
         let mut disabled = pair("new");
         disabled.mask = 0;
         assert!(!state.observe(disabled, 3));
+        state.armed = true;
+        state.last = Some(pair("old"));
+        assert!(!state.observe(pair("old"), 7));
+    }
+
+    #[test]
+    fn steady_cache_requires_full_topology_policy_mask_and_periodic_hook_checks() {
+        let now = Instant::now();
+        let files = vec![Some(b"enabled".to_vec())];
+        let state = Reconciler {
+            last: Some(pair("old")),
+            armed: true,
+            cache: Some(PolicyCache {
+                config: String::new(),
+                firewall: String::new(),
+                files: files.clone(),
+                verified: now,
+            }),
+            ..Default::default()
+        };
+        assert!(state.can_skip(&pair("old"), 3, &files, now));
+        for mask in [0, 1, 7] {
+            assert!(!state.can_skip(&pair("old"), mask, &files, now));
+        }
+        assert!(!state.can_skip(&pair("new"), 3, &files, now));
+        let mut added = pair("old");
+        added.mask = 7;
+        added.ports.push(("fttr3".into(), vec![]));
+        assert!(!state.can_skip(&added, 3, &files, now));
+        assert!(!state.can_skip(&pair("old"), 3, &[None], now));
+        assert!(!state.can_skip(&pair("old"), 3, &files, now + FULL_CHECK));
+    }
+
+    #[test]
+    fn policy_watch_includes_uncommitted_changes_and_removal() {
+        let root = std::env::temp_dir().join(format!("fttr-npu-policy-{}", std::process::id()));
+        let config = root.join("config");
+        let delta = root.join("delta");
+        fs::create_dir_all(&config).unwrap();
+        fs::create_dir_all(&delta).unwrap();
+        let initial = policy_files(&config, &delta).unwrap();
+        fs::write(config.join("fttr"), "enabled").unwrap();
+        let committed = policy_files(&config, &delta).unwrap();
+        assert_ne!(initial, committed);
+        fs::write(delta.join("firewall"), "disabled").unwrap();
+        assert_ne!(committed, policy_files(&config, &delta).unwrap());
+        fs::remove_file(delta.join("firewall")).unwrap();
+        assert_eq!(committed, policy_files(&config, &delta).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -408,6 +495,12 @@ mod tests {
         let discover =
             |config: &str, policy: &str| topology(config, policy, &root, &mask).unwrap().mask;
         assert_eq!(discover("", firewall), 3);
+        let before = topology("", firewall, &root, &mask).unwrap();
+        fs::write(root.join("fttr1/mtu"), "1400").unwrap();
+        let after = topology("", firewall, &root, &mask).unwrap();
+        assert_eq!(before.mask, after.mask);
+        assert_ne!(before, after);
+        fs::write(root.join("fttr1/mtu"), "1500").unwrap();
         assert_eq!(discover("fttr.offload.enabled='0'", firewall), 0);
         assert_eq!(discover("fttr.offload.bridge='../br-lan'", firewall), 0);
         assert_eq!(
@@ -430,6 +523,9 @@ mod tests {
         fs::write(root.join("fttr2/brport/state"), "2").unwrap();
         assert_eq!(discover("", firewall), 0);
         fs::write(root.join("fttr2/brport/state"), "3").unwrap();
+        fs::remove_file(root.join("br-lan/bridge/vlan_filtering")).unwrap();
+        assert_eq!(discover("", firewall), 0);
+        fs::write(root.join("br-lan/bridge/vlan_filtering"), "0").unwrap();
         fs::write(root.join("fttr0/carrier"), "0").unwrap();
         assert_eq!(discover("", firewall), 0);
         let _ = fs::remove_dir_all(root);

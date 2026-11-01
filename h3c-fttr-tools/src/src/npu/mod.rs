@@ -55,8 +55,7 @@ pub fn status() -> NpuStatus {
                 "nft",
                 &["list", "flowtable", "bridge", "fw4", "fb"],
                 Duration::from_secs(2),
-            )
-            .unwrap_or_default()
+            )?
         };
 
         Ok(hooks_ready(&table, &ports, &text))
