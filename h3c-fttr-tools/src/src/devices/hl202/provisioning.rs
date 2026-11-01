@@ -102,7 +102,7 @@ done
 for radio in WLan WLan11ac; do
  read_fields "${radio}_Common" APOn BssidNum
  for slot in 0 1 2 3; do
-  read_fields "${radio}_Entry${slot}" SSID EnableSSID HideSSID AuthMode EncrypType WPAPSK
+   read_fields "${radio}_Entry${slot}" SSID EnableSSID HideSSID AuthMode EncrypType WPAPSK PMFMFPC PMFMFPR PMFSHA256
  done
 done
 printf 'FTTR_INVENTORY_COMPLETE\n'"#;
@@ -247,14 +247,18 @@ fn compile(
                 desired.set(&item.id, &node, "HideSSID", u8::from(!broadcast));
             }
             if let Some(security) = wifi.security {
-                let (auth, encrypt) = match security {
-                    WifiSecurity::None => ("OPEN", "NONE"),
-                    WifiSecurity::Wpa2Psk => ("WPA2PSK", "AES"),
-                    WifiSecurity::WpaPskWpa2Psk => ("WPAPSKWPA2PSK", "TKIPAES"),
-                    _ => return Err("native WPA3 contract not verified on this firmware".into()),
+                let (auth, encrypt, capable, required) = match security {
+                    WifiSecurity::None => ("OPEN", "NONE", "0", "0"),
+                    WifiSecurity::Wpa2Psk => ("WPA2PSK", "AES", "0", "0"),
+                    WifiSecurity::WpaPskWpa2Psk => ("WPAPSKWPA2PSK", "TKIPAES", "0", "0"),
+                    WifiSecurity::Wpa3Sae => ("WPA3PSK", "AES", "1", "1"),
+                    WifiSecurity::Wpa2PskWpa3Sae => ("WPA2PSKWPA3PSK", "AES", "1", "0"),
                 };
                 desired.set(&item.id, &node, "AuthMode", auth);
                 desired.set(&item.id, &node, "EncrypType", encrypt);
+                desired.set(&item.id, &node, "PMFMFPC", capable);
+                desired.set(&item.id, &node, "PMFMFPR", required);
+                desired.set(&item.id, &node, "PMFSHA256", "0");
             }
             if let Some(key) = &wifi.key {
                 desired.set(&item.id, &node, "WPAPSK", key);
@@ -720,8 +724,12 @@ mod tests {
         let first = compile(&device, &inv, Ownership::default(), true).unwrap();
         inv.parents.insert(0);
         inv.children.insert((0, 0));
-        inv.fields.insert(("Wan_PVC0_Entry0".into(), "ServiceList".into()), "IPTV".into());
-        inv.fields.insert(("Wan_PVC0".into(), "VLANID".into()), "88".into());
+        inv.fields.insert(
+            ("Wan_PVC0_Entry0".into(), "ServiceList".into()),
+            "IPTV".into(),
+        );
+        inv.fields
+            .insert(("Wan_PVC0".into(), "VLANID".into()), "88".into());
         device.items.clear();
         let deleting = compile(&device, &inv, first.owned, true).unwrap();
         assert!(deleting.removed.contains(&(0, 0)));
@@ -818,6 +826,37 @@ mod tests {
             },
         );
         assert!(compile(&device, &inv, owned, true).is_err());
+    }
+    #[test]
+    fn wpa3_transition_resets_required_pmf_when_returning_to_wpa2() {
+        let (mut device, inv) = fixture();
+        device.items[0].wan_intent = None;
+        device.items[0].wlan_intent = Some(WlanIntent {
+            endpoint: EndpointRef::Ssid { radio: 5, slot: 2 },
+            ssid: "test".into(),
+            enabled: Some(true),
+            broadcast: Some(true),
+            security: Some(WifiSecurity::Wpa3Sae),
+            key: Some("test-only-key".into()),
+        });
+        let pure = compile(&device, &inv, Ownership::default(), true).unwrap();
+        let field = |key: &str| ("WLan11ac_Entry1".into(), key.into());
+        assert_eq!(pure.fields[&field("AuthMode")], "WPA3PSK");
+        assert_eq!(pure.fields[&field("PMFMFPR")], "1");
+        device.items[0].wlan_intent.as_mut().unwrap().security = Some(WifiSecurity::Wpa2PskWpa3Sae);
+        let mixed = compile(&device, &inv, Ownership::default(), true).unwrap();
+        assert_eq!(mixed.fields[&field("AuthMode")], "WPA2PSKWPA3PSK");
+        assert_eq!(mixed.fields[&field("PMFMFPC")], "1");
+        assert_eq!(mixed.fields[&field("PMFMFPR")], "0");
+        device.items[0].wlan_intent.as_mut().unwrap().security = Some(WifiSecurity::Wpa2Psk);
+        let observed = Inventory {
+            fields: pure.fields,
+            ..inv
+        };
+        let restored = compile(&device, &observed, Ownership::default(), true).unwrap();
+        let diff = differences(&restored, &observed);
+        assert_eq!(diff[&field("PMFMFPC")], "0");
+        assert_eq!(diff[&field("PMFMFPR")], "0");
     }
     #[test]
     fn backend_defaults_and_explicit_override_follow_compiled_capability() {

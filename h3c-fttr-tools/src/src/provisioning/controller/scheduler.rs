@@ -302,12 +302,15 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
         o.stage != OperationPhase::Completed && o.stage != OperationPhase::Interrupted
     });
     let startup_trigger = c.startup_trigger_pending(&d.id);
+    let config_changed = c.config.triggers.contains("config_change")
+        && previous.as_ref().is_none_or(|p| p["revision"] != c.config.revision);
     let periodic = c.periodic_due(&d.id, time);
     if !active_op && reachable && c.config.enabled && c.config.automatic {
         if needs_reconcile {
             let _ = c.start_selected(&d.id, false, false, None);
         } else if !needs_manual
-            && (startup_trigger
+            && (config_changed
+                || startup_trigger
                 || periodic
                 || (c.config.triggers.contains("device_online") && !c.last_online.contains(&d.id))
                 || (new_boot && c.config.triggers.contains("cwmp_boot")))
@@ -333,6 +336,83 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
                 let _ = c.start(&d.id, true, false);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod config_change_tests {
+    use super::*;
+
+    fn fixture() -> (Controller, Device) {
+        let mut op = super::super::tests::operation(OperationPhase::Completed, false);
+        op.results.insert("wifi".into(), json!({"id":"wifi","state":"verified"}));
+        let device = op.device.clone();
+        let mut c = Controller::default();
+        c.config.enabled = true;
+        c.config.automatic = true;
+        c.config.revision = "new-revision".into();
+        c.config.triggers.insert("config_change".into());
+        c.config.devices.push(device.clone());
+        c.operations.insert(device.id.clone(), op);
+        (c, device)
+    }
+
+    #[test]
+    fn changed_revision_is_scheduled_per_device_when_it_becomes_reachable() {
+        let (mut c, ready) = fixture();
+        let mut offline = ready.clone();
+        offline.id = "offline".into();
+        offline.optical_sn = "H3CT00000002".into();
+        offline.cwmp_id = "offline-id".into();
+        c.config.devices.push(offline.clone());
+        let mut previous = c.operations[&ready.id].view();
+        previous["device"] = json!(offline.id);
+        previous["optical_sn"] = json!(offline.optical_sn);
+        c.recovered.insert(offline.id.clone(), previous);
+
+        schedule(&mut c, &offline, false, false, 100);
+        schedule(&mut c, &ready, true, false, 100);
+        assert_eq!(c.operations[&ready.id].revision, "new-revision");
+        assert!(c.operations[&ready.id].apply);
+        assert!(!c.operations.contains_key(&offline.id));
+        assert_eq!(c.recovered[&offline.id]["revision"], "rev");
+        let id = c.operations[&ready.id].id;
+        schedule(&mut c, &ready, true, false, 101);
+        assert_eq!(c.operations[&ready.id].id, id);
+
+        schedule(&mut c, &offline, true, false, 102);
+        assert_eq!(c.operations[&offline.id].revision, "new-revision");
+    }
+
+    #[test]
+    fn revision_trigger_survives_restart_and_does_not_repeat_after_completion() {
+        let (c, device) = fixture();
+        let mut restarted = Controller::default();
+        restarted.config = c.config.clone();
+        restarted.recover(c.history().as_bytes());
+        schedule(&mut restarted, &device, true, false, 100);
+        assert_eq!(restarted.operations[&device.id].revision, "new-revision");
+        let op = restarted.operations.get_mut(&device.id).unwrap();
+        op.results.insert("wifi".into(), json!({"id":"wifi","state":"verified"}));
+        op.index = op.device.items.len();
+        op.complete(101);
+        let id = op.id;
+        schedule(&mut restarted, &device, true, false, 102);
+        assert_eq!(restarted.operations[&device.id].id, id);
+    }
+
+    #[test]
+    fn config_change_preserves_unknown_write_and_disabled_trigger_guards() {
+        let (mut c, device) = fixture();
+        c.operations.get_mut(&device.id).unwrap().results.insert(
+            "wifi".into(), json!({"id":"wifi","state":"unknown"}),
+        );
+        schedule(&mut c, &device, true, false, 100);
+        assert_eq!(c.operations[&device.id].revision, "rev");
+        c.operations.get_mut(&device.id).unwrap().results.clear();
+        c.config.triggers.clear();
+        schedule(&mut c, &device, true, false, 101);
+        assert_eq!(c.operations[&device.id].revision, "rev");
     }
 }
 

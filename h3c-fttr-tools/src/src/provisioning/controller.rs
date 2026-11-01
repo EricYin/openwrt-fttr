@@ -494,21 +494,15 @@ pub fn control(request: &str) -> String {
                     controller().lock().unwrap().config_error = Some(error.clone());
                 })?;
                 let mut c = controller().lock().unwrap();
-                let changed = cfg.revision != c.config.revision;
                 if let Err(error) = c.replace_config(cfg) {
                     c.config_error = Some(error.clone());
                     return Err(error);
                 }
                 c.config_error = None;
                 c.failure = None;
-                if changed
-                    && c.config.enabled
-                    && c.config.automatic
-                    && c.config.triggers.contains("config_change")
-                    && !c.config.devices.is_empty()
-                {
-                    c.start("all", true, false)?;
-                }
+                // The scheduler compares each device's operation revision with
+                // the desired revision. One unavailable device must not consume
+                // the config-change trigger for every other device.
                 Ok(c.snapshot())
             }
             "status" => Ok(snapshot()),
