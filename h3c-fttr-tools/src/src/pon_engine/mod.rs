@@ -44,12 +44,18 @@ mod tests {
             for serial in order {
                 let id = if serial == 1 { 0 } else { 15 };
                 assert_eq!(
-                    engine.register_onu(*b"TEST", [0, 0, 0, serial]).unwrap().onu_id,
+                    engine
+                        .register_onu(*b"TEST", [0, 0, 0, serial])
+                        .unwrap()
+                        .onu_id,
                     id
                 );
                 engine.mark_offline(id);
                 assert_eq!(
-                    engine.register_onu(*b"TEST", [0, 0, 0, serial]).unwrap().onu_id,
+                    engine
+                        .register_onu(*b"TEST", [0, 0, 0, serial])
+                        .unwrap()
+                        .onu_id,
                     id
                 );
             }
@@ -87,18 +93,26 @@ mod tests {
         }
         assert!(engine.register_onu(*b"TEST", [0, 0, 0, 16]).is_none());
         for id in 0..ONU_SLOTS {
-            assert_eq!(engine.register_onu(*b"TEST", [0, 0, 0, id]).unwrap().onu_id, id);
+            assert_eq!(
+                engine.register_onu(*b"TEST", [0, 0, 0, id]).unwrap().onu_id,
+                id
+            );
         }
         assert_eq!(engine.active_onus.len(), 16);
         engine.mark_offline(15);
         assert!(engine.register_onu(*b"TEST", [0, 0, 0, 16]).is_none());
-        assert_eq!(engine.register_onu(*b"TEST", [0, 0, 0, 15]).unwrap().onu_id, 15);
+        assert_eq!(
+            engine.register_onu(*b"TEST", [0, 0, 0, 15]).unwrap().onu_id,
+            15
+        );
     }
 
     #[test]
     fn serial_and_assignment_do_not_claim_operation() {
         let mut engine = PonEngine::new();
-        let onu = engine.register_onu(*b"TEST", [0x12, 0x34, 0x56, 0x78]).unwrap();
+        let onu = engine
+            .register_onu(*b"TEST", [0x12, 0x34, 0x56, 0x78])
+            .unwrap();
         assert_eq!(onu.state, OnuState::O3SerialNumber);
         let frames = engine.activate_onu(onu.onu_id);
         assert_eq!(frames.len(), 1);
@@ -122,18 +136,26 @@ mod tests {
     fn captured_ranging_vector_and_corrupt_post_ranging_frames() {
         // Independent device trace: slot 1 measurement 0x3c9b8, absolute
         // main path, bit units. The received bad ACK must remain rejected.
-        assert_eq!(PloamFrame::assign_delay(1, 248248).to_bytes(),
-            [1, 4, 0, 0, 3, 0xc9, 0xb8, 0, 0, 0, 0, 0, 0xe8]);
-        assert!(PloamFrame::from_bytes(&[1, 2, 0x30, 0x31, 0x32, 0x33,
-            0x34, 0x35, 0x36, 0x36, 0x38, 0x38, 0x26]).is_none());
-        assert!(PloamFrame::from_bytes(&[1, 9, 0x0e, 1, 0x0e, 1,
-            0, 0x10, 0, 0, 0, 1, 0xe2]).is_none());
+        assert_eq!(
+            PloamFrame::assign_delay(1, 248248).to_bytes(),
+            [1, 4, 0, 0, 3, 0xc9, 0xb8, 0, 0, 0, 0, 0, 0xe8]
+        );
+        assert!(PloamFrame::from_bytes(&[
+            1, 2, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x36, 0x38, 0x38, 0x26
+        ])
+        .is_none());
+        assert!(
+            PloamFrame::from_bytes(&[1, 9, 0x0e, 1, 0x0e, 1, 0, 0x10, 0, 0, 0, 1, 0xe2]).is_none()
+        );
         // Native, unmodified frame after TN=10 / shift=0: CRC and copied
         // Assign_Alloc-ID payload both match, unlike the capture above.
-        let ack = PloamFrame::from_bytes(&[1, 9, 0x0e, 1, 0x0e, 1,
-            0, 0x10, 0, 0, 0, 0, 0xe2]).unwrap();
+        let ack =
+            PloamFrame::from_bytes(&[1, 9, 0x0e, 1, 0x0e, 1, 0, 0x10, 0, 0, 0, 0, 0xe2]).unwrap();
         assert_eq!(ack.payload[0], 0x0e);
-        assert_eq!(ack.payload[1..], PloamFrame::assign_alloc_id(1).to_bytes()[..9]);
+        assert_eq!(
+            ack.payload[1..],
+            PloamFrame::assign_alloc_id(1).to_bytes()[..9]
+        );
     }
 
     #[test]
@@ -150,13 +172,15 @@ mod tests {
     #[test]
     fn offline_retains_identity_but_requires_new_activation_evidence() {
         let mut engine = PonEngine::new();
-        let old = engine.register_onu(*b"TEST", [1,2,3,4]).unwrap();
+        let old = engine.register_onu(*b"TEST", [1, 2, 3, 4]).unwrap();
         engine.active_onus[0].state = OnuState::O5Operation;
         engine.active_onus[0].eq_delay = Some(248248);
         engine.mark_offline(old.onu_id);
         assert_eq!(engine.active_onus[0].state, OnuState::O1Initial);
         assert_eq!(engine.active_onus[0].eq_delay, None);
-        let again = engine.register_onu(old.vendor_id, old.serial_number).unwrap();
+        let again = engine
+            .register_onu(old.vendor_id, old.serial_number)
+            .unwrap();
         assert_eq!(again.onu_id, old.onu_id);
         assert_eq!(engine.active_onus.len(), 1);
         engine.activate_onu(again.onu_id);
@@ -187,9 +211,15 @@ impl PonEngine {
         self.try_register_onu(vendor, sn).ok()
     }
 
-    pub(crate) fn try_register_onu(&mut self, vendor: [u8; 4], sn: [u8; 4]) -> Result<GponOnu, String> {
+    pub(crate) fn try_register_onu(
+        &mut self,
+        vendor: [u8; 4],
+        sn: [u8; 4],
+    ) -> Result<GponOnu, String> {
         if let Some(error) = &self.pin_error {
-            return Err(format!("allocation blocked by startup configuration: {error}"));
+            return Err(format!(
+                "allocation blocked by startup configuration: {error}"
+            ));
         }
         // Check if already registered
         for onu in &self.active_onus {
@@ -198,7 +228,9 @@ impl PonEngine {
             }
         }
 
-        let identity = GponOnu::new(0, vendor, sn).full_sn_str().to_ascii_uppercase();
+        let identity = GponOnu::new(0, vendor, sn)
+            .full_sn_str()
+            .to_ascii_uppercase();
         let id = match self.onu_pins.get(&identity) {
             Some(&id) => id,
             None => (0..ONU_SLOTS)
@@ -206,10 +238,14 @@ impl PonEngine {
                     !self.onu_pins.values().any(|reserved| reserved == id)
                         && !self.active_onus.iter().any(|onu| onu.onu_id == *id)
                 })
-                .ok_or_else(|| format!("{identity}: all {ONU_SLOTS} slots are occupied or reserved"))?,
+                .ok_or_else(|| {
+                    format!("{identity}: all {ONU_SLOTS} slots are occupied or reserved")
+                })?,
         };
         if self.active_onus.iter().any(|onu| onu.onu_id == id) {
-            return Err(format!("{identity}: reserved ONU-ID {id} is already occupied"));
+            return Err(format!(
+                "{identity}: reserved ONU-ID {id} is already occupied"
+            ));
         }
 
         let mut onu = GponOnu::new(id, vendor, sn);
@@ -237,15 +273,19 @@ impl PonEngine {
     /// Assign the ONU ID; fresh ranging and a validated reply must establish O5.
     pub fn activate_onu(&mut self, onu_id: u8) -> Vec<PloamFrame> {
         if let Some(onu) = self.active_onus.iter_mut().find(|o| o.onu_id == onu_id) {
-            println!("[*] PLOAM: Assigning ONU {}; awaiting measured ranging response", onu_id);
+            println!(
+                "[*] PLOAM: Assigning ONU {}; awaiting measured ranging response",
+                onu_id
+            );
             onu.state = OnuState::O4Ranging;
             onu.eq_delay = None; // A new attempt must not inherit an old measurement.
-            vec![
-                PloamFrame::assign_onu_id(onu_id, onu.vendor_id, onu.serial_number),
-            ]
+            vec![PloamFrame::assign_onu_id(
+                onu_id,
+                onu.vendor_id,
+                onu.serial_number,
+            )]
         } else {
             Vec::new()
         }
     }
-
 }

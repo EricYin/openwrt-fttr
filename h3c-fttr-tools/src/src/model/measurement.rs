@@ -15,15 +15,21 @@ pub struct MeasurementEvidence {
 impl MeasurementEvidence {
     pub fn unavailable(source: impl Into<String>, unit: &str, reason: impl Into<String>) -> Self {
         Self {
-            source: source.into(), unit: unit.into(), reason: Some(reason.into()),
-            raw: None, age_seconds: None,
+            source: source.into(),
+            unit: unit.into(),
+            reason: Some(reason.into()),
+            raw: None,
+            age_seconds: None,
         }
     }
 
     pub fn observed(source: impl Into<String>, unit: &str, raw: impl Into<String>) -> Self {
         Self {
-            source: source.into(), unit: unit.into(), reason: None,
-            raw: Some(raw.into()), age_seconds: Some(0),
+            source: source.into(),
+            unit: unit.into(),
+            reason: None,
+            raw: Some(raw.into()),
+            age_seconds: Some(0),
         }
     }
 }

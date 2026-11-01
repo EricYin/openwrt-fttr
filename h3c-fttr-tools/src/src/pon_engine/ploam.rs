@@ -183,15 +183,25 @@ impl PloamFrame {
     }
 
     pub fn extended_burst_length() -> Self {
-        Self::new(0xFF, PLOAM_EXTENDED_BURST_LENGTH, [0x40, 0x40, 0, 0, 0, 0, 0, 0, 0, 0])
+        Self::new(
+            0xFF,
+            PLOAM_EXTENDED_BURST_LENGTH,
+            [0x40, 0x40, 0, 0, 0, 0, 0, 0, 0, 0],
+        )
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 13 { return None; }
+        if bytes.len() != 13 {
+            return None;
+        }
         let mut payload = [0; 10];
         payload.copy_from_slice(&bytes[2..12]);
         let frame = Self::new(bytes[0], bytes[1], payload);
-        if frame.crc == bytes[12] { Some(frame) } else { None }
+        if frame.crc == bytes[12] {
+            Some(frame)
+        } else {
+            None
+        }
     }
 
     /// 2. Serial Number Mask message (broadcast to trigger ONU discovery)

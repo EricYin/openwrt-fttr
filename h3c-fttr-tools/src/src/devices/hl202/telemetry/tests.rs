@@ -172,11 +172,15 @@ fn hl202_telemetry_private_capture_matches_observed_contract() {
 #[test]
 fn hl202_telemetry_compressed_limit_accepts_exact_size_and_rejects_next_byte() {
     let base = fixture(&[("unknown", b"bounded")]);
-    let empty = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()).finish().unwrap();
+    let empty = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast())
+        .finish()
+        .unwrap();
     let padding = super::archive::MAX_COMPRESSED - base.len();
     let remainder = padding % empty.len();
     let mut exact = Vec::with_capacity(super::archive::MAX_COMPRESSED);
-    for _ in 0..padding / empty.len() { exact.extend_from_slice(&empty); }
+    for _ in 0..padding / empty.len() {
+        exact.extend_from_slice(&empty);
+    }
     exact.extend_from_slice(&base[..10]);
     if remainder > 0 {
         let header_flag = exact.len() - 7;
@@ -197,7 +201,10 @@ fn hl202_telemetry_json_limit_accepts_exact_size_and_rejects_next_byte() {
     let overhead = serde_json::to_vec(&report).unwrap().len();
     let escaped = "\"\\\n\r\t\0未知";
     let escaped_bytes = serde_json::to_vec(escaped).unwrap().len() - 2;
-    report.members[0].text = Some(format!("{escaped}{}", "x".repeat(4 * 1024 * 1024 - overhead - escaped_bytes)));
+    report.members[0].text = Some(format!(
+        "{escaped}{}",
+        "x".repeat(4 * 1024 * 1024 - overhead - escaped_bytes)
+    ));
     assert_eq!(serde_json::to_vec(&report).unwrap().len(), 4 * 1024 * 1024);
     assert!(super::check_json_limit(&report).is_ok());
     report.members[0].text.as_mut().unwrap().push('x');

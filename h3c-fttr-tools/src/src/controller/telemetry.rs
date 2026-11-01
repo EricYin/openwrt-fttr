@@ -120,7 +120,8 @@ impl Collector {
                 None,
             ) {
                 Ok(report) => {
-                    self.inventory = inventory::InventorySample::from_report(&report, Instant::now());
+                    self.inventory =
+                        inventory::InventorySample::from_report(&report, Instant::now());
                     let entities: Vec<_> = report
                         .entities
                         .iter()

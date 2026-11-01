@@ -83,7 +83,10 @@ pub fn load_bitstream(path: &Path) -> io::Result<()> {
     // Fast path 1: Check if FPGA is already programmed and active
     if let Ok(ts) = crate::bosa::read_fpga_reg(0x00000008) {
         if ts != 0 && ts != 0xFFFFFFFF {
-            println!("[+] FPGA bitstream already active (timestamp: 0x{:08X}), skipping reload.", ts);
+            println!(
+                "[+] FPGA bitstream already active (timestamp: 0x{:08X}), skipping reload.",
+                ts
+            );
             return Ok(());
         }
     }
@@ -99,7 +102,9 @@ pub fn load_bitstream(path: &Path) -> io::Result<()> {
         }
     }
 
-    println!("[*] In-kernel loader not available; performing user-space Passive Serial programming...");
+    println!(
+        "[*] In-kernel loader not available; performing user-space Passive Serial programming..."
+    );
     export_gpio(GPIO_CLK)?;
     export_gpio(GPIO_DATA)?;
     sleep(Duration::from_millis(50));
@@ -141,7 +146,10 @@ pub fn load_bitstream(path: &Path) -> io::Result<()> {
 fn export_gpio(pin: u32) -> io::Result<()> {
     let path = format!("/sys/class/gpio/gpio{pin}");
     if !Path::new(&path).exists() {
-        if let Ok(mut f) = OpenOptions::new().write(true).open("/sys/class/gpio/export") {
+        if let Ok(mut f) = OpenOptions::new()
+            .write(true)
+            .open("/sys/class/gpio/export")
+        {
             let _ = f.write_all(pin.to_string().as_bytes());
         }
     }

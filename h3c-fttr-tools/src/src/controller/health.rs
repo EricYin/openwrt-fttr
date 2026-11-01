@@ -125,8 +125,8 @@ fn run(
     let mut observations = policy::Observations::new(watch);
     if watch
         && args
-                .iter()
-                .any(|arg| arg == "--mapped-omcc" || arg == "--stock-padding")
+            .iter()
+            .any(|arg| arg == "--mapped-omcc" || arg == "--stock-padding")
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -156,8 +156,16 @@ fn run(
     } else {
         None
     };
-    let omci = if watch { PacketSocket::health_omci(id)? } else { PacketSocket::open("molt_omci")? };
-    let physical = if watch { PacketSocket::health_gem(id)? } else { PacketSocket::open("fttr0")? };
+    let omci = if watch {
+        PacketSocket::health_omci(id)?
+    } else {
+        PacketSocket::open("molt_omci")?
+    };
+    let physical = if watch {
+        PacketSocket::health_gem(id)?
+    } else {
+        PacketSocket::open("fttr0")?
+    };
     let discovery = args.iter().any(|arg| arg == "--arp" || arg == "--1905");
     // Watch only consumes physical GEM evidence, not this diagnostic capture.
     let data = if discovery && !watch {
@@ -218,7 +226,10 @@ fn run(
         println!("TX accepted by socket; awaiting response (not proof of delivery)");
     }
     if discovery {
-        let mac = std::fs::read_to_string(format!("/sys/class/net/{}/address", crate::pon_engine::onu_interface(id)))?;
+        let mac = std::fs::read_to_string(format!(
+            "/sys/class/net/{}/address",
+            crate::pon_engine::onu_interface(id)
+        ))?;
         let mac: Vec<u8> = mac
             .trim()
             .split(':')
@@ -286,8 +297,9 @@ fn run(
     let mut next_get = start + Duration::from_secs(5);
     let mut next_state = start;
     let optical_sn = if watch {
-        super::service::onu_serial(id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "ONU identity unavailable"))?
+        super::service::onu_serial(id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "ONU identity unavailable")
+        })?
     } else {
         String::new()
     };
@@ -295,7 +307,8 @@ fn run(
         Some(wake) => wake,
         None => std::sync::Arc::new(Wake::new()?),
     };
-    let management = watch.then(|| crate::provisioning::health_watch::subscribe(&optical_sn, wake.clone()));
+    let management =
+        watch.then(|| crate::provisioning::health_watch::subscribe(&optical_sn, wake.clone()));
     let mut watchdog_start = start;
     let mut telemetry = cancellation
         .clone()
@@ -316,34 +329,34 @@ fn run(
         }
         if let Some(request) = requests.and_then(|requests| requests.try_recv().ok()) {
             match request {
-            super::inventory::WorkerRequest::Attribute(request) => {
-                let result = super::attribute_probe::run(&request, cancellation.clone());
-                let responsive = result.is_ok();
-                let _ = request.reply.send(result);
-                next_get = resume_after_omci(&mut last_get, &mut watchdog_start, responsive);
-            }
-            super::inventory::WorkerRequest::Mib(request) => {
-            let result = if Instant::now() >= request.deadline {
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "MIB request expired before monitor became ready",
-                ))
-            } else {
-                super::inventory::read_owned(
-                    id,
-                    request.tables,
-                    cancellation.clone(),
-                    request.deadline,
-                    request.progress,
-                )
-            };
-            let complete = result.is_ok();
-            let _ = request.reply.send(result);
-            // The upload is serialized with health GETs under the same lock.
-            // Resume with fresh evidence, without rerunning business provisioning.
-            // A completed, validated upload is fresh OMCI liveness evidence.
-            next_get = resume_after_omci(&mut last_get, &mut watchdog_start, complete);
-            }
+                super::inventory::WorkerRequest::Attribute(request) => {
+                    let result = super::attribute_probe::run(&request, cancellation.clone());
+                    let responsive = result.is_ok();
+                    let _ = request.reply.send(result);
+                    next_get = resume_after_omci(&mut last_get, &mut watchdog_start, responsive);
+                }
+                super::inventory::WorkerRequest::Mib(request) => {
+                    let result = if Instant::now() >= request.deadline {
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "MIB request expired before monitor became ready",
+                        ))
+                    } else {
+                        super::inventory::read_owned(
+                            id,
+                            request.tables,
+                            cancellation.clone(),
+                            request.deadline,
+                            request.progress,
+                        )
+                    };
+                    let complete = result.is_ok();
+                    let _ = request.reply.send(result);
+                    // The upload is serialized with health GETs under the same lock.
+                    // Resume with fresh evidence, without rerunning business provisioning.
+                    // A completed, validated upload is fresh OMCI liveness evidence.
+                    next_get = resume_after_omci(&mut last_get, &mut watchdog_start, complete);
+                }
             }
         }
         // Establish the link using the bounded health GET before starting a
@@ -367,7 +380,9 @@ fn run(
         }
         if watch && Instant::now() >= next_get {
             let next_tci = (tci.wrapping_add(1) & 0x7fff).max(1);
-            if observations.send(omci.send_fmcs(id, &BaselineFrame::new(next_tci, 0x49, 256, 0, payload)))? {
+            if observations
+                .send(omci.send_fmcs(id, &BaselineFrame::new(next_tci, 0x49, 256, 0, payload)))?
+            {
                 tci = next_tci;
             }
             next_get = Instant::now() + Duration::from_secs(5);
@@ -381,7 +396,9 @@ fn run(
         for (name, capture) in captures.into_iter().flatten() {
             // Bound each drain pass even on a busy physical interface.
             for _ in 0..32 {
-                let Some((bytes, kind, vlan)) = observations.receive(capture.receive_into(&mut rx_buf))? else {
+                let Some((bytes, kind, vlan)) =
+                    observations.receive(capture.receive_into(&mut rx_buf))?
+                else {
                     break;
                 };
                 if !watch {
@@ -404,7 +421,12 @@ fn run(
                                     && frame.class_id == 256
                                     && frame.instance_id == 0 =>
                             {
-                                let reported = [frame.payload[3], frame.payload[4], frame.payload[5], frame.payload[6]];
+                                let reported = [
+                                    frame.payload[3],
+                                    frame.payload[4],
+                                    frame.payload[5],
+                                    frame.payload[6],
+                                ];
                                 if frame.payload[0] == 0
                                     && frame.payload[1..3] == [0x80, 0]
                                     && (reported == vendor
@@ -450,8 +472,11 @@ fn run(
                     && carrier_lease.is_none()
                 {
                     let previous = !watch
-                        && std::fs::read_to_string(format!("/sys/class/net/{}/carrier", crate::pon_engine::onu_interface(id)))?
-                            .trim()
+                        && std::fs::read_to_string(format!(
+                            "/sys/class/net/{}/carrier",
+                            crate::pon_engine::onu_interface(id)
+                        ))?
+                        .trim()
                             == "1";
                     bosa::set_fttr_carrier(id as u32, true)?;
                     carrier_lease = Some(CarrierLease { id, previous });
@@ -459,10 +484,7 @@ fn run(
                 }
             }
         }
-        if watch
-            && carrier_lease.is_some()
-            && !policy::carrier_ready(last_get, Instant::now())
-        {
+        if watch && carrier_lease.is_some() && !policy::carrier_ready(last_get, Instant::now()) {
             drop(carrier_lease.take());
             println!("VERIFIED_LINK_DISABLED stale OMCI evidence");
         }
@@ -484,11 +506,20 @@ fn run(
             count += 1;
         }
         let deadline = if watch {
-            let expiry = last_get.map(|at| at + Duration::from_secs(15))
+            let expiry = last_get
+                .map(|at| at + Duration::from_secs(15))
                 .filter(|_| carrier_lease.is_some());
-            [Some(next_get), Some(next_state), carrier_lease.as_ref().map(|_| next_telemetry), expiry,
-                Some(last_get.unwrap_or(watchdog_start) + Duration::from_secs(30))]
-                .into_iter().flatten().min().unwrap()
+            [
+                Some(next_get),
+                Some(next_state),
+                carrier_lease.as_ref().map(|_| next_telemetry),
+                expiry,
+                Some(last_get.unwrap_or(watchdog_start) + Duration::from_secs(30)),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap()
         } else {
             (start + Duration::from_secs(seconds)).min(Instant::now() + Duration::from_secs(1))
         };

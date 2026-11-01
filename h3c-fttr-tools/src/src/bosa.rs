@@ -971,7 +971,10 @@ const IOC_SET_CARRIER: u64 = 0x4008A507;
 /// Set carrier for a protocol ONU-ID, translating to the driver's 1-based port ABI.
 pub fn set_fttr_carrier(onu_id: u32, carrier: bool) -> io::Result<()> {
     if onu_id >= u32::from(crate::pon_engine::ONU_SLOTS) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "ONU ID must be 0..15"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ONU ID must be 0..15",
+        ));
     }
     let port = onu_id + 1;
     #[cfg(unix)]

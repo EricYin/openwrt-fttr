@@ -185,8 +185,14 @@ impl Controller {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         self.config = config;
-        super::super::health_watch::config(self.config.devices.iter()
-            .filter(|d| d.omci_management).map(|d| d.optical_sn.clone()).collect());
+        super::super::health_watch::config(
+            self.config
+                .devices
+                .iter()
+                .filter(|d| d.omci_management)
+                .map(|d| d.optical_sn.clone())
+                .collect(),
+        );
         self.load_reset_intents();
         self.retain_configured_state();
         Ok(())
@@ -199,14 +205,26 @@ impl Controller {
             self.owned.len(),
         );
         let devices = &self.config.devices;
-        for (id, view) in self.operations.iter().map(|(id,op)|(id,op.view())).chain(self.recovered.iter().map(|(id,op)|(id,op.clone()))) {
-            if devices.iter().any(|d| &d.id == id && view["optical_sn"] == d.optical_sn && view["backend"]["effective"].as_str().unwrap_or("acs") != d.backend()) {
+        for (id, view) in self
+            .operations
+            .iter()
+            .map(|(id, op)| (id, op.view()))
+            .chain(self.recovered.iter().map(|(id, op)| (id, op.clone())))
+        {
+            if devices.iter().any(|d| {
+                &d.id == id
+                    && view["optical_sn"] == d.optical_sn
+                    && view["backend"]["effective"].as_str().unwrap_or("acs") != d.backend()
+            }) {
                 let mut retired = view;
-                retired["retired_reason"] = json!("provisioning backend changed; rediscovery required");
+                retired["retired_reason"] =
+                    json!("provisioning backend changed; rediscovery required");
                 self.retired.push(retired);
             }
         }
-        if self.retired.len() > 32 {self.retired.drain(..self.retired.len()-32);}
+        if self.retired.len() > 32 {
+            self.retired.drain(..self.retired.len() - 32);
+        }
         self.operations.retain(|id, op| {
             devices.iter().any(|d| {
                 &d.id == id

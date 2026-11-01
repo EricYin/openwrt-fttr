@@ -216,7 +216,9 @@ fn print_status_table(status: &FttrSystemStatus) {
             );
             println!(
                 "    Switch Port:    {} (GEM: 0x{:03x}, State: {:?})",
-                h3c_fttr_tools::pon_engine::onu_interface(sg.onu_id), 0x100u16 + u16::from(sg.onu_id), sg.state
+                h3c_fttr_tools::pon_engine::onu_interface(sg.onu_id),
+                0x100u16 + u16::from(sg.onu_id),
+                sg.state
             );
             println!("    Business:       {}", sg.business_status);
             if !sg.provisioning.is_null() {
@@ -325,7 +327,10 @@ fn print_status_table(status: &FttrSystemStatus) {
 
 fn parse_optical_args(args: &[String]) -> Result<(&'static str, bool), String> {
     if args.len() < 3 {
-        return Err("Usage: fttrctl optical <on|off|status|reload|shutdown|shutdown-offline> [--json|-j]".into());
+        return Err(
+            "Usage: fttrctl optical <on|off|status|reload|shutdown|shutdown-offline> [--json|-j]"
+                .into(),
+        );
     }
     if args[3..].iter().any(|arg| arg != "--json" && arg != "-j") {
         return Err("Unknown optical argument".into());
@@ -344,7 +349,11 @@ fn parse_optical_args(args: &[String]) -> Result<(&'static str, bool), String> {
 }
 
 fn handle_optical_command(cmd: &str, is_json: bool) {
-    let action = cmd.split_whitespace().last().unwrap_or("status").to_ascii_lowercase();
+    let action = cmd
+        .split_whitespace()
+        .last()
+        .unwrap_or("status")
+        .to_ascii_lowercase();
 
     let result = if cmd == "OFFLINE SHUTDOWN" {
         let start = std::time::Instant::now();
@@ -359,16 +368,29 @@ fn handle_optical_command(cmd: &str, is_json: bool) {
                         "error":reset.err().map(|e| serde_json::json!({"code":format!("{:?}",e.kind()),"message":e.to_string()}))});
                     break Ok(reply.to_string());
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && start.elapsed().as_secs() < 6 => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && start.elapsed().as_secs() < 6 =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(100))
+                }
                 Err(error) => break Err(error),
             }
         }
-    } else { ipc::send_ipc_command(cmd) };
+    } else {
+        ipc::send_ipc_command(cmd)
+    };
     let result = result.and_then(|response| {
         let value: serde_json::Value = serde_json::from_str(&response)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        if !matches!(value.get("status").and_then(serde_json::Value::as_str), Some("success" | "error")) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid optical response status"));
+        if !matches!(
+            value.get("status").and_then(serde_json::Value::as_str),
+            Some("success" | "error")
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid optical response status",
+            ));
         }
         Ok(response)
     });
@@ -391,10 +413,15 @@ fn handle_optical_command(cmd: &str, is_json: bool) {
         }
         Err(error) => {
             if is_json {
-                println!("{}", serde_json::json!({"schema_version":1,"status":"error","action":format!("optical_{action}"),
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"status":"error","action":format!("optical_{action}"),
                     "desired_enabled":null,"tx_enabled":null,"actor_state":"unknown","hardware_ready":false,"discovery_active":false,"cleanup_pending":false,
-                    "error":{"code":format!("{:?}",error.kind()),"message":format!("{error}; outcome unknown; query optical status")}}));
-            } else { eprintln!("[-] Optical request failed: {error}"); }
+                    "error":{"code":format!("{:?}",error.kind()),"message":format!("{error}; outcome unknown; query optical status")}})
+                );
+            } else {
+                eprintln!("[-] Optical request failed: {error}");
+            }
             exit(1);
         }
     }
@@ -408,11 +435,15 @@ fn main() {
     }
 
     let _hardware_owner = if matches!(args[1].as_str(), "load-fpga" | "fpga-write" | "bosa-write") {
-        Some(h3c_fttr_tools::optical::claim_owner().unwrap_or_else(|error| {
-            eprintln!("[-] Direct hardware write refused: {error}");
-            exit(1);
-        }))
-    } else { None };
+        Some(
+            h3c_fttr_tools::optical::claim_owner().unwrap_or_else(|error| {
+                eprintln!("[-] Direct hardware write refused: {error}");
+                exit(1);
+            }),
+        )
+    } else {
+        None
+    };
 
     match args[1].as_str() {
         "capabilities" => {

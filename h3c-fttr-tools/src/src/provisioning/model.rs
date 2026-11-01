@@ -242,8 +242,16 @@ pub struct ConnectionRequest {
 impl Default for ConnectionRequest {
     fn default() -> Self {
         Self {
-            enabled: true, defaults: true, username: String::new(), password: String::new(),
-            port: const { match std::num::NonZeroU16::new(7547) { Some(port) => port, None => panic!("invalid CR port") } },
+            enabled: true,
+            defaults: true,
+            username: String::new(),
+            password: String::new(),
+            port: const {
+                match std::num::NonZeroU16::new(7547) {
+                    Some(port) => port,
+                    None => panic!("invalid CR port"),
+                }
+            },
             authorization: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
@@ -251,20 +259,29 @@ impl Default for ConnectionRequest {
 
 impl ConnectionRequest {
     pub fn credentials_available(&self) -> bool {
-        !self.defaults && !self.username.is_empty() && !self.password.is_empty()
+        !self.defaults
+            && !self.username.is_empty()
+            && !self.password.is_empty()
             && !self.username.contains(':')
-            && [&self.username, &self.password].iter()
+            && [&self.username, &self.password]
+                .iter()
                 .all(|value| value.len() <= 1024 && !value.chars().any(char::is_control))
     }
 
     pub fn effective_freshness(&self, configured: u64) -> u64 {
-        if self.enabled { configured.max(2 * 43200) } else { configured }
+        if self.enabled {
+            configured.max(2 * 43200)
+        } else {
+            configured
+        }
     }
 
     #[cfg(feature = "acs")]
     pub(crate) fn same_policy(&self, other: &Self) -> bool {
-        self.enabled == other.enabled && self.defaults == other.defaults
-            && self.username == other.username && self.password == other.password
+        self.enabled == other.enabled
+            && self.defaults == other.defaults
+            && self.username == other.username
+            && self.password == other.password
             && self.port == other.port
             && std::sync::Arc::ptr_eq(&self.authorization, &other.authorization)
     }
@@ -272,7 +289,9 @@ impl ConnectionRequest {
 
 impl Device {
     pub fn backend(&self) -> &'static str {
-        if self.provisioning_method != "acs" && crate::devices::supports_command_provisioning(&self.adapter) {
+        if self.provisioning_method != "acs"
+            && crate::devices::supports_command_provisioning(&self.adapter)
+        {
             "command"
         } else {
             "acs"
@@ -328,12 +347,23 @@ mod backend_tests {
     #[test]
     fn per_device_selection_respects_compiled_backends() {
         let mut device = Device {
-            id: "child".into(), optical_sn: "H3CT00000001".into(), cwmp_id: "pending:H3CT00000001".into(),
-            adapter: "hl202".into(), provisioning_method: String::new(), cwmp_contract: "auto".into(),
-            omci_management: false, connection_request: ConnectionRequest::default(), items: vec![],
-            wifi_cleanup: "preserve".into(), wifi_preserve: BTreeSet::new(),
+            id: "child".into(),
+            optical_sn: "H3CT00000001".into(),
+            cwmp_id: "pending:H3CT00000001".into(),
+            adapter: "hl202".into(),
+            provisioning_method: String::new(),
+            cwmp_contract: "auto".into(),
+            omci_management: false,
+            connection_request: ConnectionRequest::default(),
+            items: vec![],
+            wifi_cleanup: "preserve".into(),
+            wifi_preserve: BTreeSet::new(),
         };
-        let expected = if cfg!(all(feature = "device-hl202", feature = "mqtt")) { "command" } else { "acs" };
+        let expected = if cfg!(all(feature = "device-hl202", feature = "mqtt")) {
+            "command"
+        } else {
+            "acs"
+        };
         assert_eq!(device.backend(), expected);
         device.provisioning_method = "command".into();
         assert_eq!(device.backend(), expected);

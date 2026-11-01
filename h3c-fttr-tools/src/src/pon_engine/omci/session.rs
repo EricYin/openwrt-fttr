@@ -208,7 +208,10 @@ impl OmciSession {
         let frame = self.request(Action::MibUpload, 2, 0, RequestBody::Empty)?;
         let count = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
         if count == 0 || count > 2048 {
-            return Err(invalid(format!("invalid/beyond supported MIB upload count: {count} (raw {:02x}{:02x})", frame.payload[0], frame.payload[1])));
+            return Err(invalid(format!(
+                "invalid/beyond supported MIB upload count: {count} (raw {:02x}{:02x})",
+                frame.payload[0], frame.payload[1]
+            )));
         }
         let mut mib = MibAssembler::new(count);
         progress(0, usize::from(count))?;

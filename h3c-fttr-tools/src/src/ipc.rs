@@ -68,6 +68,7 @@ pub fn update_status_file(devices: &[SubDevice]) -> io::Result<()> {
             .collect(),
     };
 
-    let json = serde_json::to_string_pretty(&cache).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(&cache)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     fs::write(STATUS_FILE, json)
 }

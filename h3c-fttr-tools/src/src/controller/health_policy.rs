@@ -1,4 +1,7 @@
-use std::{io, time::{Duration, Instant}};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 /// Carrier admission for a transparent bridge. A down fttrN port makes the
 /// kernel drop every downstream frame, so requiring the first packet to come
@@ -9,7 +12,11 @@ pub(super) fn carrier_ready(last_get: Option<Instant>, now: Instant) -> bool {
 }
 
 #[cfg(test)]
-pub(super) fn link_ready(last_get: Option<Instant>, last_data: Option<Instant>, now: Instant) -> bool {
+pub(super) fn link_ready(
+    last_get: Option<Instant>,
+    last_data: Option<Instant>,
+    now: Instant,
+) -> bool {
     last_get.is_some_and(|time| now.duration_since(time) < Duration::from_secs(15))
         && last_data.is_some()
 }
@@ -23,7 +30,12 @@ pub(super) struct Observations {
 
 impl Observations {
     pub(super) fn new(watch: bool) -> Self {
-        Self { watch, receive_errors: 0, send_errors: 0, last_report: Instant::now() }
+        Self {
+            watch,
+            receive_errors: 0,
+            send_errors: 0,
+            last_report: Instant::now(),
+        }
     }
 
     pub(super) fn receive<T>(&mut self, result: io::Result<Option<T>>) -> io::Result<Option<T>> {
@@ -40,8 +52,14 @@ impl Observations {
     pub(super) fn send(&mut self, result: io::Result<()>) -> io::Result<bool> {
         match result {
             Ok(()) => Ok(true),
-            Err(error) if self.watch && (resource_pressure(&error)
-                || matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)) => {
+            Err(error)
+                if self.watch
+                    && (resource_pressure(&error)
+                        || matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        )) =>
+            {
                 self.send_errors = self.send_errors.saturating_add(1);
                 Ok(false)
             }
@@ -100,22 +118,37 @@ mod tests {
     fn transient_capture_errors_are_missing_samples_only_in_watch() {
         for errno in [12, 105] {
             let mut observer = Observations::new(true);
-            assert_eq!(observer.receive::<u8>(Err(io::Error::from_raw_os_error(errno))).unwrap(), None);
+            assert_eq!(
+                observer
+                    .receive::<u8>(Err(io::Error::from_raw_os_error(errno)))
+                    .unwrap(),
+                None
+            );
             assert_eq!(observer.receive(Ok(Some(7))).unwrap(), Some(7));
             assert_eq!(observer.receive_errors, 1);
-            assert!(Observations::new(false).receive::<u8>(Err(io::Error::from_raw_os_error(errno))).is_err());
+            assert!(Observations::new(false)
+                .receive::<u8>(Err(io::Error::from_raw_os_error(errno)))
+                .is_err());
         }
     }
 
     #[test]
     fn only_known_transient_probe_errors_are_tolerated() {
         for errno in [4, 11, 12, 105] {
-            assert!(!Observations::new(true).send(Err(io::Error::from_raw_os_error(errno))).unwrap());
-            assert!(Observations::new(false).send(Err(io::Error::from_raw_os_error(errno))).is_err());
+            assert!(!Observations::new(true)
+                .send(Err(io::Error::from_raw_os_error(errno)))
+                .unwrap());
+            assert!(Observations::new(false)
+                .send(Err(io::Error::from_raw_os_error(errno)))
+                .is_err());
         }
         for errno in [1, 5, 9, 13, 19, 22, 88, 90, 100] {
-            assert!(Observations::new(true).send(Err(io::Error::from_raw_os_error(errno))).is_err());
-            assert!(Observations::new(true).receive::<u8>(Err(io::Error::from_raw_os_error(errno))).is_err());
+            assert!(Observations::new(true)
+                .send(Err(io::Error::from_raw_os_error(errno)))
+                .is_err());
+            assert!(Observations::new(true)
+                .receive::<u8>(Err(io::Error::from_raw_os_error(errno)))
+                .is_err());
         }
         assert!(Observations::new(true).send(Ok(())).unwrap());
     }
@@ -124,7 +157,9 @@ mod tests {
     fn successful_samples_do_not_reset_warning_rate_limit() {
         let mut observer = Observations::new(true);
         let start = observer.last_report;
-        observer.receive::<()>(Err(io::Error::from_raw_os_error(105))).unwrap();
+        observer
+            .receive::<()>(Err(io::Error::from_raw_os_error(105)))
+            .unwrap();
         observer.receive(Ok(Some(()))).unwrap();
         observer.report(1, start + Duration::from_secs(29));
         assert_eq!(observer.receive_errors, 1);

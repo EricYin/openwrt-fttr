@@ -1,12 +1,16 @@
 //! HWTC standard OMCI bridge service; proprietary shell management unavailable.
-pub mod service;
-pub mod cwmp;
 mod bridge;
+pub mod cwmp;
 pub mod k155;
+pub mod service;
 pub mod v152;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Profile { Standard, K155, V152 }
+pub enum Profile {
+    Standard,
+    K155,
+    V152,
+}
 
 pub(super) fn profile(equipment: Option<&str>) -> Profile {
     match equipment {

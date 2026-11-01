@@ -14,13 +14,15 @@ fn ins(code: u16, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
 
 impl Capture {
     fn program(self) -> Vec<libc::sock_filter> {
-        if matches!(self, Self::Closed) { return vec![ins(0x06, 0, 0, 0)]; }
+        if matches!(self, Self::Closed) {
+            return vec![ins(0x06, 0, 0, 0)];
+        }
         // Ancillary loads use Linux SKF_AD_OFF offsets; VLAN metadata is
         // essential when the NIC/kernel has already removed the outer tag.
         let mut code = vec![
             ins(0x20, 0, 0, (-4096i32 + 4) as u32), // packet type
-            ins(0x15, 0, 1, 4),                    // PACKET_OUTGOING
-            ins(0x06, 0, 0, 0),                    // reject
+            ins(0x15, 0, 1, 4),                     // PACKET_OUTGOING
+            ins(0x06, 0, 0, 0),                     // reject
         ];
         code.extend(match self {
             Self::Closed => unreachable!(),
@@ -65,7 +67,11 @@ impl Capture {
                 mem::size_of_val(&program) as libc::socklen_t,
             )
         };
-        if result < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -87,7 +93,9 @@ mod tests {
                 0x20 if i.k == (-4096i32 + 44) as u32 => a = vlan.unwrap_or(0) as u32,
                 0x20 | 0x28 => {
                     let width = if i.code == 0x20 { 4 } else { 2 };
-                    let Some(data) = bytes.get(i.k as usize..i.k as usize + width) else { return false; };
+                    let Some(data) = bytes.get(i.k as usize..i.k as usize + width) else {
+                        return false;
+                    };
                     a = data.iter().fold(0, |n, b| (n << 8) | u32::from(*b));
                 }
                 0x80 => a = bytes.len() as u32,
@@ -102,7 +110,10 @@ mod tests {
     #[test]
     fn health_filters_isolate_onus_directions_and_vlan_representations() {
         for id in [0, 1, 15] {
-            let frame = super::super::fmcs::envelope(id, &super::super::super::wire::BaselineFrame::new(1, 0x29, 256, 0, [0; 32]));
+            let frame = super::super::fmcs::envelope(
+                id,
+                &super::super::super::wire::BaselineFrame::new(1, 0x29, 256, 0, [0; 32]),
+            );
             assert!(accepts(Capture::Omci(id), &frame, 0, None));
             assert!(!accepts(Capture::Omci(id), &frame, 4, None));
             assert!(!accepts(Capture::Omci(id ^ 1), &frame, 0, None));
@@ -115,10 +126,30 @@ mod tests {
             ethernet[12..16].copy_from_slice(&[0x81, 0, 1, id]);
             assert!(accepts(Capture::Gem(id), &ethernet, 0, None));
             ethernet[12..14].copy_from_slice(&[8, 0]);
-            assert!(accepts(Capture::Gem(id), &ethernet, 0, Some(0x100 + id as u16)));
-            assert!(!accepts(Capture::Gem(id), &ethernet, 4, Some(0x100 + id as u16)));
-            assert!(!accepts(Capture::Gem(id ^ 1), &ethernet, 0, Some(0x100 + id as u16)));
-            assert!(!accepts(Capture::Gem(id), &ethernet, 0, Some(0x2100 + id as u16)));
+            assert!(accepts(
+                Capture::Gem(id),
+                &ethernet,
+                0,
+                Some(0x100 + id as u16)
+            ));
+            assert!(!accepts(
+                Capture::Gem(id),
+                &ethernet,
+                4,
+                Some(0x100 + id as u16)
+            ));
+            assert!(!accepts(
+                Capture::Gem(id ^ 1),
+                &ethernet,
+                0,
+                Some(0x100 + id as u16)
+            ));
+            assert!(!accepts(
+                Capture::Gem(id),
+                &ethernet,
+                0,
+                Some(0x2100 + id as u16)
+            ));
             assert!(!accepts(Capture::Gem(id), &ethernet, 0, None));
             assert!(!accepts(Capture::Gem(id), &ethernet[..13], 0, None));
         }
@@ -135,21 +166,39 @@ mod tests {
             let mut valid = vec![0; 68];
             match filter {
                 Capture::Closed => unreachable!(),
-                Capture::Omci(_) => { valid.resize(56, 0); valid[3] = 3; valid[7] = 15; }
+                Capture::Omci(_) => {
+                    valid.resize(56, 0);
+                    valid[3] = 3;
+                    valid[7] = 15;
+                }
                 Capture::Gem(_) => valid[12..16].copy_from_slice(&[0x81, 0, 1, 15]),
             }
             let mut buf = [0; 128];
             tx.send(&valid).unwrap();
             assert_eq!(rx.recv(&mut buf).unwrap(), valid.len());
             assert_eq!(&buf[..valid.len()], valid);
-            valid[if matches!(filter, Capture::Omci(_)) { 7 } else { 15 }] = 14;
+            valid[if matches!(filter, Capture::Omci(_)) {
+                7
+            } else {
+                15
+            }] = 14;
             tx.send(&valid).unwrap();
-            assert_eq!(rx.recv(&mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(
+                rx.recv(&mut buf).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
             // Once current-session GEM is proved, even valid traffic stops waking health.
-            valid[if matches!(filter, Capture::Omci(_)) { 7 } else { 15 }] = 15;
+            valid[if matches!(filter, Capture::Omci(_)) {
+                7
+            } else {
+                15
+            }] = 15;
             Capture::Closed.attach(rx.as_raw_fd()).unwrap();
             tx.send(&valid).unwrap();
-            assert_eq!(rx.recv(&mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(
+                rx.recv(&mut buf).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
         }
     }
 }

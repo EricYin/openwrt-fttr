@@ -74,9 +74,13 @@ struct TestOptics {
 }
 
 impl OpticalBackend for TestOptics {
-    fn desired(&self) -> io::Result<bool> { Ok(self.desired) }
+    fn desired(&self) -> io::Result<bool> {
+        Ok(self.desired)
+    }
     fn save(&mut self, enabled: bool) -> io::Result<()> {
-        if self.save_failure { return Err(io::Error::other("read-only configuration")); }
+        if self.save_failure {
+            return Err(io::Error::other("read-only configuration"));
+        }
         self.desired = enabled;
         Ok(())
     }
@@ -103,7 +107,9 @@ impl OpticalBackend for TestOptics {
         if !self.mismatch {
             self.tx = enabled;
         }
-        if enabled && self.enable_failure_after_write { return Err(io::Error::other("calibration failed after release")); }
+        if enabled && self.enable_failure_after_write {
+            return Err(io::Error::other("calibration failed after release"));
+        }
         Ok(())
     }
     fn read_tx(&mut self) -> io::Result<bool> {
@@ -161,8 +167,15 @@ fn optical_owner_rechecks_readiness_before_hardware_access() {
 
 #[test]
 fn optical_saved_intent_survives_shutdown_and_failed_enable() {
-    let mut actor = OpticalActor { state: OpticalState::Enabled };
-    let mut backend = TestOptics { ready: true, tx: true, desired: true, ..TestOptics::default() };
+    let mut actor = OpticalActor {
+        state: OpticalState::Enabled,
+    };
+    let mut backend = TestOptics {
+        ready: true,
+        tx: true,
+        desired: true,
+        ..TestOptics::default()
+    };
     let stopped = actor.handle(OpticalCommand::Shutdown, &mut backend);
     assert_eq!(stopped["desired_enabled"], true);
     assert_eq!(stopped["tx_enabled"], false);
@@ -174,13 +187,23 @@ fn optical_saved_intent_survives_shutdown_and_failed_enable() {
     assert_eq!(failed["actor_state"], "unknown");
     assert_eq!(failed["discovery_active"], false);
     assert_eq!(failed["tx_enabled"], false);
-    assert!(backend.events.ends_with(&["enable", "disable", "read", "quiesce"]));
+    assert!(backend
+        .events
+        .ends_with(&["enable", "disable", "read", "quiesce"]));
 }
 
 #[test]
 fn optical_save_failure_retains_actual_state_and_reload_is_idempotent() {
-    let mut actor = OpticalActor { state: OpticalState::Enabled };
-    let mut backend = TestOptics { ready: true, tx: true, desired: true, save_failure: true, ..TestOptics::default() };
+    let mut actor = OpticalActor {
+        state: OpticalState::Enabled,
+    };
+    let mut backend = TestOptics {
+        ready: true,
+        tx: true,
+        desired: true,
+        save_failure: true,
+        ..TestOptics::default()
+    };
     let failed = actor.handle(OpticalCommand::Off, &mut backend);
     assert_eq!(failed["status"], "error");
     assert_eq!(failed["desired_enabled"], true);
@@ -203,12 +226,24 @@ fn optical_save_failure_retains_actual_state_and_reload_is_idempotent() {
 fn optical_stop_before_ready_cancels_later_enable_requests() {
     let (requests, receiver) = std::sync::mpsc::sync_channel::<OpticalRequest>(2);
     let stopping = Arc::new(AtomicBool::new(false));
-    let client = OpticalClient { requests, hardware_ready: Arc::new(AtomicBool::new(false)), stopping: stopping.clone() };
+    let client = OpticalClient {
+        requests,
+        hardware_ready: Arc::new(AtomicBool::new(false)),
+        stopping: stopping.clone(),
+    };
     let owner = thread::spawn(move || {
         let request = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-        let mut actor = OpticalActor { state: OpticalState::Unknown };
-        let mut backend = TestOptics { desired: true, ..TestOptics::default() };
-        request.reply.send(actor.handle(request.command, &mut backend)).unwrap();
+        let mut actor = OpticalActor {
+            state: OpticalState::Unknown,
+        };
+        let mut backend = TestOptics {
+            desired: true,
+            ..TestOptics::default()
+        };
+        request
+            .reply
+            .send(actor.handle(request.command, &mut backend))
+            .unwrap();
     });
     let response = client.request(OpticalCommand::Shutdown).unwrap();
     assert!(stopping.load(Ordering::Acquire));
@@ -220,8 +255,15 @@ fn optical_stop_before_ready_cancels_later_enable_requests() {
 
 #[test]
 fn optical_failed_quiesce_resets_instead_of_reenabling() {
-    let mut actor = OpticalActor { state: OpticalState::Enabled };
-    let mut backend = TestOptics { ready: true, tx: true, quiesce_failure: true, ..TestOptics::default() };
+    let mut actor = OpticalActor {
+        state: OpticalState::Enabled,
+    };
+    let mut backend = TestOptics {
+        ready: true,
+        tx: true,
+        quiesce_failure: true,
+        ..TestOptics::default()
+    };
     let response = actor.handle(OpticalCommand::On, &mut backend);
     assert_eq!(response["status"], "error");
     assert_eq!(response["desired_enabled"], true);
@@ -233,8 +275,14 @@ fn optical_failed_quiesce_resets_instead_of_reenabling() {
 
 #[test]
 fn optical_partial_enable_resets_hardware_and_expired_queue_never_saves() {
-    let mut actor = OpticalActor { state: OpticalState::Disabled };
-    let mut backend = TestOptics { ready: true, enable_failure_after_write: true, ..TestOptics::default() };
+    let mut actor = OpticalActor {
+        state: OpticalState::Disabled,
+    };
+    let mut backend = TestOptics {
+        ready: true,
+        enable_failure_after_write: true,
+        ..TestOptics::default()
+    };
     let failed = actor.handle(OpticalCommand::On, &mut backend);
     assert_eq!(failed["desired_enabled"], true);
     assert_eq!(failed["tx_enabled"], false);
@@ -242,7 +290,11 @@ fn optical_partial_enable_resets_hardware_and_expired_queue_never_saves() {
     assert!(backend.events.starts_with(&["enable", "disable", "read"]));
     backend.events.clear();
     let (reply, _receiver) = std::sync::mpsc::sync_channel(1);
-    let request = OpticalRequest { command: OpticalCommand::Off, reply, deadline: Instant::now() - Duration::from_secs(1) };
+    let request = OpticalRequest {
+        command: OpticalCommand::Off,
+        reply,
+        deadline: Instant::now() - Duration::from_secs(1),
+    };
     let expired = actor.dispatch(&request, &mut backend, &AtomicBool::new(false));
     assert_eq!(expired["error"]["code"], "TimedOut");
     assert!(backend.desired);

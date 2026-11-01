@@ -105,7 +105,10 @@ mod tests {
     #[test]
     fn hwtc_identity_has_explicit_specialization() {
         assert_eq!(specialization("HWTC", "V152").unwrap().id, "hwtc-v152-hw");
-        assert_eq!(specialization("HWTC", "K155-11").unwrap().id, "hwtc-k155-hw");
+        assert_eq!(
+            specialization("HWTC", "K155-11").unwrap().id,
+            "hwtc-k155-hw"
+        );
         assert!(specialization("HWTC", "other").is_none());
     }
 }

@@ -5,15 +5,25 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
-pub fn spawn(action: impl FnOnce(TcpStream) + Send + 'static) -> (SocketAddr, std::thread::JoinHandle<()>) {
+pub fn spawn(
+    action: impl FnOnce(TcpStream) + Send + 'static,
+) -> (SocketAddr, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let handle = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         assert!(matches!(read(&mut stream).unwrap(), Packet::Connect(_)));
-        write(&mut stream, Packet::ConnAck(ConnAck::new(ConnectReturnCode::Success, false)), false);
+        write(
+            &mut stream,
+            Packet::ConnAck(ConnAck::new(ConnectReturnCode::Success, false)),
+            false,
+        );
         action(stream);
         listener.set_nonblocking(true).unwrap();
         assert!(listener.accept().is_err(), "command reconnected");
@@ -41,6 +51,10 @@ pub fn write(stream: &mut TcpStream, packet: Packet, fragmented: bool) {
     let mut bytes = BytesMut::new();
     packet.write(&mut bytes, 3_145_728).unwrap();
     if fragmented {
-        for chunk in bytes.chunks(1) { stream.write_all(chunk).unwrap(); }
-    } else { stream.write_all(&bytes).unwrap(); }
+        for chunk in bytes.chunks(1) {
+            stream.write_all(chunk).unwrap();
+        }
+    } else {
+        stream.write_all(&bytes).unwrap();
+    }
 }

@@ -214,7 +214,11 @@ impl IpcResponse {
         }
     }
 
-    pub fn subdev(status: impl Into<String>, sn: impl Into<String>, action: impl Into<String>) -> Self {
+    pub fn subdev(
+        status: impl Into<String>,
+        sn: impl Into<String>,
+        action: impl Into<String>,
+    ) -> Self {
         Self {
             status: Some(status.into()),
             error: None,
@@ -228,7 +232,8 @@ impl IpcResponse {
     }
 
     pub fn to_json_line(&self) -> String {
-        let mut s = serde_json::to_string(self).unwrap_or_else(|_| "{\"error\":\"json serialize error\"}".to_string());
+        let mut s = serde_json::to_string(self)
+            .unwrap_or_else(|_| "{\"error\":\"json serialize error\"}".to_string());
         s.push('\n');
         s
     }

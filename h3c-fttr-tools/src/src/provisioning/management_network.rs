@@ -264,7 +264,9 @@ impl Coordinator {
     fn set_ready(&mut self, ready: bool) {
         self.ready = ready;
         let version = if ready {
-            self.journal.applied.as_ref()
+            self.journal
+                .applied
+                .as_ref()
                 .map(|d| format!("{}-{}", d.version(), self.journal.applied_epoch))
                 .unwrap_or_default()
         } else {

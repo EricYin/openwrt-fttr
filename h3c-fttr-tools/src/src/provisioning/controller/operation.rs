@@ -136,10 +136,14 @@ impl Operation {
             result["revision"] = json!(self.revision);
             result["backend"] = self.device.backend_view();
             result["state"] = json!(self.stage);
-            result["mode"] = json!(if self.apply {"apply"} else {"plan"});
+            result["mode"] = json!(if self.apply { "apply" } else { "plan" });
             result["started_at"] = json!(self.started);
             result["completed_at"] = json!(self.completed_at);
-            result["wifi_stage"] = json!(if self.completed_at.is_some() {"done"} else {"inventory"});
+            result["wifi_stage"] = json!(if self.completed_at.is_some() {
+                "done"
+            } else {
+                "inventory"
+            });
             if let Some(items) = result["items"].as_array_mut() {
                 items.extend(self.results.values().cloned());
                 for item in items {

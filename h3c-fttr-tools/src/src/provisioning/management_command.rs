@@ -1,6 +1,9 @@
 use std::{
     io::{ErrorKind, Read},
-    os::{fd::OwnedFd, unix::{net::UnixStream, process::CommandExt}},
+    os::{
+        fd::OwnedFd,
+        unix::{net::UnixStream, process::CommandExt},
+    },
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -83,7 +86,9 @@ fn capture(program: &str, args: &[&str], timeout: Duration) -> Result<String, St
             if error.raw_os_error() != Some(libc::ESRCH) {
                 return match child.wait() {
                     Ok(_) => Err(format!("cannot stop {program}: {error}")),
-                    Err(wait) => Err(format!("cannot stop {program}: {error}; cannot reap: {wait}")),
+                    Err(wait) => Err(format!(
+                        "cannot stop {program}: {error}; cannot reap: {wait}"
+                    )),
                 };
             }
         }

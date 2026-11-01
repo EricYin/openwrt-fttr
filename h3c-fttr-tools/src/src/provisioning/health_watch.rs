@@ -1,13 +1,21 @@
 //! Published management invalidations; health never locks the provisioning controller.
 use crate::pon_engine::omci::platform::wake::Wake;
-use std::{collections::BTreeSet, sync::{Arc, Mutex, OnceLock, Weak, atomic::{AtomicBool, Ordering}}};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
+};
 
 pub(crate) struct Subscription {
     changed: AtomicBool,
     wake: Arc<Wake>,
 }
 impl Subscription {
-    pub(crate) fn changed(&self) -> bool { self.changed.load(Ordering::Acquire) }
+    pub(crate) fn changed(&self) -> bool {
+        self.changed.load(Ordering::Acquire)
+    }
     fn invalidate(&self) {
         self.changed.store(true, Ordering::Release);
         self.wake.notify();
@@ -23,24 +31,37 @@ struct Published {
 impl Published {
     fn subscribe(&mut self, serial: &str, wake: Arc<Wake>) -> Arc<Subscription> {
         self.watches.retain(|(_, watch)| watch.strong_count() != 0);
-        let watch = Arc::new(Subscription { changed: AtomicBool::new(false), wake });
+        let watch = Arc::new(Subscription {
+            changed: AtomicBool::new(false),
+            wake,
+        });
         self.watches.push((serial.into(), Arc::downgrade(&watch)));
         watch
     }
     fn config(&mut self, enabled: BTreeSet<String>) {
         self.watches.retain(|(serial, weak)| {
-            let Some(watch) = weak.upgrade() else { return false; };
-            if self.enabled.contains(serial) != enabled.contains(serial) { watch.invalidate(); }
+            let Some(watch) = weak.upgrade() else {
+                return false;
+            };
+            if self.enabled.contains(serial) != enabled.contains(serial) {
+                watch.invalidate();
+            }
             true
         });
         self.enabled = enabled;
     }
     fn network(&mut self, version: String) {
-        if self.network == version { return; }
+        if self.network == version {
+            return;
+        }
         self.network = version;
         self.watches.retain(|(serial, weak)| {
-            let Some(watch) = weak.upgrade() else { return false; };
-            if self.enabled.contains(serial) { watch.invalidate(); }
+            let Some(watch) = weak.upgrade() else {
+                return false;
+            };
+            if self.enabled.contains(serial) {
+                watch.invalidate();
+            }
             true
         });
     }
@@ -52,8 +73,12 @@ fn published() -> &'static Mutex<Published> {
 pub(crate) fn subscribe(serial: &str, wake: Arc<Wake>) -> Arc<Subscription> {
     published().lock().unwrap().subscribe(serial, wake)
 }
-pub(super) fn config(enabled: BTreeSet<String>) { published().lock().unwrap().config(enabled); }
-pub(super) fn network(version: String) { published().lock().unwrap().network(version); }
+pub(super) fn config(enabled: BTreeSet<String>) {
+    published().lock().unwrap().config(enabled);
+}
+pub(super) fn network(version: String) {
+    published().lock().unwrap().network(version);
+}
 
 #[cfg(test)]
 mod tests {

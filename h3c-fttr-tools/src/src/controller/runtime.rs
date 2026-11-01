@@ -482,7 +482,8 @@ fn ipc_handler(
             let result = serde_json::from_str::<super::attribute_probe::Command>(request)
                 .map_err(std::io::Error::other)
                 .and_then(|command| super::attribute_probe::control(command, &services));
-            let response = result.unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+            let response =
+                result.unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
             let _ = serde_json::to_writer(&mut stream, &response);
             let _ = stream.write_all(b"\n");
         } else if let Some(request) = line.strip_prefix("MIB ") {

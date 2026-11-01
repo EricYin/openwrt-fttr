@@ -229,7 +229,9 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
         if let Some(values) = s.options.get("onu_id") {
             let value = s.get("onu_id");
             if values.len() != 1 || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(format!("{id}: onu_id must be a single decimal number 0..15"));
+                return Err(format!(
+                    "{id}: onu_id must be a single decimal number 0..15"
+                ));
             }
             let slot = value
                 .parse::<u8>()
@@ -281,22 +283,32 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
         }
         let use_defaults = boolean(
             s.get("connection_request_defaults"),
-            s.get("connection_request_username").is_empty() || s.get("connection_request_password").is_empty(),
+            s.get("connection_request_username").is_empty()
+                || s.get("connection_request_password").is_empty(),
         )
         .map_err(|error| format!("{id}: connection_request_defaults: {error}"))?;
         let (cr_username, cr_password, cr_defaults) = if use_defaults {
             if adapter == "hl202" || cwmp_contract == "hl202" {
                 ("rms".to_string(), "rms".to_string(), false)
             } else {
-                (s.get("connection_request_username").into(), s.get("connection_request_password").into(), true)
+                (
+                    s.get("connection_request_username").into(),
+                    s.get("connection_request_password").into(),
+                    true,
+                )
             }
         } else {
-            (s.get("connection_request_username").into(), s.get("connection_request_password").into(), false)
+            (
+                s.get("connection_request_username").into(),
+                s.get("connection_request_password").into(),
+                false,
+            )
         };
         let port = if s.get("connection_request_port").is_empty() {
             super::model::ConnectionRequest::default().port
         } else {
-            s.get("connection_request_port").parse::<std::num::NonZeroU16>()
+            s.get("connection_request_port")
+                .parse::<std::num::NonZeroU16>()
                 .map_err(|_| format!("{id}: connection_request_port must be 1..65535"))?
         };
         let connection_request = super::model::ConnectionRequest {
@@ -312,7 +324,9 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
             return Err(format!("{id}: provisioning_method must be command or acs"));
         }
         if s.get("provisioning_method") == "command" && adapter != "hl202" {
-            return Err(format!("{id}: command provisioning is only supported by HL202"));
+            return Err(format!(
+                "{id}: command provisioning is only supported by HL202"
+            ));
         }
         cfg.devices.push(Device {
             id: id.clone(),
@@ -639,8 +653,7 @@ mod tests {
     }
     #[test]
     fn parses_periodic_interval_minutes_and_rejects_old_interval_option() {
-        let config =
-            parse("config provisioning 'global'\n option interval_minutes '30'").unwrap();
+        let config = parse("config provisioning 'global'\n option interval_minutes '30'").unwrap();
         assert_eq!(config.interval_seconds, 1800);
         assert!(parse("config provisioning 'global'\n option interval '3600'").is_err());
     }
@@ -682,7 +695,8 @@ mod tests {
         assert!(config.allow_unsupported_as_bridge);
         assert_eq!(config.devices[0].adapter, "generic");
 
-        let text_disabled = "config provisioning 'global'\n option allow_unsupported_as_bridge '0'\n";
+        let text_disabled =
+            "config provisioning 'global'\n option allow_unsupported_as_bridge '0'\n";
         let config_disabled = parse_expanded(text_disabled).unwrap();
         assert!(!config_disabled.allow_unsupported_as_bridge);
     }

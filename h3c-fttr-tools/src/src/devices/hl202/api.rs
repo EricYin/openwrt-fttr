@@ -101,55 +101,58 @@ pub fn control(input: &str, devices: &[Device]) -> Value {
             #[cfg(not(feature = "mqtt"))]
             {
                 let _ = request;
-                error("mqtt_unavailable", "MQTT commands unavailable: build requires mqtt")
+                error(
+                    "mqtt_unavailable",
+                    "MQTT commands unavailable: build requires mqtt",
+                )
             }
             #[cfg(feature = "mqtt")]
             {
-            if !devices.iter().any(|device| {
-                device.online
-                    && device.optical_sn == request.target.optical_sn
-                    && device.onu_id == request.target.onu_id
-                    && device.model == "HL202-DU-C"
-            }) {
-                return error(
-                    "unsupported_target",
-                    "selected device is not an online HL202",
-                );
-            }
-            let encoded = match serde_json::to_string(&request) {
-                Ok(encoded) => encoded,
-                Err(_) => return error("invalid_request", "invalid HL202 request schema"),
-            };
-            let request = match super::request::parse(&encoded) {
-                Ok(request) => request,
-                Err(_) => return error("invalid_request", "invalid HL202 action parameters"),
-            };
-            match request.action {
-                super::request::Action::Exec {
-                    script,
-                    timeout_seconds,
-                } => {
-                    match super::command_binding::execute(
-                        &request.target,
-                        &script,
-                        std::time::Duration::from_secs(u64::from(timeout_seconds)),
-                    ) {
-                        Ok(result) => json!({"schema_version":1,"operation":result}),
-                        Err(cause) => error("command_failed", &cause.to_string()),
+                if !devices.iter().any(|device| {
+                    device.online
+                        && device.optical_sn == request.target.optical_sn
+                        && device.onu_id == request.target.onu_id
+                        && device.model == "HL202-DU-C"
+                }) {
+                    return error(
+                        "unsupported_target",
+                        "selected device is not an online HL202",
+                    );
+                }
+                let encoded = match serde_json::to_string(&request) {
+                    Ok(encoded) => encoded,
+                    Err(_) => return error("invalid_request", "invalid HL202 request schema"),
+                };
+                let request = match super::request::parse(&encoded) {
+                    Ok(request) => request,
+                    Err(_) => return error("invalid_request", "invalid HL202 action parameters"),
+                };
+                match request.action {
+                    super::request::Action::Exec {
+                        script,
+                        timeout_seconds,
+                    } => {
+                        match super::command_binding::execute(
+                            &request.target,
+                            &script,
+                            std::time::Duration::from_secs(u64::from(timeout_seconds)),
+                        ) {
+                            Ok(result) => json!({"schema_version":1,"operation":result}),
+                            Err(cause) => error("command_failed", &cause.to_string()),
+                        }
+                    }
+                    action @ (super::request::Action::AccountsRead
+                    | super::request::Action::AccountSetPassword { .. }
+                    | super::request::Action::AccountSetActive { .. }) => {
+                        match super::accounts::run(&request.target, &action) {
+                            Ok(result) => result,
+                            Err(_) => error(
+                                "account_failed",
+                                "account command failed or returned unsupported metadata",
+                            ),
+                        }
                     }
                 }
-                action @ (super::request::Action::AccountsRead
-                | super::request::Action::AccountSetPassword { .. }
-                | super::request::Action::AccountSetActive { .. }) => {
-                    match super::accounts::run(&request.target, &action) {
-                        Ok(result) => result,
-                        Err(_) => error(
-                            "account_failed",
-                            "account command failed or returned unsupported metadata",
-                        ),
-                    }
-                }
-            }
             }
         }
     }

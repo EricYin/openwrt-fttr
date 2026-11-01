@@ -141,28 +141,53 @@ fn ip_host_upload_separates_manual_and_current_addresses_and_rejects_current_wri
     assert_eq!(block.attributes[0].definition.name, "IpAddress");
     assert_eq!(block.attributes[5].definition.name, "CurrentAddress");
     assert_eq!(block.attributes[5].value.unsigned(), Some(0xc0000214));
-    assert!(AttributeCodec::encode(def, &[(9, AttributeValue::number(1))], AttributeContext::SetRequest).is_err());
-    assert_eq!(AttributeCodec::encode(def, &[(1, AttributeValue::number(9))], AttributeContext::SetRequest).unwrap(), (0x8000, vec![9]));
+    assert!(AttributeCodec::encode(
+        def,
+        &[(9, AttributeValue::number(1))],
+        AttributeContext::SetRequest
+    )
+    .is_err());
+    assert_eq!(
+        AttributeCodec::encode(
+            def,
+            &[(1, AttributeValue::number(9))],
+            AttributeContext::SetRequest
+        )
+        .unwrap(),
+        (0x8000, vec![9])
+    );
 }
 
 #[test]
 fn management_association_layouts_decode_and_encode_standard_links() {
     let server = MeRegistry::get(340).unwrap();
     let block = AttributeCodec::decode(
-        server, 0xe000, &[0, 0x80, 1, 0, 46], AttributeContext::GetResponse,
+        server,
+        0xe000,
+        &[0, 0x80, 1, 0, 46],
+        AttributeContext::GetResponse,
     );
     assert_eq!((block.consumed, block.undecoded_mask), (5, 0));
     for (attr, (name, value)) in block.attributes.iter().zip([
-        ("AdministrativeState", 0), ("AcsNetworkAddress", 0x8001), ("AssociatedTag", 46),
+        ("AdministrativeState", 0),
+        ("AcsNetworkAddress", 0x8001),
+        ("AssociatedTag", 46),
     ]) {
         assert_eq!(attr.definition.name, name);
         assert_eq!(attr.value.unsigned(), Some(value));
     }
-    assert_eq!(AttributeCodec::encode(
-        MeRegistry::get(137).unwrap(),
-        &[(1, AttributeValue::number(0)), (2, AttributeValue::number(0x200))],
-        AttributeContext::CreateRequest,
-    ).unwrap(), (0xc000, vec![0, 0, 2, 0]));
+    assert_eq!(
+        AttributeCodec::encode(
+            MeRegistry::get(137).unwrap(),
+            &[
+                (1, AttributeValue::number(0)),
+                (2, AttributeValue::number(0x200))
+            ],
+            AttributeContext::CreateRequest,
+        )
+        .unwrap(),
+        (0xc000, vec![0, 0, 2, 0])
+    );
 }
 
 #[test]
@@ -176,7 +201,10 @@ fn large_string_upload_decodes_count_and_parts_without_consuming_padding() {
     assert_eq!(block.attributes[0].definition.name, "NumberOfParts");
     assert_eq!(block.attributes[0].value.unsigned(), Some(1));
     assert_eq!(block.attributes[1].definition.name, "Part1");
-    assert_eq!(block.attributes[1].raw_hex, "6578616d706c65000000000000000000000000000000000000");
+    assert_eq!(
+        block.attributes[1].raw_hex,
+        "6578616d706c65000000000000000000000000000000000000"
+    );
     let last = AttributeCodec::decode(def, 0x0001, &[0; 26], AttributeContext::GetResponse);
     assert_eq!(last.attributes[0].definition.name, "Part15");
     assert_eq!((last.consumed, last.undecoded_mask), (25, 0));
@@ -200,7 +228,8 @@ fn ip_host_diagnostics_decode_mixed_width_counters_and_transport_binding() {
         counters,
         &[(3, AttributeValue::number(0))],
         AttributeContext::SetRequest,
-    ).is_err());
+    )
+    .is_err());
 
     let binding = AttributeCodec::decode(
         MeRegistry::get(136).unwrap(),
@@ -215,9 +244,7 @@ fn ip_host_diagnostics_decode_mixed_width_counters_and_transport_binding() {
 
     let auth = MeRegistry::get(148).unwrap();
     assert!(auth.layout_supported);
-    let truncated = AttributeCodec::decode(
-        auth, 0x2000, &[0; 24], AttributeContext::GetResponse,
-    );
+    let truncated = AttributeCodec::decode(auth, 0x2000, &[0; 24], AttributeContext::GetResponse);
     assert_eq!(truncated.consumed, 0);
     assert_eq!(truncated.diagnostics[0].code, "truncated_attribute");
 }
@@ -347,7 +374,10 @@ struct SlowUpload {
 impl OmciTransport for SlowUpload {
     fn send(&mut self, request: &BaselineFrame) -> io::Result<()> {
         if request.message_type == 0x4d {
-            assert!(self.ready.is_none(), "snapshot must not be restarted after two seconds");
+            assert!(
+                self.ready.is_none(),
+                "snapshot must not be restarted after two seconds"
+            );
             self.ready = Some(Instant::now() + std::time::Duration::from_millis(2100));
         }
         self.script.send(request)
@@ -363,14 +393,19 @@ impl OmciTransport for SlowUpload {
 #[test]
 fn slow_snapshot_waits_without_restarting_and_still_obeys_total_deadline() {
     let transport = || SlowUpload {
-        script: Script { responses: VecDeque::new() },
+        script: Script {
+            responses: VecDeque::new(),
+        },
         ready: None,
     };
     let mut session = OmciSession::new(transport());
     assert!(session.upload_mib().unwrap().uploaded_complete);
     let mut session = OmciSession::new(transport());
     session.finish_before(Instant::now() + std::time::Duration::from_millis(10));
-    assert_eq!(session.upload_mib().unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert_eq!(
+        session.upload_mib().unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
 }
 
 struct Script {

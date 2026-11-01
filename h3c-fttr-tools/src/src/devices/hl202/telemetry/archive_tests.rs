@@ -9,7 +9,9 @@ fn gzip(raw: &[u8]) -> Vec<u8> {
 fn raw_fixture() -> Vec<u8> {
     let input = super::fixture(&[("IP", b"192.0.2.10")]);
     let mut raw = Vec::new();
-    flate2::read::MultiGzDecoder::new(input.as_slice()).read_to_end(&mut raw).unwrap();
+    flate2::read::MultiGzDecoder::new(input.as_slice())
+        .read_to_end(&mut raw)
+        .unwrap();
     raw
 }
 
@@ -82,7 +84,11 @@ fn invalid_gzip_is_rejected_when_after_valid_archive() {
 fn expansion_limit_is_enforced_when_padding_is_in_another_gzip_member() {
     let raw = raw_fixture();
     let mut input = gzip(&raw);
-    input.extend(gzip(&vec![0; super::super::archive::MAX_DECOMPRESSED + 512 - raw.len()]));
+    input.extend(gzip(&vec![
+        0;
+        super::super::archive::MAX_DECOMPRESSED + 512
+            - raw.len()
+    ]));
 
     let result = super::super::parse(&input);
 

@@ -57,7 +57,9 @@ impl Drop for PacketSocket {
     }
 }
 impl PacketSocket {
-    pub(crate) fn raw_fd(&self) -> i32 { self.fd }
+    pub(crate) fn raw_fd(&self) -> i32 {
+        self.fd
+    }
     pub(crate) fn stop_capture(&self) -> io::Result<()> {
         super::capture::Capture::Closed.attach(self.fd)
     }

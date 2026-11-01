@@ -1,6 +1,6 @@
 //! Whole-device compile-time registry. Core activation/inventory never depend on adapters.
-pub mod cwmp;
 pub mod command_provisioning;
+pub mod cwmp;
 use crate::model::BusinessPhase;
 
 pub fn observe_mqtt_report(source: &str, payload: Vec<u8>, received: u64) -> bool {
@@ -300,9 +300,7 @@ pub fn select_with_serial(
         // Any other Huawei ONT (e.g. HG8010C) has a different MIB and goes
         // through the vendor-neutral generic bridge instead.
         match hwtc::profile(equipment) {
-            profile @ (hwtc::Profile::K155 | hwtc::Profile::V152) => {
-                return Adapter::Hwtc(profile)
-            }
+            profile @ (hwtc::Profile::K155 | hwtc::Profile::V152) => return Adapter::Hwtc(profile),
             hwtc::Profile::Standard => {}
         }
     }
@@ -491,24 +489,74 @@ mod tests {
     fn adapter_matches_cwmp_identity_rules() {
         #[cfg(feature = "device-hl202")]
         {
-            assert!(matches_cwmp_adapter("hl202", "H3CT12345678", "HL202-DU-C", "SN-H3CT12345678-01"));
-            assert!(!matches_cwmp_adapter("hl202", "H3CT12345678", "OTHER-DEVICE", "SN-H3CT12345678-01"));
-            assert!(!matches_cwmp_adapter("hl202", "H3CT12345678", "HL202-DU-C", "SN-WRONG-01"));
+            assert!(matches_cwmp_adapter(
+                "hl202",
+                "H3CT12345678",
+                "HL202-DU-C",
+                "SN-H3CT12345678-01"
+            ));
+            assert!(!matches_cwmp_adapter(
+                "hl202",
+                "H3CT12345678",
+                "OTHER-DEVICE",
+                "SN-H3CT12345678-01"
+            ));
+            assert!(!matches_cwmp_adapter(
+                "hl202",
+                "H3CT12345678",
+                "HL202-DU-C",
+                "SN-WRONG-01"
+            ));
         }
         #[cfg(feature = "device-hwtc")]
         {
             // HWTC in hex is 48575443
-            assert!(matches_cwmp_adapter("hwtc", "HWTC12345678", "K155-11", "4857544312345678"));
-            assert!(!matches_cwmp_adapter("hwtc", "HWTC12345678", "K155-11", "WRONGSERIAL"));
-            assert!(!matches_cwmp_adapter("hwtc", "OTHER12345678", "K155-11", "4857544312345678"));
+            assert!(matches_cwmp_adapter(
+                "hwtc",
+                "HWTC12345678",
+                "K155-11",
+                "4857544312345678"
+            ));
+            assert!(!matches_cwmp_adapter(
+                "hwtc",
+                "HWTC12345678",
+                "K155-11",
+                "WRONGSERIAL"
+            ));
+            assert!(!matches_cwmp_adapter(
+                "hwtc",
+                "OTHER12345678",
+                "K155-11",
+                "4857544312345678"
+            ));
         }
         #[cfg(feature = "device-star")]
         {
-            assert!(matches_cwmp_adapter("star", "STAR1234ABCD", "SG631Z-C", "MODEL-STAR1234ABCD-01"));
-            assert!(!matches_cwmp_adapter("star", "STAR1234ABCD", "OTHER-DEVICE", "MODEL-STAR1234ABCD-01"));
-            assert!(!matches_cwmp_adapter("star", "STAR1234ABCD", "SG631Z-C", "MODEL-WRONG-01"));
+            assert!(matches_cwmp_adapter(
+                "star",
+                "STAR1234ABCD",
+                "SG631Z-C",
+                "MODEL-STAR1234ABCD-01"
+            ));
+            assert!(!matches_cwmp_adapter(
+                "star",
+                "STAR1234ABCD",
+                "OTHER-DEVICE",
+                "MODEL-STAR1234ABCD-01"
+            ));
+            assert!(!matches_cwmp_adapter(
+                "star",
+                "STAR1234ABCD",
+                "SG631Z-C",
+                "MODEL-WRONG-01"
+            ));
         }
-        assert!(!matches_cwmp_adapter("unknown", "TEST12345678", "CLASS", "SERIAL"));
+        assert!(!matches_cwmp_adapter(
+            "unknown",
+            "TEST12345678",
+            "CLASS",
+            "SERIAL"
+        ));
     }
 }
 pub fn supports_command_provisioning(adapter: &str) -> bool {

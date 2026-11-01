@@ -1,28 +1,51 @@
 //! Device-independent OMCI writes: preserve existing entities and require readback.
-use crate::pon_engine::omci::{OmciSession, error::{is_absent, is_unknown_instance, result_code}, attributes::AttributeValue};
+use crate::pon_engine::omci::{
+    attributes::AttributeValue,
+    error::{is_absent, is_unknown_instance, result_code},
+    OmciSession,
+};
 use std::io;
 
 pub fn matches(attributes: &[u8], expected: &[u8]) -> bool {
     attributes.get(..expected.len()) == Some(expected)
 }
-pub fn verify(session: &mut OmciSession, class: u16, instance: u16, mask: u16, expected: &[u8]) -> io::Result<()> {
+pub fn verify(
+    session: &mut OmciSession,
+    class: u16,
+    instance: u16,
+    mask: u16,
+    expected: &[u8],
+) -> io::Result<()> {
     let response = session.get(class, instance, mask)?;
     if !matches(&response.payload[3..], expected) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("readback mismatch class={class} instance={instance:04x}")));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("readback mismatch class={class} instance={instance:04x}"),
+        ));
     }
     println!("READBACK_OK class={class} instance={instance:04x} mask={mask:04x}");
     Ok(())
 }
-pub fn create_verified(session: &mut OmciSession, class: u16, instance: u16, attributes: &[u8], mask: u16, expected: &[u8]) -> io::Result<()> {
+pub fn create_verified(
+    session: &mut OmciSession,
+    class: u16,
+    instance: u16,
+    attributes: &[u8],
+    mask: u16,
+    expected: &[u8],
+) -> io::Result<()> {
     match session.get(class, instance, mask) {
         Ok(response) => {
             if !matches(&response.payload[3..], expected) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("existing entity differs class={class} instance={instance:04x}")));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("existing entity differs class={class} instance={instance:04x}"),
+                ));
             }
             println!("EXISTING_READBACK_OK class={class} instance={instance:04x}");
             return Ok(());
         }
-        Err(error) if is_unknown_instance(&error) => {},
+        Err(error) if is_unknown_instance(&error) => {}
         Err(error) => return Err(error),
     }
     session.create(class, instance, attributes)?;
@@ -33,7 +56,14 @@ pub fn create_verified(session: &mut OmciSession, class: u16, instance: u16, att
 /// result code they use for "already exists", so an unclear probe or a changing
 /// entity is resolved by replacing the entity with our own definition instead of
 /// aborting the profile forever.
-pub fn create_verified_lenient(session: &mut OmciSession, class: u16, instance: u16, attributes: &[u8], mask: u16, expected: &[u8]) -> io::Result<()> {
+pub fn create_verified_lenient(
+    session: &mut OmciSession,
+    class: u16,
+    instance: u16,
+    attributes: &[u8],
+    mask: u16,
+    expected: &[u8],
+) -> io::Result<()> {
     match session.get(class, instance, mask) {
         Ok(response) => {
             if matches(&response.payload[3..], expected) {
@@ -43,10 +73,12 @@ pub fn create_verified_lenient(session: &mut OmciSession, class: u16, instance: 
             println!("REPLACING_DIFFERING_ENTITY class={class} instance={instance:04x}");
             let _ = session.delete(class, instance);
         }
-        Err(error) if is_absent(&error) => {},
+        Err(error) if is_absent(&error) => {}
         Err(error) if result_code(&error) == Some(9) => {
             // The ONU refuses this mask, so what is stored cannot be compared.
-            println!("REPLACING_UNREPORTED_ENTITY class={class} instance={instance:04x} mask={mask:04x}");
+            println!(
+                "REPLACING_UNREPORTED_ENTITY class={class} instance={instance:04x} mask={mask:04x}"
+            );
             let _ = session.delete(class, instance);
         }
         Err(error) => return Err(error),
@@ -78,14 +110,25 @@ pub fn assign_tcont(session: &mut OmciSession, instance: u16, alloc: u16) -> io:
     }
     verify(session, 262, instance, 0x8000, &alloc.to_be_bytes())
 }
-pub fn create_gem(session: &mut OmciSession, instance: u16, port: u16, tcont: u16, bridge: u16, gal: u16) -> io::Result<()> {
+pub fn create_gem(
+    session: &mut OmciSession,
+    instance: u16,
+    port: u16,
+    tcont: u16,
+    bridge: u16,
+    gal: u16,
+) -> io::Result<()> {
     let mut ctp = Vec::new();
-    ctp.extend(port.to_be_bytes()); ctp.extend(tcont.to_be_bytes());
-    ctp.extend([3,0,0,0,0,0,0,0,0,0]);
+    ctp.extend(port.to_be_bytes());
+    ctp.extend(tcont.to_be_bytes());
+    ctp.extend([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     create_verified(session, 268, instance, &ctp, 0xe000, &ctp[..5])?;
     let mut iw = Vec::new();
-    iw.extend(instance.to_be_bytes()); iw.push(1); iw.extend(bridge.to_be_bytes());
-    iw.extend([0,0]); iw.extend(gal.to_be_bytes());
+    iw.extend(instance.to_be_bytes());
+    iw.push(1);
+    iw.extend(bridge.to_be_bytes());
+    iw.extend([0, 0]);
+    iw.extend(gal.to_be_bytes());
     create_verified(session, 266, instance, &iw, 0xf200, &iw)
 }
 

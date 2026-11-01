@@ -1,5 +1,11 @@
-use crate::{bosa, pon_engine::{ploam::PloamFrame, omci::platform::leases::update_onu_enable}};
-use std::{io, time::{Duration, Instant}};
+use crate::{
+    bosa,
+    pon_engine::{omci::platform::leases::update_onu_enable, ploam::PloamFrame},
+};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 pub(super) struct RangingSession {
     pub id: u8,
@@ -20,12 +26,19 @@ impl RangingSession {
         }
     }
     pub fn expired(&self, now: Instant) -> bool {
-        if self.confirmed { now.duration_since(self.last_valid_rx) >= Duration::from_secs(15) }
-        else { now.duration_since(self.started) >= Duration::from_secs(10) }
+        if self.confirmed {
+            now.duration_since(self.last_valid_rx) >= Duration::from_secs(15)
+        } else {
+            now.duration_since(self.started) >= Duration::from_secs(10)
+        }
     }
 }
 
-pub(super) fn grant_target(active: Option<u8>, online: impl Iterator<Item = u8>, cycle: usize) -> u8 {
+pub(super) fn grant_target(
+    active: Option<u8>,
+    online: impl Iterator<Item = u8>,
+    cycle: usize,
+) -> u8 {
     let mut targets = vec![active.unwrap_or(0xfe)];
     targets.extend(online);
     targets[cycle % targets.len()]
@@ -34,9 +47,14 @@ pub(super) fn grant_target(active: Option<u8>, online: impl Iterator<Item = u8>,
 pub(super) fn clear_offline_hardware(id: u8) -> io::Result<()> {
     // Caller holds this ONU's lock after cancellation and worker lease release.
     bosa::set_fttr_carrier(id as u32, false)?;
-    for _ in 0..3 { bosa::send_ploam_msg(&PloamFrame::new(id, 5, [0;10]).to_bytes())?; }
+    for _ in 0..3 {
+        bosa::send_ploam_msg(&PloamFrame::new(id, 5, [0; 10]).to_bytes())?;
+    }
     update_onu_enable(id, false)?;
-    for address in [0x0500009c + 16 * u32::from(id), 0x050000a4 + 16 * u32::from(id)] {
+    for address in [
+        0x0500009c + 16 * u32::from(id),
+        0x050000a4 + 16 * u32::from(id),
+    ] {
         bosa::write_fpga_reg(address, 0x01000000)?;
     }
     bosa::exchange_omci_channel(id, 0)?;
@@ -49,20 +67,34 @@ mod tests {
     use super::*;
     #[test]
     fn discovery_and_activation_preserve_each_online_onu_grant() {
-        let targets: Vec<_> = (0..6).map(|cycle| grant_target(None, [1,2].into_iter(), cycle)).collect();
-        assert_eq!(targets, [0xfe,1,2,0xfe,1,2]);
-        let targets: Vec<_> = (0..6).map(|cycle| grant_target(Some(3), [1,2].into_iter(), cycle)).collect();
-        assert_eq!(targets, [3,1,2,3,1,2]);
+        let targets: Vec<_> = (0..6)
+            .map(|cycle| grant_target(None, [1, 2].into_iter(), cycle))
+            .collect();
+        assert_eq!(targets, [0xfe, 1, 2, 0xfe, 1, 2]);
+        let targets: Vec<_> = (0..6)
+            .map(|cycle| grant_target(Some(3), [1, 2].into_iter(), cycle))
+            .collect();
+        assert_eq!(targets, [3, 1, 2, 3, 1, 2]);
         assert_eq!(grant_target(None, [].into_iter(), 99), 0xfe);
     }
     #[test]
     fn anothers_valid_frames_do_not_extend_a_disconnected_onu_lifetime() {
         let start = Instant::now();
-        let make = |id| RangingSession { id, serial: [0;8], started: start, armed: true,
-            matched: true, measured: Some(248248), ranged: Some(start), allocated: true, confirmed: true, last_valid_rx: start };
+        let make = |id| RangingSession {
+            id,
+            serial: [0; 8],
+            started: start,
+            armed: true,
+            matched: true,
+            measured: Some(248248),
+            ranged: Some(start),
+            allocated: true,
+            confirmed: true,
+            last_valid_rx: start,
+        };
         let mut disconnected = make(1);
         let mut connected = make(2);
-        let frame = PloamFrame::new(2, 4, [0;10]).to_bytes();
+        let frame = PloamFrame::new(2, 4, [0; 10]).to_bytes();
         disconnected.observe(&frame, start + Duration::from_secs(14));
         connected.observe(&frame, start + Duration::from_secs(14));
         assert!(disconnected.expired(start + Duration::from_secs(16)));

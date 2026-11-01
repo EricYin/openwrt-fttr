@@ -4,26 +4,52 @@ use rumqttc::{Publish, QoS, SubAck, SubscribeReasonCode};
 use std::io::Read;
 
 fn request(timeout: Duration) -> Request<'static> {
-    Request { target: "1A2B3C4DA111".into(), script: "printf '猫';\n$(id); `id`", id: "current".into(), timeout }
+    Request {
+        target: "1A2B3C4DA111".into(),
+        script: "printf '猫';\n$(id); `id`",
+        id: "current".into(),
+        timeout,
+    }
 }
 
 pub(crate) fn subscribe(stream: &mut std::net::TcpStream, accepted: bool) {
-    let Packet::Subscribe(subscription) = read(stream).unwrap() else { panic!("expected subscription") };
-    assert_eq!(subscription.filters[0].path, "/fttr/subdev/exec/1A2B3C4DA111/resp");
-    let code = if accepted { SubscribeReasonCode::Success(QoS::AtMostOnce) } else { SubscribeReasonCode::Failure };
-    write(stream, Packet::SubAck(SubAck::new(subscription.pkid, vec![code])), true);
+    let Packet::Subscribe(subscription) = read(stream).unwrap() else {
+        panic!("expected subscription")
+    };
+    assert_eq!(
+        subscription.filters[0].path,
+        "/fttr/subdev/exec/1A2B3C4DA111/resp"
+    );
+    let code = if accepted {
+        SubscribeReasonCode::Success(QoS::AtMostOnce)
+    } else {
+        SubscribeReasonCode::Failure
+    };
+    write(
+        stream,
+        Packet::SubAck(SubAck::new(subscription.pkid, vec![code])),
+        true,
+    );
 }
 
 fn publication(stream: &mut std::net::TcpStream) {
-    let Packet::Publish(published) = read(stream).unwrap() else { panic!("expected publication") };
+    let Packet::Publish(published) = read(stream).unwrap() else {
+        panic!("expected publication")
+    };
     assert_eq!(published.topic, "/fttr/subdev/exec/1A2B3C4DA111");
-    assert!(std::str::from_utf8(&published.payload).unwrap().contains("$(id); `id`"));
+    assert!(std::str::from_utf8(&published.payload)
+        .unwrap()
+        .contains("$(id); `id`"));
     assert_eq!(published.qos, QoS::AtMostOnce);
     assert!(!published.retain);
 }
 
 fn reply(stream: &mut std::net::TcpStream, topic: &str, id: &str, retained: bool) {
-    let mut reply = Publish::new(topic, QoS::AtMostOnce, format!("__FTTR_BEGIN_{id}__\n猫\n__FTTR_END_{id}__=7\n"));
+    let mut reply = Publish::new(
+        topic,
+        QoS::AtMostOnce,
+        format!("__FTTR_BEGIN_{id}__\n猫\n__FTTR_END_{id}__=7\n"),
+    );
     reply.retain = retained;
     write(stream, Packet::Publish(reply), true);
 }
@@ -67,7 +93,12 @@ fn mqtt_command_transport_subscription_rejection_prevents_publication() {
         subscribe(&mut stream, false);
         assert_eq!(stream.read(&mut [0]).unwrap(), 0); // No publication before or after rejection.
     });
-    assert_eq!(blocking(run(address, request(Duration::from_secs(1)), enqueue)).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        blocking(run(address, request(Duration::from_secs(1)), enqueue))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
     worker.join().unwrap();
 }
 
@@ -76,7 +107,12 @@ fn mqtt_command_transport_round_trips_fragmented_tcp_packets() {
     let (address, worker) = test_peer::spawn(|mut stream| {
         subscribe(&mut stream, true);
         publication(&mut stream);
-        reply(&mut stream, "/fttr/subdev/exec/1A2B3C4DA111/resp", "current", false);
+        reply(
+            &mut stream,
+            "/fttr/subdev/exec/1A2B3C4DA111/resp",
+            "current",
+            false,
+        );
         assert_eq!(stream.read(&mut [0]).unwrap(), 0);
     });
     let result = blocking(run(address, request(Duration::from_secs(2)), enqueue)).unwrap();

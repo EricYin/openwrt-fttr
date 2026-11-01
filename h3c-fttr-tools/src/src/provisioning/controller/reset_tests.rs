@@ -195,7 +195,10 @@ fn startup_leaves_unconfigured_reset_intents_untouched() {
 
 #[test]
 fn reload_blocks_retained_intents_before_start_without_replaying_cleanup() {
-    for data in [br#"{"optical_sn":"H3CT12345678","cwmp_id":"id"}"#.as_slice(), b"bad json"] {
+    for data in [
+        br#"{"optical_sn":"H3CT12345678","cwmp_id":"id"}"#.as_slice(),
+        b"bad json",
+    ] {
         let mut fixture = Fixture::new();
         let c = &mut fixture.controller;
         let target = c.config.devices.pop().unwrap();
@@ -226,19 +229,34 @@ fn reload_blocks_retained_intents_before_start_without_replaying_cleanup() {
         c.replace_config(config).unwrap();
 
         assert!(c.resets.blocks(&target.optical_sn));
-        assert_eq!(c.snapshot()["devices"][1]["provisioning"]["state"], "reset_pending");
+        assert_eq!(
+            c.snapshot()["devices"][1]["provisioning"]["state"],
+            "reset_pending"
+        );
         for (selected, apply) in [("all", true), ("child", true), ("child", false)] {
-            assert_eq!(c.start(selected, apply, false).unwrap_err(), "device reset pending; retry reset before synchronization");
+            assert_eq!(
+                c.start(selected, apply, false).unwrap_err(),
+                "device reset pending; retry reset before synchronization"
+            );
         }
         assert_eq!(c.next_id, 1);
         assert!(c.operations.is_empty());
         assert_eq!(c.history(), history);
-        assert_eq!(std::fs::read(&c.resets.history).unwrap(), history.as_bytes());
+        assert_eq!(
+            std::fs::read(&c.resets.history).unwrap(),
+            history.as_bytes()
+        );
         assert_eq!(std::fs::read(&marker).unwrap(), data);
         assert_eq!(std::fs::read(&unrelated).unwrap(), b"untouched");
         for directory in [&c.resets.wan, &c.resets.wifi] {
-            assert_eq!(std::fs::read(storage::registry_path(directory, "other")).unwrap(), b"untouched");
-            assert_eq!(std::fs::read(storage::registry_path(directory, "id")).unwrap(), b"owned");
+            assert_eq!(
+                std::fs::read(storage::registry_path(directory, "other")).unwrap(),
+                b"untouched"
+            );
+            assert_eq!(
+                std::fs::read(storage::registry_path(directory, "id")).unwrap(),
+                b"owned"
+            );
         }
     }
 }

@@ -77,9 +77,7 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     // T-CONT allocation. Some ONUs refuse to rewrite Alloc-ID; the GEM port can
     // still be created against the existing T-CONT, so a refusal is not fatal.
     if let Err(error) = assign_tcont(&mut session, tcont_inst, port) {
-        println!(
-            "GENERIC_TCONT_ALLOC_SKIPPED instance={tcont_inst:04x} alloc={port:04x}: {error}"
-        );
+        println!("GENERIC_TCONT_ALLOC_SKIPPED instance={tcont_inst:04x} alloc={port:04x}: {error}");
     }
 
     // GAL Ethernet profile (ME 272): reuse a factory profile when present.
@@ -96,8 +94,14 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
         1u16
     };
     let bridge_data = [0, 1, 0, 0x80, 0, 0x14, 0, 2, 0, 0x0f, 0, 0];
-    if let Err(error) = create_verified_lenient(&mut session, 45, bridge_inst, &bridge_data, 0xe000, &[0, 1, 0])
-    {
+    if let Err(error) = create_verified_lenient(
+        &mut session,
+        45,
+        bridge_inst,
+        &bridge_data,
+        0xe000,
+        &[0, 1, 0],
+    ) {
         println!("GENERIC_BRIDGE_PROFILE_REUSED instance={bridge_inst:04x}: {error}");
     }
 
@@ -172,7 +176,9 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
         // a second one for the same UNI.
         let evto_inst = match inventory.evtos.get(&endpoint).copied() {
             Some(instance) => {
-                println!("GENERIC_ENDPOINT_EVTO_REUSED endpoint={endpoint:04x} instance={instance:04x}");
+                println!(
+                    "GENERIC_ENDPOINT_EVTO_REUSED endpoint={endpoint:04x} instance={instance:04x}"
+                );
                 instance
             }
             None => {
@@ -186,9 +192,9 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
             Ok(()) => {
                 let _ = verify(&mut session, 171, evto_inst, 0x0800, &[1]);
             }
-            Err(error) => println!(
-                "GENERIC_EVTO_DOWNSTREAM_MODE_SKIPPED instance={evto_inst:04x}: {error}"
-            ),
+            Err(error) => {
+                println!("GENERIC_EVTO_DOWNSTREAM_MODE_SKIPPED instance={evto_inst:04x}: {error}")
+            }
         }
         if let Err(error) = apply_transparent_evto_table(&mut session, evto_inst) {
             println!("GENERIC_EVTO_TABLE_SKIPPED instance={evto_inst:04x}: {error}");

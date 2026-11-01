@@ -59,10 +59,16 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
             continue;
         }
         if d.backend() == "command" {
-            let reachable = crate::mqtt_identity::shared().lock().unwrap().snapshots(time).iter()
+            let reachable = crate::mqtt_identity::shared()
+                .lock()
+                .unwrap()
+                .snapshots(time)
+                .iter()
                 .any(|s| s.optical_sn.as_deref() == Some(&d.optical_sn) && s.reason == "ready");
             c.management.insert(d.id.clone(), json!({"state":if reachable {"online"} else {"waiting_transport"},"optical_online":online.contains(&d.optical_sn),"cwmp_id":d.cwmp_id,"last_inform":null,"age_seconds":null,"backend":d.backend_view()}));
-            if reachable { fresh.insert(d.id.clone()); }
+            if reachable {
+                fresh.insert(d.id.clone());
+            }
             schedule(&mut c, d, reachable, false, time);
             if let Some(op) = c.operations.get_mut(&d.id) {
                 if let Some(job) = &op.command_job {
@@ -73,7 +79,13 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
                         history_changed = true;
                     }
                 } else if op.stage != OperationPhase::Completed && reachable {
-                    op.command_job = Some(crate::devices::command_provisioning::Job::start(op.device.clone(), op.apply, op.full_sync, op.revision.clone(), op.id));
+                    op.command_job = Some(crate::devices::command_provisioning::Job::start(
+                        op.device.clone(),
+                        op.apply,
+                        op.full_sync,
+                        op.revision.clone(),
+                        op.id,
+                    ));
                     op.stage = OperationPhase::Reading;
                     history_changed = true;
                 }
@@ -303,7 +315,9 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
     });
     let startup_trigger = c.startup_trigger_pending(&d.id);
     let config_changed = c.config.triggers.contains("config_change")
-        && previous.as_ref().is_none_or(|p| p["revision"] != c.config.revision);
+        && previous
+            .as_ref()
+            .is_none_or(|p| p["revision"] != c.config.revision);
     let periodic = c.periodic_due(&d.id, time);
     if !active_op && reachable && c.config.enabled && c.config.automatic {
         if needs_reconcile {
@@ -345,7 +359,8 @@ mod config_change_tests {
 
     fn fixture() -> (Controller, Device) {
         let mut op = super::super::tests::operation(OperationPhase::Completed, false);
-        op.results.insert("wifi".into(), json!({"id":"wifi","state":"verified"}));
+        op.results
+            .insert("wifi".into(), json!({"id":"wifi","state":"verified"}));
         let device = op.device.clone();
         let mut c = Controller::default();
         c.config.enabled = true;
@@ -393,7 +408,8 @@ mod config_change_tests {
         schedule(&mut restarted, &device, true, false, 100);
         assert_eq!(restarted.operations[&device.id].revision, "new-revision");
         let op = restarted.operations.get_mut(&device.id).unwrap();
-        op.results.insert("wifi".into(), json!({"id":"wifi","state":"verified"}));
+        op.results
+            .insert("wifi".into(), json!({"id":"wifi","state":"verified"}));
         op.index = op.device.items.len();
         op.complete(101);
         let id = op.id;
@@ -404,9 +420,11 @@ mod config_change_tests {
     #[test]
     fn config_change_preserves_unknown_write_and_disabled_trigger_guards() {
         let (mut c, device) = fixture();
-        c.operations.get_mut(&device.id).unwrap().results.insert(
-            "wifi".into(), json!({"id":"wifi","state":"unknown"}),
-        );
+        c.operations
+            .get_mut(&device.id)
+            .unwrap()
+            .results
+            .insert("wifi".into(), json!({"id":"wifi","state":"unknown"}));
         schedule(&mut c, &device, true, false, 100);
         assert_eq!(c.operations[&device.id].revision, "rev");
         c.operations.get_mut(&device.id).unwrap().results.clear();

@@ -286,10 +286,11 @@ impl Controller {
         }
         if apply
             && self.config.management_network.as_ref().is_some_and(|d| {
-                (devices.iter().any(|device| device.backend() == "acs") && !super::management_network::matches_desired(d))
-                    || devices
-                        .iter()
-                        .any(|device| device.backend() == "acs" && !super::bootstrap::is_ready(&device.id))
+                (devices.iter().any(|device| device.backend() == "acs")
+                    && !super::management_network::matches_desired(d))
+                    || devices.iter().any(|device| {
+                        device.backend() == "acs" && !super::bootstrap::is_ready(&device.id)
+                    })
             })
         {
             return Err("apply and verify management configuration and fresh device Inform before business synchronization".into());
@@ -684,10 +685,14 @@ mod tests {
         let devices = json!({"devices":{
             "child":{"product_class":"SG631Z-C","serial":"MODEL-STAR1234ABCD-SUFFIX"}
         }});
-        assert_eq!(discovered_identity(&devices, "STAR1234ABCD", "star"),
-            cfg!(feature = "device-star").then(|| "child".into()));
-        assert_eq!(discovered_identity(&devices, "STAR1234ABCD", "generic"),
-            cfg!(feature = "device-star").then(|| "child".into()));
+        assert_eq!(
+            discovered_identity(&devices, "STAR1234ABCD", "star"),
+            cfg!(feature = "device-star").then(|| "child".into())
+        );
+        assert_eq!(
+            discovered_identity(&devices, "STAR1234ABCD", "generic"),
+            cfg!(feature = "device-star").then(|| "child".into())
+        );
         for serial in ["STAR1234ABCE", "STAR1234ABC0", "HWTC1234ABCD"] {
             assert_eq!(discovered_identity(&devices, serial, "generic"), None);
         }
@@ -695,12 +700,18 @@ mod tests {
         let wrong_model = json!({"devices":{
             "child":{"product_class":"OTHER","serial":"MODEL-STAR1234ABCD-SUFFIX"}
         }});
-        assert_eq!(discovered_identity(&wrong_model, "STAR1234ABCD", "generic"), None);
+        assert_eq!(
+            discovered_identity(&wrong_model, "STAR1234ABCD", "generic"),
+            None
+        );
         let ambiguous = json!({"devices":{
             "one":{"product_class":"SG631Z-C","serial":"MODEL-STAR1234ABCD-SUFFIX"},
             "two":{"product_class":"SG631Z-C","serial":"OTHER-STAR1234ABCD-SUFFIX"}
         }});
-        assert_eq!(discovered_identity(&ambiguous, "STAR1234ABCD", "generic"), None);
+        assert_eq!(
+            discovered_identity(&ambiguous, "STAR1234ABCD", "generic"),
+            None
+        );
     }
     #[test]
     fn hwtc_identity_matches_serial_across_models() {
