@@ -4,6 +4,7 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::Path;
+use std::str::FromStr;
 
 use crate::error::UciError;
 use crate::raw::*;
@@ -108,6 +109,22 @@ impl Uci {
                     Ok(Some(values.join(" ")))
                 }
             }
+        }
+    }
+
+    /// Read an option and parse directly into a typed primitive (e.g. u32, bool, IpAddr)
+    pub fn get_parsed<T: FromStr>(
+        &mut self,
+        package: &str,
+        section: &str,
+        option: &str,
+    ) -> Result<Option<T>, UciError> {
+        match self.get(package, section, option)? {
+            Some(val) => val
+                .parse::<T>()
+                .map(Some)
+                .map_err(|_| UciError::InvalidParameter(format!("Failed to parse value '{val}'"))),
+            None => Ok(None),
         }
     }
 

@@ -4,6 +4,8 @@
 use std::ffi::{c_void, CString};
 use std::os::raw::c_int;
 
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::blobmsg::BlobBuffer;
@@ -134,6 +136,38 @@ impl Ubus {
 
             Ok(state.response.unwrap_or(Value::Null))
         }
+    }
+
+    /// Type-safe typed RPC invocation: converts request to json and parses response directly into R
+    pub fn call_typed<T, R>(
+        &mut self,
+        object: &str,
+        method: &str,
+        params: &T,
+        timeout_ms: i32,
+    ) -> Result<R, UbusError>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        let json_val =
+            serde_json::to_value(params).map_err(|e| UbusError::Serialization(e.to_string()))?;
+        let resp_val = self.call(object, method, Some(&json_val), timeout_ms)?;
+        serde_json::from_value(resp_val).map_err(|e| UbusError::Serialization(e.to_string()))
+    }
+
+    /// Parameterless typed RPC invocation: directly decodes result into struct R
+    pub fn call_empty<R>(
+        &mut self,
+        object: &str,
+        method: &str,
+        timeout_ms: i32,
+    ) -> Result<R, UbusError>
+    where
+        R: DeserializeOwned,
+    {
+        let resp_val = self.call(object, method, None, timeout_ms)?;
+        serde_json::from_value(resp_val).map_err(|e| UbusError::Serialization(e.to_string()))
     }
 }
 
