@@ -34,6 +34,36 @@ pub(crate) fn matches_cwmp_identity(optical_sn: &str, product_class: &str, seria
     }
 }
 
+/// Match a CWMP device record against the expected optical serial and adapter.
+pub fn matches_cwmp_adapter(
+    adapter: &str,
+    optical_sn: &str,
+    product_class: &str,
+    serial: &str,
+) -> bool {
+    match adapter {
+        #[cfg(feature = "device-hl202")]
+        "hl202" => product_class == "HL202-DU-C" && serial.contains(optical_sn),
+        #[cfg(feature = "device-hwtc")]
+        "hwtc" => {
+            if !optical_sn.starts_with("HWTC") || optical_sn.len() < 4 {
+                return false;
+            }
+            let hex = format!(
+                "{}{}",
+                optical_sn[..4]
+                    .bytes()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<String>(),
+                &optical_sn[4..]
+            );
+            serial.eq_ignore_ascii_case(&hex)
+        }
+        "generic" => matches_cwmp_identity(optical_sn, product_class, serial),
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Adapter {
     #[cfg(feature = "device-hl202")]
@@ -428,5 +458,23 @@ mod tests {
             Adapter::GenericBridge
         );
         std::env::remove_var("FTTR_ALLOW_UNSUPPORTED_AS_BRIDGE");
+    }
+
+    #[test]
+    fn adapter_matches_cwmp_identity_rules() {
+        #[cfg(feature = "device-hl202")]
+        {
+            assert!(matches_cwmp_adapter("hl202", "H3CT12345678", "HL202-DU-C", "SN-H3CT12345678-01"));
+            assert!(!matches_cwmp_adapter("hl202", "H3CT12345678", "OTHER-DEVICE", "SN-H3CT12345678-01"));
+            assert!(!matches_cwmp_adapter("hl202", "H3CT12345678", "HL202-DU-C", "SN-WRONG-01"));
+        }
+        #[cfg(feature = "device-hwtc")]
+        {
+            // HWTC in hex is 48575443
+            assert!(matches_cwmp_adapter("hwtc", "HWTC12345678", "K155-11", "4857544312345678"));
+            assert!(!matches_cwmp_adapter("hwtc", "HWTC12345678", "K155-11", "WRONGSERIAL"));
+            assert!(!matches_cwmp_adapter("hwtc", "OTHER12345678", "K155-11", "4857544312345678"));
+        }
+        assert!(!matches_cwmp_adapter("unknown", "TEST12345678", "CLASS", "SERIAL"));
     }
 }

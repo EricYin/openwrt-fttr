@@ -77,8 +77,6 @@ define Package/h3c-fttr-tools/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/bin/fttrctl $(1)/usr/sbin/
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/bin/fttrd $(1)/usr/sbin/
-	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/bin/fttr-omci-service $(1)/usr/sbin/
-	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/bin/fttr-omci-probe $(1)/usr/sbin/
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/fttr.init $(1)/etc/init.d/fttr
 	$(INSTALL_DIR) $(1)/etc/config

@@ -8,6 +8,7 @@ pub(super) fn carrier_ready(last_get: Option<Instant>, now: Instant) -> bool {
     last_get.is_some_and(|time| now.duration_since(time) < Duration::from_secs(15))
 }
 
+#[cfg(test)]
 pub(super) fn link_ready(last_get: Option<Instant>, last_data: Option<Instant>, now: Instant) -> bool {
     last_get.is_some_and(|time| now.duration_since(time) < Duration::from_secs(15))
         && last_data.is_some()

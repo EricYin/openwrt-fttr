@@ -393,27 +393,13 @@ impl Controller {
     }
 }
 fn discovered_identity(devices: &Value, optical_sn: &str, adapter: &str) -> Option<String> {
-    let hex = format!(
-        "{}{}",
-        optical_sn[..4]
-            .bytes()
-            .map(|b| format!("{b:02X}"))
-            .collect::<String>(),
-        &optical_sn[4..]
-    );
     let matches: Vec<_> = devices["devices"]
         .as_object()?
         .iter()
         .filter(|(_, d)| {
+            let product_class = d["product_class"].as_str().unwrap_or("");
             let serial = d["serial"].as_str().unwrap_or("");
-            match adapter {
-                "hl202" => d["product_class"] == "HL202-DU-C" && serial.contains(optical_sn),
-                "hwtc" => optical_sn.starts_with("HWTC") && serial.eq_ignore_ascii_case(&hex),
-                "generic" => crate::devices::matches_cwmp_identity(
-                    optical_sn, d["product_class"].as_str().unwrap_or(""), serial,
-                ),
-                _ => false,
-            }
+            crate::devices::matches_cwmp_adapter(adapter, optical_sn, product_class, serial)
         })
         .map(|(id, _)| id.clone())
         .collect();
