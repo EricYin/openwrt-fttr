@@ -1,0 +1,37 @@
+name: FTTR API contract
+on:
+  push:
+    paths: ['h3c-fttr-tools/src/crates/fttr-api/**', '.github/workflows/fttr-api.yml']
+  pull_request:
+    paths: ['h3c-fttr-tools/src/crates/fttr-api/**', '.github/workflows/fttr-api.yml']
+  workflow_dispatch:
+    inputs:
+      frontend_ref:
+        description: LuCI frontend revision
+        default: main
+        required: true
+permissions:
+  contents: read
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: openwrt-fttr
+      - uses: actions/checkout@v4
+        with:
+          repository: LazuliKao/luci-app-fttr
+          ref: ${{ inputs.frontend_ref || vars.FTTR_FRONTEND_REF || 'main' }}
+          path: luci-app-fttr
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --manifest-path openwrt-fttr/h3c-fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen
+      - run: cargo run --locked --manifest-path openwrt-fttr/h3c-fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --check
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: luci-app-fttr/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile && pnpm typecheck && pnpm test
+        working-directory: luci-app-fttr

@@ -28,15 +28,8 @@ pub struct Capabilities {
 pub struct OpticalReply {
     #[cfg_attr(feature = "codegen", ts(type = "1"))]
     pub schema_version: u8,
-    #[cfg_attr(feature = "codegen", ts(type = "\"success\" | \"error\""))]
-    pub status: String,
-    #[cfg_attr(
-        feature = "codegen",
-        ts(
-            type = "\"optical_on\" | \"optical_off\" | \"optical_status\" | \"optical_reload\" | \"optical_reinitialize\" | \"optical_shutdown\""
-        )
-    )]
-    pub action: String,
+    pub status: ReplyStatus,
+    pub action: OpticalAction,
     pub desired_enabled: Option<bool>,
     pub tx_enabled: Option<bool>,
     pub actor_state: OpticalState,
@@ -51,6 +44,26 @@ pub struct OpticalReply {
 pub struct OpticalError {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyStatus {
+    Success,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum OpticalAction {
+    OpticalOn,
+    OpticalOff,
+    OpticalStatus,
+    OpticalReload,
+    OpticalReinitialize,
+    OpticalShutdown,
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]

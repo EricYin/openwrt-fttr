@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod ipc_server;
 mod ubus;
 
-use fttr_api::{OpticalError, OpticalReply, OpticalState};
+use fttr_api::{OpticalAction, OpticalError, OpticalReply, OpticalState, ReplyStatus};
 
 #[derive(Clone, Copy)]
 enum OpticalCommand {
@@ -37,14 +37,14 @@ enum OpticalCommand {
 }
 
 impl OpticalCommand {
-    fn action(self) -> &'static str {
+    fn action(self) -> OpticalAction {
         match self {
-            Self::On => "optical_on",
-            Self::Off => "optical_off",
-            Self::Status => "optical_status",
-            Self::Reload => "optical_reload",
-            Self::Reinitialize => "optical_reinitialize",
-            Self::Shutdown => "optical_shutdown",
+            Self::On => OpticalAction::OpticalOn,
+            Self::Off => OpticalAction::OpticalOff,
+            Self::Status => OpticalAction::OpticalStatus,
+            Self::Reload => OpticalAction::OpticalReload,
+            Self::Reinitialize => OpticalAction::OpticalReinitialize,
+            Self::Shutdown => OpticalAction::OpticalShutdown,
         }
     }
 }
@@ -61,8 +61,8 @@ impl OpticalReplyExt for OpticalReply {
     fn unavailable(command: OpticalCommand, ready: bool, error: io::Error) -> serde_json::Value {
         Self {
             schema_version: 1,
-            status: "error".into(),
-            action: command.action().into(),
+            status: ReplyStatus::Error,
+            action: command.action(),
             desired_enabled: None,
             tx_enabled: None,
             actor_state: OpticalState::Unknown,
@@ -227,7 +227,7 @@ impl OpticalActor {
                             self.handle(OpticalCommand::Status, backend)
                         };
                         reply["status"] = "error".into();
-                        reply["action"] = command.action().into();
+                        reply["action"] = serde_json::to_value(command.action()).unwrap();
                         reply["error"] =
                             serde_json::json!({"code":"Configuration","message":error.to_string()});
                         return reply;
@@ -243,7 +243,7 @@ impl OpticalActor {
                         && backend.read_tx().ok() == Some(enabled)
                     {
                         let mut reply = self.handle(OpticalCommand::Status, backend);
-                        reply["action"] = command.action().into();
+                        reply["action"] = serde_json::to_value(command.action()).unwrap();
                         return reply;
                     }
                     let was_enabled = self.state != OpticalState::Disabled;
@@ -327,8 +327,12 @@ impl OpticalActor {
         };
         OpticalReply {
             schema_version: 1,
-            status: if result.is_ok() { "success" } else { "error" }.into(),
-            action: command.action().into(),
+            status: if result.is_ok() {
+                ReplyStatus::Success
+            } else {
+                ReplyStatus::Error
+            },
+            action: command.action(),
             desired_enabled,
             tx_enabled,
             actor_state: self.state,

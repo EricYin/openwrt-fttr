@@ -80,3 +80,5 @@ cargo run --locked --manifest-path h3c-fttr-tools/src/crates/fttr-api/Cargo.toml
 
 其他布局追加 `--out-dir FRONTEND/src/api/generated`。`--check` 只检查生成
 一致性，不写文件。更新后在前端运行 `pnpm typecheck`、`pnpm test`。
+
+CI 同时检查前端生成文件和 ACL；可用 `FTTR_FRONTEND_REF` 仓库变量或手动运行时的 ref 选择配套前端版本。
