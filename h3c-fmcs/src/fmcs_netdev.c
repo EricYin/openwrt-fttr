@@ -556,7 +556,7 @@ static netdev_tx_t fmcs_fttr_xmit(struct sk_buff *skb, struct net_device *dev)
 				goto drop_put;
 		}
 		/* port N maps to ONU-ID N-1 and GEM 0x100 + ONU-ID. */
-		vlan_tci = (u16)(0x100 + port_priv->port_idx - 1);
+		vlan_tci = FMCS_PORT_TO_FPGA_VID(port_priv->port_idx);
 		skb = vlan_insert_tag_set_proto(skb, htons(ETH_P_8021Q), vlan_tci);
 		if (skb && !skb_put_padto(skb, 68)) {
 			skb->dev = dst_dev;
@@ -649,7 +649,7 @@ static int fmcs_fttr_fill_forward_path(struct net_device_path_ctx *ctx,
 
 	path->type = DEV_PATH_VLAN;
 	path->dev = dev;
-	path->encap.id = 0x100 + port->port_idx - 1;
+	path->encap.id = FMCS_PORT_TO_FPGA_VID(port->port_idx);
 	path->encap.proto = htons(ETH_P_8021Q);
 	ctx->vlan[ctx->num_vlans].id = path->encap.id;
 	ctx->vlan[ctx->num_vlans].proto = path->encap.proto;

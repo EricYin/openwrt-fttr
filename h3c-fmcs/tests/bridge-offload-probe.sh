@@ -21,9 +21,68 @@ for mac in "$src_mac" "$dst_mac"; do
     case "$mac" in ''|*[!0-9A-Fa-f]*) exit 2;; esac
     [ "${#mac}" = 12 ]
 done
-for ip in "$src_ip" "$dst_ip"; do
-    case "$ip" in ''|*[!0-9.]*) exit 2;; esac
-done
+is_ipv6=0
+case "$src_ip" in *:* ) is_ipv6=1;; esac
+normalize_ipv6() {
+    _ip=$1
+    case "$_ip" in
+        *::* )
+            _left=${_ip%%::*}
+            _right=${_ip#*::}
+            ;;
+        * )
+            _left=$_ip
+            _right=""
+            ;;
+    esac
+    _l_cnt=0
+    _r_cnt=0
+    _l_res=""
+    _r_res=""
+    if [ -n "$_left" ]; then
+        _oIFS=$IFS; IFS=:
+        set -- $_left
+        IFS=$_oIFS
+        _l_cnt=$#
+        for _w in "$@"; do
+            _h=$(printf '%04x' "0x$_w")
+            _l_res="${_l_res}${_h}:"
+        done
+    fi
+    if [ -n "$_right" ]; then
+        _oIFS=$IFS; IFS=:
+        set -- $_right
+        IFS=$_oIFS
+        _r_cnt=$#
+        for _w in "$@"; do
+            _h=$(printf '%04x' "0x$_w")
+            _r_res="${_r_res}${_h}:"
+        done
+    fi
+    _zeros=$((8 - _l_cnt - _r_cnt))
+    _z_res=""
+    _i=0
+    while [ "$_i" -lt "$_zeros" ]; do
+        _z_res="${_z_res}0000:"
+        _i=$((_i + 1))
+    done
+    _full="${_l_res}${_z_res}${_r_res}"
+    echo "${_full%:}"
+}
+if [ "$is_ipv6" = 0 ]; then
+    for ip in "$src_ip" "$dst_ip"; do
+        case "$ip" in ''|*[!0-9.]*) exit 2;; esac
+    done
+    src_match="$src_ip"
+    dst_match="$dst_ip"
+else
+    case "$dst_ip" in *:* ) ;; *) exit 2;; esac
+    for ip in "$src_ip" "$dst_ip"; do
+        case "$ip" in ''|*[!0-9A-Fa-f:]*) exit 2;; esac
+    done
+    src_match=$(normalize_ipv6 "$src_ip")
+    dst_match=$(normalize_ipv6 "$dst_ip")
+fi
 [ "$src_mac" != "$dst_mac" ] && [ "$src_ip" != "$dst_ip" ]
 mask=/sys/module/h3c_fmcs/parameters/bridge_offload_mask
 [ "$managed" = 1 ] || [ "$(cat "$mask")" = 0 ]
@@ -65,10 +124,16 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 # A forgotten routed test must not masquerade as a bridge test.
-exec_checked "$src_mac" "ip route get $dst_ip from $src_ip && ! ip route get $dst_ip from $src_ip | grep -q via && command -v sha256sum"
-exec_checked "$dst_mac" "ip route get $src_ip from $dst_ip && ! ip route get $src_ip from $dst_ip | grep -q via && command -v sha256sum"
+if [ "$is_ipv6" = 0 ]; then
+    exec_checked "$src_mac" "ip route get $dst_ip from $src_ip && ! ip route get $dst_ip from $src_ip | grep -q via && command -v sha256sum"
+    exec_checked "$dst_mac" "ip route get $src_ip from $dst_ip && ! ip route get $src_ip from $dst_ip | grep -q via && command -v sha256sum"
+else
+    exec_checked "$src_mac" "ip -6 route get $dst_ip from $src_ip && ! ip -6 route get $dst_ip from $src_ip | grep -q via && command -v sha256sum"
+    exec_checked "$dst_mac" "ip -6 route get $src_ip from $dst_ip && ! ip -6 route get $src_ip from $dst_ip | grep -q via && command -v sha256sum"
+fi
 # Counts after the normal fw4 bridge policy; never adds an early accept rule.
 if [ "$managed" = 0 ]; then
+if [ "$is_ipv6" = 0 ]; then
 nft -f - <<NFT
 add table bridge fmcs_pair_probe
 add flowtable bridge fmcs_pair_probe pair { hook ingress priority 1; devices = { fttr$src_port, fttr$dst_port }; flags offload; counter; }
@@ -76,6 +141,15 @@ add chain bridge fmcs_pair_probe forward { type filter hook forward priority 10;
 add rule bridge fmcs_pair_probe forward ether type ip ip saddr $src_ip ip daddr $dst_ip tcp dport 49176 counter flow add @pair
 add rule bridge fmcs_pair_probe forward ether type ip ip saddr $dst_ip ip daddr $src_ip tcp sport 49176 counter flow add @pair
 NFT
+else
+nft -f - <<NFT
+add table bridge fmcs_pair_probe
+add flowtable bridge fmcs_pair_probe pair { hook ingress priority 1; devices = { fttr$src_port, fttr$dst_port }; flags offload; counter; }
+add chain bridge fmcs_pair_probe forward { type filter hook forward priority 10; policy accept; }
+add rule bridge fmcs_pair_probe forward ether type ip6 ip6 saddr $src_ip ip6 daddr $dst_ip tcp dport 49176 counter flow add @pair
+add rule bridge fmcs_pair_probe forward ether type ip6 ip6 saddr $dst_ip ip6 daddr $src_ip tcp sport 49176 counter flow add @pair
+NFT
+fi
 table_created=1
 fi
 echo 'logical counters before transfer (rx_bytes, tx_bytes):'
@@ -99,21 +173,23 @@ while [ "$sample" -lt "$samples" ]; do
     sample=$((sample + 1))
     sleep 4
     echo "sample=$sample mode=$mode mask=$(cat "$mask")"
-    bound=$(grep -F '49176' /sys/kernel/debug/ppe/bind | grep -F "$src_ip:" | grep -F "$dst_ip:" || true)
+    bound=$(grep -F '49176' /sys/kernel/debug/ppe/bind | grep -F "$src_match" | grep -F "$dst_match" || true)
     printf '%s\n' "$bound"
-    conntrack=$(grep 'dport=49176\|sport=49176' /proc/net/nf_conntrack | grep -F "$src_ip" | grep -F "$dst_ip" || true)
+    conntrack=$(grep 'dport=49176\|sport=49176' /proc/net/nf_conntrack | grep -F "$src_match" | grep -F "$dst_match" || true)
     printf '%s\n' "$conntrack"
     if [ "$managed" = 1 ]; then
         nft list flowtable bridge fw4 fb
     else
         nft list table bridge fmcs_pair_probe
     fi
+    proto_label="IPv4"
+    [ "$is_ipv6" = 0 ] || proto_label="IPv6"
     if [ "$mode" = hardware ] || [ "$mode" = auto ] ||
        { [ "$mode" = auto-recover ] && [ "$sample" != 3 ]; } ||
        { [ "$mode" = revoke ] && [ "$sample" -lt 3 ]; }; then
         [ "$(($(cat "$mask") & probe_mask))" = "$probe_mask" ]
-        printf '%s\n' "$bound" | grep -F "BND IPv4 5T orig=$src_ip:" | grep -F -- "->$dst_ip:49176" >/dev/null
-        printf '%s\n' "$bound" | grep -F "BND IPv4 5T orig=$dst_ip:49176->" | grep -F -- "->$src_ip:" >/dev/null
+        printf '%s\n' "$bound" | grep -F "BND $proto_label 5T orig=$src_match:" | grep -F -- "->$dst_match:49176" >/dev/null
+        printf '%s\n' "$bound" | grep -F "BND $proto_label 5T orig=$dst_match:49176->" | grep -F -- "->$src_match:" >/dev/null
         printf '%s\n' "$conntrack" | grep -F 'dport=49176' | grep -F '[HW_OFFLOAD]' >/dev/null
     fi
     if [ "$mode" = auto-recover ] && [ "$sample" = 2 ]; then
@@ -135,8 +211,8 @@ while [ "$sample" -lt "$samples" ]; do
             printf '0\n' > "$mask"
         elif [ "$sample" = 3 ]; then
             [ "$(cat "$mask")" = 0 ]
-            ! printf '%s\n' "$bound" | grep -F "BND IPv4 5T orig=$src_ip:" | grep -F -- "->$dst_ip:49176" >/dev/null
-            ! printf '%s\n' "$bound" | grep -F "BND IPv4 5T orig=$dst_ip:49176->" | grep -F -- "->$src_ip:" >/dev/null
+            ! printf '%s\n' "$bound" | grep -F "BND $proto_label 5T orig=$src_match:" | grep -F -- "->$dst_match:49176" >/dev/null
+            ! printf '%s\n' "$bound" | grep -F "BND $proto_label 5T orig=$dst_match:49176->" | grep -F -- "->$src_match:" >/dev/null
             ! printf '%s\n' "$conntrack" | grep -F 'dport=49176' | grep -F '[HW_OFFLOAD]' >/dev/null
         fi
     fi

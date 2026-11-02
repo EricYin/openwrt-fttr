@@ -120,6 +120,10 @@ pub struct NpuStatus {
     pub fw4_hooks_ready: bool,
     pub total_entries: u32,
     pub bound_entries: u32,
+    #[serde(default)]
+    pub bound_ipv4_entries: u32,
+    #[serde(default)]
+    pub bound_ipv6_entries: u32,
     pub total_packets: u64,
     pub total_bytes: u64,
     pub bound_flows: Vec<PpeFlowEntry>,

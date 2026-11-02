@@ -121,9 +121,11 @@ fn handle_offload(args: &[String]) {
                     if status.fw4_hooks_ready { "YES" } else { "NO" }
                 );
                 println!(
-                    "    FOE Entries: total {} | bound {} | Offload traffic: {} pkts, {} bytes",
+                    "    FOE Entries: total {} | bound {} (IPv4: {}, IPv6: {}) | Offload traffic: {} pkts, {} bytes",
                     status.total_entries,
                     status.bound_entries,
+                    status.bound_ipv4_entries,
+                    status.bound_ipv6_entries,
                     status.total_packets,
                     status.total_bytes
                 );
