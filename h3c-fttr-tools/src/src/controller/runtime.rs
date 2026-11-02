@@ -457,61 +457,7 @@ fn start_ubus_server(
                           services: super::service::States,
                           optics: OpticalClient|
      -> Vec<(String, openwrt_ubus::MethodHandler)> {
-        let mut m: Vec<(String, openwrt_ubus::MethodHandler)> = Vec::new();
-
-        m.extend(ubus::methods(optics.clone(), devices, pon_engine, services));
-
-        m.push((
-            "config_reload".into(),
-            Box::new(|_, _| {
-                let resp = crate::provisioning::control("{\"op\":\"reload\"}");
-                serde_json::from_str(&resp).map_err(|_| 9)
-            }),
-        ));
-
-        m.push((
-            "sync".into(),
-            Box::new(|_, msg| {
-                let req_json = msg.cloned().unwrap_or_else(|| serde_json::json!({}));
-                let action = req_json
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("plan");
-                let target = req_json
-                    .get("target")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("all");
-                let management = req_json
-                    .get("management")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let item = req_json.get("item").and_then(|v| v.as_str());
-
-                let payload = serde_json::json!({
-                    "op": action,
-                    "target": target,
-                    "management": management,
-                    "item": item
-                });
-                let resp = crate::provisioning::control(&payload.to_string());
-                serde_json::from_str(&resp).map_err(|_| 9)
-            }),
-        ));
-
-        m.push((
-            "restart_service".into(),
-            Box::new(|_, _| {
-                std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    let _ = std::process::Command::new("/etc/init.d/fttr")
-                        .arg("restart")
-                        .spawn();
-                });
-                Ok(serde_json::json!({ "restarting": true }))
-            }),
-        ));
-
-        m
+        ubus::methods(optics, devices, pon_engine, services)
     };
 
     std::thread::Builder::new()

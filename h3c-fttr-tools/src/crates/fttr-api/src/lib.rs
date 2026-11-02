@@ -6,6 +6,8 @@ pub const OBJECT: &str = "fttr";
 
 mod queries;
 pub use queries::*;
+mod commands;
+pub use commands::*;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
@@ -141,6 +143,9 @@ macro_rules! fttr_methods {
             GET_SYNC, get_sync, getSync, EmptyRequest, SyncStatusReply, Read, Always, [];
             CONFIG_CHECK, config_check, configCheck, EmptyRequest, ConfigCheckReply, Read, Always, [];
             NPU_STATUS, npu_status, npuStatus, EmptyRequest, NpuStatus, Read, Npu, [];
+            CONFIG_RELOAD, config_reload, configReload, EmptyRequest, ConfigReloadReply, Write, Always, [];
+            RESTART_SERVICE, restart_service, restartService, EmptyRequest, RestartReply, Write, Always, [];
+            SYNC, sync, sync, SyncRequest, SyncReply, Write, Always, [action, target, management, item];
         }
     };
 }

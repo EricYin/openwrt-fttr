@@ -73,6 +73,36 @@ impl Handlers {
     fn config_check(&self, _: EmptyRequest) -> Result<ConfigCheckReply, i32> {
         serde_json::from_str(&crate::provisioning::control("{\"op\":\"check\"}")).map_err(|_| 9)
     }
+    fn config_reload(&self, _: EmptyRequest) -> Result<ConfigReloadReply, i32> {
+        serde_json::from_str(&crate::provisioning::control("{\"op\":\"reload\"}")).map_err(|_| 9)
+    }
+    fn sync(&self, request: SyncRequest) -> Result<SyncReply, i32> {
+        let payload = request.provisioning_request().map_err(|_| 2)?;
+        serde_json::from_str(&crate::provisioning::control(&payload.to_string())).map_err(|_| 9)
+    }
+    fn restart_service(&self, _: EmptyRequest) -> Result<RestartReply, i32> {
+        std::thread::Builder::new()
+            .name("service-restart".into())
+            .spawn(|| {
+                // Let ubus deliver admission before the service exits. Never retry a write.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                // procd owns the helper: descendants of fttrd are killed with its
+                // service cgroup, even if they use a separate process group.
+                let result = openwrt_ubus::Ubus::connect(None).and_then(|mut bus| {
+                    bus.call(
+                        "service",
+                        "event",
+                        Some(&serde_json::json!({"type": "fttr.restart", "data": {}})),
+                        5000,
+                    )
+                });
+                if let Err(error) = result {
+                    eprintln!("[ubus] service restart request failed: {error}");
+                }
+            })
+            .map_err(|_| 9)?;
+        Ok(RestartReply { restarting: true })
+    }
     fn npu_status(&self, _: EmptyRequest) -> Result<NpuStatus, i32> {
         #[cfg(feature = "npu")]
         {
