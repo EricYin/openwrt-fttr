@@ -16,6 +16,7 @@ const FULL_CHECK: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Topology {
     pub bridge: String,
+    pub routed: bool,
     pub mask: u16,
     // Includes ifindex, MTU, MAC and learning: even same-mask changes must drain.
     pub ports: Vec<(String, Vec<String>)>,
@@ -46,6 +47,7 @@ pub fn topology(config: &str, firewall: &str, net: &Path, mask: &Path) -> io::Re
     let bridge = option(config, "fttr.offload.bridge").unwrap_or("br-lan");
     let mut topology = Topology {
         bridge: bridge.into(),
+        routed: directions(config) & 3 != 0,
         mask: 0,
         ports: Vec::new(),
     };
@@ -54,7 +56,12 @@ pub fn topology(config: &str, firewall: &str, net: &Path, mask: &Path) -> io::Re
         && bridge
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
-    if !valid_bridge || directions(config) & 4 == 0 {
+    if topology.routed && directions(config) & 4 != 0 {
+        return Err(io::Error::other(
+            "WAN and ONU bridge offload currently require exclusive port modes; set onu_bridge=0 for WAN",
+        ));
+    }
+    if !valid_bridge || directions(config) == 0 {
         return Ok(topology);
     }
     // uci show uses the actual section name for both named and anonymous defaults.
@@ -66,7 +73,11 @@ pub fn topology(config: &str, firewall: &str, net: &Path, mask: &Path) -> io::Re
             && option(firewall, &format!("{section}.flow_offloading_hw")) == Some("1")
     });
     if !policy
-        || !mask.exists()
+        || !if topology.routed {
+            mask.with_file_name("routed_offload_mask").exists()
+        } else {
+            mask.exists()
+        }
         || text(net.join("fttr0/carrier")).ok().as_deref() != Some("1")
         || text(net.join(bridge).join("bridge/vlan_filtering"))
             .ok()
@@ -92,7 +103,7 @@ pub fn topology(config: &str, firewall: &str, net: &Path, mask: &Path) -> io::Re
         topology.mask |= 1 << (port - 1);
         topology.ports.push((name, identity));
     }
-    if topology.ports.len() < 2 {
+    if topology.ports.len() < if topology.routed { 1 } else { 2 } {
         topology.mask = 0;
     }
     Ok(topology)
@@ -159,13 +170,17 @@ impl Reconciler {
 }
 
 pub fn text_offload_flag(table: &str) -> bool {
+    named_offload_flag(table, "bridge", "fb")
+}
+
+fn named_offload_flag(table: &str, family: &str, name: &str) -> bool {
     let lines: Vec<_> = table
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect();
-    lines.first() == Some(&"table bridge fw4 {")
-        && lines.get(1) == Some(&"flowtable fb {")
+    lines.first().copied() == Some(format!("table {family} fw4 {{").as_str())
+        && lines.get(1).copied() == Some(format!("flowtable {name} {{").as_str())
         && lines
             .iter()
             .any(|line| line.trim_end_matches(';') == "flags offload")
@@ -194,6 +209,27 @@ pub fn hooks_ready(table: &serde_json::Value, ports: &[(String, Vec<String>)], t
                             .any(|device| device.as_str() == Some(port.as_str()))
                     })
                 })
+        })
+    })
+}
+
+pub fn routed_hooks_ready(table: &serde_json::Value, text: &str) -> bool {
+    table["nftables"].as_array().is_some_and(|entries| {
+        entries.iter().any(|entry| {
+            let flow = &entry["flowtable"];
+            flow["family"] == "inet"
+                && flow["table"] == "fw4"
+                && flow["name"] == "ft"
+                && flow["hook"] == "ingress"
+                && match flow.get("flags") {
+                    Some(flags) => flags
+                        .as_array()
+                        .is_some_and(|flags| flags.iter().any(|flag| flag == "offload")),
+                    None => named_offload_flag(text, "inet", "ft"),
+                }
+                && flow["dev"]
+                    .as_array()
+                    .is_some_and(|devices| devices.iter().any(|device| device == "fttr0"))
         })
     })
 }
@@ -233,7 +269,8 @@ impl Admission {
         // Attempt both withdrawals even if one sysfs write fails.
         let directions = self.set_directions(0);
         let bridge = self.set(0);
-        directions.and(bridge)
+        let routed = self.set_routed(0);
+        directions.and(bridge).and(routed)
     }
 
     pub fn new(path: impl Into<PathBuf>) -> Self {
@@ -244,7 +281,16 @@ impl Admission {
     }
 
     pub fn current(&self) -> io::Result<u16> {
-        match text(&self.path) {
+        self.current_mode(false)
+    }
+
+    pub fn current_mode(&self, routed: bool) -> io::Result<u16> {
+        let path = if routed {
+            self.path.with_file_name("routed_offload_mask")
+        } else {
+            self.path.clone()
+        };
+        match text(path) {
             Ok(value) => value.parse().map_err(io::Error::other),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
             Err(error) => Err(error),
@@ -252,10 +298,26 @@ impl Admission {
     }
 
     pub fn set(&mut self, mask: u16) -> io::Result<()> {
+        self.set_mode(false, mask)
+    }
+
+    pub fn set_routed(&mut self, mask: u16) -> io::Result<()> {
+        self.set_mode(true, mask)
+    }
+
+    pub fn set_mode(&mut self, routed: bool, mask: u16) -> io::Result<()> {
         let mask = if self.stopped { 0 } else { mask };
-        if self.current()? != mask {
-            fs::write(&self.path, format!("{mask}\n"))?;
-            eprintln!("[*] NPU bridge admission mask={mask}");
+        if self.current_mode(routed)? != mask {
+            let path = if routed {
+                self.path.with_file_name("routed_offload_mask")
+            } else {
+                self.path.clone()
+            };
+            fs::write(path, format!("{mask}\n"))?;
+            eprintln!(
+                "[*] NPU {} admission mask={mask}",
+                if routed { "routed" } else { "bridge" }
+            );
         }
         Ok(())
     }
@@ -270,7 +332,11 @@ pub async fn reconcile(
 ) -> io::Result<Duration> {
     let net = Path::new(NET);
     let mask_path = Path::new(MASK);
-    let current_mask = admission.lock().unwrap().current()?;
+    let routed = state
+        .cache
+        .as_ref()
+        .is_some_and(|cache| directions(&cache.config) & 3 != 0);
+    let current_mask = admission.lock().unwrap().current_mode(routed)?;
     let files = policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))?;
 
     // Fast-path: When already armed and the driver hasn't revoked the mask,
@@ -294,7 +360,7 @@ pub async fn reconcile(
                 || cache.files != files)
         {
             // Withdraw before waiting on UCI/nft when a known prerequisite changed.
-            admission.lock().unwrap().set(0)?;
+            admission.lock().unwrap().withdraw()?;
         }
     }
 
@@ -307,11 +373,13 @@ pub async fn reconcile(
         *state = Reconciler::default();
         return Ok(POLL_FAST);
     }
-    admission
-        .lock()
-        .unwrap()
-        .set_directions(directions(&config))?;
     let topology = topology(&config, &firewall, net, mask_path)?;
+    {
+        let mut admission = admission.lock().unwrap();
+        // Drain the previous mode before enabling the new one.
+        admission.set_mode(!topology.routed, 0)?;
+        admission.set_directions(directions(&config))?;
+    }
     // Timestamp is refreshed only after hooks pass, never by a cheap probe.
     let verified = state
         .cache
@@ -324,19 +392,25 @@ pub async fn reconcile(
         files,
         verified,
     });
-    let current = admission.lock().unwrap().current()?;
+    let current = admission.lock().unwrap().current_mode(topology.routed)?;
 
     if !state.observe(topology, current) {
-        admission.lock().unwrap().set(0)?;
+        let routed = state.last.as_ref().unwrap().routed;
+        admission.lock().unwrap().set_mode(routed, 0)?;
         return Ok(POLL_FAST);
     }
 
     let topology = state.last.as_ref().unwrap();
+    let (family, flowtable) = if topology.routed {
+        ("inet", "ft")
+    } else {
+        ("bridge", "fb")
+    };
 
     // Query flowtable hooks with lazy text fallback (avoid duplicate nft listing)
     let json_table = command::run_async(
         "nft",
-        &["-j", "list", "flowtable", "bridge", "fw4", "fb"],
+        &["-j", "list", "flowtable", family, "fw4", flowtable],
         Duration::from_secs(5),
     )
     .await;
@@ -354,13 +428,17 @@ pub async fn reconcile(
                 } else {
                     command::run_async(
                         "nft",
-                        &["list", "flowtable", "bridge", "fw4", "fb"],
+                        &["list", "flowtable", family, "fw4", flowtable],
                         Duration::from_secs(5),
                     )
                     .await
                     .unwrap_or_default()
                 };
-                hooks_ready(table, &topology.ports, &text_listing)
+                if topology.routed {
+                    routed_hooks_ready(table, &text_listing)
+                } else {
+                    hooks_ready(table, &topology.ports, &text_listing)
+                }
             }
             Err(_) => false,
         },
@@ -368,7 +446,7 @@ pub async fn reconcile(
     };
 
     if !ready {
-        admission.lock().unwrap().set(0)?;
+        admission.lock().unwrap().set_mode(topology.routed, 0)?;
         state.armed = false;
         if !state.reload_requested {
             state.reload_requested = true;
@@ -389,7 +467,7 @@ pub async fn reconcile(
     let cache = state.cache.as_ref().unwrap();
     if policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))? != cache.files
         || self::topology(&cache.config, &cache.firewall, net, mask_path)? != *topology
-        || admission.lock().unwrap().current()? != current
+        || admission.lock().unwrap().current_mode(topology.routed)? != current
     {
         admission.lock().unwrap().withdraw()?;
         state.last = None;
@@ -397,7 +475,10 @@ pub async fn reconcile(
         state.stable = 0;
         return Ok(POLL_FAST);
     }
-    admission.lock().unwrap().set(topology.mask)?;
+    admission
+        .lock()
+        .unwrap()
+        .set_mode(topology.routed, topology.mask)?;
     state.armed = true;
     state.cache.as_mut().unwrap().verified = Instant::now();
     Ok(POLL_STEADY)
@@ -410,6 +491,7 @@ mod tests {
     fn pair(identity: &str) -> Topology {
         Topology {
             bridge: "br-lan".into(),
+            routed: false,
             mask: 3,
             ports: vec![
                 ("fttr1".into(), vec![identity.into()]),
