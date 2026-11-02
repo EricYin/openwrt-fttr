@@ -19,8 +19,6 @@ struct SystemInfo {
 struct MemoryInfo {
     total: u64,
     free: u64,
-    shared: u64,
-    available: Option<u64>,
 }
 
 fn get_process_rss_kb() -> Option<u64> {

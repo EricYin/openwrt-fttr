@@ -108,10 +108,6 @@ pub(super) fn methods(
                 let handler = handlers.clone();
                 methods.push(bind(&$id, move |request| handler.$wire(request)));
             })*
-            // Preserve the CLI-compatible alias, using the same typed handler.
-            let handler = handlers.clone();
-            let (_, status) = bind(&GET_STATUS, move |request| handler.get_status(request));
-            methods.push(("status".into(), status));
             methods
         }
         };
