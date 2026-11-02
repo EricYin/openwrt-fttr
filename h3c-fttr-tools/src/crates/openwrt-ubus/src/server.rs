@@ -39,6 +39,7 @@ unsafe extern "C" fn server_method_dispatch(
     method: *const c_char,
     msg: *mut blob_attr,
 ) -> c_int {
+    let _lock = crate::raw::LIBUBUS_LOCK.lock().unwrap();
     if obj.is_null() || method.is_null() {
         return UBUS_STATUS_INVALID_ARGUMENT;
     }
@@ -80,6 +81,16 @@ unsafe extern "C" fn server_method_dispatch(
     }
 }
 
+static GLOBAL_ULOOP_CANCELLED: std::sync::atomic::AtomicPtr<bool> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+unsafe extern "C" fn on_connection_lost(_ctx: *mut ubus_context) {
+    let ptr = GLOBAL_ULOOP_CANCELLED.load(std::sync::atomic::Ordering::Acquire);
+    if !ptr.is_null() {
+        *ptr = true;
+    }
+}
+
 pub struct UbusServer {
     lib: LibUbus,
     ctx: *mut ubus_context,
@@ -95,6 +106,11 @@ impl UbusServer {
     }
 
     pub fn new_with_lib(lib: LibUbus, socket_path: Option<&str>) -> Result<Self, UbusError> {
+        let _lock = crate::raw::LIBUBUS_LOCK.lock().unwrap();
+        GLOBAL_ULOOP_CANCELLED.store(
+            lib.uloop_cancelled_ptr(),
+            std::sync::atomic::Ordering::Release,
+        );
         let c_path = match socket_path {
             Some(p) => Some(CString::new(p)?),
             None => None,
@@ -113,6 +129,7 @@ impl UbusServer {
                         .to_string(),
                 ));
             }
+            (*ctx).connection_lost = Some(on_connection_lost);
             Ok(Self {
                 lib,
                 ctx,
@@ -125,6 +142,7 @@ impl UbusServer {
     where
         I: IntoIterator<Item = (String, MethodHandler)>,
     {
+        let _lock = crate::raw::LIBUBUS_LOCK.lock().unwrap();
         let c_name = CString::new(object_name)?;
         let type_name = CString::new(format!("{object_name}_type"))?;
 
@@ -212,21 +230,28 @@ impl UbusServer {
 
     pub fn run_loop(&self) -> Result<(), UbusError> {
         unsafe {
-            self.lib.uloop_init();
-            let ret = self.lib.ubus_add_uloop(self.ctx);
-            if ret != 0 {
-                return Err(UbusError::Backend(format!(
-                    "ubus_add_uloop failed with return code {ret}"
-                )));
+            {
+                let _lock = crate::raw::LIBUBUS_LOCK.lock().unwrap();
+                self.lib.uloop_init();
+                let ret = self.lib.ubus_add_uloop(self.ctx);
+                if ret != 0 {
+                    return Err(UbusError::Backend(format!(
+                        "ubus_add_uloop failed with return code {ret}"
+                    )));
+                }
             }
             self.lib.uloop_run();
-            self.lib.uloop_done();
+            {
+                let _lock = crate::raw::LIBUBUS_LOCK.lock().unwrap();
+                self.lib.uloop_done();
+            }
             Ok(())
         }
     }
 
     pub fn stop_loop(&self) {
         unsafe {
+            let _lock = crate::raw::LIBUBUS_LOCK.lock().unwrap();
             self.lib.uloop_end();
         }
     }
@@ -234,6 +259,7 @@ impl UbusServer {
 
 impl Drop for UbusServer {
     fn drop(&mut self) {
+        let _lock = crate::raw::LIBUBUS_LOCK.lock().unwrap();
         unsafe {
             for obj in &mut self.objects {
                 self.lib

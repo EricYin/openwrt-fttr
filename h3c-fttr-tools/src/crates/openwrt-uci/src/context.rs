@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -39,12 +39,28 @@ impl Uci {
         }
     }
 
+    fn get_last_error(&self, ret: c_int, fallback: &str) -> UciError {
+        let msg = unsafe { self.lib.get_error_message(self.ctx) };
+        let detail = if msg.is_empty() {
+            fallback.to_string()
+        } else {
+            msg
+        };
+        match ret {
+            UCI_ERR_NOTFOUND => UciError::PackageNotFound(detail),
+            UCI_ERR_PARSE => UciError::ParseError(detail),
+            UCI_ERR_IO => UciError::IoError(detail),
+            UCI_ERR_INVAL => UciError::InvalidParameter(detail),
+            _ => UciError::Backend(detail),
+        }
+    }
+
     pub fn set_confdir<P: AsRef<Path>>(&mut self, path: P) -> Result<(), UciError> {
         let c_path = CString::new(path.as_ref().to_string_lossy().as_bytes())?;
         unsafe {
             let ret = self.lib.uci_set_confdir(self.ctx, c_path.as_ptr());
             if ret != UCI_OK {
-                return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+                return Err(self.get_last_error(ret, "uci_set_confdir failed"));
             }
         }
         Ok(())
@@ -55,7 +71,7 @@ impl Uci {
         unsafe {
             let ret = self.lib.uci_set_savedir(self.ctx, c_path.as_ptr());
             if ret != UCI_OK {
-                return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+                return Err(self.get_last_error(ret, "uci_set_savedir failed"));
             }
         }
         Ok(())
@@ -81,7 +97,7 @@ impl Uci {
                 if ret == UCI_ERR_NOTFOUND {
                     return Ok(None);
                 }
-                return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+                return Err(self.get_last_error(ret, "uci_lookup_ptr failed"));
             }
             if ptr.o.is_null() || (ptr.flags & UCI_LOOKUP_COMPLETE == 0) {
                 return Ok(None);
@@ -136,7 +152,7 @@ impl Uci {
                 if ret == UCI_ERR_NOTFOUND {
                     return Ok(None);
                 }
-                return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+                return Err(self.get_last_error(ret, "uci_lookup_ptr failed"));
             }
             if ptr.o.is_null() || (ptr.flags & UCI_LOOKUP_COMPLETE == 0) {
                 return Ok(None);
@@ -355,14 +371,14 @@ impl Uci {
                 let mut loaded: *mut uci_package = std::ptr::null_mut();
                 let ret = self.lib.uci_load(self.ctx, c_pkg.as_ptr(), &mut loaded);
                 if (ret != UCI_OK && ret != UCI_ERR_DUPLICATE) || loaded.is_null() {
-                    return Err(UciError::PackageNotFound(package.to_string()));
+                    return Err(self.get_last_error(ret, "uci_load failed"));
                 }
                 loaded
             };
 
             let ret = self.lib.uci_commit(self.ctx, &mut p, false);
             if ret != UCI_OK {
-                return Err(UciError::Backend(self.lib.get_error_message(self.ctx)));
+                return Err(self.get_last_error(ret, "uci_commit failed"));
             }
         }
         Ok(())
@@ -408,7 +424,7 @@ impl Uci {
                 let mut loaded: *mut uci_package = std::ptr::null_mut();
                 let ret = self.lib.uci_load(self.ctx, c_pkg.as_ptr(), &mut loaded);
                 if (ret != UCI_OK && ret != UCI_ERR_DUPLICATE) || loaded.is_null() {
-                    return Err(UciError::PackageNotFound(package.to_string()));
+                    return Err(self.get_last_error(ret, "uci_load failed"));
                 }
                 loaded
             };

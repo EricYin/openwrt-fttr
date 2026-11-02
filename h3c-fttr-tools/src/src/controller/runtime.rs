@@ -466,15 +466,8 @@ fn start_ubus_server(
     pon_engine: Arc<Mutex<PonEngine>>,
     services: super::service::States,
     optics: OpticalClient,
+    stopping: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
-    let mut server = match openwrt_ubus::UbusServer::new(None) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[-] Native ubus server not available: {e}");
-            return None;
-        }
-    };
-
     let create_methods = |devices: Arc<Mutex<Vec<SubDevice>>>,
                           pon_engine: Arc<Mutex<PonEngine>>,
                           services: super::service::States,
@@ -615,7 +608,7 @@ fn start_ubus_server(
                 let enabled = msg
                     .and_then(|v| v.get("enabled"))
                     .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                    .ok_or(2)?; // 2 = UBUS_STATUS_INVALID_ARGUMENT
                 let cmd = if enabled {
                     OpticalCommand::On
                 } else {
@@ -662,32 +655,44 @@ fn start_ubus_server(
         m
     };
 
-    let methods_luci = create_methods(
-        devices.clone(),
-        pon_engine.clone(),
-        services.clone(),
-        optics.clone(),
-    );
-    if let Err(e) = server.add_object("luci.fttr", methods_luci) {
-        eprintln!("[-] Failed to register 'luci.fttr' ubus object: {e}");
-    } else {
-        println!("[+] Registered native ubus object 'luci.fttr'");
-    }
-
-    let methods_fttr = create_methods(devices, pon_engine, services, optics);
-    if let Err(e) = server.add_object("fttr", methods_fttr) {
-        eprintln!("[-] Failed to register 'fttr' ubus object: {e}");
-    } else {
-        println!("[+] Registered native ubus object 'fttr'");
-    }
-
     std::thread::Builder::new()
         .name("ubus-server".into())
         .spawn(move || {
-            println!("[+] Native ubus event loop started.");
-            if let Err(e) = server.run_loop() {
-                eprintln!("[-] ubus server run_loop exited with error: {e}");
+            while !stopping.load(Ordering::Acquire) {
+                let mut server = match openwrt_ubus::UbusServer::new(None) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[-] Native ubus server connect failed: {e}; retrying in 3s");
+                        std::thread::sleep(Duration::from_secs(3));
+                        continue;
+                    }
+                };
+
+                let methods = create_methods(
+                    devices.clone(),
+                    pon_engine.clone(),
+                    services.clone(),
+                    optics.clone(),
+                );
+                // Exclusively register native system 'fttr' object.
+                // Compatibility 'luci.fttr' is owned by the rpcd shell plugin.
+                if let Err(e) = server.add_object("fttr", methods) {
+                    eprintln!("[-] Failed to register 'fttr' ubus object: {e}; retrying in 3s");
+                    std::thread::sleep(Duration::from_secs(3));
+                    continue;
+                }
+                println!("[+] Registered native ubus object 'fttr'. Starting ubus event loop.");
+
+                if let Err(e) = server.run_loop() {
+                    eprintln!("[-] ubus server run_loop exited: {e}");
+                }
+                if stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                println!("[!] ubus disconnected; reconnecting in 2s...");
+                std::thread::sleep(Duration::from_secs(2));
             }
+            println!("[*] ubus server thread stopped cleanly.");
         })
         .ok()
 }
@@ -973,6 +978,7 @@ async fn run_async() {
             hardware_ready: hardware_ready.clone(),
             stopping: stopping.clone(),
         },
+        stopping.clone(),
     );
 
     // One hardware owner performs initialization, transitions and PLOAM reception.

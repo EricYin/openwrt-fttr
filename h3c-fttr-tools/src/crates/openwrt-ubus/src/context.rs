@@ -56,6 +56,7 @@ impl Ubus {
     }
 
     pub fn connect_with_lib(lib: LibUbus, socket_path: Option<&str>) -> Result<Self, UbusError> {
+        let _lock = crate::raw::LIBUBUS_LOCK.lock().unwrap();
         let c_path = match socket_path {
             Some(p) => Some(CString::new(p)?),
             None => None,
@@ -85,6 +86,7 @@ impl Ubus {
         msg: Option<&Value>,
         timeout_ms: i32,
     ) -> Result<Value, UbusError> {
+        let _lock = crate::raw::LIBUBUS_LOCK.lock().unwrap();
         let c_obj = CString::new(object)?;
         let c_method = CString::new(method)?;
 
@@ -190,6 +192,7 @@ impl Ubus {
 impl Drop for Ubus {
     fn drop(&mut self) {
         if !self.ctx.is_null() {
+            let _lock = crate::raw::LIBUBUS_LOCK.lock().unwrap();
             unsafe {
                 self.lib.ubus_free(self.ctx);
             }

@@ -36,11 +36,35 @@ fn verify_abi() {
     assert_eq!(uci_option_type::UCI_TYPE_STRING as i32, 0);
     assert_eq!(uci_option_type::UCI_TYPE_LIST as i32, 1);
 
-    // Assert pointer sizes (on 64-bit target)
+    // Assert pointer sizes and field offsets (on 64-bit target)
     if std::mem::size_of::<usize>() == 8 {
+        macro_rules! offset_of {
+            ($ty:ty, $field:ident) => {{
+                let uninit = std::mem::MaybeUninit::<$ty>::uninit();
+                let base = uninit.as_ptr();
+                let field = unsafe { std::ptr::addr_of!((*base).$field) };
+                unsafe { (field as *const u8).offset_from(base as *const u8) as usize }
+            }};
+        }
+
         assert_eq!(std::mem::size_of::<uci_list>(), 16);
         assert_eq!(std::mem::size_of::<uci_element>(), 32);
         assert_eq!(std::mem::size_of::<uci_ptr>(), 72);
+
+        assert_eq!(offset_of!(uci_element, list), 0);
+        assert_eq!(offset_of!(uci_element, type_), 16);
+        assert_eq!(offset_of!(uci_element, name), 24);
+
+        assert_eq!(offset_of!(uci_ptr, target), 0);
+        assert_eq!(offset_of!(uci_ptr, flags), 4);
+        assert_eq!(offset_of!(uci_ptr, p), 8);
+        assert_eq!(offset_of!(uci_ptr, s), 16);
+        assert_eq!(offset_of!(uci_ptr, o), 24);
+        assert_eq!(offset_of!(uci_ptr, last), 32);
+        assert_eq!(offset_of!(uci_ptr, package), 40);
+        assert_eq!(offset_of!(uci_ptr, section), 48);
+        assert_eq!(offset_of!(uci_ptr, option), 56);
+        assert_eq!(offset_of!(uci_ptr, value), 64);
     }
 }
 

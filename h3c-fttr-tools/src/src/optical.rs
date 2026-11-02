@@ -32,6 +32,7 @@ const CONFIG: &str = "/etc/config/fttr";
 
 struct UciSession {
     dir: PathBuf,
+    conf_dir: PathBuf,
     package: String,
     original: Vec<u8>,
     uci: openwrt_uci::Uci,
@@ -49,16 +50,21 @@ impl UciSession {
                 std::env::temp_dir().join(format!("fttr-optical-{}-{nonce}", std::process::id()));
             match fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => {
+                    let conf_dir = path.join("config");
+                    let delta_dir = path.join("delta");
+                    fs::create_dir(&conf_dir)?;
+                    fs::create_dir(&delta_dir)?;
                     let package = format!("optical_{}_{stamp}_{nonce}", std::process::id());
-                    fs::write(path.join(&package), &original)?;
+                    fs::write(conf_dir.join(&package), &original)?;
                     let mut uci =
                         openwrt_uci::Uci::new().map_err(|e| io::Error::other(e.to_string()))?;
-                    uci.set_confdir(&path)
+                    uci.set_confdir(&conf_dir)
                         .map_err(|e| io::Error::other(e.to_string()))?;
-                    uci.set_savedir(&path)
+                    uci.set_savedir(&delta_dir)
                         .map_err(|e| io::Error::other(e.to_string()))?;
                     return Ok(Self {
                         dir: path,
+                        conf_dir,
                         package,
                         original,
                         uci,
@@ -104,15 +110,38 @@ impl Drop for UciSession {
 }
 
 pub fn load_enabled() -> io::Result<bool> {
-    let mut uci = openwrt_uci::Uci::new().map_err(|e| io::Error::other(e.to_string()))?;
-    let text = match uci.export_package("fttr") {
-        Ok(t) => t,
-        Err(openwrt_uci::UciError::PackageNotFound(_)) => {
-            return Ok(true);
-        }
-        Err(e) => return Err(io::Error::other(e.to_string())),
-    };
-    parse_export(&text)
+    load_enabled_from(std::path::Path::new(CONFIG))
+}
+
+pub fn load_enabled_from(config_path: &std::path::Path) -> io::Result<bool> {
+    if !config_path.exists() {
+        return Ok(true);
+    }
+    let original = fs::read(config_path)?;
+    // Create an isolated temporary session without reading shared /tmp/.uci deltas
+    let temp_dir = std::env::temp_dir().join(format!("fttr-optical-load-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir)?;
+    let conf_dir = temp_dir.join("config");
+    let delta_dir = temp_dir.join("delta");
+    fs::create_dir_all(&conf_dir)?;
+    fs::create_dir_all(&delta_dir)?;
+    let package = "fttr";
+    fs::write(conf_dir.join(package), &original)?;
+
+    let res = (|| -> io::Result<bool> {
+        let mut uci = openwrt_uci::Uci::new().map_err(|e| io::Error::other(e.to_string()))?;
+        uci.set_confdir(&conf_dir)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        uci.set_savedir(&delta_dir)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let text = uci
+            .export_package(package)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        parse_export(&text)
+    })();
+    let _ = fs::remove_dir_all(&temp_dir);
+    res
 }
 
 pub fn save_enabled(enabled: bool) -> io::Result<()> {
@@ -136,7 +165,7 @@ fn save_at(config: &std::path::Path, enabled: bool) -> io::Result<()> {
     if session.load()? != enabled {
         return Err(io::Error::other("optical configuration readback mismatch"));
     }
-    let bytes = fs::read(session.dir.join(&session.package))?;
+    let bytes = fs::read(session.conf_dir.join(&session.package))?;
     replace_config(config, &source, &session.original, &bytes, &session.package)
 }
 

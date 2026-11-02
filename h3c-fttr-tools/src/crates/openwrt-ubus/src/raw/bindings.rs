@@ -123,12 +123,35 @@ pub struct ubus_request_data {
     pub req_fd: c_int,
 }
 
+pub type ubus_connection_lost_cb = Option<unsafe extern "C" fn(ctx: *mut ubus_context)>;
+
+#[repr(C)]
+pub struct uloop_timeout {
+    pub list: list_head,
+    pub pending: bool,
+    pub _pad: [u8; 7],
+    pub cb: Option<unsafe extern "C" fn(*mut uloop_timeout)>,
+    pub time: [u8; 16],
+}
+
 #[repr(C)]
 pub struct ubus_context {
     pub requests: list_head,
     pub objects: avl_tree,
     pub pending: list_head,
     pub sock: uloop_fd,
+    pub pending_timer: uloop_timeout,
+    pub local_id: u32,
+    pub request_seq: u16,
+    pub cancel_poll: bool,
+    pub _pad1: u8,
+    pub stack_depth: c_int,
+    pub _pad2: [u8; 4],
+    pub connection_lost: ubus_connection_lost_cb,
+    pub monitor_cb: *mut c_void,
+    pub msgbuf_hdr: *mut c_void,
+    pub msgbuf_data: *mut c_void,
+    pub msgbuf_data_len: u32,
 }
 
 #[repr(C)]

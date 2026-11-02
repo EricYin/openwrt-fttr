@@ -48,6 +48,49 @@ fn verify_abi() {
         assert_eq!(std::mem::size_of::<ubus_method>(), 48);
         assert_eq!(std::mem::size_of::<ubus_object_type>(), 32);
         assert_eq!(std::mem::size_of::<ubus_object>(), 120);
+
+        macro_rules! offset_of {
+            ($ty:ty, $field:ident) => {{
+                let uninit = std::mem::MaybeUninit::<$ty>::uninit();
+                let base = uninit.as_ptr();
+                let field = unsafe { std::ptr::addr_of!((*base).$field) };
+                unsafe { (field as *const u8).offset_from(base as *const u8) as usize }
+            }};
+        }
+
+        // Verify key structural offsets against upstream C ABI
+        assert_eq!(offset_of!(avl_node, list), 0);
+        assert_eq!(offset_of!(avl_node, parent), 16);
+        assert_eq!(offset_of!(avl_node, left), 24);
+        assert_eq!(offset_of!(avl_node, right), 32);
+
+        assert_eq!(offset_of!(ubus_request_data, object), 0);
+        assert_eq!(offset_of!(ubus_request_data, peer), 4);
+        assert_eq!(offset_of!(ubus_request_data, seq), 8);
+        assert_eq!(offset_of!(ubus_request_data, acl), 16);
+        assert_eq!(offset_of!(ubus_request_data, deferred), 40);
+        assert_eq!(offset_of!(ubus_request_data, fd), 44);
+        assert_eq!(offset_of!(ubus_request_data, req_fd), 48);
+
+        assert_eq!(offset_of!(ubus_object, avl), 0);
+        assert_eq!(offset_of!(ubus_object, name), 56);
+        assert_eq!(offset_of!(ubus_object, id), 64);
+        assert_eq!(offset_of!(ubus_object, path), 72);
+        assert_eq!(offset_of!(ubus_object, type_), 80);
+        assert_eq!(offset_of!(ubus_object, subscribe_cb), 88);
+        assert_eq!(offset_of!(ubus_object, has_subscribers), 96);
+        assert_eq!(offset_of!(ubus_object, methods), 104);
+        assert_eq!(offset_of!(ubus_object, n_methods), 112);
+
+        assert_eq!(offset_of!(ubus_context, requests), 0);
+        assert_eq!(offset_of!(ubus_context, objects), 16);
+        assert_eq!(offset_of!(ubus_context, pending), 64);
+        assert_eq!(offset_of!(ubus_context, sock), 80);
+        assert_eq!(offset_of!(ubus_context, pending_timer), 96);
+        assert_eq!(offset_of!(ubus_context, local_id), 144);
+        assert_eq!(offset_of!(ubus_context, connection_lost), 160);
+        assert_eq!(offset_of!(ubus_context, msgbuf_data), 184);
+        assert_eq!(offset_of!(ubus_context, msgbuf_data_len), 192);
     }
 }
 

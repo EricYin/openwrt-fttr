@@ -463,6 +463,11 @@ impl LibUbus {
     }
 
     #[inline]
+    pub fn uloop_cancelled_ptr(&self) -> *mut bool {
+        self.inner.uloop_cancelled
+    }
+
+    #[inline]
     pub unsafe fn uloop_done(&self) {
         (self.inner.uloop_done)()
     }

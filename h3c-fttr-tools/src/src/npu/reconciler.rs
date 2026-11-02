@@ -252,28 +252,42 @@ pub async fn reconcile(
     // Slow-path: Inspect configuration and topology via native UCI
     let (config, firewall) = {
         let mut uci = openwrt_uci::Uci::new().map_err(|e| io::Error::other(e.to_string()))?;
-        let bridge = uci
-            .get("fttr", "offload", "bridge")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "br-lan".into());
-        let offload_enabled = uci
-            .get("fttr", "offload", "enabled")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "1".into());
-        let hw_offload = uci
-            .get("firewall", "@defaults[0]", "flow_offloading_hw")
-            .ok()
-            .flatten()
-            .as_deref()
-            == Some("1")
-            && uci
-                .get("firewall", "@defaults[0]", "flow_offloading")
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some("1");
+        let bridge = match uci.get("fttr", "offload", "bridge") {
+            Ok(Some(v)) => v,
+            Ok(None) => "br-lan".to_string(),
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "fttr.offload.bridge read error: {e}"
+                )))
+            }
+        };
+        let offload_enabled = match uci.get("fttr", "offload", "enabled") {
+            Ok(Some(v)) => v,
+            Ok(None) => "1".to_string(),
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "fttr.offload.enabled read error: {e}"
+                )))
+            }
+        };
+        let flow_offloading = match uci.get("firewall", "@defaults[0]", "flow_offloading") {
+            Ok(opt) => opt,
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "firewall.flow_offloading read error: {e}"
+                )))
+            }
+        };
+        let flow_offloading_hw = match uci.get("firewall", "@defaults[0]", "flow_offloading_hw") {
+            Ok(opt) => opt,
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "firewall.flow_offloading_hw read error: {e}"
+                )))
+            }
+        };
+        let hw_offload =
+            flow_offloading.as_deref() == Some("1") && flow_offloading_hw.as_deref() == Some("1");
 
         let config =
             format!("fttr.offload.bridge={bridge}\nfttr.offload.enabled={offload_enabled}\n");

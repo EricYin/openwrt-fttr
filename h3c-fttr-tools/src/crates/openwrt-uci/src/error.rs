@@ -17,6 +17,10 @@ pub enum UciError {
     SectionNotFound(String),
     #[error("UCI option not found: {0}")]
     OptionNotFound(String),
+    #[error("UCI parse error: {0}")]
+    ParseError(String),
+    #[error("UCI I/O error: {0}")]
+    IoError(String),
     #[error("UCI backend error: {0}")]
     Backend(String),
     #[error("String contains null byte: {0}")]
