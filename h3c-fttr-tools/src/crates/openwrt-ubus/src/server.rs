@@ -10,6 +10,8 @@ use serde_json::Value;
 use crate::blobmsg::BlobBuffer;
 use crate::error::UbusError;
 use crate::raw::*;
+#[path = "dispatch.rs"]
+mod dispatch;
 
 pub type MethodHandler =
     Box<dyn Fn(&str, Option<&Value>) -> Result<Value, c_int> + Send + Sync + 'static>;
@@ -40,7 +42,7 @@ unsafe extern "C" fn server_method_dispatch(
     msg: *mut blob_attr,
 ) -> c_int {
     let _lock = crate::raw::LIBUBUS_LOCK.lock().unwrap();
-    if obj.is_null() || method.is_null() {
+    if ctx.is_null() || obj.is_null() || req.is_null() || method.is_null() {
         return UBUS_STATUS_INVALID_ARGUMENT;
     }
     let method_name = match CStr::from_ptr(method).to_str() {
@@ -51,31 +53,34 @@ unsafe extern "C" fn server_method_dispatch(
     let rust_obj = &*(obj as *const RustUbusObject);
     let state = &*rust_obj.state_ptr;
 
-    let parsed_msg = if !msg.is_null() {
-        state
-            .lib
-            .blobmsg_format_json(msg, true)
-            .and_then(|j| serde_json::from_str::<Value>(&j).ok())
-    } else {
+    let encoded = if msg.is_null() {
         None
+    } else {
+        state.lib.blobmsg_format_json(msg, true)
+    };
+    let parsed_msg = match dispatch::parse_request(encoded.as_deref(), !msg.is_null()) {
+        Ok(value) => value,
+        Err(code) => return code,
     };
 
+    // Business handlers never execute under the process-wide libubus mutex.
+    // Object/request pointers stay on this owner thread for the entire dispatch.
+    drop(_lock);
     if let Some(handler) = state.handlers.get(method_name) {
-        match handler(method_name, parsed_msg.as_ref()) {
-            Ok(reply_val) => {
-                if !reply_val.is_null() {
-                    if let Ok(json_str) = serde_json::to_string(&reply_val) {
-                        if let Ok(mut blob) =
-                            BlobBuffer::from_json_str(state.lib.clone(), &json_str)
-                        {
-                            state.lib.ubus_send_reply(ctx, req, blob.head());
-                        }
-                    }
+        dispatch::reply_status(
+            handler(method_name, parsed_msg.as_ref()),
+            |value| serde_json::to_string(value).map_err(|_| ()),
+            |json| {
+                let _lock = crate::raw::LIBUBUS_LOCK.lock().unwrap();
+                let mut blob = BlobBuffer::from_json_str(state.lib.clone(), json).map_err(|_| 9)?;
+                let status = state.lib.ubus_send_reply(ctx, req, blob.head());
+                if status == 0 {
+                    Ok(())
+                } else {
+                    Err(status)
                 }
-                UBUS_STATUS_OK
-            }
-            Err(code) => code,
-        }
+            },
+        )
     } else {
         UBUS_STATUS_METHOD_NOT_FOUND
     }
