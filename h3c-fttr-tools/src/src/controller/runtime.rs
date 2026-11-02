@@ -22,6 +22,9 @@ use crate::pon_engine::PonEngine;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod ipc_server;
+mod ubus;
+
+use fttr_api::{OpticalError, OpticalReply, OpticalState};
 
 #[derive(Clone, Copy)]
 enum OpticalCommand {
@@ -46,35 +49,20 @@ impl OpticalCommand {
     }
 }
 
-#[derive(serde::Serialize)]
-struct OpticalReply {
-    schema_version: u8,
-    status: &'static str,
-    action: &'static str,
-    desired_enabled: Option<bool>,
-    tx_enabled: Option<bool>,
-    actor_state: OpticalState,
-    hardware_ready: bool,
-    discovery_active: bool,
-    cleanup_pending: bool,
-    error: Option<OpticalError>,
+trait OpticalReplyExt {
+    fn value(self) -> Value;
+    fn unavailable(command: OpticalCommand, ready: bool, error: io::Error) -> Value;
 }
 
-#[derive(serde::Serialize)]
-struct OpticalError {
-    code: String,
-    message: String,
-}
-
-impl OpticalReply {
+impl OpticalReplyExt for OpticalReply {
     fn value(self) -> serde_json::Value {
         serde_json::to_value(self).expect("optical reply is serializable")
     }
     fn unavailable(command: OpticalCommand, ready: bool, error: io::Error) -> serde_json::Value {
         Self {
             schema_version: 1,
-            status: "error",
-            action: command.action(),
+            status: "error".into(),
+            action: command.action().into(),
             desired_enabled: None,
             tx_enabled: None,
             actor_state: OpticalState::Unknown,
@@ -88,14 +76,6 @@ impl OpticalReply {
         }
         .value()
     }
-}
-
-#[derive(Clone, Copy, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-enum OpticalState {
-    Enabled,
-    Disabled,
-    Unknown,
 }
 
 struct OpticalRequest {
@@ -347,8 +327,8 @@ impl OpticalActor {
         };
         OpticalReply {
             schema_version: 1,
-            status: if result.is_ok() { "success" } else { "error" },
-            action: command.action(),
+            status: if result.is_ok() { "success" } else { "error" }.into(),
+            action: command.action().into(),
             desired_enabled,
             tx_enabled,
             actor_state: self.state,
@@ -475,14 +455,7 @@ fn start_ubus_server(
      -> Vec<(String, openwrt_ubus::MethodHandler)> {
         let mut m: Vec<(String, openwrt_ubus::MethodHandler)> = Vec::new();
 
-        m.push((
-            "get_capabilities".into(),
-            Box::new(|_, _| {
-                let caps_str = crate::capabilities::json();
-                let caps_val: Value = serde_json::from_str(&caps_str).unwrap_or(Value::Null);
-                Ok(caps_val)
-            }),
-        ));
+        m.extend(ubus::methods(optics.clone()));
 
         let d = devices.clone();
         let p = pon_engine.clone();
@@ -585,47 +558,6 @@ fn start_ubus_server(
             }),
         ));
 
-        let opt = optics.clone();
-        m.push((
-            "optical_status".into(),
-            Box::new(move |_, _| {
-                let response = match opt.request(OpticalCommand::Status) {
-                    Ok(resp) => resp,
-                    Err(error) => OpticalReply::unavailable(
-                        OpticalCommand::Status,
-                        opt.hardware_ready.load(Ordering::Acquire),
-                        error,
-                    ),
-                };
-                serde_json::to_value(&response).map_err(|_| 9)
-            }),
-        ));
-
-        let opt = optics.clone();
-        m.push((
-            "optical_set".into(),
-            Box::new(move |_, msg| {
-                let enabled = msg
-                    .and_then(|v| v.get("enabled"))
-                    .and_then(|v| v.as_bool())
-                    .ok_or(2)?; // 2 = UBUS_STATUS_INVALID_ARGUMENT
-                let cmd = if enabled {
-                    OpticalCommand::On
-                } else {
-                    OpticalCommand::Off
-                };
-                let response = match opt.request(cmd) {
-                    Ok(resp) => resp,
-                    Err(error) => OpticalReply::unavailable(
-                        cmd,
-                        opt.hardware_ready.load(Ordering::Acquire),
-                        error,
-                    ),
-                };
-                serde_json::to_value(&response).map_err(|_| 9)
-            }),
-        ));
-
         #[cfg(feature = "npu")]
         m.push((
             "npu_status".into(),
@@ -676,7 +608,7 @@ fn start_ubus_server(
                 );
                 // Exclusively register native system 'fttr' object.
                 // Compatibility 'luci.fttr' is owned by the rpcd shell plugin.
-                if let Err(e) = server.add_object("fttr", methods) {
+                if let Err(e) = server.add_object(fttr_api::OBJECT, methods) {
                     eprintln!("[-] Failed to register 'fttr' ubus object: {e}; retrying in 3s");
                     std::thread::sleep(Duration::from_secs(3));
                     continue;

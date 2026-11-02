@@ -18,6 +18,7 @@ mqtt = ["dep:rumqttd", "dep:rumqttc"]
 allocator-mimalloc = ["dep:mimalloc"]
 
 [dependencies]
+fttr-api = { path = "crates/fttr-api" }
 libc = "0.2.191"
 # The original mimalloc 0.1.52 still bundles C 3.3.2; this fork bundles 3.5.3.
 mimalloc = { package = "mold-mimalloc", version = "=0.1.52", default-features = false, features = ["no_thp"], optional = true }

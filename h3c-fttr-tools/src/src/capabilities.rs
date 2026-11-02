@@ -1,22 +1,6 @@
 //! Compile-time support, deliberately independent of UCI, hardware and liveness.
-use serde::Serialize;
+pub use fttr_api::{AdapterCapability, Capabilities};
 use std::{collections::BTreeMap, fs, io, path::Path};
-
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct AdapterCapability {
-    pub id: &'static str,
-    pub name: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Capabilities {
-    pub schema_version: u32,
-    pub version: &'static str,
-    pub features: BTreeMap<&'static str, bool>,
-    pub functions: BTreeMap<&'static str, bool>,
-    pub pages: BTreeMap<&'static str, bool>,
-    pub adapters: Vec<AdapterCapability>,
-}
 
 pub fn compiled() -> Capabilities {
     let acs = cfg!(feature = "acs");

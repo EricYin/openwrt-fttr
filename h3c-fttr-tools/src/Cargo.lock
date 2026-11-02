@@ -514,6 +514,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fttr-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -594,6 +601,7 @@ dependencies = [
  "bytes",
  "digest_auth",
  "flate2",
+ "fttr-api",
  "http-body-util",
  "hyper 1.12.0",
  "hyper-rustls",

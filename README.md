@@ -67,3 +67,16 @@ try {
 
 产物位于 `src/target/aarch64-unknown-linux-musl/release/`。
 内核驱动与固件镜像使用 Linux OpenWrt 构建环境。
+
+## LuCI SDK 生成
+
+`fttr-api` 共享后端声明并生成 LuCI 类型和客户端，默认输出到
+`../luci-app-fttr/src/api/generated/`。在仓库根目录执行：
+
+```sh
+cargo run --locked --manifest-path h3c-fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --generate
+cargo run --locked --manifest-path h3c-fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --check
+```
+
+其他布局追加 `--out-dir FRONTEND/src/api/generated`。`--check` 只检查生成
+一致性，不写文件。更新后在前端运行 `pnpm typecheck`、`pnpm test`。
