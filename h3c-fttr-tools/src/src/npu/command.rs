@@ -18,6 +18,7 @@ pub fn run_sync(program: &str, args: &[&str], timeout: Duration) -> io::Result<S
         .stderr(Stdio::null())
         .spawn()?;
 
+    let mut exit_status = None;
     let result = (|| {
         let mut stdout = child.stdout.take().unwrap();
         let fd = stdout.as_raw_fd();
@@ -52,7 +53,14 @@ pub fn run_sync(program: &str, args: &[&str], timeout: Duration) -> io::Result<S
                     Err(error) => return Err(error),
                 }
             }
-            if let Some(status) = child.try_wait()? {
+            if exit_status.is_none() {
+                match child.try_wait() {
+                    Ok(Some(status)) => exit_status = Some(status),
+                    Ok(None) => (),
+                    Err(e) => return Err(e),
+                }
+            }
+            if let Some(status) = exit_status {
                 if !status.success() {
                     return Err(io::Error::other(format!("{program}: exited with {status}")));
                 }
@@ -66,13 +74,45 @@ pub fn run_sync(program: &str, args: &[&str], timeout: Duration) -> io::Result<S
     if result.is_err() {
         let _ = child.kill();
     }
-    child.wait()?;
+    if exit_status.is_none() {
+        match child.wait() {
+            Ok(_) => (),
+            Err(e) if e.raw_os_error() == Some(libc::ECHILD) => (),
+            Err(e) => return Err(e),
+        }
+    }
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_rejects_unavailable_exit_status() {
+        const ISOLATED: &str = "FTTR_TEST_IGNORED_SIGCHLD";
+        if std::env::var_os(ISOLATED).is_some() {
+            // SAFETY: this branch runs only in a dedicated test subprocess.
+            // Ignoring SIGCHLD automatically reaps children on Linux.
+            assert_ne!(
+                unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) },
+                libc::SIG_ERR
+            );
+            let error = run_sync("sh", &["-c", "exit 7"], Duration::from_secs(2)).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+            return;
+        }
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "npu::command::tests::sync_rejects_unavailable_exit_status",
+            ])
+            .env(ISOLATED, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn sync_drains_pipe_and_rejects_truncation() {

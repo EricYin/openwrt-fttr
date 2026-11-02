@@ -245,6 +245,13 @@ pub fn status_from(
     status.total_packets_exact = status.total_packets.to_string();
     status.total_bytes_exact = status.total_bytes.to_string();
     status.bound_entries = status.bound_flows.len() as u32;
+    for flow in &status.bound_flows {
+        if flow.pkt_type.starts_with("IPv4") {
+            status.bound_ipv4_entries += 1;
+        } else if flow.pkt_type.starts_with("IPv6") {
+            status.bound_ipv6_entries += 1;
+        }
+    }
 
     if let Ok(entries_content) = fs::read_to_string(ppe_debug_path.join("entries")) {
         status.entries_valid = true;

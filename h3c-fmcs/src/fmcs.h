@@ -112,6 +112,8 @@ enum fmcs_fpga_status {
 #define FMCS_SPI_CMD_READ_RESP    0x50
 
 #define FMCS_MAX_FTTR_PORTS 16
+#define FMCS_FPGA_TRANSPORT_VID_BASE 0x100
+#define FMCS_PORT_TO_FPGA_VID(port)  ((u16)(FMCS_FPGA_TRANSPORT_VID_BASE + (port) - 1))
 #define FMCS_PLOAM_RX_DEPTH 64
 #define FMCS_PLOAM_RX_BUDGET 16
 

@@ -49,8 +49,13 @@ pub fn compile(text: &str) -> Result<Config, String> {
         }
         match w[0].as_str() {
             "package" => (),
-            "config" if w.len() == 3 => {
-                if all.iter().any(|(id, _)| id == &w[2]) {
+            "config" if w.len() == 2 || w.len() == 3 => {
+                let id = if w.len() == 3 {
+                    w[2].clone()
+                } else {
+                    format!("_anon_{}_{}", w[1], all.len())
+                };
+                if all.iter().any(|(existing_id, _)| existing_id == &id) {
                     return Err("duplicate section".into());
                 }
                 if !matches!(
@@ -69,7 +74,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
                     return Err(format!("unsupported section: {}", w[1]));
                 }
                 all.push((
-                    w[2].clone(),
+                    id,
                     Section {
                         kind: w[1].clone(),
                         ..Default::default()
@@ -164,7 +169,13 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 "username",
                 "password",
             ],
-            "offload" => &["enabled", "bridge"],
+            "offload" => &[
+                "enabled",
+                "bridge",
+                "wan_upstream",
+                "wan_downstream",
+                "onu_bridge",
+            ],
             _ => &[],
         };
         if let Some(key) = s.options.keys().find(|k| !allowed.contains(&k.as_str())) {

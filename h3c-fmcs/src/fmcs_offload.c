@@ -3,6 +3,7 @@
 #include <linux/etherdevice.h>
 #include <linux/if_vlan.h>
 #include <linux/if_bridge.h>
+#include <linux/in6.h>
 #include <linux/rtnetlink.h>
 #include <linux/xarray.h>
 #include <net/flow_offload.h>
@@ -12,6 +13,14 @@
 static bool fmcs_bridge_debug;
 module_param_named(bridge_offload_debug, fmcs_bridge_debug, bool, 0644);
 MODULE_PARM_DESC(bridge_offload_debug, "Rate-limited bridge TC adapter diagnostics");
+
+static inline bool fmcs_ipv6_addr_all_ones(const struct in6_addr *addr)
+{
+	return (addr->s6_addr32[0] == U32_MAX &&
+		addr->s6_addr32[1] == U32_MAX &&
+		addr->s6_addr32[2] == U32_MAX &&
+		addr->s6_addr32[3] == U32_MAX);
+}
 
 struct fmcs_bridge_offload {
 	struct fmcs_priv *priv;
@@ -29,6 +38,7 @@ struct fmcs_bridge_key {
 	struct flow_dissector_key_control control;
 	struct flow_dissector_key_basic basic;
 	struct flow_dissector_key_ipv4_addrs ipv4;
+	struct flow_dissector_key_ipv6_addrs ipv6;
 	struct flow_dissector_key_ip ip;
 	struct flow_dissector_key_tcp tcp;
 	struct flow_dissector_key_ports ports;
@@ -57,20 +67,24 @@ static int fmcs_bridge_replace(struct fmcs_bridge_offload *b,
 	struct net_device *lower, *out = NULL, *in, *master;
 	struct flow_action_entry *act;
 	unsigned long allowed;
+	bool is_ipv4, is_ipv6;
 	int i, src, dst, ret;
 
 	allowed = BIT_ULL(FLOW_DISSECTOR_KEY_META) |
 		  BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
 		  BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
 		  BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS) |
+		  BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS) |
 		  BIT_ULL(FLOW_DISSECTOR_KEY_PORTS) |
 		  BIT_ULL(FLOW_DISSECTOR_KEY_IP) |
 		  BIT_ULL(FLOW_DISSECTOR_KEY_TCP);
+	is_ipv4 = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS);
+	is_ipv6 = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV6_ADDRS);
 	if (rule->match.dissector->used_keys & ~allowed ||
 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META) ||
 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
-	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS) ||
+	    !(is_ipv4 ^ is_ipv6) ||
 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS))
 		return -EOPNOTSUPP;
 	flow_rule_match_meta(rule, &meta);
@@ -129,20 +143,30 @@ static int fmcs_bridge_replace(struct fmcs_bridge_offload *b,
 	FMCS_COPY_KEY(CONTROL, control, control);
 	FMCS_COPY_KEY(BASIC, basic, basic);
 	FMCS_COPY_KEY(IPV4_ADDRS, ipv4, ipv4_addrs);
+	FMCS_COPY_KEY(IPV6_ADDRS, ipv6, ipv6_addrs);
 	FMCS_COPY_KEY(IP, ip, ip);
 	FMCS_COPY_KEY(TCP, tcp, tcp);
 	FMCS_COPY_KEY(PORTS, ports, ports);
 #undef FMCS_COPY_KEY
-	if (key.control.addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS ||
-	    mask.control.addr_type != U16_MAX ||
-	    key.basic.n_proto != htons(ETH_P_IP) ||
+	if (mask.control.addr_type != U16_MAX ||
 	    mask.basic.n_proto != htons(0xffff) || mask.basic.ip_proto != U8_MAX ||
-	    mask.ipv4.src != htonl(U32_MAX) || mask.ipv4.dst != htonl(U32_MAX) ||
 	    mask.ports.src != htons(0xffff) || mask.ports.dst != htons(0xffff) ||
 	    (key.basic.ip_proto != IPPROTO_TCP && key.basic.ip_proto != IPPROTO_UDP))
 		return -EOPNOTSUPP;
+	if (is_ipv4) {
+		if (key.control.addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS ||
+		    key.basic.n_proto != htons(ETH_P_IP) ||
+		    mask.ipv4.src != htonl(U32_MAX) || mask.ipv4.dst != htonl(U32_MAX))
+			return -EOPNOTSUPP;
+	} else {
+		if (key.control.addr_type != FLOW_DISSECTOR_KEY_IPV6_ADDRS ||
+		    key.basic.n_proto != htons(ETH_P_IPV6) ||
+		    !fmcs_ipv6_addr_all_ones(&mask.ipv6.src) ||
+		    !fmcs_ipv6_addr_all_ones(&mask.ipv6.dst))
+			return -EOPNOTSUPP;
+	}
 	key.meta.ingress_ifindex = lower->ifindex;
-	key.vlan.vlan_id = 0x100 + src - 1;
+	key.vlan.vlan_id = FMCS_PORT_TO_FPGA_VID(src);
 	key.vlan.vlan_tpid = htons(ETH_P_8021Q);
 	mask.vlan.vlan_id = VLAN_VID_MASK;
 	mask.vlan.vlan_priority = 7;
@@ -159,7 +183,7 @@ static int fmcs_bridge_replace(struct fmcs_bridge_offload *b,
 	copy->match.mask = &mask;
 	copy->action.entries[0].id = FLOW_ACTION_VLAN_POP;
 	copy->action.entries[1].id = FLOW_ACTION_VLAN_PUSH;
-	copy->action.entries[1].vlan.vid = 0x100 + dst - 1;
+	copy->action.entries[1].vlan.vid = FMCS_PORT_TO_FPGA_VID(dst);
 	copy->action.entries[1].vlan.proto = htons(ETH_P_8021Q);
 	memcpy(&copy->action.entries[2], rule->action.entries,
 	       sizeof(*act) * rule->action.num_entries);

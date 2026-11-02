@@ -94,10 +94,15 @@ fn capture(program: &str, args: &[&str], timeout: Duration) -> Result<String, St
         }
         match child.kill() {
             Ok(()) => (),
-            Err(error) if error.kind() == ErrorKind::InvalidInput => (),
+            Err(error)
+                if error.kind() == ErrorKind::InvalidInput
+                    || error.raw_os_error() == Some(libc::ESRCH) => {}
             Err(error) => {
                 return match child.wait() {
                     Ok(_) => Err(format!("cannot stop {program}: {error}")),
+                    Err(wait) if wait.raw_os_error() == Some(libc::ECHILD) => {
+                        Err(format!("cannot stop {program}: {error}"))
+                    }
                     Err(wait) => Err(format!(
                         "cannot stop {program}: {error}; cannot reap: {wait}"
                     )),
@@ -105,9 +110,11 @@ fn capture(program: &str, args: &[&str], timeout: Duration) -> Result<String, St
             }
         }
     }
-    child
-        .wait()
-        .map_err(|error| format!("cannot reap {program}: {error}"))?;
+    match child.wait() {
+        Ok(_) => (),
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => (),
+        Err(error) => return Err(format!("cannot reap {program}: {error}")),
+    }
     result
 }
 
