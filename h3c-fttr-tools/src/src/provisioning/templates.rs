@@ -169,7 +169,13 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 "username",
                 "password",
             ],
-            "offload" => &["enabled", "bridge"],
+            "offload" => &[
+                "enabled",
+                "bridge",
+                "wan_upstream",
+                "wan_downstream",
+                "onu_bridge",
+            ],
             _ => &[],
         };
         if let Some(key) = s.options.keys().find(|k| !allowed.contains(&k.as_str())) {
