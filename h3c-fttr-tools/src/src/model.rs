@@ -76,58 +76,7 @@ pub struct DataPathOffloadStatus {
     pub forwarding_verified: Option<bool>,
 }
 
-/// An active or recorded PPE hardware flow entry from debugfs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PpeFlowEntry {
-    pub index: String,
-    pub state: String,
-    pub pkt_type: String,
-    pub orig_tuple: String,
-    pub new_tuple: String,
-    pub eth: String,
-    pub vlan: String,
-    pub packets: u64,
-    pub bytes: u64,
-    pub counters_valid: bool,
-    pub packets_exact: String,
-    pub bytes_exact: String,
-}
-
-/// Aggregated real-time NPU / PPE hardware offload status and statistics.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NpuStatus {
-    pub sampled_at_ms: u64,
-    pub errors: Vec<String>,
-    pub config_valid: bool,
-    pub engine_valid: bool,
-    pub mask_valid: bool,
-    pub routed_mask_valid: bool,
-    pub debug_valid: bool,
-    pub flows_valid: bool,
-    pub entries_valid: bool,
-    pub counters_valid: bool,
-    pub hooks_valid: bool,
-    pub total_packets_exact: String,
-    pub total_bytes_exact: String,
-    pub supported: bool,
-    pub engine_attached: bool,
-    pub bridge_offload_enabled: bool,
-    pub bridge_offload_mask: u16,
-    pub routed_offload_mask: u16,
-    pub bridge_offload_debug: bool,
-    pub bridge: String,
-    pub active_ports: Vec<String>,
-    pub fw4_hooks_ready: bool,
-    pub total_entries: u32,
-    pub bound_entries: u32,
-    #[serde(default)]
-    pub bound_ipv4_entries: u32,
-    #[serde(default)]
-    pub bound_ipv6_entries: u32,
-    pub total_packets: u64,
-    pub total_bytes: u64,
-    pub bound_flows: Vec<PpeFlowEntry>,
-}
+pub use fttr_api::{NpuStatus, PpeFlowEntry};
 
 /// Data path statistics and provisioning parameters for an ONU.
 #[derive(Debug, Clone, Serialize, Deserialize)]

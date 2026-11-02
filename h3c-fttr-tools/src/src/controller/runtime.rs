@@ -459,71 +459,7 @@ fn start_ubus_server(
      -> Vec<(String, openwrt_ubus::MethodHandler)> {
         let mut m: Vec<(String, openwrt_ubus::MethodHandler)> = Vec::new();
 
-        m.extend(ubus::methods(optics.clone()));
-
-        let d = devices.clone();
-        let p = pon_engine.clone();
-        let s = services.clone();
-        let status_fn = move |_: &str, _: Option<&Value>| {
-            let provisioning = crate::provisioning::snapshot();
-            let devs = d.lock().unwrap();
-            let engine = p.lock().unwrap();
-            let sys_status = super::status::snapshot(&engine, &s, (&devs, provisioning));
-
-            #[derive(serde::Serialize)]
-            struct Status<'a> {
-                #[serde(flatten)]
-                system: &'a FttrSystemStatus,
-                ipc: ipc_server::metrics::Snapshot,
-            }
-            let status = Status {
-                system: &sys_status,
-                ipc: ipc_server::metrics::snapshot(),
-            };
-            serde_json::to_value(&status).map_err(|_| 9)
-        };
-        m.push(("get_status".into(), Box::new(status_fn)));
-
-        let d = devices.clone();
-        let p = pon_engine.clone();
-        let s = services.clone();
-        m.push((
-            "status".into(),
-            Box::new(move |_, _| {
-                let provisioning = crate::provisioning::snapshot();
-                let devs = d.lock().unwrap();
-                let engine = p.lock().unwrap();
-                let sys_status = super::status::snapshot(&engine, &s, (&devs, provisioning));
-
-                #[derive(serde::Serialize)]
-                struct Status<'a> {
-                    #[serde(flatten)]
-                    system: &'a FttrSystemStatus,
-                    ipc: ipc_server::metrics::Snapshot,
-                }
-                let status = Status {
-                    system: &sys_status,
-                    ipc: ipc_server::metrics::snapshot(),
-                };
-                serde_json::to_value(&status).map_err(|_| 9)
-            }),
-        ));
-
-        m.push((
-            "get_sync".into(),
-            Box::new(|_, _| {
-                let resp = crate::provisioning::control("{\"op\":\"status\"}");
-                serde_json::from_str(&resp).map_err(|_| 9)
-            }),
-        ));
-
-        m.push((
-            "config_check".into(),
-            Box::new(|_, _| {
-                let resp = crate::provisioning::control("{\"op\":\"check\"}");
-                serde_json::from_str(&resp).map_err(|_| 9)
-            }),
-        ));
+        m.extend(ubus::methods(optics.clone(), devices, pon_engine, services));
 
         m.push((
             "config_reload".into(),
@@ -559,19 +495,6 @@ fn start_ubus_server(
                 });
                 let resp = crate::provisioning::control(&payload.to_string());
                 serde_json::from_str(&resp).map_err(|_| 9)
-            }),
-        ));
-
-        #[cfg(feature = "npu")]
-        m.push((
-            "npu_status".into(),
-            Box::new(|_, _| {
-                let status = crate::npu::status_from(
-                    std::path::Path::new("/etc/config/fttr"),
-                    std::path::Path::new("/sys/kernel/debug/ppe0/entries"),
-                    std::path::Path::new("/sys/module/h3c_fmcs/parameters"),
-                );
-                serde_json::to_value(&status).map_err(|_| 9)
             }),
         ));
 

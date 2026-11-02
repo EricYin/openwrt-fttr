@@ -4,6 +4,9 @@ use std::{collections::BTreeMap, marker::PhantomData};
 
 pub const OBJECT: &str = "fttr";
 
+mod queries;
+pub use queries::*;
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct AdapterCapability {
@@ -91,11 +94,18 @@ pub enum Access {
     Write,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Availability {
+    Always,
+    Npu,
+}
+
 pub struct Method<Request, Response> {
     pub name: &'static str,
     pub sdk_name: &'static str,
     pub params: &'static [&'static str],
     pub access: Access,
+    pub availability: Availability,
     types: PhantomData<fn(Request) -> Response>,
 }
 
@@ -105,12 +115,14 @@ impl<Q, R> Method<Q, R> {
         sdk_name: &'static str,
         params: &'static [&'static str],
         access: Access,
+        availability: Availability,
     ) -> Self {
         Self {
             name,
             sdk_name,
             params,
             access,
+            availability,
             types: PhantomData,
         }
     }
@@ -122,16 +134,20 @@ impl<Q, R> Method<Q, R> {
 macro_rules! fttr_methods {
     ($consumer:ident) => {
         $consumer! {
-            GET_CAPABILITIES, get_capabilities, getCapabilities, EmptyRequest, Capabilities, Read, [];
-            OPTICAL_STATUS, optical_status, opticalStatus, EmptyRequest, OpticalReply, Read, [];
-            OPTICAL_SET, optical_set, opticalSet, OpticalSetRequest, OpticalReply, Write, [enabled];
+            GET_CAPABILITIES, get_capabilities, getCapabilities, EmptyRequest, Capabilities, Read, Always, [];
+            OPTICAL_STATUS, optical_status, opticalStatus, EmptyRequest, OpticalReply, Read, Always, [];
+            OPTICAL_SET, optical_set, opticalSet, OpticalSetRequest, OpticalReply, Write, Always, [enabled];
+            GET_STATUS, get_status, getStatus, EmptyRequest, StatusReply, Read, Always, [];
+            GET_SYNC, get_sync, getSync, EmptyRequest, SyncStatusReply, Read, Always, [];
+            CONFIG_CHECK, config_check, configCheck, EmptyRequest, ConfigCheckReply, Read, Always, [];
+            NPU_STATUS, npu_status, npuStatus, EmptyRequest, NpuStatus, Read, Npu, [];
         }
     };
 }
 
 macro_rules! declare_methods {
-    ($( $id:ident, $wire:ident, $sdk:ident, $req:ident, $res:ident, $access:ident, [$($param:ident),*]; )*) => {
-        $(pub const $id: Method<$req, $res> = Method::new(stringify!($wire), stringify!($sdk), &[$(stringify!($param)),*], Access::$access);)*
+    ($( $id:ident, $wire:ident, $sdk:ident, $req:ident, $res:ident, $access:ident, $availability:ident, [$($param:ident),*]; )*) => {
+        $(pub const $id: Method<$req, $res> = Method::new(stringify!($wire), stringify!($sdk), &[$(stringify!($param)),*], Access::$access, Availability::$availability);)*
     };
 }
 fttr_methods!(declare_methods);

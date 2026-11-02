@@ -37,7 +37,7 @@ fn render() -> BTreeMap<&'static str, String> {
     let mut metadata = String::new();
     let mut imports = BTreeSet::new();
     macro_rules! generate {
-        ($( $id:ident, $wire:ident, $sdk:ident, $req:ident, $res:ident, $access:ident, [$($param:ident),*]; )*) => {$(
+        ($( $id:ident, $wire:ident, $sdk:ident, $req:ident, $res:ident, $access:ident, $availability:ident, [$($param:ident),*]; )*) => {$(
             add::<$req>(&mut types);
             add::<$res>(&mut types);
             let method = &$id;
@@ -54,7 +54,8 @@ fn render() -> BTreeMap<&'static str, String> {
             let argument = if method.params.is_empty() { String::new() } else { format!("request: {}", stringify!($req)) };
             let values = method.params.iter().map(|p| format!("request.{p}")).collect::<Vec<_>>().join(", ");
             calls.push_str(&format!("    async {sdk}({argument}): Promise<{result}> {{\n      return validators.{sdk}.parse(await raw_{sdk}({values}));\n    }},\n"));
-            metadata.push_str(&format!("  {{ method: \"{}\", access: \"{}\", params: [{params}] }},\n", method.name, match method.access { Access::Read => "read", Access::Write => "write" }));
+            let feature = match method.availability { Availability::Always => "null", Availability::Npu => "\"npu\"" };
+            metadata.push_str(&format!("  {{ method: \"{}\", access: \"{}\", feature: {feature}, params: [{params}] }},\n", method.name, match method.access { Access::Read => "read", Access::Write => "write" }));
         )*};
     }
     fttr_methods!(generate);
@@ -159,5 +160,9 @@ mod tests {
         assert!(client.contains("[OpticalSetRequest[\"enabled\"]]"));
         assert!(client.contains("raw_opticalSet(request.enabled)"));
         assert!(client.contains("object: \"fttr\""));
+        assert!(types.contains("total_packets: number"));
+        assert!(!types.contains("bigint"));
+        assert!(types.contains("optical_transceiver: unknown"));
+        assert!(client.contains("method: \"npu_status\", access: \"read\", feature: \"npu\""));
     }
 }
