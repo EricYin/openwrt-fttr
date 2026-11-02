@@ -15,7 +15,7 @@ impl Service {
         let admission = Arc::new(Mutex::new(Admission::new(reconciler::MASK)));
         let service = Self(admission.clone());
         // Revoke stale admission before discovery, including after daemon restart.
-        if let Err(error) = admission.lock().unwrap().set(0) {
+        if let Err(error) = admission.lock().unwrap().withdraw() {
             eprintln!("[-] NPU initial withdrawal failed: {error}");
         }
         if !is_supported_platform() {
@@ -45,7 +45,7 @@ impl Service {
                     Err(error) => {
                         poll_interval = reconciler::POLL_FAST;
                         reconciler = Reconciler::default();
-                        if let Err(error) = admission.lock().unwrap().set(0) {
+                        if let Err(error) = admission.lock().unwrap().withdraw() {
                             eprintln!("[-] NPU withdrawal failed: {error}");
                         }
                         let message = error.to_string();
@@ -63,7 +63,7 @@ impl Service {
     pub fn stop(&self) {
         let mut admission = self.0.lock().unwrap();
         admission.stopped = true;
-        if let Err(error) = admission.set(0) {
+        if let Err(error) = admission.withdraw() {
             eprintln!("[-] NPU shutdown withdrawal failed: {error}");
         }
     }

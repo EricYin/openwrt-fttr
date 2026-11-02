@@ -7,6 +7,7 @@ use std::{
 };
 
 pub const MASK: &str = "/sys/module/h3c_fmcs/parameters/bridge_offload_mask";
+pub const DIRECTIONS: &str = "/sys/module/airoha_eth/parameters/fttr_offload_directions";
 pub const NET: &str = "/sys/class/net";
 pub const POLL_FAST: Duration = Duration::from_secs(2);
 pub const POLL_STEADY: Duration = Duration::from_secs(10);
@@ -31,6 +32,16 @@ pub(crate) fn option<'a>(config: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+/// Explicit direction policy; missing WAN options stay experimental/disabled.
+pub fn directions(config: &str) -> u8 {
+    if option(config, "fttr.offload.enabled").unwrap_or("1") != "1" {
+        return 0;
+    }
+    u8::from(option(config, "fttr.offload.wan_upstream") == Some("1"))
+        | (u8::from(option(config, "fttr.offload.wan_downstream") == Some("1")) << 1)
+        | (u8::from(option(config, "fttr.offload.onu_bridge").unwrap_or("1") == "1") << 2)
+}
+
 pub fn topology(config: &str, firewall: &str, net: &Path, mask: &Path) -> io::Result<Topology> {
     let bridge = option(config, "fttr.offload.bridge").unwrap_or("br-lan");
     let mut topology = Topology {
@@ -43,7 +54,7 @@ pub fn topology(config: &str, firewall: &str, net: &Path, mask: &Path) -> io::Re
         && bridge
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
-    if !valid_bridge || option(config, "fttr.offload.enabled").unwrap_or("1") != "1" {
+    if !valid_bridge || directions(config) & 4 == 0 {
         return Ok(topology);
     }
     // uci show uses the actual section name for both named and anonymous defaults.
@@ -193,6 +204,38 @@ pub struct Admission {
 }
 
 impl Admission {
+    pub fn set_directions(&self, mask: u8) -> io::Result<()> {
+        let mask = if self.stopped { 0 } else { mask };
+        let path = Path::new(DIRECTIONS);
+        if !path.try_exists()? {
+            // Older kernels can still enforce the bridge gate through MASK.
+            // Routed rules bypass that adapter: withdraw them before reporting
+            // that independent WAN policy needs the platform patch.
+            let routed = self.path.with_file_name("routed_offload_mask");
+            if routed.try_exists()? && text(&routed)? != "0" {
+                fs::write(routed, "0\n")?;
+            }
+            if mask & 3 != 0 {
+                return Err(io::Error::other(
+                    "WAN direction policy requires Airoha patch 933",
+                ));
+            }
+            return Ok(());
+        }
+        if text(path)? != mask.to_string() {
+            fs::write(path, format!("{mask}\n"))?;
+            eprintln!("[*] NPU direction admission mask={mask}");
+        }
+        Ok(())
+    }
+
+    pub fn withdraw(&mut self) -> io::Result<()> {
+        // Attempt both withdrawals even if one sysfs write fails.
+        let directions = self.set_directions(0);
+        let bridge = self.set(0);
+        directions.and(bridge)
+    }
+
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
@@ -233,6 +276,12 @@ pub async fn reconcile(
     // Fast-path: When already armed and the driver hasn't revoked the mask,
     // verify the physical link status before spawning any external processes.
     if let Some(cache) = &state.cache {
+        let policy = if cache.files == files {
+            directions(&cache.config)
+        } else {
+            0
+        };
+        admission.lock().unwrap().set_directions(policy)?;
         // Reuse the complete topology predicate, including new ports, master,
         // forwarding state and identity. Missing sysfs data is never healthy.
         let live = topology(&cache.config, &cache.firewall, net, mask_path)?;
@@ -253,6 +302,15 @@ pub async fn reconcile(
     let config = command::run_async("uci", &["-q", "show", "fttr"], Duration::from_secs(5)).await?;
     let firewall =
         command::run_async("uci", &["-q", "show", "firewall"], Duration::from_secs(5)).await?;
+    if policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))? != files {
+        admission.lock().unwrap().withdraw()?;
+        *state = Reconciler::default();
+        return Ok(POLL_FAST);
+    }
+    admission
+        .lock()
+        .unwrap()
+        .set_directions(directions(&config))?;
     let topology = topology(&config, &firewall, net, mask_path)?;
     // Timestamp is refreshed only after hooks pass, never by a cheap probe.
     let verified = state
@@ -333,7 +391,7 @@ pub async fn reconcile(
         || self::topology(&cache.config, &cache.firewall, net, mask_path)? != *topology
         || admission.lock().unwrap().current()? != current
     {
-        admission.lock().unwrap().set(0)?;
+        admission.lock().unwrap().withdraw()?;
         state.last = None;
         state.armed = false;
         state.stable = 0;
