@@ -37,9 +37,179 @@ struct Handlers {
     devices: std::sync::Arc<std::sync::Mutex<Vec<crate::ipc::SubDevice>>>,
     engine: std::sync::Arc<std::sync::Mutex<crate::pon_engine::PonEngine>>,
     services: crate::controller::service::States,
+    jobs: fttr_jobs::Jobs,
 }
 
 impl Handlers {
+    fn npu_set(&self, request: NpuSetRequest) -> Result<NpuSetReply, i32> {
+        #[cfg(feature = "npu")]
+        {
+            response(
+                match crate::npu::settings::set(
+                    request.enabled,
+                    (!request.bridge.is_empty()).then_some(request.bridge.as_str()),
+                ) {
+                    Ok(()) => serde_json::json!({"status":"success","enabled":request.enabled}),
+                    Err(error) => serde_json::json!({"status":"error","error":error.to_string()}),
+                },
+            )
+        }
+        #[cfg(not(feature = "npu"))]
+        {
+            let _ = request;
+            Err(4)
+        }
+    }
+    fn mib_start(&self, request: MibStartRequest) -> Result<JobStartReply, i32> {
+        use crate::pon_engine::ploam::OnuState;
+        if request.onu_id >= crate::pon_engine::ONU_SLOTS {
+            return Err(2);
+        }
+        let engine = self.engine.try_lock().map_err(|_| 9)?;
+        if !engine.active_onus.iter().any(|onu| {
+            onu.onu_id == request.onu_id
+                && onu.full_sn_str() == request.optical_sn
+                && onu.state == OnuState::O5Operation
+        }) {
+            return response(fttr_jobs::error(
+                "Device registration changed; reopen device details",
+            ));
+        }
+        let generation = self
+            .services
+            .try_lock()
+            .map_err(|_| 9)?
+            .get(&request.onu_id)
+            .map(|s| s.generation)
+            .ok_or(9)?;
+        drop(engine);
+        let handler = self.clone();
+        let guard: crate::controller::inventory::RegistrationGuard =
+            std::sync::Arc::new(move || {
+                let Ok(engine) = handler.engine.lock() else {
+                    return false;
+                };
+                let Ok(services) = handler.services.lock() else {
+                    return false;
+                };
+                engine.active_onus.iter().any(|onu| {
+                    onu.onu_id == request.onu_id
+                        && onu.full_sn_str() == request.optical_sn
+                        && onu.state == OnuState::O5Operation
+                }) && services
+                    .get(&request.onu_id)
+                    .is_some_and(|s| s.generation == generation)
+            });
+        let states = self.services.clone();
+        let id = request.onu_id;
+        let tables = request.tables;
+        response(self.jobs.start(
+            "mib",
+            move || match crate::controller::inventory::control_guarded(
+                id,
+                tables,
+                None,
+                &states,
+                Some(guard.clone()),
+            ) {
+                Ok(report) if guard() => serde_json::json!({"status":"ready","report":report}),
+                Ok(_) => fttr_jobs::error("Device registration changed during MIB read"),
+                Err(error) => fttr_jobs::error(&error.to_string()),
+            },
+        ))
+    }
+    fn mib_result(&self, request: JobRequest) -> Result<JobChunkReply, i32> {
+        response(self.jobs.result(&request.job, request.chunk, Some("mib")))
+    }
+    fn job_result(&self, request: JobRequest) -> Result<JobChunkReply, i32> {
+        response(self.jobs.result(&request.job, request.chunk, None))
+    }
+    fn job_release(&self, request: JobReleaseRequest) -> Result<JobReleaseReply, i32> {
+        response(self.jobs.release(&request.job))
+    }
+    fn hl_query(
+        &self,
+        value: serde_json::Value,
+        background: bool,
+    ) -> Result<serde_json::Value, i32> {
+        #[cfg(feature = "device-hl202")]
+        {
+            let input = value.to_string();
+            if input.len() > crate::hl202_ipc::MAX_REQUEST_BYTES
+                || serde_json::from_str::<crate::devices::hl202::api::Query>(&input).is_err()
+            {
+                return Err(2);
+            }
+            if !background {
+                return Ok(crate::controller::hl202::control(
+                    &input,
+                    &self.engine,
+                    &self.services,
+                ));
+            }
+            let handler = self.clone();
+            Ok(self.jobs.start("hl202", move || {
+                crate::controller::hl202::control(&input, &handler.engine, &handler.services)
+            }))
+        }
+        #[cfg(not(feature = "device-hl202"))]
+        {
+            let _ = (value, background);
+            Err(4)
+        }
+    }
+    fn hl202_list(&self, _: EmptyRequest) -> Result<HlListReply, i32> {
+        response(self.hl_query(serde_json::json!({"method":"list"}), false)?)
+    }
+    fn hl202_report(&self, request: HlReportRequest) -> Result<JobStartReply, i32> {
+        let source = matches!(&request.target, HlTarget::Source { .. });
+        response(self.hl_query(serde_json::json!({"method":if source {"source_report"} else {"report"},"target":target(request.target)}), true)?)
+    }
+    fn hl202_accounts_start(&self, request: HlAccountsRequest) -> Result<JobStartReply, i32> {
+        self.hl_run(request.target, serde_json::json!({"kind":"accounts_read"}))
+    }
+    fn hl202_account_update(&self, request: HlUpdateRequest) -> Result<JobStartReply, i32> {
+        let action = match request.kind {
+            AccountChange::AccountSetPassword => {
+                serde_json::json!({"kind":"account_set_password","entry":request.entry,"password":request.password})
+            }
+            AccountChange::AccountSetActive => {
+                serde_json::json!({"kind":"account_set_active","entry":request.entry,"active":request.active})
+            }
+        };
+        self.hl_run(request.target, action)
+    }
+    fn hl202_exec_start(&self, request: HlExecRequest) -> Result<JobStartReply, i32> {
+        self.hl_run(request.target, serde_json::json!({"kind":"exec","script":request.script,"timeout_seconds":request.timeout_seconds}))
+    }
+    fn hl_run(&self, selection: HlTarget, action: serde_json::Value) -> Result<JobStartReply, i32> {
+        if matches!(selection, HlTarget::Source { .. }) {
+            return Err(2);
+        }
+        response(self.hl_query(serde_json::json!({"method":"run","request":{"schema_version":1,"target":target(selection),"action":action}}), true)?)
+    }
+    fn get_calibration(&self, _: EmptyRequest) -> Result<CalibrationInfoReply, i32> {
+        response(super::calibration::get().unwrap_or_else(|e| fttr_jobs::error(&e.to_string())))
+    }
+    fn save_calibration(
+        &self,
+        request: CalibrationSaveRequest,
+    ) -> Result<CalibrationSaveReply, i32> {
+        response(
+            super::calibration::save(&request.data)
+                .unwrap_or_else(|e| fttr_jobs::error(&e.to_string())),
+        )
+    }
+    fn apply_calibration(&self, _: EmptyRequest) -> Result<JobStartReply, i32> {
+        let optics = self.optics.clone();
+        response(self.jobs.start("calibration", move || {
+            match optical(&optics, OpticalCommand::Reinitialize) {
+                Ok(reply) if reply.status == ReplyStatus::Success => serde_json::json!({"success":true,"output":if reply.desired_enabled == Some(true) {"Calibration applied by optical owner"} else {"Optical TX remains disabled; calibration will load on next enable"}}),
+                Ok(reply) => serde_json::json!({"success":false,"error":reply.error.map(|e|e.message).unwrap_or_else(||"Calibration failed".into())}),
+                Err(_) => serde_json::json!({"success":false,"error":"Optical owner unavailable; execution outcome may be unknown"}),
+            }
+        }))
+    }
     fn get_capabilities(&self, _: EmptyRequest) -> Result<Capabilities, i32> {
         Ok(crate::capabilities::compiled())
     }
@@ -130,11 +300,15 @@ pub(super) fn methods(
         devices,
         engine,
         services,
+        jobs: {
+            static JOBS: std::sync::OnceLock<fttr_jobs::Jobs> = std::sync::OnceLock::new();
+            JOBS.get_or_init(fttr_jobs::Jobs::default).clone()
+        },
     };
     macro_rules! register {
         ($( $id:ident, $wire:ident, $sdk:ident, $req:ident, $res:ident, $access:ident, $availability:ident, [$($param:ident),*]; )*) => {{
             let mut methods = Vec::new();
-            $(if $id.availability != Availability::Npu || cfg!(feature = "npu") {
+            $(if match $id.availability { Availability::Always => true, Availability::Npu => cfg!(feature = "npu"), Availability::Hl202 => cfg!(feature = "device-hl202") } {
                 let handler = handlers.clone();
                 methods.push(bind(&$id, move |request| handler.$wire(request)));
             })*
@@ -143,4 +317,24 @@ pub(super) fn methods(
         };
     }
     fttr_methods!(register)
+}
+
+fn target(selection: HlTarget) -> serde_json::Value {
+    match selection {
+        HlTarget::Optical {
+            optical_sn,
+            onu_id,
+            binding_generation,
+        } => {
+            serde_json::json!({"optical_sn":optical_sn,"onu_id":onu_id,"binding_generation":binding_generation})
+        }
+        HlTarget::Source {
+            mqtt_mac,
+            binding_generation,
+        } => serde_json::json!({"mqtt_mac":mqtt_mac,"binding_generation":binding_generation}),
+    }
+}
+
+fn response<R: DeserializeOwned>(value: serde_json::Value) -> Result<R, i32> {
+    serde_json::from_value(value).map_err(|_| 9)
 }

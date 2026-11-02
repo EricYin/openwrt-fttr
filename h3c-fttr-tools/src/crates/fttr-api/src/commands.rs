@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 
 use crate::SyncStatusReply;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct CommandError {
     pub error: String,

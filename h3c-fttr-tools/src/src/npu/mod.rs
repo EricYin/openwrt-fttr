@@ -10,6 +10,7 @@ pub mod command;
 pub mod ppe;
 pub mod reconciler;
 pub mod service;
+pub mod settings;
 
 use crate::model::NpuStatus;
 use std::{io, path::Path, time::Duration};

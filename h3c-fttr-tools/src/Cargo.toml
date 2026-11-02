@@ -13,12 +13,14 @@ device-hwtc = []
 device-star = []
 device-zte = []
 all-devices = ["device-hl202", "device-hwtc", "device-star", "device-zte"]
-acs = ["dep:quick-xml", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:base64", "dep:digest_auth", "dep:hyper-rustls", "dep:tokio-io-timeout"]
+acs = ["dep:quick-xml", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:digest_auth", "dep:hyper-rustls", "dep:tokio-io-timeout"]
 mqtt = ["dep:rumqttd", "dep:rumqttc"]
 allocator-mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 fttr-api = { path = "crates/fttr-api" }
+fttr-jobs = { path = "crates/fttr-jobs" }
+sha2 = "0.10.9"
 libc = "0.2.191"
 # The original mimalloc 0.1.52 still bundles C 3.3.2; this fork bundles 3.5.3.
 mimalloc = { package = "mold-mimalloc", version = "=0.1.52", default-features = false, features = ["no_thp"], optional = true }
@@ -34,7 +36,7 @@ hyper = { version = "1.12.0", default-features = false, features = ["http1", "se
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "client-legacy", "http1"], optional = true }
 http-body-util = { version = "0.1.5", optional = true }
 bytes = { version = "1.12.1", optional = true }
-base64 = { version = "0.23.1", optional = true }
+base64 = "0.23.1"
 digest_auth = { version = "0.3.1", optional = true }
 hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "ring", "webpki-roots", "tls12"], optional = true }
 tokio-io-timeout = { version = "1.2.1", optional = true }

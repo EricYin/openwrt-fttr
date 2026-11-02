@@ -7,7 +7,9 @@ pub const OBJECT: &str = "fttr";
 mod queries;
 pub use queries::*;
 mod commands;
+mod operations;
 pub use commands::*;
+pub use operations::*;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
@@ -44,7 +46,7 @@ pub struct OpticalReply {
     pub error: Option<OpticalError>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct OpticalError {
     pub code: String,
@@ -100,6 +102,7 @@ pub enum Access {
 pub enum Availability {
     Always,
     Npu,
+    Hl202,
 }
 
 pub struct Method<Request, Response> {
@@ -146,6 +149,19 @@ macro_rules! fttr_methods {
             CONFIG_RELOAD, config_reload, configReload, EmptyRequest, ConfigReloadReply, Write, Always, [];
             RESTART_SERVICE, restart_service, restartService, EmptyRequest, RestartReply, Write, Always, [];
             SYNC, sync, sync, SyncRequest, SyncReply, Write, Always, [action, target, management, item];
+            NPU_SET, npu_set, npuSet, NpuSetRequest, NpuSetReply, Write, Npu, [enabled, bridge];
+            MIB_START, mib_start, mibStart, MibStartRequest, JobStartReply, Read, Always, [onu_id, optical_sn, tables];
+            MIB_RESULT, mib_result, mibResult, JobRequest, JobChunkReply, Read, Always, [job, chunk];
+            JOB_RELEASE, job_release, jobRelease, JobReleaseRequest, JobReleaseReply, Read, Always, [job];
+            HL202_LIST, hl202_list, hl202List, EmptyRequest, HlListReply, Read, Hl202, [];
+            HL202_REPORT, hl202_report, hl202Report, HlReportRequest, JobStartReply, Read, Hl202, [target];
+            HL202_ACCOUNTS_START, hl202_accounts_start, hl202AccountsStart, HlAccountsRequest, JobStartReply, Read, Hl202, [target];
+            HL202_ACCOUNT_UPDATE, hl202_account_update, hl202AccountUpdate, HlUpdateRequest, JobStartReply, Write, Hl202, [target, kind, entry, password, active];
+            HL202_EXEC_START, hl202_exec_start, hl202ExecStart, HlExecRequest, JobStartReply, Write, Hl202, [target, script, timeout_seconds];
+            JOB_RESULT, job_result, jobResult, JobRequest, JobChunkReply, Read, Always, [job, chunk];
+            GET_CALIBRATION, get_calibration, getCalibration, EmptyRequest, CalibrationInfoReply, Read, Always, [];
+            SAVE_CALIBRATION, save_calibration, saveCalibration, CalibrationSaveRequest, CalibrationSaveReply, Write, Always, [data];
+            APPLY_CALIBRATION, apply_calibration, applyCalibration, EmptyRequest, JobStartReply, Write, Always, [];
         }
     };
 }

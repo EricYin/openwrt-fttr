@@ -152,60 +152,7 @@ fn handle_offload(args: &[String]) {
                 .iter()
                 .position(|a| a == "--bridge")
                 .map(|i| args.get(i + 1).map(String::as_str).unwrap_or(""));
-            let result = (|| -> std::io::Result<()> {
-                if let Some(bridge) = bridge {
-                    if bridge.is_empty()
-                        || bridge.len() > 15
-                        || !bridge
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
-                    {
-                        return Err(std::io::Error::other("Invalid bridge interface"));
-                    }
-                }
-                // Do not commit unrelated staged edits from another LuCI session.
-                let delta_path = std::path::Path::new("/tmp/.uci/fttr");
-                if delta_path.exists()
-                    && std::fs::metadata(delta_path)
-                        .map(|m| m.len() > 0)
-                        .unwrap_or(false)
-                {
-                    return Err(std::io::Error::other(
-                        "FTTR has pending UCI changes; apply or revert them first",
-                    ));
-                }
-                let mut uci =
-                    openwrt_uci::Uci::new().map_err(|e| std::io::Error::other(e.to_string()))?;
-                uci.ensure_section("fttr", "offload", "offload")
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                uci.set(
-                    "fttr",
-                    "offload",
-                    "enabled",
-                    if enabled { "1" } else { "0" },
-                )
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-                if let Some(bridge) = bridge {
-                    uci.set("fttr", "offload", "bridge", bridge)
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
-                }
-                uci.commit("fttr")
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                if !enabled {
-                    std::fs::write("/sys/module/h3c_fmcs/parameters/bridge_offload_mask", "0\n")?;
-                    if std::fs::read_to_string(
-                        "/sys/module/h3c_fmcs/parameters/bridge_offload_mask",
-                    )?
-                    .trim()
-                        != "0"
-                    {
-                        return Err(std::io::Error::other(
-                            "Saved, but driver withdrawal is not confirmed",
-                        ));
-                    }
-                }
-                Ok(())
-            })();
+            let result = h3c_fttr_tools::npu::settings::set(enabled, bridge);
             match result {
                 Ok(()) => {
                     if is_json {

@@ -54,7 +54,7 @@ fn render() -> BTreeMap<&'static str, String> {
             let argument = if method.params.is_empty() { String::new() } else { format!("request: {}", stringify!($req)) };
             let values = method.params.iter().map(|p| format!("request.{p}")).collect::<Vec<_>>().join(", ");
             calls.push_str(&format!("    async {sdk}({argument}): Promise<{result}> {{\n      return validators.{sdk}.parse(await raw_{sdk}({values}));\n    }},\n"));
-            let feature = match method.availability { Availability::Always => "null", Availability::Npu => "\"npu\"" };
+            let feature = match method.availability { Availability::Always => "null", Availability::Npu => "\"npu\"", Availability::Hl202 => "\"device-hl202\"" };
             metadata.push_str(&format!("  {{ method: \"{}\", access: \"{}\", feature: {feature}, params: [{params}] }},\n", method.name, match method.access { Access::Read => "read", Access::Write => "write" }));
         )*};
     }

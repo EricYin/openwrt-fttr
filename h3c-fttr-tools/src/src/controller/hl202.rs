@@ -22,36 +22,7 @@ pub(super) fn start(
     };
     crate::runtime::spawn_blocking(move || {
         let _permit = permit;
-        let response = match (engine.lock(), services.lock()) {
-            (Ok(engine), Ok(services)) => {
-                let devices: Vec<Device> = engine
-                    .active_onus
-                    .iter()
-                    .filter_map(|onu| {
-                        let model = services
-                            .get(&onu.onu_id)
-                            .and_then(|service| service.identity.as_ref())
-                            .and_then(|identity| identity.equipment_id.clone())
-                            .unwrap_or_else(|| onu.model.clone());
-                        if onu.vendor_str() != "H3CT" || model != "HL202-DU-C" {
-                            return None;
-                        }
-                        Some(Device {
-                            optical_sn: onu.full_sn_str(),
-                            onu_id: u16::from(onu.onu_id),
-                            model,
-                            online: onu.state == OnuState::O5Operation,
-                        })
-                    })
-                    .collect();
-                drop(services);
-                drop(engine);
-                api::control(&input, &devices)
-            }
-            _ => {
-                serde_json::json!({"schema_version":1,"error":{"code":"unavailable","message":"optical identity state unavailable"}})
-            }
-        };
+        let response = control(&input, &engine, &services);
         let encoded = response.to_string();
         if encoded.len() <= crate::hl202_ipc::MAX_RESPONSE_BYTES {
             let _ = stream.write_all(encoded.as_bytes());
@@ -59,4 +30,41 @@ pub(super) fn start(
             let _ = stream.write_all(b"{\"schema_version\":1,\"error\":{\"code\":\"response_limit\",\"message\":\"HL202 response exceeds byte limit\"}}");
         }
     });
+}
+
+pub(super) fn control(
+    input: &str,
+    engine: &Arc<Mutex<PonEngine>>,
+    services: &super::service::States,
+) -> serde_json::Value {
+    match (engine.lock(), services.lock()) {
+        (Ok(engine), Ok(services)) => {
+            let devices: Vec<Device> = engine
+                .active_onus
+                .iter()
+                .filter_map(|onu| {
+                    let model = services
+                        .get(&onu.onu_id)
+                        .and_then(|service| service.identity.as_ref())
+                        .and_then(|identity| identity.equipment_id.clone())
+                        .unwrap_or_else(|| onu.model.clone());
+                    if onu.vendor_str() != "H3CT" || model != "HL202-DU-C" {
+                        return None;
+                    }
+                    Some(Device {
+                        optical_sn: onu.full_sn_str(),
+                        onu_id: u16::from(onu.onu_id),
+                        model,
+                        online: onu.state == OnuState::O5Operation,
+                    })
+                })
+                .collect();
+            drop(services);
+            drop(engine);
+            api::control(input, &devices)
+        }
+        _ => {
+            serde_json::json!({"schema_version":1,"error":{"code":"unavailable","message":"optical identity state unavailable"}})
+        }
+    }
 }

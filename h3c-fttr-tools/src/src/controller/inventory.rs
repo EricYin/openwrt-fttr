@@ -154,7 +154,9 @@ pub(super) struct MibRequest {
     pub deadline: Instant,
     pub progress: Option<MibProgressReporter>,
     pub reply: std::sync::mpsc::Sender<io::Result<MibReport>>,
+    pub registration: Option<RegistrationGuard>,
 }
+pub(super) type RegistrationGuard = Arc<dyn Fn() -> bool + Send + Sync>;
 pub(super) enum WorkerRequest {
     Mib(MibRequest),
     Attribute(super::attribute_probe::Request),
@@ -257,15 +259,20 @@ pub(super) fn read_owned(
     cancellation: Option<Arc<AtomicBool>>,
     deadline: Instant,
     progress: Option<MibProgressReporter>,
+    registration: Option<RegistrationGuard>,
 ) -> io::Result<MibReport> {
-    if !super::service::operation_confirmed(id) {
+    if !super::service::operation_confirmed(id)
+        || registration.as_ref().is_some_and(|guard| !guard())
+    {
         return Err(io::Error::new(
             io::ErrorKind::NotConnected,
             "MIB requires a currently registered ONU",
         ));
     }
     let mut session = OmciSession::new(FmcsTransport::open(id)?);
-    session.guard_registration(move || super::service::operation_confirmed(id));
+    session.guard_registration(move || {
+        super::service::operation_confirmed(id) && registration.as_ref().is_none_or(|guard| guard())
+    });
     session.finish_before(deadline);
     if let Some(token) = cancellation {
         session.cancel_when(token);
@@ -321,6 +328,16 @@ pub(super) fn control(
     progress: Option<MibProgressReporter>,
     states: &super::service::States,
 ) -> io::Result<MibReport> {
+    control_guarded(id, tables, progress, states, None)
+}
+
+pub(super) fn control_guarded(
+    id: u8,
+    tables: bool,
+    progress: Option<MibProgressReporter>,
+    states: &super::service::States,
+    registration: Option<RegistrationGuard>,
+) -> io::Result<MibReport> {
     if id >= crate::pon_engine::ONU_SLOTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -346,7 +363,7 @@ pub(super) fn control(
             }
             let _lease = StockOmccLease::open(id)?;
             let _channel = ChannelLease::open(id, 0)?;
-            read_owned(id, tables, None, deadline, progress)
+            read_owned(id, tables, None, deadline, progress, registration)
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
             let (sender, wake) = states
@@ -364,6 +381,7 @@ pub(super) fn control(
                     deadline,
                     progress,
                     reply,
+                    registration,
                 }))
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::WouldBlock, "MIB queue busy or stopped")

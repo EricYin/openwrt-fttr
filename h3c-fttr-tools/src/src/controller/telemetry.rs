@@ -118,6 +118,7 @@ impl Collector {
                 Some(self.token.clone()),
                 started + Duration::from_secs(600),
                 None,
+                None,
             ) {
                 Ok(report) => {
                     self.inventory =

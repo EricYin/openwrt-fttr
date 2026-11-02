@@ -348,6 +348,7 @@ fn run(
                             cancellation.clone(),
                             request.deadline,
                             request.progress,
+                            request.registration,
                         )
                     };
                     let complete = result.is_ok();
