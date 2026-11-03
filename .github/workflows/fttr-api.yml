@@ -1,9 +1,9 @@
 name: FTTR API contract
 on:
   push:
-    paths: ['h3c-fttr-tools/src/crates/fttr-api/**', 'h3c-fttr-tools/src/crates/fttr-jobs/**', 'h3c-fttr-tools/src/crates/openwrt-ubus/**', 'h3c-fttr-tools/src/src/capabilities.rs', 'h3c-fttr-tools/src/src/controller/runtime/ubus.rs', '.github/workflows/fttr-api.yml']
+    paths: ['h3c-fttr-tools/src/crates/fttr-api/**', 'h3c-fttr-tools/src/crates/fttr-jobs/**', 'h3c-fttr-tools/src/crates/openwrt-ubus/**', 'h3c-fttr-tools/src/src/**', '.github/workflows/fttr-api.yml']
   pull_request:
-    paths: ['h3c-fttr-tools/src/crates/fttr-api/**', 'h3c-fttr-tools/src/crates/fttr-jobs/**', 'h3c-fttr-tools/src/crates/openwrt-ubus/**', 'h3c-fttr-tools/src/src/capabilities.rs', 'h3c-fttr-tools/src/src/controller/runtime/ubus.rs', '.github/workflows/fttr-api.yml']
+    paths: ['h3c-fttr-tools/src/crates/fttr-api/**', 'h3c-fttr-tools/src/crates/fttr-jobs/**', 'h3c-fttr-tools/src/crates/openwrt-ubus/**', 'h3c-fttr-tools/src/src/**', '.github/workflows/fttr-api.yml']
   workflow_dispatch:
     inputs:
       frontend_ref:

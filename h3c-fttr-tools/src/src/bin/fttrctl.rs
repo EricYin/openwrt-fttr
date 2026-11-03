@@ -148,11 +148,18 @@ fn handle_offload(args: &[String]) {
         }
         "on" | "off" => {
             let enabled = sub == "on";
+            #[cfg(feature = "npu")]
             let bridge = args
                 .iter()
                 .position(|a| a == "--bridge")
                 .map(|i| args.get(i + 1).map(String::as_str).unwrap_or(""));
+            #[cfg(feature = "npu")]
             let result = h3c_fttr_tools::npu::settings::set(enabled, bridge);
+            #[cfg(not(feature = "npu"))]
+            let result: std::io::Result<()> = Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "NPU adapter not compiled (enable Cargo feature npu)",
+            ));
             match result {
                 Ok(()) => {
                     if is_json {

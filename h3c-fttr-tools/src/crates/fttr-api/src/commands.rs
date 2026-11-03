@@ -20,7 +20,19 @@ pub enum ConfigReloadReply {
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct RestartReply {
+    #[serde(deserialize_with = "crate::commands::true_value")]
+    #[cfg_attr(feature = "codegen", ts(type = "true"))]
     pub restarting: bool,
+}
+
+pub(crate) fn true_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
+    if bool::deserialize(deserializer)? {
+        Ok(true)
+    } else {
+        Err(serde::de::Error::custom("expected true"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,10 +103,14 @@ pub enum SyncReply {
         revision: String,
     },
     Management {
+        #[serde(deserialize_with = "true_value")]
+        #[cfg_attr(feature = "codegen", ts(type = "true"))]
         started: bool,
         mode: OperationMode,
     },
     Reset {
+        #[serde(deserialize_with = "true_value")]
+        #[cfg_attr(feature = "codegen", ts(type = "true"))]
         reset: bool,
         device: String,
     },

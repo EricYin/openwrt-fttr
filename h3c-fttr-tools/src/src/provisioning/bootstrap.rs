@@ -669,7 +669,13 @@ pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Va
     view["inflight"] = json!(r.worker.is_some());
     view["persistence_error"] = json!(c.persistence_error);
     view["link_identity_error"] = json!(sources.topology_error());
-    view["listener"] = json!({"enabled":acs["enabled"],"listen":acs["listen"],"path":acs["path"],"error":acs["error"]});
+    view["listener"] = serde_json::to_value(fttr_api::AcsListener {
+        enabled: acs["enabled"].as_bool().unwrap_or(false),
+        listen: acs["listen"].as_str().map(str::to_owned),
+        path: acs["path"].as_str().map(str::to_owned),
+        error: acs["error"].as_str().map(str::to_owned),
+    })
+    .expect("ACS listener serialization");
     view["mqtt_last_seen"] = json!(r.mqtt_target.as_ref().and_then(|t| sources.last_seen(t)));
     if let Some(m) = management {
         let url = public_url(&m.acs_url);

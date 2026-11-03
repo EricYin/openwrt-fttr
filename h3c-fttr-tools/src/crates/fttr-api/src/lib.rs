@@ -6,6 +6,12 @@ pub const OBJECT: &str = "fttr";
 
 mod queries;
 pub use queries::*;
+mod provisioning;
+mod results;
+mod status;
+pub use provisioning::*;
+pub use results::*;
+pub use status::*;
 mod commands;
 mod operations;
 pub use commands::*;

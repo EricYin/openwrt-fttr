@@ -1,9 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-
-// Nested status/provisioning views remain owned by their existing producers.
-// Export them as unknown, never as unchecked TypeScript domain objects; LuCI's
-// existing Zod parsers validate and narrow these parts at the client boundary.
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct StatusReply {
@@ -14,25 +9,20 @@ pub struct StatusReply {
     #[cfg_attr(feature = "codegen", ts(optional))]
     pub jobs: Option<crate::JobStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "codegen", ts(type = "unknown", optional))]
-    pub onu_pinning: Option<Value>,
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub onu_pinning: Option<crate::OnuPinning>,
     pub fpga_status: String,
-    #[cfg_attr(feature = "codegen", ts(type = "unknown"))]
-    pub provisioning: Value,
-    #[cfg_attr(feature = "codegen", ts(type = "unknown"))]
-    pub optical_transceiver: Value,
-    #[cfg_attr(feature = "codegen", ts(type = "Array<unknown>"))]
-    pub switch_ports: Vec<Value>,
-    #[cfg_attr(feature = "codegen", ts(type = "Array<unknown>"))]
-    pub sub_gateways: Vec<Value>,
-    #[cfg_attr(feature = "codegen", ts(type = "Array<unknown>"))]
-    pub telemetry_gateways: Vec<Value>,
+    pub provisioning: Option<SyncStatusReply>,
+    pub optical_transceiver: crate::OpticalTransceiverStatus,
+    pub switch_ports: Vec<crate::SwitchPortStatus>,
+    pub sub_gateways: Vec<crate::SubGatewayStatus>,
+    pub telemetry_gateways: Vec<crate::TelemetryGatewayInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "codegen", ts(type = "unknown", optional))]
-    pub npu: Option<Value>,
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub npu: Option<NpuStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "codegen", ts(type = "unknown", optional))]
-    pub ipc: Option<Value>,
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub ipc: Option<crate::IpcStats>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,14 +37,17 @@ pub struct SyncStatusReply {
     #[cfg_attr(feature = "codegen", ts(type = "number"))]
     pub interval_minutes: u64,
     pub error: Option<String>,
-    #[cfg_attr(feature = "codegen", ts(type = "Array<unknown>"))]
-    pub devices: Vec<Value>,
-    #[cfg_attr(feature = "codegen", ts(type = "unknown"))]
-    pub management_network: Value,
-    #[cfg_attr(feature = "codegen", ts(type = "unknown"))]
-    pub omci_management: Value,
+    pub devices: Vec<crate::DeviceSync>,
+    pub management_network: crate::ManagementNetwork,
+    pub omci_management: crate::OmciManagement,
     pub groups: Vec<SyncGroup>,
     pub pending_devices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub onu_pins: Option<std::collections::BTreeMap<String, u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub config_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,6 +78,8 @@ pub struct SyncGroup {
 #[serde(untagged, deny_unknown_fields)]
 pub enum ConfigCheckReply {
     Valid {
+        #[serde(deserialize_with = "crate::commands::true_value")]
+        #[cfg_attr(feature = "codegen", ts(type = "true"))]
         valid: bool,
         revision: String,
         devices: usize,

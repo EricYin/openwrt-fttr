@@ -122,7 +122,16 @@ impl Handlers {
                 &states,
                 Some(guard.clone()),
             ) {
-                Ok(report) if guard() => serde_json::json!({"status":"ready","report":report}),
+                Ok(report) if guard() => match serde_json::to_value(report)
+                    .and_then(serde_json::from_value::<MibReport>)
+                {
+                    Ok(report) => serde_json::to_value(MibSnapshot {
+                        status: MibReady::Ready,
+                        report,
+                    })
+                    .expect("MIB snapshot is JSON serializable"),
+                    Err(_) => fttr_jobs::error("Invalid MIB report contract"),
+                },
                 Ok(_) => fttr_jobs::error("Device registration changed during MIB read"),
                 Err(error) => fttr_jobs::error(&error.to_string()),
             }
@@ -157,9 +166,21 @@ impl Handlers {
                     &self.services,
                 ));
             }
+            let method = value["method"].as_str().unwrap_or_default().to_owned();
+            let exec = value["request"]["action"]["kind"] == "exec";
             let handler = self.clone();
             Ok(self.jobs.start("hl202", move || {
-                crate::controller::hl202::control(&input, &handler.engine, &handler.services)
+                let result =
+                    crate::controller::hl202::control(&input, &handler.engine, &handler.services);
+                // Validate the final payload before publishing it into the job store.
+                let result = if method == "report" || method == "source_report" {
+                    normalize::<HlReportReply>(result)
+                } else if exec {
+                    normalize::<HlExecReply>(result)
+                } else {
+                    normalize::<HlAccountReply>(result)
+                };
+                result.unwrap_or_else(|_| fttr_jobs::error("Invalid HL202 result contract"))
             }))
         }
         #[cfg(not(feature = "device-hl202"))]
@@ -382,4 +403,11 @@ fn target(selection: HlTarget) -> serde_json::Value {
 
 fn response<R: DeserializeOwned>(value: serde_json::Value) -> Result<R, i32> {
     serde_json::from_value(value).map_err(|_| 9)
+}
+
+#[cfg(feature = "device-hl202")]
+fn normalize<R: DeserializeOwned + Serialize>(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, i32> {
+    serde_json::to_value(response::<R>(value)?).map_err(|_| 9)
 }

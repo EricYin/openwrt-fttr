@@ -61,6 +61,10 @@ fn render() -> BTreeMap<&'static str, String> {
     fttr_methods!(generate);
     // Async envelopes contain serialized JSON; register their final payloads too.
     add::<CalibrationApplied>(&mut types);
+    add::<MibSnapshot>(&mut types);
+    add::<HlReportReply>(&mut types);
+    add::<HlAccountReply>(&mut types);
+    add::<HlExecReply>(&mut types);
     let type_names = imports.into_iter().collect::<Vec<_>>().join(", ");
     let type_source = format!("{banner}{}", types.values().cloned().collect::<String>());
     let client = format!("{banner}import type {{ {type_names} }} from \"./types\";\n\nexport const fttrMethods = [\n{metadata}] as const;\n\nexport function createFttrClient<{}>(\n  rpc: typeof L.rpc,\n  validators: {{\n{}  }},\n) {{\n{declarations}  return {{\n{calls}  }};\n}}\n", generics.join(", "), validators.concat());
@@ -213,7 +217,10 @@ mod tests {
         assert!(client.contains("object: \"fttr\""));
         assert!(types.contains("total_packets: number"));
         assert!(!types.contains("bigint"));
-        assert!(types.contains("optical_transceiver: unknown"));
+        assert!(types.contains("optical_transceiver: OpticalTransceiverStatus"));
+        assert!(types.contains("devices: Array<DeviceSync>"));
+        assert!(types.contains("report: MibReport"));
+        assert!(!types.contains("Array<unknown>"));
         assert!(client.contains("method: \"npu_status\", access: \"read\", feature: \"npu\""));
     }
 
