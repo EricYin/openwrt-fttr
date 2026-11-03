@@ -208,8 +208,10 @@ impl Jobs {
     }
 
     pub fn result(&self, id: &str, chunk: u16, kind: Option<&str>) -> Value {
-        let Ok(mut state) = self.0.try_lock() else {
-            return error("Job queue busy");
+        // These critical sections only inspect or update bounded in-memory data.
+        // Contention with completion/expiry is not a fatal polling error.
+        let Ok(mut state) = self.0.lock() else {
+            return error("Job store unavailable; execution outcome is unknown");
         };
         let Some(job) = state.jobs.get(id) else {
             // The daemon instance is part of the opaque ID. Losing a store is
@@ -251,8 +253,8 @@ impl Jobs {
 
     // Release discards results; it does not retry or cancel side effects.
     pub fn release(&self, id: &str) -> Value {
-        let Ok(mut state) = self.0.try_lock() else {
-            return error("Job queue busy");
+        let Ok(mut state) = self.0.lock() else {
+            return error("Job store unavailable; execution outcome is unknown");
         };
         if let Some(job) = state.jobs.get_mut(id) {
             job.released = true;
@@ -281,6 +283,50 @@ impl Write for Limited {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn polling_and_release_wait_for_short_store_contention() {
+        let jobs = Jobs::default();
+        jobs.0.lock().unwrap().jobs.insert(
+            "completed".into(),
+            Job {
+                kind: "test",
+                created: Instant::now(),
+                result: Some(br#"{"done":true}"#.to_vec()),
+                released: false,
+                progress: None,
+            },
+        );
+        for release in [false, true] {
+            let guard = jobs.0.lock().unwrap();
+            let worker_jobs = jobs.clone();
+            let (started, ready) = std::sync::mpsc::channel();
+            let (sent, received) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                sent.send(if release {
+                    worker_jobs.release("completed")
+                } else {
+                    worker_jobs.result("completed", 0, None)
+                })
+                .unwrap();
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(received.recv_timeout(Duration::from_millis(20)).is_err());
+            drop(guard);
+            let reply = received.recv_timeout(Duration::from_secs(2)).unwrap();
+            if release {
+                assert_eq!(reply, json!({"released":true}));
+            } else {
+                assert_eq!(reply["status"], "ready");
+                assert_eq!(
+                    STANDARD.decode(reply["data"].as_str().unwrap()).unwrap(),
+                    br#"{"done":true}"#
+                );
+            }
+            worker.join().unwrap();
+        }
+        assert!(jobs.0.lock().unwrap().jobs.is_empty());
+    }
     #[test]
     fn daemon_restart_does_not_report_missing_admitted_work_as_not_executed() {
         let first = Jobs::default();
