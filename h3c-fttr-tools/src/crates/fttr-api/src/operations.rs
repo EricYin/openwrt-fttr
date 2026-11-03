@@ -219,6 +219,7 @@ pub struct HlDevice {
 pub enum HlListReply {
     List {
         #[cfg_attr(feature = "codegen", ts(type = "1"))]
+        #[serde(deserialize_with = "crate::results::version_one")]
         schema_version: u8,
         devices: Vec<HlDevice>,
         sources: Vec<MqttSource>,

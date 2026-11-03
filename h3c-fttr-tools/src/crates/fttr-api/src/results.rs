@@ -2,7 +2,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-fn version_one<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
+pub(crate) fn version_one<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u8, D::Error> {
     match u8::deserialize(deserializer)? {
         1 => Ok(1),
         _ => Err(serde::de::Error::custom("unsupported schema version")),

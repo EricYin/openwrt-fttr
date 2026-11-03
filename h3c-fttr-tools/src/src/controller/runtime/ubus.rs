@@ -4,6 +4,8 @@ use fttr_api::*;
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::atomic::Ordering;
 mod metrics;
+#[cfg(test)]
+mod tests;
 
 fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
     method: &Method<Q, R>,
@@ -150,63 +152,44 @@ impl Handlers {
     fn job_release(&self, request: JobReleaseRequest) -> Result<JobReleaseReply, i32> {
         response(self.jobs.release(&request.job))
     }
-    fn hl_query(&self, query: HlQuery, background: bool) -> Result<serde_json::Value, i32> {
+    fn hl_query(&self, query: HlQuery) -> Result<serde_json::Value, i32> {
         #[cfg(feature = "device-hl202")]
         {
             let input = serde_json::to_string(&query).map_err(|_| 2)?;
             if input.len() > crate::hl202_ipc::MAX_REQUEST_BYTES {
                 return Err(2);
             }
-            if !background {
+            if matches!(&query, HlQuery::List) {
                 return Ok(crate::controller::hl202::control(
                     &input,
                     &self.engine,
                     &self.services,
                 ));
             }
-            let report = matches!(
-                &query,
-                HlQuery::Report { .. } | HlQuery::SourceReport { .. }
-            );
-            let exec = matches!(
-                &query,
-                HlQuery::Run {
-                    request: HlCommandRequest {
-                        action: HlAction::Exec { .. },
-                        ..
-                    }
-                }
-            );
             let handler = self.clone();
             Ok(self.jobs.start("hl202", move || {
                 let result =
                     crate::controller::hl202::control(&input, &handler.engine, &handler.services);
                 // Validate the final payload before publishing it into the job store.
-                let result = if report {
-                    normalize::<HlReportReply>(result)
-                } else if exec {
-                    normalize::<HlExecReply>(result)
-                } else {
-                    normalize::<HlAccountReply>(result)
-                };
+                let result = normalize_hl_result(&query, result);
                 result.unwrap_or_else(|_| fttr_jobs::error("Invalid HL202 result contract"))
             }))
         }
         #[cfg(not(feature = "device-hl202"))]
         {
-            let _ = (query, background);
+            let _ = query;
             Err(4)
         }
     }
     fn hl202_list(&self, _: EmptyRequest) -> Result<HlListReply, i32> {
-        response(self.hl_query(HlQuery::List, false)?)
+        response(self.hl_query(HlQuery::List)?)
     }
     fn hl202_report(&self, request: HlReportRequest) -> Result<JobStartReply, i32> {
         let query = match request.target {
             HlTarget::Optical(target) => HlQuery::Report { target },
             HlTarget::Source(target) => HlQuery::SourceReport { target },
         };
-        response(self.hl_query(query, true)?)
+        response(self.hl_query(query)?)
     }
     fn hl202_accounts_start(&self, request: HlAccountsRequest) -> Result<JobStartReply, i32> {
         self.hl_run(request.target, HlAction::AccountsRead)
@@ -238,16 +221,13 @@ impl Handlers {
         let HlTarget::Optical(target) = selection else {
             return Err(2);
         };
-        response(self.hl_query(
-            HlQuery::Run {
-                request: HlCommandRequest {
-                    schema_version: 1,
-                    target,
-                    action,
-                },
+        response(self.hl_query(HlQuery::Run {
+            request: HlCommandRequest {
+                schema_version: 1,
+                target,
+                action,
             },
-            true,
-        )?)
+        })?)
     }
     fn get_calibration(&self, _: EmptyRequest) -> Result<CalibrationInfoReply, i32> {
         Ok(match super::calibration::get() {
@@ -421,6 +401,23 @@ pub(super) fn methods(
 
 fn response<R: DeserializeOwned>(value: serde_json::Value) -> Result<R, i32> {
     serde_json::from_value(value).map_err(|_| 9)
+}
+
+#[cfg(feature = "device-hl202")]
+fn normalize_hl_result(
+    query: &HlQuery,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, i32> {
+    match query {
+        HlQuery::List => normalize::<HlListReply>(value),
+        HlQuery::Report { .. } | HlQuery::SourceReport { .. } => normalize::<HlReportReply>(value),
+        HlQuery::Run { request } => match &request.action {
+            HlAction::Exec { .. } => normalize::<HlExecReply>(value),
+            HlAction::AccountsRead
+            | HlAction::AccountSetPassword { .. }
+            | HlAction::AccountSetActive { .. } => normalize::<HlAccountReply>(value),
+        },
+    }
 }
 
 #[cfg(feature = "device-hl202")]

@@ -96,6 +96,7 @@ impl CapabilityPages {
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct OpticalReply {
     #[cfg_attr(feature = "codegen", ts(type = "1"))]
+    #[serde(deserialize_with = "crate::results::version_one")]
     pub schema_version: u8,
     pub status: ReplyStatus,
     pub action: OpticalAction,

@@ -9,6 +9,25 @@ use serde_json::{json, Value};
 mod telemetry;
 
 #[test]
+fn success_envelope_versions_match_generated_literal_contracts() {
+    let mut optical = json!({
+        "schema_version": 1, "status": "success", "action": "optical_status",
+        "desired_enabled": null, "tx_enabled": null, "actor_state": "unknown",
+        "hardware_ready": false, "discovery_active": false, "cleanup_pending": false,
+        "error": null
+    });
+    assert!(serde_json::from_value::<OpticalReply>(optical.clone()).is_ok());
+    let mut list = json!({"schema_version": 1, "devices": [], "sources": []});
+    assert!(serde_json::from_value::<HlListReply>(list.clone()).is_ok());
+    for version in [0, 2, 255] {
+        optical["schema_version"] = json!(version);
+        list["schema_version"] = json!(version);
+        assert!(serde_json::from_value::<OpticalReply>(optical.clone()).is_err());
+        assert!(serde_json::from_value::<HlListReply>(list.clone()).is_err());
+    }
+}
+
+#[test]
 fn mib_producer_preserves_decoded_unknown_and_table_evidence() {
     let mut assembler = MibAssembler::new(2);
     assembler.push(MibRecord {
