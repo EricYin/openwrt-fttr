@@ -52,6 +52,34 @@ impl State {
     }
 }
 pub(super) type States = Arc<Mutex<BTreeMap<u8, State>>>;
+
+// Selection policy can change while an ONU remains registered (config reload).
+// Keep unsupported workers cancellable and re-evaluate without resetting PLOAM
+// or restarting healthy ONUs. No OMCI writes occur while waiting for permission.
+fn wait_for_adapter(
+    cancellation: &AtomicBool,
+    mut select: impl FnMut() -> crate::devices::Adapter,
+    mut unsupported: impl FnMut(),
+) -> Option<crate::devices::Adapter> {
+    while !cancellation.load(Ordering::Acquire) {
+        let adapter = select();
+        if cancellation.load(Ordering::Acquire) {
+            return None;
+        }
+        if adapter.capabilities().business {
+            return Some(adapter);
+        }
+        unsupported();
+        for _ in 0..10 {
+            if cancellation.load(Ordering::Acquire) {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    None
+}
+
 pub(super) struct Services {
     pub states: States,
     tokens: BTreeMap<u8, Arc<AtomicBool>>,
@@ -119,17 +147,23 @@ impl Services {
                 }
             };
             if token.load(Ordering::Acquire) { return; }
-            let serial = super::service::onu_serial(id);
-            let adapter = crate::devices::select_with_serial(&vendor, &identity, serial.as_deref());
             if let Some(state) = states.lock().unwrap().get_mut(&id).filter(|state| state.generation == generation) {
-                state.phase = adapter.status();
-                state.identity = Some(identity);
+                state.identity = Some(identity.clone());
                 state.identity_at = Some(std::time::Instant::now());
             }
-            if !adapter.capabilities().business {
-                println!("[!] ONU {id} generation={generation} vendor={vendor}: identity collected; business profile unsupported");
-                return;
-            }
+            let mut reported_unsupported = false;
+            let Some(adapter) = wait_for_adapter(&token, || {
+                let serial = super::service::onu_serial(id);
+                crate::devices::select_with_serial(&vendor, &identity, serial.as_deref())
+            }, || {
+                if let Some(state) = states.lock().unwrap().get_mut(&id).filter(|state| state.generation == generation) {
+                    state.phase = BusinessPhase::Unsupported;
+                }
+                if !reported_unsupported {
+                    println!("[!] ONU {id} generation={generation} vendor={vendor}: identity collected; business profile unsupported; waiting for adapter policy change");
+                    reported_unsupported = true;
+                }
+            }) else { return; };
             let set = |phase: BusinessPhase, error: Option<String>| {
                 if token.load(Ordering::Acquire) { return; }
                 if let Some(state) = states.lock().unwrap().get_mut(&id).filter(|state| state.generation == generation) {
@@ -208,6 +242,68 @@ pub(crate) fn onu_serial(id: u8) -> Option<String> {
 mod tests {
     use super::State;
     use crate::model::{BusinessPhase, BusinessStatus};
+
+    #[test]
+    fn unsupported_worker_observes_policy_change_without_reregistration() {
+        use crate::devices::Adapter;
+        use std::cell::Cell;
+        use std::sync::atomic::AtomicBool;
+
+        let cancellation = AtomicBool::new(false);
+        let allowed = Cell::new(false);
+        let selections = Cell::new(0);
+        let adapter = super::wait_for_adapter(
+            &cancellation,
+            || {
+                selections.set(selections.get() + 1);
+                if allowed.get() {
+                    Adapter::GenericBridge
+                } else {
+                    Adapter::Unavailable
+                }
+            },
+            || allowed.set(true), // Reload enables the previously denied bridge.
+        );
+        assert_eq!(adapter, Some(Adapter::GenericBridge));
+        assert_eq!(selections.get(), 2);
+    }
+
+    #[test]
+    fn unsupported_worker_cancellation_prevents_later_configuration() {
+        use crate::devices::Adapter;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cancellation = AtomicBool::new(false);
+        assert_eq!(
+            super::wait_for_adapter(
+                &cancellation,
+                || Adapter::Unavailable,
+                || cancellation.store(true, Ordering::Release),
+            ),
+            None
+        );
+        assert_eq!(
+            super::wait_for_adapter(
+                &cancellation,
+                || panic!("a stopped registration must not select an adapter"),
+                || unreachable!(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn supported_worker_does_not_wait_for_policy_change() {
+        use crate::devices::Adapter;
+        assert_eq!(
+            super::wait_for_adapter(
+                &std::sync::atomic::AtomicBool::new(false),
+                || Adapter::GenericBridge,
+                || panic!("healthy devices must not enter unsupported state"),
+            ),
+            Some(Adapter::GenericBridge)
+        );
+    }
 
     #[test]
     fn business_status_tracks_management_and_carrier_readiness() {
