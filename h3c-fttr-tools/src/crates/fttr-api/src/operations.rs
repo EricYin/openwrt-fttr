@@ -235,6 +235,9 @@ pub enum HlListReply {
 pub struct NpuSetRequest {
     pub enabled: bool,
     pub bridge: String,
+    pub wan_upstream: bool,
+    pub wan_downstream: bool,
+    pub onu_bridge: bool,
 }
 
 #[derive(Debug, Deserialize)]

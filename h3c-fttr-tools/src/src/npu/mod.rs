@@ -1,4 +1,4 @@
-//! fttrd NPU Bridge Offload control-plane & hardware diagnostics service.
+//! FTTR bridge and routed offload control-plane and hardware diagnostics.
 //!
 //! Submodules:
 //! - `command`: Bounded sync/async process execution without shell or leaking child processes.
@@ -27,15 +27,25 @@ pub fn status() -> NpuStatus {
         Path::new("/sys/module/h3c_fmcs/parameters"),
     );
 
-    // Inspect the real named flowtable; admission is not proof that hooks still exist.
+    // Inspect the selected mode's real flowtable, independently of its mask.
+    let routed = status.wan_upstream || status.wan_downstream;
+    let (family, name) = if routed {
+        ("inet", "ft")
+    } else {
+        ("bridge", "fb")
+    };
     let hooks = (|| -> io::Result<bool> {
         let json = command::run_sync(
             "nft",
-            &["-j", "list", "flowtable", "bridge", "fw4", "fb"],
+            &["-j", "list", "flowtable", family, "fw4", name],
             Duration::from_secs(2),
         )?;
         let table: serde_json::Value = serde_json::from_str(&json).map_err(io::Error::other)?;
-        if !status.mask_valid {
+        if !(if routed {
+            status.routed_mask_valid
+        } else {
+            status.mask_valid
+        }) {
             return Err(io::Error::other("admitted port mask unavailable"));
         }
         let ports = status
@@ -54,12 +64,16 @@ pub fn status() -> NpuStatus {
         } else {
             command::run_sync(
                 "nft",
-                &["list", "flowtable", "bridge", "fw4", "fb"],
+                &["list", "flowtable", family, "fw4", name],
                 Duration::from_secs(2),
             )?
         };
 
-        Ok(hooks_ready(&table, &ports, &text))
+        Ok(if routed {
+            reconciler::routed_hooks_ready(&table, &text)
+        } else {
+            hooks_ready(&table, &ports, &text)
+        })
     })();
 
     match hooks {

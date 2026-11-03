@@ -150,7 +150,7 @@ fn handle_offload(args: &[String]) {
                 .position(|a| a == "--bridge")
                 .map(|i| args.get(i + 1).map(String::as_str).unwrap_or(""));
             #[cfg(feature = "npu")]
-            let result = h3c_fttr_tools::npu::settings::set(enabled, bridge);
+            let result = h3c_fttr_tools::npu::settings::set(enabled, bridge, None, None, None);
             #[cfg(not(feature = "npu"))]
             let result: std::io::Result<()> = Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,

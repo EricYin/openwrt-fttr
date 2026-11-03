@@ -47,3 +47,20 @@ fn calibration_final_payload_keeps_business_failure_and_omits_absent_fields() {
         serde_json::from_value::<CalibrationApplied>(json!({"error":"worker failure"})).is_err()
     );
 }
+
+#[test]
+fn npu_policy_requires_all_direction_flags_and_preserves_false() {
+    let value = json!({"enabled":false,"bridge":"br-lan","wan_upstream":false,"wan_downstream":false,"onu_bridge":false});
+    let request: NpuSetRequest = serde_json::from_value(value.clone()).unwrap();
+    assert!(
+        !request.enabled && !request.wan_upstream && !request.wan_downstream && !request.onu_bridge
+    );
+    for field in ["wan_upstream", "wan_downstream", "onu_bridge"] {
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<NpuSetRequest>(missing).is_err());
+        let mut invalid = value.clone();
+        invalid[field] = json!("0");
+        assert!(serde_json::from_value::<NpuSetRequest>(invalid).is_err());
+    }
+}

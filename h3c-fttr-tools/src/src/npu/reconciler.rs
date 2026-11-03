@@ -292,6 +292,11 @@ impl Admission {
         }
         if text(path)? != mask.to_string() {
             fs::write(path, format!("{mask}\n"))?;
+            if text(path)? != mask.to_string() {
+                return Err(io::Error::other(
+                    "NPU direction admission readback mismatch",
+                ));
+            }
             eprintln!("[*] NPU direction admission mask={mask}");
         }
         Ok(())
@@ -640,6 +645,27 @@ mod tests {
             &pair("").ports,
             &text.replace("flags offload", "counter")
         ));
+    }
+
+    #[test]
+    fn routed_hooks_require_the_transport_and_the_named_inet_hardware_table() {
+        let mut table = serde_json::json!({"nftables": [{"flowtable": {
+            "family": "inet", "table": "fw4", "name": "ft", "hook": "ingress",
+            "flags": ["offload"], "dev": ["fttr0", "lan1"]
+        }}]});
+        assert!(routed_hooks_ready(&table, ""));
+        table["nftables"][0]["flowtable"]["dev"] = serde_json::json!(["fttr1", "lan1"]);
+        assert!(!routed_hooks_ready(&table, ""));
+        table["nftables"][0]["flowtable"]["dev"] = serde_json::json!(["fttr0", "lan1"]);
+        let text = "table inet fw4 {\n flowtable ft {\n flags offload\n counter\n }\n}";
+        table["nftables"][0]["flowtable"]["flags"] = serde_json::json!([]);
+        assert!(!routed_hooks_ready(&table, text));
+        table["nftables"][0]["flowtable"]
+            .as_object_mut()
+            .unwrap()
+            .remove("flags");
+        assert!(routed_hooks_ready(&table, text));
+        assert!(!routed_hooks_ready(&table, &text.replace("inet", "bridge")));
     }
 
     #[test]

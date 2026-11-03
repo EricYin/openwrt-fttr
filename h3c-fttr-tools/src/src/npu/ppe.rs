@@ -120,11 +120,27 @@ pub fn status_from(
             .as_millis() as u64,
         bridge: "br-lan".into(),
         bridge_offload_enabled: true,
+        onu_bridge: true,
         ..Default::default()
     };
 
     if let Ok(config) = fs::read_to_string(config_path) {
         status.config_valid = true;
+        for (option, flag) in [
+            ("wan_upstream", &mut status.wan_upstream),
+            ("wan_downstream", &mut status.wan_downstream),
+            ("onu_bridge", &mut status.onu_bridge),
+        ] {
+            if let Some(value) = parse_uci_option(&config, "offload", option) {
+                *flag = value == "1";
+                if value != "0" && value != "1" {
+                    status.config_valid = false;
+                    status
+                        .errors
+                        .push(format!("offload.{option}: expected 0 or 1"));
+                }
+            }
+        }
         if let Some(val) = parse_uci_option(&config, "offload", "enabled") {
             status.bridge_offload_enabled = val == "1";
             if val != "0" && val != "1" {
@@ -168,11 +184,6 @@ pub fn status_from(
         if let Ok(mask) = val.trim().parse::<u16>() {
             status.bridge_offload_mask = mask;
             status.mask_valid = true;
-            for i in 0..16 {
-                if (mask & (1 << i)) != 0 {
-                    status.active_ports.push(format!("fttr{}", i + 1));
-                }
-            }
         }
     }
     if !status.mask_valid {
@@ -191,6 +202,18 @@ pub fn status_from(
         status
             .errors
             .push("routed_offload_mask: read or parse failed".into());
+    }
+    let (mask, valid) = if status.wan_upstream || status.wan_downstream {
+        (status.routed_offload_mask, status.routed_mask_valid)
+    } else {
+        (status.bridge_offload_mask, status.mask_valid)
+    };
+    if valid {
+        for i in 0..16 {
+            if mask & (1 << i) != 0 {
+                status.active_ports.push(format!("fttr{}", i + 1));
+            }
+        }
     }
 
     if let Ok(val) = fs::read_to_string(module_params_path.join("bridge_offload_debug")) {
@@ -364,6 +387,7 @@ mod tests {
         assert_eq!(s.bound_entries, 2);
         assert_eq!(s.total_packets, 30);
         assert_eq!(s.total_bytes, 3000);
+        assert!(!s.wan_upstream && !s.wan_downstream && s.onu_bridge);
         assert_eq!(s.bound_flows.len(), 2);
         assert!(
             s.config_valid
@@ -386,12 +410,22 @@ mod tests {
 
         fs::write(
             &cfg_path,
-            "config offload 'offload'\n\toption enabled '0'\n\toption bridge 'br-fttr'\n",
+            "config offload 'offload'\n\toption enabled '0'\n\toption bridge 'br-fttr'\n\toption wan_upstream '1'\n\toption wan_downstream '1'\n\toption onu_bridge '0'\n",
         )
         .unwrap();
+        fs::write(mod_dir.join("routed_offload_mask"), "9\n").unwrap();
         let s2 = status_from(&cfg_path, &ppe_dir, &mod_dir);
         assert!(!s2.bridge_offload_enabled);
         assert_eq!(s2.bridge, "br-fttr");
+        assert!(s2.wan_upstream && s2.wan_downstream && !s2.onu_bridge);
+        assert_eq!(s2.active_ports, vec!["fttr1", "fttr4"]);
+        fs::write(&cfg_path, "fttr.offload.wan_upstream='invalid'\n").unwrap();
+        let invalid = status_from(&cfg_path, &ppe_dir, &mod_dir);
+        assert!(!invalid.config_valid);
+        assert!(invalid
+            .errors
+            .iter()
+            .any(|error| error.contains("offload.wan_upstream")));
 
         let _ = fs::remove_dir_all(&dir);
     }

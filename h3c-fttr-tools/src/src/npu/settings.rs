@@ -1,7 +1,21 @@
 //! Persisted offload settings shared by the CLI and native controller.
 use std::{io, path::Path};
 
-pub fn set(enabled: bool, bridge: Option<&str>) -> io::Result<()> {
+pub fn set(
+    enabled: bool,
+    bridge: Option<&str>,
+    wan_upstream: Option<bool>,
+    wan_downstream: Option<bool>,
+    onu_bridge: Option<bool>,
+) -> io::Result<()> {
+    if enabled
+        && onu_bridge == Some(true)
+        && (wan_upstream == Some(true) || wan_downstream == Some(true))
+    {
+        return Err(io::Error::other(
+            "WAN and ONU bridge offload currently require exclusive port modes; disable onu_bridge for WAN",
+        ));
+    }
     if let Some(bridge) = bridge {
         if bridge.is_empty()
             || bridge.len() > 15
@@ -32,15 +46,66 @@ pub fn set(enabled: bool, bridge: Option<&str>) -> io::Result<()> {
         uci.set("fttr", "offload", "bridge", bridge)
             .map_err(io::Error::other)?;
     }
-    uci.commit("fttr").map_err(io::Error::other)?;
-    if !enabled {
-        let mask = "/sys/module/h3c_fmcs/parameters/bridge_offload_mask";
-        std::fs::write(mask, "0\n")?;
-        if std::fs::read_to_string(mask)?.trim() != "0" {
-            return Err(io::Error::other(
-                "Saved, but driver withdrawal is not confirmed",
-            ));
+    for (option, value) in [
+        ("wan_upstream", wan_upstream),
+        ("wan_downstream", wan_downstream),
+        ("onu_bridge", onu_bridge),
+    ] {
+        if let Some(value) = value {
+            uci.set("fttr", "offload", option, if value { "1" } else { "0" })
+                .map_err(io::Error::other)?;
         }
     }
+    uci.commit("fttr").map_err(io::Error::other)?;
+    if !enabled {
+        withdraw(Path::new(super::reconciler::MASK))?;
+    }
     Ok(())
+}
+
+fn withdraw(mask: &Path) -> io::Result<()> {
+    let mut admission = super::reconciler::Admission::new(mask);
+    admission.withdraw()?;
+    if admission.current()? != 0 || admission.current_mode(true)? != 0 {
+        return Err(io::Error::other(
+            "Saved, but driver withdrawal is not confirmed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conflicting_port_modes_are_rejected_before_uci_changes() {
+        for (upstream, downstream) in [(true, false), (false, true), (true, true)] {
+            let error = set(
+                true,
+                Some("br-lan"),
+                Some(upstream),
+                Some(downstream),
+                Some(true),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("exclusive port modes"));
+        }
+    }
+
+    #[test]
+    fn disabling_withdraws_routed_as_well_as_bridge_admission() {
+        let dir = std::env::temp_dir().join(format!("fttr-npu-disable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bridge = dir.join("bridge_offload_mask");
+        let routed = dir.join("routed_offload_mask");
+        std::fs::write(&bridge, "0\n").unwrap();
+        std::fs::write(&routed, "11\n").unwrap();
+        withdraw(&bridge).unwrap();
+        assert_eq!(std::fs::read_to_string(&routed).unwrap().trim(), "0");
+        std::fs::write(&bridge, "11\n").unwrap();
+        withdraw(&bridge).unwrap();
+        assert_eq!(std::fs::read_to_string(&bridge).unwrap().trim(), "0");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

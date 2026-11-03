@@ -212,7 +212,7 @@ macro_rules! fttr_methods {
             CONFIG_RELOAD, config_reload, configReload, EmptyRequest, ConfigReloadReply, Write, Always, [];
             RESTART_SERVICE, restart_service, restartService, EmptyRequest, RestartReply, Write, Always, [];
             SYNC, sync, sync, SyncRequest, SyncReply, Write, Always, [action, target, management, item];
-            NPU_SET, npu_set, npuSet, NpuSetRequest, NpuSetReply, Write, Npu, [enabled, bridge];
+            NPU_SET, npu_set, npuSet, NpuSetRequest, NpuSetReply, Write, Npu, [enabled, bridge, wan_upstream, wan_downstream, onu_bridge];
             MIB_START, mib_start, mibStart, MibStartRequest, JobStartReply, Read, Always, [onu_id, optical_sn, tables];
             MIB_RESULT, mib_result, mibResult, JobRequest, JobChunkReply, Read, Always, [job, chunk];
             JOB_RELEASE, job_release, jobRelease, JobReleaseRequest, JobReleaseReply, Read, Always, [job];

@@ -57,7 +57,10 @@ impl Handlers {
             Ok(
                 match crate::npu::settings::set(
                     request.enabled,
-                    (!request.bridge.is_empty()).then_some(request.bridge.as_str()),
+                    Some(request.bridge.as_str()),
+                    Some(request.wan_upstream),
+                    Some(request.wan_downstream),
+                    Some(request.onu_bridge),
                 ) {
                     Ok(()) => NpuSetReply::Success {
                         enabled: request.enabled,
