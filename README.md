@@ -50,6 +50,38 @@ cargo check --locked --all-targets --no-default-features --features all-devices,
 cargo check --locked --all-targets --no-default-features --features all-devices,acs
 ```
 
+### Workspace 与诊断工具
+
+`h3c-fttr-tools/src/Cargo.toml` 是 workspace 根，所有内部 crate 共用根目录
+`Cargo.lock`。普通 `cargo build` 只构建主包，默认二进制为 `fttrd` 和
+`fttrctl`；OpenWrt 打包也显式限定这两个入口。完整主机测试在该目录执行：
+
+```sh
+cargo test --locked --workspace --features fttr-api/codegen
+cargo test --locked --lib --no-default-features --features all-devices,acs,mqtt,npu
+cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt,npu,diagnostics
+```
+
+`fttr-platform-probe`、`fttr-omci-mib`、`fttr-omci-probe`、`fttr-omci-service`、
+`fttr-ranging` 需显式启用 `diagnostics`；`fttr-k155-service` 还需 `device-hwtc`，
+`fttr-star-observe` 还需 `device-star`。例如：
+
+```sh
+cargo build --locked --features diagnostics,device-star --bin fttr-star-observe
+fttr-star-observe 02:00:00:00:00:01
+```
+
+STAR 观察工具要求传入源 MAC；不再内置现场设备地址。独立 ranging 工具仍需先停止
+`fttrd`，OMCI MIB 入口复用控制器 inventory 核心。CLI 的受支持命令以
+`fttrctl help` 为准，手动 `discover/register/auth/sync-wifi/provision` 入口已移除。
+
+正常保留配置的 sysupgrade 会同时备份 `/lib/firmware/modified_UX3326.bin`
+校准文件（若存在），保留项由 `/lib/upgrade/keep.d/fttr` 声明。
+
+持久化状态按内容去重：管理网络 journal 在成功提交后缓存快照，相同状态不再
+写盘；共用原子写入层也避免重写相同文件。事务状态变更仍同步落盘，失败重试
+保留文件和目录同步屏障，以保证断电恢复。
+
 
 ## Windows Rust 交叉编译
 

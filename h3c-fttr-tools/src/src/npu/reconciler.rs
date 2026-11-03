@@ -26,28 +26,69 @@ pub(crate) fn text(path: impl AsRef<Path>) -> io::Result<String> {
     fs::read_to_string(path).map(|value| value.trim().to_owned())
 }
 
-pub(crate) fn option<'a>(config: &'a str, key: &str) -> Option<&'a str> {
-    config.lines().find_map(|line| {
-        let (name, value) = line.split_once('=')?;
-        (name == key).then(|| value.trim_matches('\''))
-    })
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Policy {
+    pub bridge: String,
+    pub enabled: bool,
+    pub wan_upstream: bool,
+    pub wan_downstream: bool,
+    pub onu_bridge: bool,
+    pub firewall_offload: bool,
 }
 
-/// Explicit direction policy; missing WAN options stay experimental/disabled.
-pub fn directions(config: &str) -> u8 {
-    if option(config, "fttr.offload.enabled").unwrap_or("1") != "1" {
-        return 0;
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            bridge: "br-lan".into(),
+            enabled: true,
+            wan_upstream: false,
+            wan_downstream: false,
+            onu_bridge: true,
+            firewall_offload: false,
+        }
     }
-    u8::from(option(config, "fttr.offload.wan_upstream") == Some("1"))
-        | (u8::from(option(config, "fttr.offload.wan_downstream") == Some("1")) << 1)
-        | (u8::from(option(config, "fttr.offload.onu_bridge").unwrap_or("1") == "1") << 2)
 }
 
-pub fn topology(config: &str, firewall: &str, net: &Path, mask: &Path) -> io::Result<Topology> {
-    let bridge = option(config, "fttr.offload.bridge").unwrap_or("br-lan");
+impl Policy {
+    /// Missing WAN options stay experimental/disabled; invalid flags stay disabled.
+    pub fn directions(&self) -> u8 {
+        if !self.enabled {
+            return 0;
+        }
+        u8::from(self.wan_upstream)
+            | (u8::from(self.wan_downstream) << 1)
+            | (u8::from(self.onu_bridge) << 2)
+    }
+
+    fn load() -> io::Result<Self> {
+        let mut uci = openwrt_uci::Uci::new().map_err(io::Error::other)?;
+        let mut get = |package, section, key| {
+            uci.get(package, section, key)
+                .map_err(|e| io::Error::other(format!("{package}.{section}.{key} read error: {e}")))
+        };
+        Ok(Self {
+            bridge: get("fttr", "offload", "bridge")?.unwrap_or_else(|| "br-lan".into()),
+            enabled: get("fttr", "offload", "enabled")?.as_deref().unwrap_or("1") == "1",
+            wan_upstream: get("fttr", "offload", "wan_upstream")?.as_deref() == Some("1"),
+            wan_downstream: get("fttr", "offload", "wan_downstream")?.as_deref() == Some("1"),
+            onu_bridge: get("fttr", "offload", "onu_bridge")?
+                .as_deref()
+                .unwrap_or("1")
+                == "1",
+            firewall_offload: {
+                let software = get("firewall", "@defaults[0]", "flow_offloading")?;
+                let hardware = get("firewall", "@defaults[0]", "flow_offloading_hw")?;
+                software.as_deref() == Some("1") && hardware.as_deref() == Some("1")
+            },
+        })
+    }
+}
+
+pub fn topology(policy: &Policy, net: &Path, mask: &Path) -> io::Result<Topology> {
+    let bridge = policy.bridge.as_str();
     let mut topology = Topology {
         bridge: bridge.into(),
-        routed: directions(config) & 3 != 0,
+        routed: policy.directions() & 3 != 0,
         mask: 0,
         ports: Vec::new(),
     };
@@ -56,23 +97,15 @@ pub fn topology(config: &str, firewall: &str, net: &Path, mask: &Path) -> io::Re
         && bridge
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
-    if topology.routed && directions(config) & 4 != 0 {
+    if topology.routed && policy.directions() & 4 != 0 {
         return Err(io::Error::other(
             "WAN and ONU bridge offload currently require exclusive port modes; set onu_bridge=0 for WAN",
         ));
     }
-    if !valid_bridge || directions(config) == 0 {
+    if !valid_bridge || policy.directions() == 0 {
         return Ok(topology);
     }
-    // uci show uses the actual section name for both named and anonymous defaults.
-    let defaults = firewall
-        .lines()
-        .find_map(|line| line.strip_suffix("=defaults"));
-    let policy = defaults.is_some_and(|section| {
-        option(firewall, &format!("{section}.flow_offloading")) == Some("1")
-            && option(firewall, &format!("{section}.flow_offloading_hw")) == Some("1")
-    });
-    if !policy
+    if !policy.firewall_offload
         || !if topology.routed {
             mask.with_file_name("routed_offload_mask").exists()
         } else {
@@ -119,8 +152,7 @@ pub struct Reconciler {
 }
 
 struct PolicyCache {
-    config: String,
-    firewall: String,
+    policy: Policy,
     files: Vec<Option<Vec<u8>>>,
     verified: Instant,
 }
@@ -335,7 +367,7 @@ pub async fn reconcile(
     let routed = state
         .cache
         .as_ref()
-        .is_some_and(|cache| directions(&cache.config) & 3 != 0);
+        .is_some_and(|cache| cache.policy.directions() & 3 != 0);
     let current_mask = admission.lock().unwrap().current_mode(routed)?;
     let files = policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))?;
 
@@ -343,14 +375,14 @@ pub async fn reconcile(
     // verify the physical link status before spawning any external processes.
     if let Some(cache) = &state.cache {
         let policy = if cache.files == files {
-            directions(&cache.config)
+            cache.policy.directions()
         } else {
             0
         };
         admission.lock().unwrap().set_directions(policy)?;
         // Reuse the complete topology predicate, including new ports, master,
         // forwarding state and identity. Missing sysfs data is never healthy.
-        let live = topology(&cache.config, &cache.firewall, net, mask_path)?;
+        let live = topology(&cache.policy, net, mask_path)?;
         if state.can_skip(&live, current_mask, &files, Instant::now()) {
             return Ok(POLL_STEADY);
         }
@@ -365,93 +397,18 @@ pub async fn reconcile(
     }
 
     // Slow-path: Inspect configuration and topology via native UCI
-    let (config, firewall) = {
-        let mut uci = openwrt_uci::Uci::new().map_err(|e| io::Error::other(e.to_string()))?;
-        let bridge = match uci.get("fttr", "offload", "bridge") {
-            Ok(Some(v)) => v,
-            Ok(None) => "br-lan".to_string(),
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "fttr.offload.bridge read error: {e}"
-                )))
-            }
-        };
-        let offload_enabled = match uci.get("fttr", "offload", "enabled") {
-            Ok(Some(v)) => v,
-            Ok(None) => "1".to_string(),
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "fttr.offload.enabled read error: {e}"
-                )))
-            }
-        };
-        let wan_upstream = match uci.get("fttr", "offload", "wan_upstream") {
-            Ok(Some(v)) => v,
-            Ok(None) => "0".to_string(),
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "fttr.offload.wan_upstream read error: {e}"
-                )))
-            }
-        };
-        let wan_downstream = match uci.get("fttr", "offload", "wan_downstream") {
-            Ok(Some(v)) => v,
-            Ok(None) => "0".to_string(),
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "fttr.offload.wan_downstream read error: {e}"
-                )))
-            }
-        };
-        let onu_bridge = match uci.get("fttr", "offload", "onu_bridge") {
-            Ok(Some(v)) => v,
-            Ok(None) => "1".to_string(),
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "fttr.offload.onu_bridge read error: {e}"
-                )))
-            }
-        };
-        let flow_offloading = match uci.get("firewall", "@defaults[0]", "flow_offloading") {
-            Ok(opt) => opt,
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "firewall.flow_offloading read error: {e}"
-                )))
-            }
-        };
-        let flow_offloading_hw = match uci.get("firewall", "@defaults[0]", "flow_offloading_hw") {
-            Ok(opt) => opt,
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "firewall.flow_offloading_hw read error: {e}"
-                )))
-            }
-        };
-        let hw_offload =
-            flow_offloading.as_deref() == Some("1") && flow_offloading_hw.as_deref() == Some("1");
-
-        let config = format!(
-            "fttr.offload.bridge={bridge}\nfttr.offload.enabled={offload_enabled}\nfttr.offload.wan_upstream={wan_upstream}\nfttr.offload.wan_downstream={wan_downstream}\nfttr.offload.onu_bridge={onu_bridge}\n"
-        );
-        let firewall = if hw_offload {
-            "firewall.@defaults[0]=defaults\nfirewall.@defaults[0].flow_offloading='1'\nfirewall.@defaults[0].flow_offloading_hw='1'\n".to_string()
-        } else {
-            "firewall.@defaults[0]=defaults\n".to_string()
-        };
-        (config, firewall)
-    };
+    let policy = Policy::load()?;
     if policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))? != files {
         admission.lock().unwrap().withdraw()?;
         *state = Reconciler::default();
         return Ok(POLL_FAST);
     }
-    let topology = topology(&config, &firewall, net, mask_path)?;
+    let topology = topology(&policy, net, mask_path)?;
     {
         let mut admission = admission.lock().unwrap();
         // Drain the previous mode before enabling the new one.
         admission.set_mode(!topology.routed, 0)?;
-        admission.set_directions(directions(&config))?;
+        admission.set_directions(policy.directions())?;
     }
     // Timestamp is refreshed only after hooks pass, never by a cheap probe.
     let verified = state
@@ -460,8 +417,7 @@ pub async fn reconcile(
         .map(|cache| cache.verified)
         .unwrap_or_else(Instant::now);
     state.cache = Some(PolicyCache {
-        config,
-        firewall,
+        policy,
         files,
         verified,
     });
@@ -539,7 +495,7 @@ pub async fn reconcile(
     // during hook inspection (including a kernel withdrawal with the same mask).
     let cache = state.cache.as_ref().unwrap();
     if policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))? != cache.files
-        || self::topology(&cache.config, &cache.firewall, net, mask_path)? != *topology
+        || self::topology(&cache.policy, net, mask_path)? != *topology
         || admission.lock().unwrap().current_mode(topology.routed)? != current
     {
         admission.lock().unwrap().withdraw()?;
@@ -560,6 +516,20 @@ pub async fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_policy_defaults_disable_wan_and_conflicting_modes_are_rejected() {
+        let mut policy = Policy::default();
+        assert_eq!(policy.directions(), 4);
+        policy.wan_upstream = true;
+        assert!(topology(&policy, Path::new("/unused"), Path::new("/unused")).is_err());
+        policy.onu_bridge = false;
+        assert_eq!(policy.directions(), 1);
+        policy.wan_downstream = true;
+        assert_eq!(policy.directions(), 3);
+        policy.enabled = false;
+        assert_eq!(policy.directions(), 0);
+    }
 
     fn pair(identity: &str) -> Topology {
         Topology {
@@ -602,8 +572,7 @@ mod tests {
             last: Some(pair("old")),
             armed: true,
             cache: Some(PolicyCache {
-                config: String::new(),
-                firewall: String::new(),
+                policy: Policy::default(),
                 files: files.clone(),
                 verified: now,
             }),
@@ -704,43 +673,44 @@ mod tests {
             let _ = fs::write(root.join(port).join("master"), "../br-lan");
         }
         fs::write(&mask, "0").unwrap();
-        let firewall = "firewall.@defaults[0]=defaults\nfirewall.@defaults[0].flow_offloading='1'\nfirewall.@defaults[0].flow_offloading_hw='1'\n";
-        let discover =
-            |config: &str, policy: &str| topology(config, policy, &root, &mask).unwrap().mask;
-        assert_eq!(discover("", firewall), 3);
-        let before = topology("", firewall, &root, &mask).unwrap();
+        let policy = Policy {
+            firewall_offload: true,
+            ..Default::default()
+        };
+        let discover = |policy: &Policy| topology(policy, &root, &mask).unwrap().mask;
+        assert_eq!(discover(&policy), 3);
+        let before = topology(&policy, &root, &mask).unwrap();
         fs::write(root.join("fttr1/mtu"), "1400").unwrap();
-        let after = topology("", firewall, &root, &mask).unwrap();
+        let after = topology(&policy, &root, &mask).unwrap();
         assert_eq!(before.mask, after.mask);
         assert_ne!(before, after);
         fs::write(root.join("fttr1/mtu"), "1500").unwrap();
-        assert_eq!(discover("fttr.offload.enabled='0'", firewall), 0);
-        assert_eq!(discover("fttr.offload.bridge='../br-lan'", firewall), 0);
         assert_eq!(
-            discover(
-                "",
-                "firewall.main=defaults\nfirewall.main.flow_offloading='1'"
-            ),
+            discover(&Policy {
+                enabled: false,
+                ..policy.clone()
+            }),
             0
         );
         assert_eq!(
-            discover(
-                "",
-                &firewall.replace("flow_offloading_hw='1'", "flow_offloading_hw='0'")
-            ),
+            discover(&Policy {
+                bridge: "../br-lan".into(),
+                ..policy.clone()
+            }),
             0
         );
+        assert_eq!(discover(&Policy::default()), 0);
         fs::write(root.join("br-lan/bridge/vlan_filtering"), "1").unwrap();
-        assert_eq!(discover("", firewall), 0);
+        assert_eq!(discover(&policy), 0);
         fs::write(root.join("br-lan/bridge/vlan_filtering"), "0").unwrap();
         fs::write(root.join("fttr2/brport/state"), "2").unwrap();
-        assert_eq!(discover("", firewall), 0);
+        assert_eq!(discover(&policy), 0);
         fs::write(root.join("fttr2/brport/state"), "3").unwrap();
         fs::remove_file(root.join("br-lan/bridge/vlan_filtering")).unwrap();
-        assert_eq!(discover("", firewall), 0);
+        assert_eq!(discover(&policy), 0);
         fs::write(root.join("br-lan/bridge/vlan_filtering"), "0").unwrap();
         fs::write(root.join("fttr0/carrier"), "0").unwrap();
-        assert_eq!(discover("", firewall), 0);
+        assert_eq!(discover(&policy), 0);
         let _ = fs::remove_dir_all(root);
     }
 }

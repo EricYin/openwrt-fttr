@@ -6,12 +6,35 @@ use std::{
 };
 
 fn main() -> io::Result<()> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: fttr-star-observe SOURCE_MAC (90-second passive capture)",
+        ));
+    }
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected six colon-separated MAC octets",
+        )
+    };
+    let octets = args[0]
+        .split(':')
+        .map(|octet| {
+            if octet.len() != 2 || !octet.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(invalid());
+            }
+            u8::from_str_radix(octet, 16).map_err(|_| invalid())
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let expected: [u8; 6] = octets.try_into().map_err(|_| invalid())?;
     let socket = PacketSocket::open("fttr0")?;
     let start = Instant::now();
     let mut buffer = [0u8; 4096];
     let mut counts = BTreeMap::new();
     let mut star = 0u64;
-    println!("PASSIVE duration=90s expected_source=ec:cf:70:ec:54:88 no_transmit=true");
+    println!("PASSIVE duration=90s source_filter=configured no_transmit=true");
     while start.elapsed() < Duration::from_secs(90) {
         let Some((bytes, kind, aux)) = socket.receive_into(&mut buffer)? else {
             std::thread::sleep(Duration::from_millis(5));
@@ -22,7 +45,7 @@ fn main() -> io::Result<()> {
         }
         let gem = aux.map(|tag| tag & 0xfff);
         *counts.entry(gem).or_insert(0u64) += 1;
-        if bytes[6..12] != [0xec, 0xcf, 0x70, 0xec, 0x54, 0x88] {
+        if bytes[6..12] != expected {
             continue;
         }
         star += 1;

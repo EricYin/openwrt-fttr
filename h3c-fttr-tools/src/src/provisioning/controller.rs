@@ -720,7 +720,7 @@ mod tests {
                 json!({"devices":{"child":{"product_class":model,"serial":"485754431234ABCD"}}});
             assert_eq!(
                 discovered_identity(&devices, "HWTC1234ABCD", "hwtc"),
-                Some("child".into())
+                cfg!(feature = "device-hwtc").then(|| "child".into())
             );
             assert_eq!(discovered_identity(&devices, "HWTC9999ABCD", "hwtc"), None);
         }

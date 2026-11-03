@@ -34,14 +34,10 @@ Commands:\n  \
   bosa-diag [--json]   Read calibrated UX3326 optical diagnostics (Temp, Vcc, Bias, TX)\n  \
   bosa-read <addr>     Directly read 8-bit BOSA UX3326 optical register\n  \
   bosa-write <a> <v>   Directly write 8-bit BOSA UX3326 optical register\n  \
-  discover             Trigger PLOAM discovery sequence on optical link\n  \
-  register <sn>        Register and activate sub-gateway by SN (e.g. H3CT1A2B3C4D)\n  \
-  auth [onu_id]        Send OMCI LOID authentication success to sub-gateway (default: 1)\n  \
-  sync-wifi            Push Wi-Fi SSID and credentials to sub-gateways via MQTT\n  \
-  provision <onu_id>   Trigger G.988 OMCI provisioning for specific ONU\n  \
-   exec [options] <mac> <command>  Execute, wait for combined output and exit status\n  \
-   cmd [options] <mac> <command>   Dispatch without waiting for device execution\n  \
-   broadcast [options] <command>  Broadcast dispatch, or --wait for per-device replies\n  \
+  hl202 <subcommand>   HL202 device reports, commands and accounts (hl202 help)\n  \
+  exec [options] <mac> <command>  Execute, wait for combined output and exit status\n  \
+  cmd [options] <mac> <command>   Dispatch without waiting for device execution\n  \
+  broadcast [options] <command>  Broadcast dispatch, or --wait for per-device replies\n  \
   help                 Show this help message"
     );
 }
@@ -853,46 +849,6 @@ fn main() {
             ) {
                 eprintln!("[-] MIB read failed: {error}");
                 exit(1);
-            }
-        }
-        "discover" => match ipc::send_ipc_command("DISCOVER") {
-            Ok(resp) => println!("{resp}"),
-            Err(e) => eprintln!("[-] Failed to communicate with fttrd: {e}"),
-        },
-        "register" => {
-            if args.len() < 3 {
-                eprintln!("Usage: fttrctl register <sn> (e.g. H3CT1A2B3C4D)");
-                exit(1);
-            }
-            let sn = &args[2];
-            let payload = format!("REGISTER {sn}");
-            match ipc::send_ipc_command(&payload) {
-                Ok(resp) => println!("{resp}"),
-                Err(e) => eprintln!("[-] Failed to communicate with fttrd: {e}"),
-            }
-        }
-        "auth" => {
-            let id = args.get(2).map(|s| s.as_str()).unwrap_or("1");
-            let payload = format!("AUTH {id}");
-            match ipc::send_ipc_command(&payload) {
-                Ok(resp) => println!("{resp}"),
-                Err(e) => eprintln!("[-] Failed to communicate with fttrd: {e}"),
-            }
-        }
-        "sync-wifi" => match ipc::send_ipc_command("SYNC_WIFI") {
-            Ok(resp) => println!("{resp}"),
-            Err(e) => eprintln!("[-] Failed to communicate with fttrd: {e}"),
-        },
-        "provision" => {
-            if args.len() < 3 {
-                eprintln!("Usage: fttrctl provision <onu_id>");
-                exit(1);
-            }
-            let id = &args[2];
-            let payload = format!("PROVISION {id}");
-            match ipc::send_ipc_command(&payload) {
-                Ok(resp) => println!("{resp}"),
-                Err(e) => eprintln!("[-] Failed to communicate with fttrd: {e}"),
             }
         }
         "exec" | "cmd" | "broadcast" => match handle_mqtt_command(&args[1..]) {

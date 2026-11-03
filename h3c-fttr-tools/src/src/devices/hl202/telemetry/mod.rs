@@ -1,9 +1,8 @@
 mod archive;
 mod decode;
-mod model;
 pub mod store;
 mod worker;
-pub use model::{Field, Member, Report};
+pub use fttr_api::{HlTelemetry as Report, HlTelemetryField as Field, HlTelemetryMember as Member};
 
 pub fn parse(input: &[u8]) -> std::io::Result<Report> {
     let (members, decompressed_bytes) = archive::read(input)?;

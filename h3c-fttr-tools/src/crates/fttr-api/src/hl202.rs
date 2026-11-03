@@ -18,7 +18,7 @@ pub struct HlSourceSelection {
     pub binding_generation: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub enum HlAction {
@@ -37,7 +37,7 @@ pub enum HlAction {
     },
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct HlCommandRequest {
@@ -46,7 +46,7 @@ pub struct HlCommandRequest {
     pub action: HlAction,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub enum HlQuery {

@@ -2,11 +2,16 @@
 use super::config::{self, Config, Section};
 use std::collections::{BTreeMap, BTreeSet};
 
-fn quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+fn emit(out: &mut Vec<(String, Section)>, kind: &str, id: &str, s: &Section) {
+    let mut section = s.clone();
+    section.kind = kind.into();
+    out.push((id.into(), section));
 }
-fn emit(out: &mut String, kind: &str, id: &str, s: &Section) {
-    out.push_str(&format!("config {} {}\n", quote(kind), quote(id)));
+
+// Stable, quoted encoding for business revisions only; never reparsed as input.
+fn canonical_section(out: &mut String, id: &str, s: &Section) {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    out.push_str(&format!("config {} {}\n", quote(&s.kind), quote(id)));
     for (key, values) in &s.options {
         for value in values {
             out.push_str(&format!(
@@ -41,77 +46,27 @@ pub fn compile(text: &str) -> Result<Config, String> {
     // Optical state belongs to the controller, not the expanded provisioning plan.
     // Share its validation so config check and optical startup accept the same input.
     crate::optical::parse_export(text).map_err(|error| error.to_string())?;
-    let mut all = Vec::<(String, Section)>::new();
-    for line in text.lines() {
-        let w = config::words(line)?;
-        if w.is_empty() || w[0].starts_with('#') {
-            continue;
-        }
-        match w[0].as_str() {
-            "package" => (),
-            "config" if w.len() == 2 || w.len() == 3 => {
-                let id = if w.len() == 3 {
-                    w[2].clone()
-                } else {
-                    format!("_anon_{}_{}", w[1], all.len())
-                };
-                if all.iter().any(|(existing_id, _)| existing_id == &id) {
-                    return Err("duplicate section".into());
-                }
-                if !matches!(
-                    w[1].as_str(),
-                    "optical"
-                        | "acs"
-                        | "provisioning"
-                        | "management"
-                        | "device"
-                        | "group"
-                        | "template"
-                        | "network"
-                        | "wifi"
-                        | "offload"
-                ) {
-                    return Err(format!("unsupported section: {}", w[1]));
-                }
-                all.push((
-                    id,
-                    Section {
-                        kind: w[1].clone(),
-                        ..Default::default()
-                    },
-                ));
-            }
-            "option" | "list" if w.len() == 3 => {
-                let s = &mut all.last_mut().ok_or("option without section")?.1;
-                if s.kind == "device"
-                    && w[1] == "onu_id"
-                    && (w[0] != "option" || s.options.contains_key("onu_id"))
-                {
-                    return Err("device onu_id requires one scalar option".into());
-                }
-                if s.kind == "management" && w[1] == "vlan" && w[0] != "list" {
-                    return Err(
-                        "management VLAN requires list vlan; scalar option vlan is unsupported"
-                            .into(),
-                    );
-                }
-                if w[0] == "option" {
-                    s.options.insert(w[1].clone(), vec![w[2].clone()]);
-                } else {
-                    s.options
-                        .entry(w[1].clone())
-                        .or_default()
-                        .push(w[2].clone());
-                }
-            }
-            _ => return Err("invalid configuration".into()),
-        }
-    }
+    let all = config::parse_sections(text)?;
     if all.iter().filter(|(_, s)| s.kind == "management").count() > 1 {
         return Err("only one management network allowed".into());
     }
     // Validate every template, including ones not assigned to a group yet.
     for (id, s) in &all {
+        if !matches!(
+            s.kind.as_str(),
+            "optical"
+                | "acs"
+                | "provisioning"
+                | "management"
+                | "device"
+                | "group"
+                | "template"
+                | "network"
+                | "wifi"
+                | "offload"
+        ) {
+            return Err(format!("unsupported section: {}", s.kind));
+        }
         let allowed: &[&str] = match s.kind.as_str() {
             "optical" => &["enabled"],
             "device" => &[
@@ -266,7 +221,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
             }
         }
     }
-    let mut expanded = String::new();
+    let mut expanded = Vec::new();
     let mut order = BTreeMap::<String, Vec<String>>::new();
     for (id, s) in all
         .iter()
@@ -401,7 +356,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
         network_ids.extend(bindings);
         order.insert(device.clone(), network_ids);
     }
-    let mut cfg = config::parse_expanded(&expanded)?;
+    let mut cfg = config::compile_sections(expanded)?;
     if let Some((_, s)) = all.iter().find(|(_, s)| s.kind == "management") {
         let acs = all.iter().find(|(_, s)| s.kind == "acs").map(|(_, s)| s);
         let mut desired = super::management_network::Desired::parse(s, acs)?;
@@ -474,7 +429,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
             if business.kind == "device" {
                 business.options.remove("onu_id");
             }
-            emit(&mut canonical, &s.kind, id, &business);
+            canonical_section(&mut canonical, id, &business);
         }
     }
     cfg.revision = format!(

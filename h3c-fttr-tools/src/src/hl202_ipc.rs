@@ -5,6 +5,26 @@ use std::time::Duration;
 pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 512 * 1024;
 
+/// Preserve the wire-size budget for typed callers without allocating a JSON body.
+pub fn check_request_size(value: &impl serde::Serialize) -> io::Result<()> {
+    struct Budget(usize);
+    impl Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self.0.checked_sub(bytes.len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "HL202 request exceeds the byte limit",
+                )
+            })?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Budget(MAX_REQUEST_BYTES), value).map_err(io::Error::other)
+}
+
 pub fn send(body: &str, timeout: Duration) -> io::Result<String> {
     exchange(UnixStream::connect(crate::ipc::SOCKET_PATH)?, body, timeout)
 }
@@ -62,6 +82,14 @@ mod tests {
     use super::*;
     use std::net::Shutdown;
     use std::thread;
+
+    #[test]
+    fn typed_request_budget_counts_json_escaping_and_accepts_exact_limit() {
+        assert!(check_request_size(&"a".repeat(MAX_REQUEST_BYTES - 2)).is_ok());
+        assert!(check_request_size(&"a".repeat(MAX_REQUEST_BYTES - 1)).is_err());
+        // The wire budget counts encoded bytes, not only the source string.
+        assert!(check_request_size(&"\n".repeat(MAX_REQUEST_BYTES / 2)).is_err());
+    }
 
     #[test]
     fn hl202_ipc_transports_multiline_script_as_json_without_interpretation() {

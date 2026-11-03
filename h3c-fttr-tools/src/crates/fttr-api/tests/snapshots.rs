@@ -5,9 +5,6 @@ use fttr_omci::{
 };
 use serde_json::{json, Value};
 
-#[path = "../../../src/devices/hl202/telemetry/model.rs"]
-mod telemetry;
-
 #[test]
 fn success_envelope_versions_match_generated_literal_contracts() {
     let mut optical = json!({
@@ -67,20 +64,20 @@ fn mib_producer_preserves_decoded_unknown_and_table_evidence() {
 
 #[test]
 fn telemetry_producer_preserves_open_values_inside_typed_envelopes() {
-    let report = telemetry::Report {
+    let report = HlTelemetry {
         schema_version: 1,
         compressed_bytes: 12,
         decompressed_bytes: 24,
         fields: [(
             "extension".into(),
-            telemetry::Field {
+            HlTelemetryField {
                 value: json!({"vendor": [false, null, 3]}),
                 member: "test.json".into(),
                 unit: None,
             },
         )]
         .into(),
-        members: vec![telemetry::Member {
+        members: vec![HlTelemetryMember {
             name: "test.json".into(),
             bytes: 24,
             encoding: "utf8".into(),

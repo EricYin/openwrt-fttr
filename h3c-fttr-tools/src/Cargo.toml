@@ -2,8 +2,14 @@
 name = "h3c-fttr-tools"
 version = "0.1.0"
 edition = "2021"
+autobins = false
 description = "H3C HM2004-DU FTTR Micro-OLT utilities and controller daemon"
 repository = "https://github.com/LazuliKao/openwrt-fttr"
+
+[workspace]
+members = ["crates/*"]
+default-members = ["."]
+resolver = "2"
 
 [features]
 default = ["device-hl202", "mqtt", "npu"]
@@ -16,6 +22,7 @@ all-devices = ["device-hl202", "device-hwtc", "device-star", "device-zte"]
 acs = ["dep:quick-xml", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:digest_auth", "dep:hyper-rustls", "dep:tokio-io-timeout"]
 mqtt = ["dep:rumqttd", "dep:rumqttc"]
 allocator-mimalloc = ["dep:mimalloc"]
+diagnostics = []
 
 [dependencies]
 fttr-api = { path = "crates/fttr-api" }
@@ -57,6 +64,37 @@ path = "src/bin/fttrd.rs"
 [[bin]]
 name = "fttr-platform-probe"
 path = "src/bin/fttr-platform-probe.rs"
+required-features = ["diagnostics"]
+
+[[bin]]
+name = "fttr-omci-mib"
+path = "src/bin/fttr-omci-mib.rs"
+required-features = ["diagnostics"]
+
+[[bin]]
+name = "fttr-omci-probe"
+path = "src/bin/fttr-omci-probe.rs"
+required-features = ["diagnostics"]
+
+[[bin]]
+name = "fttr-omci-service"
+path = "src/bin/fttr-omci-service.rs"
+required-features = ["diagnostics"]
+
+[[bin]]
+name = "fttr-k155-service"
+path = "src/bin/fttr-k155-service.rs"
+required-features = ["diagnostics", "device-hwtc"]
+
+[[bin]]
+name = "fttr-ranging"
+path = "src/bin/fttr-ranging.rs"
+required-features = ["diagnostics"]
+
+[[bin]]
+name = "fttr-star-observe"
+path = "src/bin/fttr-star-observe.rs"
+required-features = ["diagnostics", "device-star"]
 
 [profile.release]
 opt-level = "s"

@@ -1,4 +1,4 @@
-use super::model::Member;
+use super::Member;
 use std::{
     collections::BTreeSet,
     io::{self, Read},

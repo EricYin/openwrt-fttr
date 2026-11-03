@@ -1,4 +1,4 @@
-use super::model::{Field, Member, Report};
+use super::{Field, Member, Report};
 use std::{collections::BTreeMap, net::IpAddr};
 
 enum Format {

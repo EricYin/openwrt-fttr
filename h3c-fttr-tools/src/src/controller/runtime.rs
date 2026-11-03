@@ -585,34 +585,6 @@ fn ipc_handler(
                 let _ = stream.write_all(json_str.as_bytes());
                 let _ = stream.write_all(b"\n");
             }
-        } else if line == "DISCOVER" {
-            if let Err(error) = stream.write_all(
-                IpcResponse::err("discovery is managed by the PLOAM owner")
-                    .to_json_line()
-                    .as_bytes(),
-            ) {
-                eprintln!("[-] Discovery IPC response failed: {error}");
-            }
-        } else if line.starts_with("REGISTER ") {
-            let _ = stream.write_all(
-                IpcResponse::err(
-                    "manual registration disabled; serial must arrive over upstream PLOAM",
-                )
-                .to_json_line()
-                .as_bytes(),
-            );
-        } else if line.starts_with("PROVISION ") {
-            let _ = stream.write_all(IpcResponse::err("provisioning is managed automatically by the per-ONU controller; use STATUS for readback").to_json_line().as_bytes());
-        } else if line.starts_with("AUTH ") {
-            let _ = stream.write_all(IpcResponse::err("authentication is owned by the verified vendor profile; use fttrctl mib ONU_ID --summary to inspect capabilities").to_json_line().as_bytes());
-        } else if line == "SYNC_WIFI" {
-            let _ = stream.write_all(
-                IpcResponse::err(
-                    "automatic Wi-Fi synchronization has no verified payload contract",
-                )
-                .to_json_line()
-                .as_bytes(),
-            );
         } else if let Some(command) = match line {
             "OPTICAL ON" => Some(OpticalCommand::On),
             "OPTICAL OFF" => Some(OpticalCommand::Off),

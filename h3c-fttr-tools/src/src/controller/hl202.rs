@@ -37,6 +37,22 @@ pub(super) fn control(
     engine: &Arc<Mutex<PonEngine>>,
     services: &super::service::States,
 ) -> serde_json::Value {
+    if input.len() > crate::hl202_ipc::MAX_REQUEST_BYTES {
+        return serde_json::json!({"schema_version":1,"error":{"code":"invalid_request","message":"HL202 request exceeds the byte limit"}});
+    }
+    match serde_json::from_str(input) {
+        Ok(query) => control_query(query, engine, services),
+        Err(_) => {
+            serde_json::json!({"schema_version":1,"error":{"code":"invalid_request","message":"invalid HL202 request schema"}})
+        }
+    }
+}
+
+pub(super) fn control_query(
+    query: fttr_api::HlQuery,
+    engine: &Arc<Mutex<PonEngine>>,
+    services: &super::service::States,
+) -> serde_json::Value {
     match (engine.lock(), services.lock()) {
         (Ok(engine), Ok(services)) => {
             let devices: Vec<Device> = engine
@@ -61,7 +77,7 @@ pub(super) fn control(
                 .collect();
             drop(services);
             drop(engine);
-            api::control(input, &devices)
+            api::control_query(query, &devices)
         }
         _ => {
             serde_json::json!({"schema_version":1,"error":{"code":"unavailable","message":"optical identity state unavailable"}})

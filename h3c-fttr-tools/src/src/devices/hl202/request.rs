@@ -15,8 +15,13 @@ pub fn parse(input: &str) -> io::Result<Request> {
     if input.len() > MAX_REQUEST_BYTES {
         return Err(invalid("HL202 request exceeds the byte limit"));
     }
-    let mut request: Request = serde_json::from_str(input)
+    let request: Request = serde_json::from_str(input)
         .map_err(|_| invalid("invalid HL202 request JSON or action schema"))?;
+    validate(request)
+}
+
+/// Validate requests from every transport without a JSON round trip.
+pub fn validate(mut request: Request) -> io::Result<Request> {
     if request.schema_version != 1 {
         return Err(invalid("unsupported HL202 request schema version"));
     }
@@ -57,6 +62,48 @@ pub fn parse(input: &str) -> io::Result<Request> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_requests_cannot_bypass_action_or_selection_validation() {
+        let request = || Request {
+            schema_version: 1,
+            target: fttr_api::HlOpticalSelection {
+                optical_sn: "TEST12345678".into(),
+                onu_id: 0,
+                binding_generation: "test-epoch".into(),
+            },
+            action: Action::AccountsRead,
+        };
+        assert!(validate(request()).is_ok());
+        let mut invalid = request();
+        invalid.schema_version = 2;
+        assert!(validate(invalid).is_err());
+        let mut invalid = request();
+        invalid.target.onu_id = 16;
+        assert!(validate(invalid).is_err());
+        for action in [
+            Action::Exec {
+                script: "id".into(),
+                timeout_seconds: 0,
+            },
+            Action::Exec {
+                script: "id\0".into(),
+                timeout_seconds: 1,
+            },
+            Action::AccountSetPassword {
+                entry: 3,
+                password: "test-only".into(),
+            },
+            Action::AccountSetActive {
+                entry: 3,
+                active: true,
+            },
+        ] {
+            let mut invalid = request();
+            invalid.action = action;
+            assert!(validate(invalid).is_err());
+        }
+    }
 
     #[test]
     fn hl202_request_preserves_remote_shell_as_json_data() {

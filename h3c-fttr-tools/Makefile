@@ -67,7 +67,8 @@ define Package/h3c-fttr-tools/config
 endef
 
 RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC),device-hwtc) $(if $(CONFIG_FTTR_DEVICE_STAR),device-star) $(if $(CONFIG_FTTR_DEVICE_ZTE),device-zte) $(if $(CONFIG_FTTR_ACS),acs) $(if $(CONFIG_FTTR_MQTT),mqtt) $(if $(CONFIG_FTTR_NPU),npu) $(if $(CONFIG_FTTR_MIMALLOC),allocator-mimalloc)
-CARGO_PKG_ARGS+= --no-default-features --frozen
+# Keep production installation independent of workspace SDK/diagnostic binaries.
+CARGO_PKG_ARGS+= --no-default-features --frozen --bin fttrd --bin fttrctl
 
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)

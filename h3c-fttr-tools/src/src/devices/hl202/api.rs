@@ -55,6 +55,10 @@ pub fn control(input: &str, devices: &[Device]) -> Value {
         Ok(query) => query,
         Err(_) => return error("invalid_request", "invalid HL202 request schema"),
     };
+    control_query(query, devices)
+}
+
+pub fn control_query(query: Query, devices: &[Device]) -> Value {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -139,11 +143,7 @@ pub fn control(input: &str, devices: &[Device]) -> Value {
                         "selected device is not an online HL202",
                     );
                 }
-                let encoded = match serde_json::to_string(&request) {
-                    Ok(encoded) => encoded,
-                    Err(_) => return error("invalid_request", "invalid HL202 request schema"),
-                };
-                let request = match super::request::parse(&encoded) {
+                let request = match super::request::validate(request) {
                     Ok(request) => request,
                     Err(_) => return error("invalid_request", "invalid HL202 action parameters"),
                 };

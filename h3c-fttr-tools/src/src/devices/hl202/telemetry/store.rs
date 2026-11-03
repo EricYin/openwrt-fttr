@@ -1,7 +1,5 @@
 use super::Report;
-#[path = "store_state.rs"]
-mod state;
-pub use state::State;
+pub use fttr_api::HlReportState as State;
 use std::{
     collections::BTreeMap,
     sync::{Mutex, OnceLock},

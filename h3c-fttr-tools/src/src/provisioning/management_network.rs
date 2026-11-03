@@ -207,6 +207,8 @@ struct Journal {
 }
 struct Coordinator {
     journal: Journal,
+    // Only cache a snapshot after all durability barriers have succeeded.
+    saved: Option<Vec<u8>>,
     requires_apply: bool,
     busy: bool,
     state: Phase,
@@ -221,16 +223,28 @@ static COORDINATOR: OnceLock<Mutex<Coordinator>> = OnceLock::new();
 fn coordinator() -> &'static Mutex<Coordinator> {
     COORDINATOR.get_or_init(|| {
         let (journal, error) = match std::fs::read(JOURNAL) { Ok(bytes) => match serde_json::from_slice(&bytes) { Ok(j) => (j, None), Err(_) => (Journal::default(), Some("management journal is invalid or uses the old scalar VLAN format; explicitly apply the VLAN list configuration".into())) }, Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Journal::default(), None), Err(_) => (Journal::default(), Some("management journal cannot be read".into())) };
-        Mutex::new(Coordinator { journal, requires_apply:error.is_some(), busy:false, state:Phase::Discovering, error, plan:json!([]), next_retry:0, attempts:0, ready:false, last_discovery:0 })
+        Mutex::new(Coordinator { journal, saved:None, requires_apply:error.is_some(), busy:false, state:Phase::Discovering, error, plan:json!([]), next_retry:0, attempts:0, ready:false, last_discovery:0 })
     })
 }
-fn persist(c: &Coordinator) -> Result<(), String> {
-    storage::write_atomic(
-        JOURNAL,
-        &serde_json::to_vec(&c.journal).map_err(|_| "cannot encode management journal")?,
-        true,
-    )
-    .map_err(|_| "cannot persist management authorization".into())
+fn persist(c: &mut Coordinator) -> Result<(), String> {
+    persist_journal(&c.journal, &mut c.saved, |bytes| {
+        storage::write_atomic(JOURNAL, bytes, true)
+    })
+}
+fn persist_journal(
+    journal: &Journal,
+    saved: &mut Option<Vec<u8>>,
+    write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec(journal).map_err(|_| "cannot encode management journal")?;
+    if saved.as_deref() != Some(bytes.as_slice()) {
+        // A failed rename/directory sync can leave new bytes on disk. Forget the
+        // old snapshot too, so an in-memory rollback cannot skip its next commit.
+        *saved = None;
+        write(&bytes).map_err(|_| "cannot persist management authorization")?;
+        *saved = Some(bytes);
+    }
+    Ok(())
 }
 pub(super) fn active() -> Option<Management> {
     let c = coordinator().lock().unwrap();
@@ -359,7 +373,7 @@ fn start(desired: Desired, apply: bool, fresh_grant: bool) -> Result<Value, Stri
         c.journal.authorized = Some(desired.clone());
         if fresh_grant || changed || !c.ready || c.journal.pending {
             c.journal.pending = true;
-            if let Err(e) = persist(&c) {
+            if let Err(e) = persist(&mut c) {
                 c.journal = before;
                 return Err(e);
             }
@@ -448,7 +462,7 @@ pub(super) fn tick(desired: Option<&Desired>) {
     {
         if let Some(applied) = c.journal.applied.clone() {
             c.journal.cleanup_pending = true;
-            if let Err(e) = persist(&c) {
+            if let Err(e) = persist(&mut c) {
                 c.error = Some(e);
                 return;
             }
@@ -473,7 +487,7 @@ fn restore(d: Desired) {
         .and_then(|_| configure_listener(&d, previous.as_ref()));
     let mut c = coordinator().lock().unwrap();
     c.busy = false;
-    match result.and_then(|_| persist(&c)) {
+    match result.and_then(|_| persist(&mut c)) {
         Ok(()) => {
             c.set_ready(true);
             c.state = if c.journal.previous.is_some() {
@@ -1240,7 +1254,7 @@ fn execute(d: Desired, apply_authorized: bool) {
             let mut c = coordinator().lock().unwrap();
             c.set_ready(false);
             c.journal.pending = true;
-            persist(&c)?;
+            persist(&mut c)?;
             drop(c);
             apply(&actions)?;
         }
@@ -1255,11 +1269,6 @@ fn execute(d: Desired, apply_authorized: bool) {
     c.busy = false;
     match result {
         Ok(true) => {
-            let save = c.journal.pending
-                || c.journal
-                    .applied
-                    .as_ref()
-                    .is_none_or(|a| a.version() != d.version());
             if !d.enabled {
                 c.journal.previous = None;
                 c.journal.cleanup_pending = false;
@@ -1267,7 +1276,7 @@ fn execute(d: Desired, apply_authorized: bool) {
             c.journal.applied = Some(d);
             c.journal.applied_epoch = c.journal.epoch;
             c.journal.pending = false;
-            match if save { persist(&c) } else { Ok(()) } {
+            match persist(&mut c) {
                 Ok(()) => {
                     c.set_ready(true);
                     c.state = if c.journal.previous.is_some() {
@@ -1365,7 +1374,7 @@ fn cleanup_previous(d: Desired) {
         Ok(()) => {
             c.journal.previous = None;
             c.journal.cleanup_pending = false;
-            if let Err(e) = persist(&c) {
+            if let Err(e) = persist(&mut c) {
                 c.set_ready(false);
                 c.state = Phase::Blocked;
                 c.error = Some(e);
@@ -1388,12 +1397,64 @@ fn cleanup_previous(d: Desired) {
 mod tests {
     use super::*;
     #[test]
+    fn journal_skips_unchanged_writes_and_retries_failed_commits() {
+        let mut journal = Journal::default();
+        let mut saved = None;
+        let mut writes = 0;
+        let mut commit = |_: &[u8]| {
+            writes += 1;
+            Ok(())
+        };
+        persist_journal(&journal, &mut saved, &mut commit).unwrap();
+        for _ in 0..100 {
+            persist_journal(&journal, &mut saved, &mut commit).unwrap();
+        }
+        assert_eq!(writes, 1);
+        journal.pending = true;
+        // Even an error after rename must not mark the new snapshot durable.
+        assert!(persist_journal(&journal, &mut saved, |_| {
+            Err(std::io::Error::other("directory sync failed"))
+        })
+        .is_err());
+        assert!(saved.is_none());
+        let mut retries = 0;
+        persist_journal(&journal, &mut saved, |_| {
+            retries += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(retries, 1);
+        persist_journal(&journal, &mut saved, |_| panic!("unchanged commit")).unwrap();
+        journal.pending = false;
+        persist_journal(&journal, &mut saved, |_| {
+            retries += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(retries, 2);
+        // A rollback to the previously committed journal must also write after
+        // a failed attempt, because rename may already have replaced the file.
+        journal.pending = true;
+        assert!(persist_journal(&journal, &mut saved, |_| {
+            Err(std::io::Error::other("directory sync failed"))
+        })
+        .is_err());
+        journal.pending = false;
+        persist_journal(&journal, &mut saved, |_| {
+            retries += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(retries, 3);
+    }
+    #[test]
     fn failed_worker_spawn_is_reported_and_allows_a_later_launch() {
         let mut c = Coordinator {
             journal: Journal {
                 pending: true,
                 ..Default::default()
             },
+            saved: None,
             requires_apply: false,
             busy: false,
             state: Phase::Discovering,

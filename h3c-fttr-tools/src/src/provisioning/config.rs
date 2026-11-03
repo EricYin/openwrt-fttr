@@ -109,35 +109,45 @@ pub fn load() -> Result<Config, String> {
 pub fn parse(text: &str) -> Result<Config, String> {
     super::templates::compile(text)
 }
-pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
-    let mut sections = BTreeMap::<String, Section>::new();
-    let mut current = String::new();
+/// Decode UCI once at the input boundary; compilers pass sections directly.
+pub(super) fn parse_sections(text: &str) -> Result<Vec<(String, Section)>, String> {
+    let mut sections = Vec::<(String, Section)>::new();
     for line in text.lines() {
         let w = words(line)?;
         if w.is_empty() || w[0].starts_with('#') {
             continue;
         }
         match w[0].as_str() {
-            "config" if w.len() >= 2 => {
-                current = w
+            "config" if w.len() == 2 || w.len() == 3 => {
+                let id = w
                     .get(2)
                     .cloned()
-                    .unwrap_or_else(|| format!("@{}", sections.len()));
-                if sections
-                    .insert(
-                        current.clone(),
-                        Section {
-                            kind: w[1].clone(),
-                            ..Section::default()
-                        },
-                    )
-                    .is_some()
-                {
+                    .unwrap_or_else(|| format!("_anon_{}_{}", w[1], sections.len()));
+                if sections.iter().any(|(existing, _)| existing == &id) {
                     return Err("duplicate section".into());
                 }
+                sections.push((
+                    id,
+                    Section {
+                        kind: w[1].clone(),
+                        ..Section::default()
+                    },
+                ));
             }
             "option" | "list" if w.len() == 3 => {
-                let section = sections.get_mut(&current).ok_or("option without section")?;
+                let section = &mut sections.last_mut().ok_or("option without section")?.1;
+                if section.kind == "device"
+                    && w[1] == "onu_id"
+                    && (w[0] != "option" || section.options.contains_key("onu_id"))
+                {
+                    return Err("device onu_id requires one scalar option".into());
+                }
+                if section.kind == "management" && w[1] == "vlan" && w[0] != "list" {
+                    return Err(
+                        "management VLAN requires list vlan; scalar option vlan is unsupported"
+                            .into(),
+                    );
+                }
                 if w[0] == "option" {
                     section.options.insert(w[1].clone(), vec![w[2].clone()]);
                 } else {
@@ -150,6 +160,21 @@ pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
             }
             "package" => (),
             _ => return Err("invalid UCI export".into()),
+        }
+    }
+    Ok(sections)
+}
+
+#[cfg(test)]
+pub(super) fn parse_expanded(text: &str) -> Result<Config, String> {
+    compile_sections(parse_sections(text)?)
+}
+
+pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, String> {
+    let mut sections = BTreeMap::new();
+    for (id, section) in input {
+        if sections.insert(id, section).is_some() {
+            return Err("duplicate section".into());
         }
     }
     let globals: Vec<_> = sections
