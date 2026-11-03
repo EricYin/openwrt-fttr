@@ -3,7 +3,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::bindings::*;
 
@@ -224,6 +224,15 @@ impl Drop for DlHandle {
 
 impl LibUbus {
     pub fn load() -> Result<Self, String> {
+        // Keep the libraries and their process-global uloop policy alive for the
+        // process lifetime. Concurrent clients must never rewrite that policy
+        // while another thread is already running uloop. Paths (and failures)
+        // are consequently fixed by the first load attempt.
+        static LIBRARY: OnceLock<Result<LibUbus, String>> = OnceLock::new();
+        LIBRARY.get_or_init(Self::load_once).clone()
+    }
+
+    fn load_once() -> Result<Self, String> {
         unsafe {
             let (h_ubox, _ubox_path) = load_first_working("libubox.so", "LIBUBOX_SO_PATH")
                 .map_err(|e| format!("Failed to load libubox:\n{e}"))?;
@@ -264,6 +273,15 @@ impl LibUbus {
                     }
                 }};
             }
+
+            let handle_sigchld = {
+                let c_sym = CString::new("uloop_handle_sigchld").unwrap();
+                let ptr = dlsym(handle_ubox.raw(), c_sym.as_ptr()) as *mut bool;
+                if ptr.is_null() {
+                    return Err("Symbol 'uloop_handle_sigchld' missing in library".into());
+                }
+                ptr
+            };
 
             let inner = LibUbusInner {
                 ubus_connect: resolve!(handle_ubus.raw(), ubus_connect, FnUbusConnect),
@@ -312,6 +330,12 @@ impl LibUbus {
                 handle_ubox: handle_ubox.into_raw(),
                 handle_json: handle_json.into_raw(),
             };
+
+            // Rust Child owns all subprocess exit statuses in this process.
+            // uloop's default SIGCHLD handler calls waitpid(-1), including for
+            // children it does not track. Disable it before any caller can
+            // initialize/run uloop; do not mask ECHILD in command executors.
+            *handle_sigchld = false;
 
             Ok(LibUbus {
                 inner: Arc::new(inner),
@@ -486,5 +510,51 @@ impl LibUbus {
     pub unsafe fn ubus_add_uloop(&self, ctx: *mut ubus_context) -> c_int {
         let flags = (ULOOP_BLOCKING | ULOOP_READ) as c_uint;
         self.uloop_fd_add(&mut (*ctx).sock, flags)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    // uloop owns process-global signal handlers. Run only this test in a fresh
+    // OpenWrt test process: --ignored --exact <test name> --test-threads=1.
+    #[test]
+    #[ignore = "requires OpenWrt shared libraries and an isolated test process"]
+    fn uloop_preserves_rust_child_exit_status_and_output() {
+        let lib = LibUbus::load().expect("load OpenWrt libraries");
+        struct LoopGuard(LibUbus);
+        impl Drop for LoopGuard {
+            fn drop(&mut self) {
+                unsafe { self.0.uloop_done() };
+            }
+        }
+
+        for code in [0, 7] {
+            assert_eq!(unsafe { lib.uloop_init() }, 0);
+            let _guard = LoopGuard(lib.clone());
+            // Loading another client while uloop is active must not rewrite its
+            // global signal policy, nor unload its shared-library state.
+            let _client = LibUbus::load().expect("load another client");
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", &format!("printf rust-child-output; exit {code}")])
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn harmless child");
+            // A bounded run performs only one event-loop iteration. SIGCHLD
+            // delivered during polling is reaped on the following iteration.
+            for _ in 0..4 {
+                unsafe { (lib.inner.uloop_run_timeout)(50) };
+            }
+            let status = child
+                .try_wait()
+                .expect("uloop stole Rust child status")
+                .expect("child should have exited during uloop run");
+            assert_eq!(status.code(), Some(code));
+            let output = child.wait_with_output().expect("capture child output");
+            assert_eq!(output.status.code(), Some(code));
+            assert_eq!(output.stdout, b"rust-child-output");
+        }
     }
 }

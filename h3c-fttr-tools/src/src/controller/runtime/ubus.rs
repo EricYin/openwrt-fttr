@@ -354,11 +354,7 @@ impl Handlers {
     fn npu_status(&self, _: EmptyRequest) -> Result<NpuStatus, i32> {
         #[cfg(feature = "npu")]
         {
-            Ok(crate::npu::status_from(
-                std::path::Path::new("/etc/config/fttr"),
-                std::path::Path::new("/sys/kernel/debug/ppe0/entries"),
-                std::path::Path::new("/sys/module/h3c_fmcs/parameters"),
-            ))
+            Ok(crate::npu::status())
         }
         #[cfg(not(feature = "npu"))]
         {
