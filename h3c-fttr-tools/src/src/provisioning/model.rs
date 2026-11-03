@@ -76,62 +76,9 @@ wire_enum!(WifiPendingAction {
     Deleting => "deleting",
 });
 
-wire_enum!(OperationPhase {
-    Waiting => "waiting",
-    WanReconciling => "wan_reconciling",
-    WanVerifying => "wan_verifying",
-    WifiReconciling => "wifi_reconciling",
-    Discovering => "discovering",
-    Reading => "reading",
-    Disabling => "disabling",
-    DisablingRead => "disabling_read",
-    Writing => "writing",
-    Verifying => "verifying",
-    Settling => "settling",
-    Recovering => "recovering",
-    WaitingManagement => "waiting_management",
-    WaitingTask => "waiting_task",
-    Interrupted => "interrupted",
-    Completed => "completed",
-});
-
-wire_enum!(WanPhase {
-    Waiting => "waiting",
-    Inventory => "inventory",
-    Classifying => "classifying",
-    AddingParent => "adding_parent",
-    ChildNames => "child_names",
-    AddingChild => "adding_child",
-    DeleteGuard => "delete_guard",
-    Deleting => "deleting",
-    VerifyDelete => "verify_delete",
-    EmptyParent => "empty_parent",
-    DeletingParent => "deleting_parent",
-    VerifyParentDelete => "verify_parent_delete",
-    Next => "next",
-    Done => "done",
-});
-
-wire_enum!(WifiPhase {
-    Waiting => "waiting",
-    Inventory => "inventory",
-    Adding => "adding",
-    VerifyAdd => "verify_add",
-    Deleting => "deleting",
-    VerifyDelete => "verify_delete",
-    ReadingDisable => "reading_disable",
-    Disabling => "disabling",
-    VerifyingDisable => "verifying_disable",
-    Next => "next",
-    Done => "done",
-});
-
-wire_enum!(ItemKind {
-    DeviceService => "device_service",
-    Ssid => "ssid",
-    PortBinding => "port_binding",
-    WanActivation => "wan_activation",
-});
+pub use fttr_api::{
+    OperationPhase, SyncItemKind as ItemKind, WanStage as WanPhase, WifiStage as WifiPhase,
+};
 
 wire_enum!(ParameterKind {
     String => "string",
@@ -332,13 +279,7 @@ pub struct Config {
     pub labels: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Management {
-    pub vlans: Vec<u32>,
-    pub vlan: u32,
-    pub priority: u32,
-    pub acs_url: String,
-}
+pub use fttr_api::ManagementDesired as Management;
 
 #[cfg(test)]
 mod backend_tests {

@@ -21,23 +21,7 @@ use verification::{verify_bridge, verify_dhcp, verify_firewall, verify_network};
 
 const JOURNAL: &str = "/etc/fttr/management-applied.json";
 type Sections = BTreeMap<String, Section>;
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Phase {
-    Discovering,
-    Comparing,
-    Planning,
-    Applying,
-    Verifying,
-    ConfiguringListener,
-    CleaningPrevious,
-    WaitingDevices,
-    Ready,
-    AwaitingApply,
-    Verified,
-    Blocked,
-    RetryWait,
-}
+use fttr_api::NetworkPhase as Phase;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Desired {
@@ -585,12 +569,16 @@ fn parse_export(text: &str, package: &str) -> Result<Sections, String> {
     Ok(sections)
 }
 fn discover() -> Result<Sections, String> {
+    let mut uci = match openwrt_uci::Uci::new() {
+        Ok(u) => u,
+        Err(e) => return Err(format!("cannot initialize UCI context: {e}")),
+    };
     let mut all = Sections::new();
     for package in ["network", "dhcp", "firewall"] {
-        all.extend(parse_export(
-            &run("uci", &["-q", "export", package])?,
-            package,
-        )?);
+        let text = uci
+            .export_package(package)
+            .map_err(|e| format!("cannot export {package}: {e}"))?;
+        all.extend(parse_export(&text, package)?);
     }
     Ok(all)
 }
@@ -1026,31 +1014,110 @@ fn plan_resources(
     Ok(actions)
 }
 fn apply(actions: &[Action]) -> Result<(), String> {
+    let staging_dir =
+        std::env::temp_dir().join(format!("fttr-mgmt-staging-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    std::fs::create_dir_all(&staging_dir).map_err(|e| format!("cannot create staging dir: {e}"))?;
+
+    let mut uci = match openwrt_uci::Uci::new() {
+        Ok(u) => u,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(format!("cannot initialize UCI context for apply: {e}"));
+        }
+    };
+    if let Err(e) = uci.set_savedir(&staging_dir) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(format!("cannot set isolated staging savedir: {e}"));
+    }
+
+    let mut touched_packages = std::collections::BTreeSet::new();
+
     for a in actions {
+        let parts: Vec<&str> = a.key.splitn(3, '.').collect();
         match a.operation.as_str() {
             "set" => {
-                run("uci", &["set", &format!("{}={}", a.key, a.value[0])])?;
+                if parts.len() == 2 {
+                    if let Err(e) = uci.set(parts[0], parts[1], "", &a.value[0]) {
+                        let _ = std::fs::remove_dir_all(&staging_dir);
+                        return Err(format!("uci set {} failed: {e}", a.key));
+                    }
+                } else if parts.len() == 3 {
+                    if let Err(e) = uci.set(parts[0], parts[1], parts[2], &a.value[0]) {
+                        let _ = std::fs::remove_dir_all(&staging_dir);
+                        return Err(format!("uci set {} failed: {e}", a.key));
+                    }
+                } else {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    return Err(format!("invalid UCI key format: {}", a.key));
+                }
+                touched_packages.insert(parts[0].to_string());
             }
             "replace_list" => {
-                let _ = run("uci", &["-q", "delete", &a.key]);
-                for value in &a.value {
-                    run("uci", &["add_list", &format!("{}={value}", a.key)])?;
+                if parts.len() == 3 {
+                    if let Err(e) = uci.replace_list(parts[0], parts[1], parts[2], &a.value) {
+                        let _ = std::fs::remove_dir_all(&staging_dir);
+                        return Err(format!("uci replace_list {} failed: {e}", a.key));
+                    }
+                } else {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    return Err(format!("invalid UCI list key format: {}", a.key));
                 }
+                touched_packages.insert(parts[0].to_string());
             }
             "delete" => {
-                run("uci", &["-q", "delete", &a.key])?;
+                if parts.len() == 2 {
+                    if let Err(e) = uci.delete(parts[0], parts[1], None) {
+                        let _ = std::fs::remove_dir_all(&staging_dir);
+                        return Err(format!("uci delete {} failed: {e}", a.key));
+                    }
+                } else if parts.len() == 3 {
+                    if let Err(e) = uci.delete(parts[0], parts[1], Some(parts[2])) {
+                        let _ = std::fs::remove_dir_all(&staging_dir);
+                        return Err(format!("uci delete {} failed: {e}", a.key));
+                    }
+                } else {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    return Err(format!("invalid UCI key format: {}", a.key));
+                }
+                touched_packages.insert(parts[0].to_string());
             }
             "reload_runtime" => (),
-            _ => return Err("invalid management plan action".into()),
+            _ => {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return Err("invalid management plan action".into());
+            }
         }
     }
-    for package in ["network", "dhcp", "firewall"] {
-        run("uci", &["commit", package])?;
+
+    // Verify touched packages have no external uncommitted modifications in /tmp/.uci
+    for package in &touched_packages {
+        let ext_delta = std::path::Path::new("/tmp/.uci").join(package);
+        if ext_delta.exists()
+            && std::fs::metadata(&ext_delta)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(format!(
+                "package {package} has external pending uncommitted UCI changes; aborting apply"
+            ));
+        }
     }
+
+    for package in &touched_packages {
+        if let Err(e) = uci.commit(package) {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(format!("uci commit {package} failed: {e}"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&staging_dir);
     // Validate and install isolation before activating the new interface.
     run("fw4", &["check"])?;
     run("/etc/init.d/firewall", &["reload"])?;
-    run("ubus", &["call", "network", "reload"])?;
+    let mut ubus = openwrt_ubus::Ubus::connect(None)
+        .map_err(|e| format!("cannot connect to ubus for network reload: {e}"))?;
+    crate::platform::openwrt::NetifdClient::new(&mut ubus).reload()?;
     run("/etc/init.d/dnsmasq", &["reload"])?;
     Ok(())
 }
@@ -1072,15 +1139,18 @@ fn runtime_plan(d: &Desired, previous: Option<&Desired>, actions: &mut Vec<Actio
     if !d.enabled {
         return;
     }
-    let ready = run("ubus", &["call", "network.interface.fttr_tr069", "status"])
+    let ready = openwrt_ubus::Ubus::connect(None)
         .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|mut ubus| {
+            crate::platform::openwrt::NetifdClient::new(&mut ubus)
+                .status("fttr_tr069")
+                .ok()
+        })
         .is_some_and(|s| {
-            s["up"] == true
-                && s["ipv4-address"].as_array().is_some_and(|a| {
-                    a.iter()
-                        .any(|a| a["address"] == d.address && a["mask"] == d.prefix)
-                })
+            s.up && s
+                .ipv4_address
+                .iter()
+                .any(|a| a.address == d.address && a.mask == d.prefix)
         });
     let firewall = run("nft", &["-j", "list", "table", "inet", "fw4"])
         .ok()

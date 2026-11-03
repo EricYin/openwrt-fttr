@@ -140,10 +140,10 @@ pub fn observe(source: &str, payload: Vec<u8>, received: u64) -> bool {
     true
 }
 
-pub fn snapshot(mac: &str) -> Option<serde_json::Value> {
+pub fn snapshot(mac: &str) -> Option<State> {
     let (mutex, _) = shared();
     let store = mutex.lock().ok()?;
-    serde_json::to_value(store.states.get(mac)?).ok()
+    store.states.get(mac).cloned()
 }
 
 pub fn revision(mac: &str) -> Option<u64> {
@@ -208,9 +208,12 @@ mod tests {
         let revision = super::revision(mac);
         let snapshot = super::snapshot(mac).unwrap();
         assert_eq!(revision, Some(2));
-        assert_eq!(snapshot["revision"], serde_json::json!(2));
-        assert_eq!(snapshot["report"]["members"][0]["text"], "raw text");
-        assert_eq!(snapshot["error"], "invalid gzip");
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(
+            snapshot.report.unwrap().members[0].text.as_deref(),
+            Some("raw text")
+        );
+        assert_eq!(snapshot.error.as_deref(), Some("invalid gzip"));
         super::shared().0.lock().unwrap().states.remove(mac);
     }
 

@@ -3,18 +3,7 @@
 //! Handles ONU discovery, activation state machine (O1 -> O5), ranging,
 //! and equalization delay calculation for all downstream ONUs.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OnuState {
-    O1Initial,
-    O2Standby,
-    O3SerialNumber,
-    O4Ranging,
-    O5Operation,
-    #[serde(rename = "o6_intermittent_lods")]
-    O6IntermittentLODS,
-    O7EmergencyStop,
-}
+pub use fttr_api::RegistrationState as OnuState;
 
 #[cfg(test)]
 mod state_tests {

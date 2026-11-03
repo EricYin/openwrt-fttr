@@ -15,7 +15,7 @@ use std::{
 pub(super) fn snapshot(
     engine: &PonEngine,
     services: &super::service::States,
-    sources: (&[SubDevice], serde_json::Value),
+    sources: (&[SubDevice], fttr_api::SyncStatusReply),
 ) -> FttrSystemStatus {
     let (devs, provisioning) = sources;
     let now = SystemTime::now()
@@ -68,11 +68,7 @@ pub(super) fn snapshot(
             let service = services.lock().unwrap().get(&onu.onu_id).cloned();
             let identity = service.as_ref().and_then(|state| state.identity.clone());
             let sn_str = onu.full_sn_str();
-            let desired = provisioning["devices"]
-                .as_array()
-                .and_then(|a| a.iter().find(|d| d["optical_sn"] == sn_str))
-                .cloned()
-                .unwrap_or_default();
+            let desired = provisioning.devices.iter().find(|d| d.optical_sn == sn_str);
             let mut telemetry =
                 super::telemetry::snapshot(onu.onu_id, onu.state == OnuState::O5Operation);
             for (field, unit, reason) in [
@@ -125,14 +121,11 @@ pub(super) fn snapshot(
                     .unwrap_or_else(|| onu.model.clone()),
                 serial_number: sn_str.clone(),
                 state: onu.state,
-                management: desired["management"].clone(),
-                provisioning: desired["provisioning"].clone(),
-                services: desired["services"].as_array().cloned().unwrap_or_default(),
-                ssids: desired["ssids"].as_array().cloned().unwrap_or_default(),
-                wifi_sync: desired["wifi_sync"]
-                    .as_str()
-                    .unwrap_or("not_configured")
-                    .into(),
+                management: desired.and_then(|d| d.management.clone()),
+                provisioning: desired.map(|d| d.provisioning.clone()),
+                services: desired.map(|d| d.services.clone()).unwrap_or_default(),
+                ssids: desired.map(|d| d.ssids.clone()).unwrap_or_default(),
+                wifi_sync: desired.map(|d| d.wifi_sync).unwrap_or_default(),
                 business_status: services
                     .lock()
                     .unwrap()
@@ -146,7 +139,9 @@ pub(super) fn snapshot(
                         state.business_status(
                             verified,
                             onu.state == OnuState::O5Operation
-                                && desired["management"]["state"] == "online",
+                                && desired
+                                    .and_then(|d| d.management.as_ref())
+                                    .is_some_and(|m| m.state == fttr_api::ManagementState::Online),
                         )
                     })
                     .unwrap_or_default(),
@@ -216,10 +211,17 @@ pub(super) fn snapshot(
             last_payload_bytes: dev.payload_bytes,
         })
         .collect();
-    let onu_pinning = pinning_status(engine, &provisioning);
+    let onu_pinning = pinning_status(
+        engine,
+        provisioning.onu_pins.as_ref(),
+        provisioning.config_error.clone(),
+    );
     FttrSystemStatus {
-        onu_pinning,
-        provisioning,
+        onu_pinning: Some(onu_pinning),
+        provisioning: Some(provisioning),
+        ubus: None,
+        jobs: None,
+        ipc: None,
         fpga_status: fpga::get_fpga_status().to_string(),
         optical_transceiver: bosa::get_optical_status(),
         switch_ports,
@@ -229,56 +231,50 @@ pub(super) fn snapshot(
     }
 }
 
-fn pinning_status(engine: &PonEngine, provisioning: &serde_json::Value) -> serde_json::Value {
-    let desired = &provisioning["onu_pins"];
-    let active = serde_json::json!(engine.onu_pins);
-    serde_json::json!({
-        "desired": desired,
-        "active": active,
-        "pending_restart": engine.pin_error.is_some() || *desired != active,
-        "allocation_blocked": engine.pin_error.is_some(),
-        "startup_error": engine.pin_error,
-        "config_error": provisioning["config_error"],
-    })
+fn pinning_status(
+    engine: &PonEngine,
+    desired: Option<&std::collections::BTreeMap<String, u8>>,
+    config_error: Option<String>,
+) -> fttr_api::OnuPinning {
+    let desired = desired.cloned().unwrap_or_default();
+    fttr_api::OnuPinning {
+        pending_restart: engine.pin_error.is_some() || desired != engine.onu_pins,
+        desired,
+        active: engine.onu_pins.clone(),
+        allocation_blocked: engine.pin_error.is_some(),
+        startup_error: engine.pin_error.clone(),
+        config_error,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn pin_reload_reports_pending_without_reassigning_or_inventing_onus() {
         let mut engine = PonEngine::new();
         engine.onu_pins.insert("TEST00000001".into(), 0);
-        let original = json!({"onu_pins":{"TEST00000001":0}});
-        assert_eq!(pinning_status(&engine, &original)["pending_restart"], false);
+        let original = engine.onu_pins.clone();
+        assert!(!pinning_status(&engine, Some(&original), None).pending_restart);
         for desired in [
-            json!({}),
-            json!({"TEST00000001":15}),
-            json!({"TEST00000002":0}),
+            std::collections::BTreeMap::new(),
+            [("TEST00000001".into(), 15)].into(),
+            [("TEST00000002".into(), 0)].into(),
         ] {
-            let status = pinning_status(&engine, &json!({"onu_pins":desired}));
-            assert_eq!(status["pending_restart"], true);
-            assert_eq!(status["active"], original["onu_pins"]);
+            let status = pinning_status(&engine, Some(&desired), None);
+            assert!(status.pending_restart);
+            assert_eq!(status.active, original);
             assert!(engine.active_onus.is_empty());
         }
         // Reverting the desired configuration cancels the pending change.
-        assert_eq!(pinning_status(&engine, &original)["pending_restart"], false);
-        let invalid = json!({"onu_pins":original["onu_pins"],"config_error":"duplicate slot"});
-        assert_eq!(
-            pinning_status(&engine, &invalid)["config_error"],
-            "duplicate slot"
-        );
-        assert_eq!(
-            pinning_status(&engine, &invalid)["active"],
-            original["onu_pins"]
-        );
+        assert!(!pinning_status(&engine, Some(&original), None).pending_restart);
+        let invalid = pinning_status(&engine, Some(&original), Some("duplicate slot".into()));
+        assert_eq!(invalid.config_error.as_deref(), Some("duplicate slot"));
+        assert_eq!(invalid.active, original);
         engine.pin_error = Some("unreadable UCI at startup".into());
-        assert_eq!(
-            pinning_status(&engine, &original)["allocation_blocked"],
-            true
-        );
-        assert_eq!(pinning_status(&engine, &original)["pending_restart"], true);
+        let failed = pinning_status(&engine, Some(&original), None);
+        assert!(failed.allocation_blocked);
+        assert!(failed.pending_restart);
     }
 }

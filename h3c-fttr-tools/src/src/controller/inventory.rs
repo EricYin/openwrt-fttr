@@ -28,8 +28,9 @@ pub(super) struct MibProgress {
 }
 
 #[derive(Clone)]
-pub(super) struct MibProgressReporter {
-    path: PathBuf,
+pub(super) enum MibProgressReporter {
+    File(PathBuf),
+    Job(fttr_jobs::Progress),
 }
 
 impl MibProgressReporter {
@@ -45,13 +46,26 @@ impl MibProgressReporter {
                 "invalid MIB progress identifier",
             ));
         }
-        Ok(Self {
-            path: PathBuf::from(format!("/tmp/fttr-mib.{id}/progress")),
-        })
+        Ok(Self::File(PathBuf::from(format!(
+            "/tmp/fttr-mib.{id}/progress"
+        ))))
     }
 
     pub fn update(&self, progress: &MibProgress) -> io::Result<()> {
-        let directory = self.path.parent().expect("MIB progress path has a parent");
+        let path = match self {
+            Self::File(path) => path,
+            Self::Job(reporter) => {
+                let phase = match progress.phase {
+                    "starting" => fttr_jobs::Phase::Starting,
+                    "upload" => fttr_jobs::Phase::Upload,
+                    "tables" => fttr_jobs::Phase::Tables,
+                    _ => return Err(io::Error::other("Invalid MIB progress phase")),
+                };
+                reporter.update(phase, progress.received, progress.expected);
+                return Ok(());
+            }
+        };
+        let directory = path.parent().expect("MIB progress path has a parent");
         if !fs::symlink_metadata(directory)?.file_type().is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -66,7 +80,7 @@ impl MibProgressReporter {
             .open(&temporary)?;
         serde_json::to_writer(&mut file, progress).map_err(io::Error::other)?;
         file.write_all(b"\n")?;
-        fs::rename(temporary, &self.path)
+        fs::rename(temporary, path)
     }
 }
 
@@ -154,7 +168,9 @@ pub(super) struct MibRequest {
     pub deadline: Instant,
     pub progress: Option<MibProgressReporter>,
     pub reply: std::sync::mpsc::Sender<io::Result<MibReport>>,
+    pub registration: Option<RegistrationGuard>,
 }
+pub(super) type RegistrationGuard = Arc<dyn Fn() -> bool + Send + Sync>;
 pub(super) enum WorkerRequest {
     Mib(MibRequest),
     Attribute(super::attribute_probe::Request),
@@ -257,15 +273,20 @@ pub(super) fn read_owned(
     cancellation: Option<Arc<AtomicBool>>,
     deadline: Instant,
     progress: Option<MibProgressReporter>,
+    registration: Option<RegistrationGuard>,
 ) -> io::Result<MibReport> {
-    if !super::service::operation_confirmed(id) {
+    if !super::service::operation_confirmed(id)
+        || registration.as_ref().is_some_and(|guard| !guard())
+    {
         return Err(io::Error::new(
             io::ErrorKind::NotConnected,
             "MIB requires a currently registered ONU",
         ));
     }
     let mut session = OmciSession::new(FmcsTransport::open(id)?);
-    session.guard_registration(move || super::service::operation_confirmed(id));
+    session.guard_registration(move || {
+        super::service::operation_confirmed(id) && registration.as_ref().is_none_or(|guard| guard())
+    });
     session.finish_before(deadline);
     if let Some(token) = cancellation {
         session.cancel_when(token);
@@ -321,6 +342,16 @@ pub(super) fn control(
     progress: Option<MibProgressReporter>,
     states: &super::service::States,
 ) -> io::Result<MibReport> {
+    control_guarded(id, tables, progress, states, None)
+}
+
+pub(super) fn control_guarded(
+    id: u8,
+    tables: bool,
+    progress: Option<MibProgressReporter>,
+    states: &super::service::States,
+    registration: Option<RegistrationGuard>,
+) -> io::Result<MibReport> {
     if id >= crate::pon_engine::ONU_SLOTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -346,7 +377,7 @@ pub(super) fn control(
             }
             let _lease = StockOmccLease::open(id)?;
             let _channel = ChannelLease::open(id, 0)?;
-            read_owned(id, tables, None, deadline, progress)
+            read_owned(id, tables, None, deadline, progress, registration)
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
             let (sender, wake) = states
@@ -364,6 +395,7 @@ pub(super) fn control(
                     deadline,
                     progress,
                     reply,
+                    registration,
                 }))
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::WouldBlock, "MIB queue busy or stopped")

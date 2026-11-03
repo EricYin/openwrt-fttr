@@ -1,7 +1,7 @@
 //! Shell-over-MQTT command transport. Separate connections from fttrd telemetry.
 #[cfg(feature = "mqtt")]
 use crate::mqtt::session::CommandSession;
-use serde::Serialize;
+pub use fttr_api::{HlCommandResult as CommandResult, HlCommandStatus as CommandStatus};
 #[cfg(any(feature = "mqtt", test))]
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -10,63 +10,6 @@ use std::os::fd::AsRawFd;
 use std::time::Duration;
 #[cfg(any(feature = "mqtt", test))]
 use std::time::{SystemTime, UNIX_EPOCH};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CommandStatus {
-    Error,
-    Executed,
-    Dispatched,
-    Timeout,
-}
-
-impl std::fmt::Display for CommandStatus {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Error => "error",
-            Self::Executed => "executed",
-            Self::Dispatched => "dispatched",
-            Self::Timeout => "timeout",
-        })
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub struct CommandResult {
-    pub target: String,
-    pub status: CommandStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<String>,
-    pub output_truncated: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-impl CommandResult {
-    pub fn failed(target: &str, error: impl ToString) -> Self {
-        Self {
-            target: target.into(),
-            status: CommandStatus::Error,
-            request_id: None,
-            exit_code: None,
-            output: None,
-            output_truncated: false,
-            error: Some(error.to_string()),
-        }
-    }
-    pub fn success(&self) -> bool {
-        self.error.is_none()
-            && match self.status {
-                CommandStatus::Executed => self.exit_code == Some(0),
-                CommandStatus::Dispatched => self.exit_code.is_none(),
-                CommandStatus::Error | CommandStatus::Timeout => false,
-            }
-    }
-}
 
 pub fn normalize_mac(value: &str) -> io::Result<String> {
     let mac = if value.len() == 17

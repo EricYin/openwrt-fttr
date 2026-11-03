@@ -1,7 +1,6 @@
 //! Fresh MQTT source identities, independent of ACS configuration and Inform readiness.
 mod registry;
 pub use registry::Registry;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,23 +13,9 @@ pub(crate) struct Transport {
     pub epoch: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Selection {
-    pub optical_sn: String,
-    pub onu_id: u16,
-    pub binding_generation: String,
-}
+pub use fttr_api::HlOpticalSelection as Selection;
 
-#[derive(Clone, Debug, Serialize)]
-pub struct Snapshot {
-    pub mqtt_mac: String,
-    pub optical_sn: Option<String>,
-    pub onu_id: Option<u16>,
-    pub binding_generation: String,
-    pub last_seen: u64,
-    pub reason: String,
-}
+pub use fttr_api::MqttSource as Snapshot;
 
 pub(crate) fn normalize_target(topic: &str) -> Option<String> {
     let value = topic.strip_suffix("/fttr_data.tar.gz").unwrap_or(topic);

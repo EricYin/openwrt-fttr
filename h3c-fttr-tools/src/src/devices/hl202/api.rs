@@ -1,6 +1,11 @@
-use crate::mqtt_identity::Selection;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use fttr_api::{HlListReply, HlReportPhase, HlReportReply};
+pub use fttr_api::{HlQuery as Query, HlSourceSelection as SourceSelection};
+use serde::Serialize;
+use serde_json::Value;
+
+fn wire(value: impl Serialize) -> Value {
+    serde_json::to_value(value).expect("HL202 wire models are JSON serializable")
+}
 
 #[derive(Serialize)]
 pub struct Device {
@@ -8,22 +13,6 @@ pub struct Device {
     pub onu_id: u16,
     pub model: String,
     pub online: bool,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Query {
-    List,
-    Report { target: Selection },
-    SourceReport { target: SourceSelection },
-    Run { request: super::request::Request },
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceSelection {
-    pub mqtt_mac: String,
-    pub binding_generation: String,
 }
 
 fn source_report(
@@ -35,8 +24,12 @@ fn source_report(
         snapshot.mqtt_mac == target.mqtt_mac
             && snapshot.binding_generation == target.binding_generation
     }) {
-        Some(snapshot) => json!({"schema_version":1,"target":snapshot,
-            "report":super::telemetry::store::snapshot(&snapshot.mqtt_mac),"read_only":true}),
+        Some(snapshot) => wire(HlReportReply::Source {
+            schema_version: 1,
+            report: super::telemetry::store::snapshot(&snapshot.mqtt_mac),
+            target: snapshot,
+            read_only: true,
+        }),
         None => error(
             "stale_source",
             "MQTT source observation changed or is no longer available",
@@ -45,7 +38,13 @@ fn source_report(
 }
 
 fn error(code: &str, message: &str) -> Value {
-    json!({"schema_version":1,"error":{"code":code,"message":message}})
+    wire(HlReportReply::Error {
+        schema_version: 1,
+        error: fttr_api::OpticalError {
+            code: code.into(),
+            message: message.into(),
+        },
+    })
 }
 
 pub fn control(input: &str, devices: &[Device]) -> Value {
@@ -67,27 +66,48 @@ pub fn control(input: &str, devices: &[Device]) -> Value {
                 Ok(state) => state.snapshots(now),
                 Err(_) => return error("unavailable", "MQTT identity state unavailable"),
             };
-            let rows: Vec<Value> = devices.iter().map(|device| {
-                let mqtt = sources.iter().find(|source| source.reason == "ready"
-                    && source.optical_sn.as_deref() == Some(&device.optical_sn)
-                    && source.onu_id == Some(device.onu_id));
-                let report_revision = mqtt.and_then(|source| super::telemetry::store::revision(&source.mqtt_mac));
-                json!({"optical_sn":device.optical_sn,"onu_id":device.onu_id,"model":device.model,
-                    "optical_online":device.online,"can_execute":cfg!(feature = "mqtt") && device.online && mqtt.is_some(),
-                    "mqtt":mqtt,"report_revision":report_revision})
-            }).collect();
-            json!({"schema_version":1,"devices":rows,"sources":sources})
+            let rows: Vec<fttr_api::HlDevice> = devices
+                .iter()
+                .map(|device| {
+                    let mqtt = sources.iter().find(|source| {
+                        source.reason == "ready"
+                            && source.optical_sn.as_deref() == Some(&device.optical_sn)
+                            && source.onu_id == Some(device.onu_id)
+                    });
+                    let report_revision =
+                        mqtt.and_then(|source| super::telemetry::store::revision(&source.mqtt_mac));
+                    fttr_api::HlDevice {
+                        optical_sn: device.optical_sn.clone(),
+                        onu_id: device.onu_id,
+                        model: device.model.clone(),
+                        optical_online: device.online,
+                        can_execute: cfg!(feature = "mqtt") && device.online && mqtt.is_some(),
+                        mqtt: mqtt.cloned(),
+                        report_revision,
+                    }
+                })
+                .collect();
+            wire(HlListReply::List {
+                schema_version: 1,
+                devices: rows,
+                sources,
+            })
         }
         Query::Report { target } => match registry.lock() {
             Ok(state) => match state.resolve(&target, now) {
                 Ok(snapshot) => {
                     let report = super::telemetry::store::snapshot(&snapshot.mqtt_mac);
                     let state = if report.is_some() {
-                        "received"
+                        HlReportPhase::Received
                     } else {
-                        "report_unavailable"
+                        HlReportPhase::ReportUnavailable
                     };
-                    json!({"schema_version":1,"target":snapshot,"report":report,"state":state})
+                    wire(HlReportReply::Report {
+                        schema_version: 1,
+                        target: snapshot,
+                        report,
+                        state,
+                    })
                 }
                 Err(message) => error("stale_target", message),
             },
@@ -137,7 +157,10 @@ pub fn control(input: &str, devices: &[Device]) -> Value {
                             &script,
                             std::time::Duration::from_secs(u64::from(timeout_seconds)),
                         ) {
-                            Ok(result) => json!({"schema_version":1,"operation":result}),
+                            Ok(result) => wire(fttr_api::HlExecReply::Executed {
+                                schema_version: 1,
+                                operation: result,
+                            }),
                             Err(cause) => error("command_failed", &cause.to_string()),
                         }
                     }
@@ -145,7 +168,7 @@ pub fn control(input: &str, devices: &[Device]) -> Value {
                     | super::request::Action::AccountSetPassword { .. }
                     | super::request::Action::AccountSetActive { .. }) => {
                         match super::accounts::run(&request.target, &action) {
-                            Ok(result) => result,
+                            Ok(result) => wire(result),
                             Err(_) => error(
                                 "account_failed",
                                 "account command failed or returned unsupported metadata",

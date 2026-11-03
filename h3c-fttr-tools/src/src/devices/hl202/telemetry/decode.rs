@@ -61,11 +61,11 @@ pub(super) fn report(
             match member.text.as_deref().and_then(|text| value(text, format)) {
                 Some(value) => {
                     fields.insert(
-                        key,
+                        key.into(),
                         Field {
                             value,
                             member: member.name.clone(),
-                            unit,
+                            unit: unit.map(str::to_owned),
                         },
                     );
                 }

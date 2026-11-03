@@ -9,17 +9,23 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 use super::activation::{clear_offline_hardware, RangingSession};
 use crate::bosa;
 use crate::fpga;
 use crate::ipc::{self, SubDevice};
-use crate::model::{FttrSystemStatus, IpcResponse};
+use crate::model::IpcResponse;
 use crate::pon_engine::ploam::OnuState;
 use crate::pon_engine::ploam::PloamFrame;
 use crate::pon_engine::PonEngine;
 use std::collections::{BTreeMap, BTreeSet};
 
+mod calibration;
 mod ipc_server;
+mod ubus;
+
+use fttr_api::{OpticalAction, OpticalError, OpticalReply, OpticalState, ReplyStatus};
 
 #[derive(Clone, Copy)]
 enum OpticalCommand {
@@ -32,46 +38,31 @@ enum OpticalCommand {
 }
 
 impl OpticalCommand {
-    fn action(self) -> &'static str {
+    fn action(self) -> OpticalAction {
         match self {
-            Self::On => "optical_on",
-            Self::Off => "optical_off",
-            Self::Status => "optical_status",
-            Self::Reload => "optical_reload",
-            Self::Reinitialize => "optical_reinitialize",
-            Self::Shutdown => "optical_shutdown",
+            Self::On => OpticalAction::OpticalOn,
+            Self::Off => OpticalAction::OpticalOff,
+            Self::Status => OpticalAction::OpticalStatus,
+            Self::Reload => OpticalAction::OpticalReload,
+            Self::Reinitialize => OpticalAction::OpticalReinitialize,
+            Self::Shutdown => OpticalAction::OpticalShutdown,
         }
     }
 }
 
-#[derive(serde::Serialize)]
-struct OpticalReply {
-    schema_version: u8,
-    status: &'static str,
-    action: &'static str,
-    desired_enabled: Option<bool>,
-    tx_enabled: Option<bool>,
-    actor_state: OpticalState,
-    hardware_ready: bool,
-    discovery_active: bool,
-    cleanup_pending: bool,
-    error: Option<OpticalError>,
+trait OpticalReplyExt {
+    fn value(self) -> Value;
+    fn unavailable(command: OpticalCommand, ready: bool, error: io::Error) -> Value;
 }
 
-#[derive(serde::Serialize)]
-struct OpticalError {
-    code: String,
-    message: String,
-}
-
-impl OpticalReply {
+impl OpticalReplyExt for OpticalReply {
     fn value(self) -> serde_json::Value {
         serde_json::to_value(self).expect("optical reply is serializable")
     }
     fn unavailable(command: OpticalCommand, ready: bool, error: io::Error) -> serde_json::Value {
         Self {
             schema_version: 1,
-            status: "error",
+            status: ReplyStatus::Error,
             action: command.action(),
             desired_enabled: None,
             tx_enabled: None,
@@ -88,20 +79,13 @@ impl OpticalReply {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-enum OpticalState {
-    Enabled,
-    Disabled,
-    Unknown,
-}
-
 struct OpticalRequest {
     command: OpticalCommand,
     reply: SyncSender<serde_json::Value>,
     deadline: Instant,
 }
 
+#[derive(Clone)]
 struct OpticalClient {
     requests: SyncSender<OpticalRequest>,
     hardware_ready: Arc<AtomicBool>,
@@ -244,7 +228,7 @@ impl OpticalActor {
                             self.handle(OpticalCommand::Status, backend)
                         };
                         reply["status"] = "error".into();
-                        reply["action"] = command.action().into();
+                        reply["action"] = serde_json::to_value(command.action()).unwrap();
                         reply["error"] =
                             serde_json::json!({"code":"Configuration","message":error.to_string()});
                         return reply;
@@ -260,7 +244,7 @@ impl OpticalActor {
                         && backend.read_tx().ok() == Some(enabled)
                     {
                         let mut reply = self.handle(OpticalCommand::Status, backend);
-                        reply["action"] = command.action().into();
+                        reply["action"] = serde_json::to_value(command.action()).unwrap();
                         return reply;
                     }
                     let was_enabled = self.state != OpticalState::Disabled;
@@ -344,7 +328,11 @@ impl OpticalActor {
         };
         OpticalReply {
             schema_version: 1,
-            status: if result.is_ok() { "success" } else { "error" },
+            status: if result.is_ok() {
+                ReplyStatus::Success
+            } else {
+                ReplyStatus::Error
+            },
             action: command.action(),
             desired_enabled,
             tx_enabled,
@@ -458,6 +446,64 @@ fn start_ipc_server(
     ipc_server::start(listener, ipc_handler(devices, pon_engine, services, optics));
 }
 
+fn start_ubus_server(
+    devices: Arc<Mutex<Vec<SubDevice>>>,
+    pon_engine: Arc<Mutex<PonEngine>>,
+    services: super::service::States,
+    optics: OpticalClient,
+    stopping: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let create_methods = |devices: Arc<Mutex<Vec<SubDevice>>>,
+                          pon_engine: Arc<Mutex<PonEngine>>,
+                          services: super::service::States,
+                          optics: OpticalClient,
+                          stopping: Arc<AtomicBool>|
+     -> Vec<(String, openwrt_ubus::MethodHandler)> {
+        ubus::methods(optics, devices, pon_engine, services, stopping)
+    };
+
+    std::thread::Builder::new()
+        .name("ubus-server".into())
+        .spawn(move || {
+            while !stopping.load(Ordering::Acquire) {
+                let mut server = match openwrt_ubus::UbusServer::new(None) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[-] Native ubus server connect failed: {e}; retrying in 3s");
+                        std::thread::sleep(Duration::from_secs(3));
+                        continue;
+                    }
+                };
+
+                let methods = create_methods(
+                    devices.clone(),
+                    pon_engine.clone(),
+                    services.clone(),
+                    optics.clone(),
+                    stopping.clone(),
+                );
+                // Exclusively register the native system 'fttr' object.
+                if let Err(e) = server.add_object(fttr_api::OBJECT, methods) {
+                    eprintln!("[-] Failed to register 'fttr' ubus object: {e}; retrying in 3s");
+                    std::thread::sleep(Duration::from_secs(3));
+                    continue;
+                }
+                println!("[+] Registered native ubus object 'fttr'. Starting ubus event loop.");
+
+                if let Err(e) = server.run_loop() {
+                    eprintln!("[-] ubus server run_loop exited: {e}");
+                }
+                if stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                println!("[!] ubus disconnected; reconnecting in 2s...");
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            println!("[*] ubus server thread stopped cleanly.");
+        })
+        .ok()
+}
+
 fn ipc_handler(
     devices: Arc<Mutex<Vec<SubDevice>>>,
     pon_engine: Arc<Mutex<PonEngine>>,
@@ -520,21 +566,21 @@ fn ipc_handler(
         } else if line == "CAPABILITIES" {
             let _ = writeln!(stream, "{}", crate::capabilities::json());
         } else if line == "STATUS" {
-            let provisioning = crate::provisioning::snapshot();
+            let provisioning = match serde_json::from_value(crate::provisioning::snapshot()) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    let _ = stream.write_all(
+                        IpcResponse::err("Invalid provisioning snapshot contract")
+                            .to_json_line()
+                            .as_bytes(),
+                    );
+                    return;
+                }
+            };
             let devs = devices.lock().unwrap();
             let engine = pon_engine.lock().unwrap();
-            let sys_status = super::status::snapshot(&engine, &services, (&devs, provisioning));
-
-            #[derive(serde::Serialize)]
-            struct Status<'a> {
-                #[serde(flatten)]
-                system: &'a FttrSystemStatus,
-                ipc: ipc_server::metrics::Snapshot,
-            }
-            let status = Status {
-                system: &sys_status,
-                ipc: ipc_server::metrics::snapshot(),
-            };
+            let mut status = super::status::snapshot(&engine, &services, (&devs, provisioning));
+            status.ipc = Some(ipc_server::metrics::snapshot());
             if let Ok(json_str) = serde_json::to_string_pretty(&status) {
                 let _ = stream.write_all(json_str.as_bytes());
                 let _ = stream.write_all(b"\n");
@@ -722,13 +768,25 @@ async fn run_async() {
             pon_engine.clone(),
             service_states.clone(),
             OpticalClient {
-                requests: optical_requests,
+                requests: optical_requests.clone(),
                 hardware_ready: hardware_ready.clone(),
                 stopping: stopping.clone(),
             },
         );
         println!("[+] IPC socket server listening on {}", ipc::SOCKET_PATH);
     }
+
+    let _ubus_thread = start_ubus_server(
+        devices.clone(),
+        pon_engine.clone(),
+        service_states.clone(),
+        OpticalClient {
+            requests: optical_requests,
+            hardware_ready: hardware_ready.clone(),
+            stopping: stopping.clone(),
+        },
+        stopping.clone(),
+    );
 
     // One hardware owner performs initialization, transitions and PLOAM reception.
     {

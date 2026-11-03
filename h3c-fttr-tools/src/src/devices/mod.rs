@@ -489,6 +489,13 @@ mod tests {
 
     #[test]
     fn generic_bridge_adapter_capabilities_and_selection() {
+        if std::env::var_os("FTTR_TEST_GENERIC_BRIDGE_CHILD").is_some() {
+            assert_eq!(
+                select_with_serial("ZTEG", &crate::model::OnuIdentity::default(), None),
+                Adapter::GenericBridge
+            );
+            return;
+        }
         let adapter = Adapter::GenericBridge;
         assert!(adapter.capabilities().business);
         assert!(!adapter.capabilities().shell_commands);
@@ -501,12 +508,17 @@ mod tests {
             Adapter::Unavailable
         );
 
-        std::env::set_var("FTTR_ALLOW_UNSUPPORTED_AS_BRIDGE", "1");
-        assert_eq!(
-            select_with_serial("ZTEG", &identity, None),
-            Adapter::GenericBridge
-        );
-        std::env::remove_var("FTTR_ALLOW_UNSUPPORTED_AS_BRIDGE");
+        // Do not change process-wide selection policy while other tests select adapters.
+        assert!(std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "devices::tests::generic_bridge_adapter_capabilities_and_selection"
+            ])
+            .env("FTTR_TEST_GENERIC_BRIDGE_CHILD", "1")
+            .env("FTTR_ALLOW_UNSUPPORTED_AS_BRIDGE", "1")
+            .status()
+            .unwrap()
+            .success());
     }
 
     #[test]

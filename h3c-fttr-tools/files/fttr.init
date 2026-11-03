@@ -61,6 +61,8 @@ service_stopped() {
 
 service_triggers() {
 	procd_add_reload_trigger fttr network
+	# Run restart outside fttrd's cgroup so stopping fttrd cannot kill it.
+	procd_add_raw_trigger "fttr.restart" 1000 /etc/init.d/fttr restart
 }
 
 reload_service() {

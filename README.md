@@ -58,7 +58,7 @@ cargo check --locked --all-targets --no-default-features --features all-devices,
 ```powershell
 $previous = $env:RUSTFLAGS
 try {
-    $env:RUSTFLAGS = '-C target-feature=+crt-static'
+    $env:RUSTFLAGS = '-C target-feature=-crt-static -C link-arg=-dynamic'
     cargo zigbuild --release --locked --target aarch64-unknown-linux-musl --no-default-features --features all-devices,acs,mqtt,npu --bin fttrd --bin fttrctl
 } finally {
     $env:RUSTFLAGS = $previous
@@ -67,3 +67,17 @@ try {
 
 产物位于 `src/target/aarch64-unknown-linux-musl/release/`。
 内核驱动与固件镜像使用 Linux OpenWrt 构建环境。
+
+## LuCI SDK 生成
+
+`fttr-api` 共享后端声明并生成 LuCI 类型和客户端，默认输出到
+`../luci-app-fttr/src/api/generated/`。在仓库根目录执行：
+
+```sh
+cargo run --locked --manifest-path h3c-fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --generate
+cargo run --locked --manifest-path h3c-fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --check
+```
+
+其他布局追加 `--out-dir FRONTEND/src/api/generated`。`--check` 只检查生成
+一致性，不写文件。完整链路在前端运行 `pnpm sdk:generate`，自动生成
+TypeScript 类型、客户端、ACL 和 Zod mini 校验；`pnpm check` 依次检查生成一致性。

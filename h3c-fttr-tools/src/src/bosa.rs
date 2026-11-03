@@ -269,6 +269,11 @@ impl std::fmt::Display for CalibrationSource {
 
 /// Tries to locate and read 288 bytes from the 1MB factory partition (UBI volume or MTD) at offset 0x2200.
 pub fn read_factory_calibration() -> Option<[u8; 288]> {
+    factory_calibration().1
+}
+
+pub fn factory_calibration() -> (Option<String>, Option<[u8; 288]>) {
+    let mut detected = None;
     #[cfg(unix)]
     {
         use std::io::{Read, Seek, SeekFrom};
@@ -308,20 +313,22 @@ pub fn read_factory_calibration() -> Option<[u8; 288]> {
 
         for dev in candidate_devices {
             if let Ok(mut file) = fs::File::open(&dev) {
+                if detected.is_none() {
+                    detected = Some(dev.clone());
+                }
                 if file.seek(SeekFrom::Start(FACTORY_UX3326_OFFSET)).is_ok() {
                     let mut buf = [0u8; FACTORY_UX3326_LEN];
                     if file.read_exact(&mut buf).is_ok() {
                         // Check if buffer is non-blank (not all 0xFF and not all 0x00)
                         if !buf.iter().all(|&b| b == 0xFF) && !buf.iter().all(|&b| b == 0x00) {
-                            println!("[+] Successfully loaded UX3326 calibration from factory partition ({dev} @ 0x{FACTORY_UX3326_OFFSET:04X})");
-                            return Some(buf);
+                            return (Some(dev), Some(buf));
                         }
                     }
                 }
             }
         }
     }
-    None
+    (detected, None)
 }
 
 /// Loads the calibration 288-byte data with strict priority:

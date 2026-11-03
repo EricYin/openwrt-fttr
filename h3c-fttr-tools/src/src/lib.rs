@@ -26,6 +26,7 @@ pub mod npu {
 #[cfg(any(feature = "mqtt", test))]
 mod mqtt_limits;
 pub mod optical;
+pub mod platform;
 pub mod pon_engine;
 pub mod provisioning;
 pub mod provisioning_cli;

@@ -1,10 +1,7 @@
-use super::{
-    command::{self, CommandResult},
-    command_transport,
-};
+use super::{command, command_transport};
 use crate::mqtt::session::CommandSession;
-use crate::mqtt_identity::{Registry, Selection, Snapshot};
-use serde::Serialize;
+use crate::mqtt_identity::{Registry, Selection};
+pub use fttr_api::HlOperation as SelectedResult;
 use std::{
     io,
     sync::Mutex,
@@ -35,13 +32,6 @@ fn enqueue_guarded(
     // Resolve and nonblocking enqueue are atomic against rebinding. No await
     // occurs with this lock held; a full queue is a terminal local error.
     command_transport::enqueue(session, topic, payload)
-}
-
-#[derive(Serialize)]
-pub struct SelectedResult {
-    pub target: Snapshot,
-    pub result: CommandResult,
-    pub binding_current: bool,
 }
 
 fn now() -> u64 {

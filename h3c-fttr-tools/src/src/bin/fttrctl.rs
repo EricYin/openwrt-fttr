@@ -148,64 +148,18 @@ fn handle_offload(args: &[String]) {
         }
         "on" | "off" => {
             let enabled = sub == "on";
+            #[cfg(feature = "npu")]
             let bridge = args
                 .iter()
                 .position(|a| a == "--bridge")
                 .map(|i| args.get(i + 1).map(String::as_str).unwrap_or(""));
-            let result = (|| -> std::io::Result<()> {
-                if let Some(bridge) = bridge {
-                    if bridge.is_empty()
-                        || bridge.len() > 15
-                        || !bridge
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
-                    {
-                        return Err(std::io::Error::other("Invalid bridge interface"));
-                    }
-                }
-                let uci = |args: &[&str]| -> std::io::Result<()> {
-                    let output = Command::new("uci").args(args).output()?;
-                    if output.status.success() {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::other(format!("uci {} failed", args[0])))
-                    }
-                };
-                // Do not commit unrelated staged edits from another LuCI session.
-                let pending = Command::new("uci").args(["changes", "fttr"]).output()?;
-                if !pending.status.success() || !pending.stdout.is_empty() {
-                    return Err(std::io::Error::other(
-                        "FTTR has pending UCI changes; apply or revert them first",
-                    ));
-                }
-                uci(&["set", "fttr.offload=offload"])?;
-                uci(&[
-                    "set",
-                    if enabled {
-                        "fttr.offload.enabled=1"
-                    } else {
-                        "fttr.offload.enabled=0"
-                    },
-                ])?;
-                if let Some(bridge) = bridge {
-                    uci(&["set", &format!("fttr.offload.bridge={bridge}")])?;
-                }
-                uci(&["commit", "fttr"])?;
-                if !enabled {
-                    std::fs::write("/sys/module/h3c_fmcs/parameters/bridge_offload_mask", "0\n")?;
-                    if std::fs::read_to_string(
-                        "/sys/module/h3c_fmcs/parameters/bridge_offload_mask",
-                    )?
-                    .trim()
-                        != "0"
-                    {
-                        return Err(std::io::Error::other(
-                            "Saved, but driver withdrawal is not confirmed",
-                        ));
-                    }
-                }
-                Ok(())
-            })();
+            #[cfg(feature = "npu")]
+            let result = h3c_fttr_tools::npu::settings::set(enabled, bridge);
+            #[cfg(not(feature = "npu"))]
+            let result: std::io::Result<()> = Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "NPU adapter not compiled (enable Cargo feature npu)",
+            ));
             match result {
                 Ok(()) => {
                     if is_json {
@@ -239,6 +193,13 @@ fn handle_offload(args: &[String]) {
     }
 }
 
+fn wire_name(value: &impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 fn print_status_table(status: &FttrSystemStatus) {
     println!("==========================================================================================");
     println!(
@@ -257,16 +218,14 @@ fn print_status_table(status: &FttrSystemStatus) {
         "[*] FPGA Micro-OLT Core:    {} (Status: {})",
         fpga_badge, status.fpga_status
     );
-    if !status.provisioning.is_null() {
+    if let Some(provisioning) = &status.provisioning {
         println!(
             "[*] Provisioning: {} / {} / revision {}",
-            status.provisioning["enabled"],
-            status.provisioning["mode"].as_str().unwrap_or("unknown"),
-            status.provisioning["revision"]
-                .as_str()
-                .unwrap_or("unknown")
+            provisioning.enabled,
+            wire_name(&provisioning.mode),
+            provisioning.revision
         );
-        if let Some(error) = status.provisioning["error"].as_str() {
+        if let Some(error) = &provisioning.error {
             println!("    Config error: {error}");
         }
     }
@@ -388,20 +347,23 @@ fn print_status_table(status: &FttrSystemStatus) {
                 sg.state
             );
             println!("    Business:       {}", sg.business_status);
-            if !sg.provisioning.is_null() {
+            if let Some(provisioning) = &sg.provisioning {
                 println!(
                     "    CWMP:           {} | Sync: {} | Wi-Fi: {}",
-                    sg.management["state"].as_str().unwrap_or("unknown"),
-                    sg.provisioning["state"].as_str().unwrap_or("not_started"),
-                    sg.wifi_sync
+                    sg.management
+                        .as_ref()
+                        .map(|m| wire_name(&m.state))
+                        .unwrap_or_else(|| "unknown".into()),
+                    wire_name(&provisioning.state),
+                    wire_name(&sg.wifi_sync)
                 );
                 for item in sg.services.iter().chain(sg.ssids.iter()) {
                     println!(
                         "      {} [{}]: {} {}",
-                        item["id"].as_str().unwrap_or("?"),
-                        item["service_type"].as_str().unwrap_or("?"),
-                        item["state"].as_str().unwrap_or("?"),
-                        item["reason"].as_str().unwrap_or("")
+                        item.id,
+                        item.service_type,
+                        item.state,
+                        item.reason.as_deref().unwrap_or("")
                     );
                 }
             }

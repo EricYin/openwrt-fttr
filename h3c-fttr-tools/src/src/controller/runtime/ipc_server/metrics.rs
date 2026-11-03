@@ -8,15 +8,7 @@ static HANDLED: AtomicU64 = AtomicU64::new(0);
 static MAX_INTAKE_US: AtomicU64 = AtomicU64::new(0);
 static MAX_HANDLER_US: AtomicU64 = AtomicU64::new(0);
 
-#[derive(serde::Serialize)]
-pub(in crate::controller::runtime) struct Snapshot {
-    accepted: u64,
-    rejected: u64,
-    read_errors: u64,
-    handled: u64,
-    max_intake_us: u64,
-    max_handler_us: u64,
-}
+use fttr_api::IpcStats as Snapshot;
 
 pub(super) fn accepted() {
     ACCEPTED.fetch_add(1, Ordering::Relaxed);

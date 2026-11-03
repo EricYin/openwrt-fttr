@@ -1,15 +1,7 @@
 use super::request::Action;
 use crate::mqtt_identity::Selection;
-use serde::Serialize;
-use serde_json::{json, Value};
+use fttr_api::{HlAccount as Account, HlAccountReply, HlWriteStatus};
 use std::{io, time::Duration};
-
-#[derive(Serialize)]
-struct Account {
-    entry: u8,
-    username: String,
-    active: bool,
-}
 
 fn invalid() -> io::Error {
     io::Error::new(
@@ -79,7 +71,7 @@ fn mutation(action: &Action) -> io::Result<String> {
     Ok(format!("tcapi set Account_Entry{entry} {field} {quoted} >/dev/null 2>&1 || exit 11; tcapi commit Account >/dev/null 2>&1 || exit 12; tcapi save >/dev/null 2>&1 || exit 13; {verify}printf 'ACCOUNT_WRITE_ACCEPTED'"))
 }
 
-pub fn run(selection: &Selection, action: &Action) -> io::Result<Value> {
+pub fn run(selection: &Selection, action: &Action) -> io::Result<HlAccountReply> {
     let script = match action {
         Action::AccountsRead => "for i in 0 1 2; do u=$(tcapi get Account_Entry$i username) || exit 1; a=$(tcapi get Account_Entry$i Active) || exit 1; printf '%s\\t%s\\t%s\\n' \"$i\" \"$u\" \"$a\"; done".into(),
         Action::AccountSetPassword { .. } | Action::AccountSetActive { .. } => mutation(action)?,
@@ -101,10 +93,19 @@ pub fn run(selection: &Selection, action: &Action) -> io::Result<Value> {
         .result
         .error
         .map(|_| "account command did not complete; outcome may be unknown".into());
-    Ok(
-        json!({"schema_version":1,"operation":result,"accounts":accounts,
-        "write_status":if accounts.is_some() { "not_applicable" } else if result.result.success() { "accepted_and_saved" } else { "unconfirmed" }}),
-    )
+    let write_status = if accounts.is_some() {
+        HlWriteStatus::NotApplicable
+    } else if result.result.success() {
+        HlWriteStatus::AcceptedAndSaved
+    } else {
+        HlWriteStatus::Unconfirmed
+    };
+    Ok(HlAccountReply::Accounts {
+        schema_version: 1,
+        operation: result,
+        accounts,
+        write_status,
+    })
 }
 
 #[cfg(test)]

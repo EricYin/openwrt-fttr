@@ -153,11 +153,10 @@ pub(super) fn verify_dhcp(d: &Desired, interface: &str) -> Result<(), String> {
     if !d.enabled || !d.dhcp {
         return Ok(());
     }
-    let services: Value = serde_json::from_str(&run(
-        "ubus",
-        &["call", "service", "list", "{\"name\":\"dnsmasq\"}"],
-    )?)
-    .map_err(|_| "invalid DHCP service status")?;
+    let mut ubus = openwrt_ubus::Ubus::connect(None)
+        .map_err(|e| format!("cannot connect to ubus for DHCP verification: {e}"))?;
+    let mut client = crate::platform::openwrt::ServiceClient::new(&mut ubus);
+    let services = client.list("dnsmasq")?;
     let instances = services["dnsmasq"]["instances"]
         .as_object()
         .ok_or("DHCP service instances are missing")?;
@@ -237,29 +236,32 @@ pub(super) fn verify_network(d: &Desired, previous: Option<&Desired>) -> Result<
     if !plan_resources(d, previous, &discover()?)?.is_empty() {
         return Err("management UCI readback differs from the plan".into());
     }
+    let mut ubus = openwrt_ubus::Ubus::connect(None)
+        .map_err(|e| format!("cannot connect to ubus for network verification: {e}"))?;
+    let mut client = crate::platform::openwrt::NetifdClient::new(&mut ubus);
+
     if !d.enabled {
-        let status: Value =
-            serde_json::from_str(&run("ubus", &["call", "network.interface", "dump"])?)
-                .map_err(|_| "invalid netifd inventory")?;
-        if status["interface"].as_array().is_some_and(|a| {
-            a.iter()
-                .any(|i| i["interface"] == "fttr_tr069" && i["up"] == true)
-        }) {
+        let dump = client.dump()?;
+        if dump
+            .interface
+            .iter()
+            .any(|i| i.interface == "fttr_tr069" && i.up)
+        {
             return Err("disabled management interface is still up".into());
         }
         return Ok(());
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let text = run("ubus", &["call", "network.interface.fttr_tr069", "status"])?;
-        let status: Value = serde_json::from_str(&text).map_err(|_| "invalid netifd status")?;
-        if status["up"] == true
-            && status["ipv4-address"].as_array().is_some_and(|a| {
-                a.iter()
-                    .any(|a| a["address"] == d.address && a["mask"] == d.prefix)
-            })
-        {
-            break;
+        if let Ok(status) = client.status("fttr_tr069") {
+            if status.up
+                && status
+                    .ipv4_address
+                    .iter()
+                    .any(|a| a.address == d.address && a.mask == d.prefix)
+            {
+                break;
+            }
         }
         if Instant::now() >= deadline {
             return Err("management interface address did not become ready".into());
@@ -272,16 +274,12 @@ pub(super) fn verify_network(d: &Desired, previous: Option<&Desired>) -> Result<
     verify_bridge(d, previous)?;
     verify_dhcp(d, "fttr_tr069")?;
     if let Some(p) = previous.filter(|p| p.address != d.address || p.prefix != d.prefix) {
-        let status: Value = serde_json::from_str(&run(
-            "ubus",
-            &["call", "network.interface.fttr_tr069_previous", "status"],
-        )?)
-        .map_err(|_| "invalid previous management status")?;
-        if status["up"] != true
-            || !status["ipv4-address"].as_array().is_some_and(|a| {
-                a.iter()
-                    .any(|i| i["address"] == p.address && i["mask"] == p.prefix)
-            })
+        let status = client.status("fttr_tr069_previous")?;
+        if !status.up
+            || !status
+                .ipv4_address
+                .iter()
+                .any(|i| i.address == p.address && i.mask == p.prefix)
         {
             return Err("previous management path was not retained".into());
         }
