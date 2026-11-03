@@ -1138,6 +1138,36 @@ mod tests {
     }
 
     #[test]
+    fn production_snapshots_match_shared_contract_before_status_composition() {
+        let mut controller = Controller::default();
+        for phase in [
+            None,
+            Some(OperationPhase::Waiting),
+            Some(OperationPhase::Completed),
+        ] {
+            controller.operations.clear();
+            let operation = operation(phase.unwrap_or(OperationPhase::Waiting), false);
+            controller.config.devices = vec![operation.device.clone()];
+            if phase.is_some() {
+                controller.operations.insert("child".into(), operation);
+            }
+            let value = controller.snapshot();
+            let typed: fttr_api::SyncStatusReply = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(typed.devices.len(), 1);
+            assert_eq!(typed.devices[0].device, "child");
+            assert_eq!(typed.devices[0].ssids[0].id, "wifi");
+            assert_eq!(
+                serde_json::to_value(&typed.devices[0].provisioning.state).unwrap(),
+                value["devices"][0]["provisioning"]["state"]
+            );
+            assert_eq!(
+                serde_json::to_value(typed.devices[0].wifi_sync).unwrap(),
+                value["devices"][0]["wifi_sync"]
+            );
+        }
+    }
+
+    #[test]
     fn snapshot_reports_self_healing_attempts_and_waiting_management() {
         let mut c = Controller::default();
         let op = operation(OperationPhase::Waiting, false);

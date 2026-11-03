@@ -1,5 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
-use serde_json::{json, Value};
+use fttr_api::{
+    CalibrationInfo, CalibrationSaved, CalibrationSource, FactoryCalibration, FirmwareCalibration,
+};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -12,7 +14,7 @@ fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-pub(super) fn get() -> io::Result<Value> {
+pub(super) fn get() -> io::Result<CalibrationInfo> {
     let (device, factory) = crate::bosa::factory_calibration();
     let firmware = match fs::File::open(PATH) {
         Ok(file) => {
@@ -29,30 +31,56 @@ pub(super) fn get() -> io::Result<Value> {
         return Err(io::Error::other("Calibration file exceeds 288 bytes"));
     }
     let exists = std::path::Path::new(PATH).is_file();
-    let (source, path, bytes): (&str, &str, &[u8]) = if let Some(bytes) = &factory {
-        ("factory", "Factory partition (offset 0x2200)", bytes)
+    let (source, path, bytes): (CalibrationSource, &str, &[u8]) = if let Some(bytes) = &factory {
+        (
+            CalibrationSource::Factory,
+            "Factory partition (offset 0x2200)",
+            bytes,
+        )
     } else if firmware.len() >= 56 {
-        ("firmware", PATH, &firmware)
+        (CalibrationSource::Firmware, PATH, &firmware)
     } else {
         (
-            "builtin",
+            CalibrationSource::Builtin,
             "Builtin static default",
             &crate::bosa::DEFAULT_UX3326_CALIBRATION_DATA,
         )
     };
-    Ok(
-        json!({"source":source,"active_path":path,"size":bytes.len(),"sha256":hash(bytes),"data":STANDARD.encode(bytes),
-        "factory":{"detected":device.is_some(),"device":device.unwrap_or_default(),"has_data":factory.is_some(),
-            "sha256":factory.as_ref().map(|b|hash(b)).unwrap_or_default(),"data":factory.as_ref().map(|b|STANDARD.encode(b)).unwrap_or_default()},
-        "firmware":{"exists":exists,"path":PATH,"size":firmware.len(),"sha256":if exists {hash(&firmware)} else {String::new()},"data":STANDARD.encode(&firmware)}}),
-    )
+    Ok(CalibrationInfo {
+        source,
+        active_path: path.into(),
+        size: bytes.len() as u32,
+        sha256: hash(bytes),
+        data: STANDARD.encode(bytes),
+        factory: FactoryCalibration {
+            detected: device.is_some(),
+            device: device.unwrap_or_default(),
+            has_data: factory.is_some(),
+            sha256: factory.as_ref().map(|b| hash(b)).unwrap_or_default(),
+            data: factory
+                .as_ref()
+                .map(|b| STANDARD.encode(b))
+                .unwrap_or_default(),
+        },
+        firmware: FirmwareCalibration {
+            exists,
+            path: PATH.into(),
+            size: firmware.len() as u32,
+            sha256: if exists {
+                hash(&firmware)
+            } else {
+                String::new()
+            },
+            data: STANDARD.encode(&firmware),
+        },
+    })
 }
 
-pub(super) fn save(data: &str) -> io::Result<Value> {
+pub(super) fn save(data: &str) -> io::Result<CalibrationSaved> {
     save_at(data, std::path::Path::new(PATH))
 }
 
-fn save_at(data: &str, path: &std::path::Path) -> io::Result<Value> {
+fn save_at(data: &str, path: &std::path::Path) -> io::Result<CalibrationSaved> {
     if data.len() > 384 {
         return Err(io::Error::other("Invalid calibration length"));
     }
@@ -78,7 +106,12 @@ fn save_at(data: &str, path: &std::path::Path) -> io::Result<Value> {
         file.sync_all()?;
         fs::rename(&temporary, path)?;
         fs::File::open(parent)?.sync_all()?;
-        Ok(json!({"success":true,"path":path,"size":bytes.len(),"sha256":hash(&bytes)}))
+        Ok(CalibrationSaved {
+            success: true,
+            path: path.to_string_lossy().into_owned(),
+            size: bytes.len() as u32,
+            sha256: hash(&bytes),
+        })
     })();
     if result.is_err() {
         let _ = fs::remove_file(temporary);
@@ -98,7 +131,7 @@ mod tests {
         for length in [56, 288] {
             let bytes = vec![0x5a; length];
             let reply = save_at(&STANDARD.encode(&bytes), &path).unwrap();
-            assert_eq!(reply["sha256"], hash(&bytes));
+            assert_eq!(reply.sha256, hash(&bytes));
             assert_eq!(fs::read(&path).unwrap(), bytes);
         }
         let expected = fs::read(&path).unwrap();

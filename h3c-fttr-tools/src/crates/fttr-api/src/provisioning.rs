@@ -2,33 +2,35 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Serialize, Deserialize)]
-#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum OperationPhase {
-    Waiting,
-    WanReconciling,
-    WanVerifying,
-    WifiReconciling,
-    Discovering,
-    Reading,
-    Disabling,
-    DisablingRead,
-    Writing,
-    Verifying,
-    Settling,
-    Completed,
-    NotStarted,
-    ResetPending,
-    Interrupted,
-    Recovering,
-    WaitingManagement,
-    WaitingTask,
+macro_rules! wire_enum {
+    ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+        pub enum $name { $(#[serde(rename = $wire)] $variant),+ }
+        impl $name {
+            pub const fn as_str(self) -> &'static str { match self { $(Self::$variant => $wire),+ } }
+        }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.as_str()) }
+        }
+    };
 }
+
+wire_enum!(OperationPhase {
+    Waiting => "waiting", WanReconciling => "wan_reconciling",
+    WanVerifying => "wan_verifying", WifiReconciling => "wifi_reconciling",
+    Discovering => "discovering", Reading => "reading", Disabling => "disabling",
+    DisablingRead => "disabling_read", Writing => "writing", Verifying => "verifying",
+    Settling => "settling", Completed => "completed", NotStarted => "not_started",
+    ResetPending => "reset_pending", Interrupted => "interrupted", Recovering => "recovering",
+    WaitingManagement => "waiting_management", WaitingTask => "waiting_task",
+});
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum WifiSync {
+    #[default]
     NotConfigured,
     StaleRevision,
     StaleManagement,
@@ -39,18 +41,14 @@ pub enum WifiSync {
     Recovering,
     WaitingManagement,
 }
-#[derive(Serialize, Deserialize)]
-#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum SyncItemKind {
-    DeviceService,
-    Ssid,
-    PortBinding,
-    WanActivation,
-}
+wire_enum!(SyncItemKind {
+    DeviceService => "device_service", Ssid => "ssid",
+    PortBinding => "port_binding", WanActivation => "wan_activation",
+});
 
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct SyncChange {
     pub name: String,
     pub desired: String,
@@ -58,6 +56,7 @@ pub struct SyncChange {
 
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct SyncItem {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,6 +92,7 @@ pub struct SyncItem {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct Lifecycle {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,6 +111,7 @@ pub struct Lifecycle {
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagementState {
     Online,
     WaitingInform,
@@ -119,6 +120,7 @@ pub enum ManagementState {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct ManagementStatus {
     pub cwmp_id: String,
     pub state: ManagementState,
@@ -128,7 +130,7 @@ pub struct ManagementStatus {
     #[cfg_attr(feature = "codegen", ts(type = "number | null"))]
     pub age_seconds: Option<u64>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct ManagementDesired {
     pub vlan: u32,
@@ -147,7 +149,9 @@ pub struct AcsListener {
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BootstrapPhase {
+    #[default]
     WaitingTransport,
     WaitingIdentity,
     Reading,
@@ -229,6 +233,7 @@ pub enum AcsBootstrap {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct BackendStatus {
     pub configured: String,
     pub effective: String,
@@ -237,6 +242,7 @@ pub struct BackendStatus {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct CwmpCapabilities {
     pub wan: String,
     pub wlan: String,
@@ -244,6 +250,7 @@ pub struct CwmpCapabilities {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct CwmpContract {
     pub state: String,
     pub requested: String,
@@ -255,6 +262,7 @@ pub struct CwmpContract {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct WanOwned {
     pub parent: u32,
     pub connection: u32,
@@ -265,49 +273,28 @@ pub struct WanOwned {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct WifiOwned {
     pub owned: Vec<u32>,
     pub pending: Option<String>,
     pub pending_instance: Option<u32>,
 }
+wire_enum!(WanStage {
+    Waiting => "waiting", Inventory => "inventory", Classifying => "classifying",
+    AddingParent => "adding_parent", ChildNames => "child_names", AddingChild => "adding_child",
+    DeleteGuard => "delete_guard", Deleting => "deleting", VerifyDelete => "verify_delete",
+    EmptyParent => "empty_parent", DeletingParent => "deleting_parent",
+    VerifyParentDelete => "verify_parent_delete", Next => "next", Done => "done",
+});
+wire_enum!(WifiStage {
+    Waiting => "waiting", Inventory => "inventory", Adding => "adding", VerifyAdd => "verify_add",
+    Deleting => "deleting", VerifyDelete => "verify_delete", ReadingDisable => "reading_disable",
+    Disabling => "disabling", VerifyingDisable => "verifying_disable", Next => "next", Done => "done",
+});
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-pub enum WanStage {
-    Waiting,
-    Inventory,
-    Classifying,
-    AddingParent,
-    ChildNames,
-    AddingChild,
-    DeleteGuard,
-    Deleting,
-    VerifyDelete,
-    EmptyParent,
-    DeletingParent,
-    VerifyParentDelete,
-    Next,
-    Done,
-}
-#[derive(Serialize, Deserialize)]
-#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum WifiStage {
-    Waiting,
-    Inventory,
-    Adding,
-    VerifyAdd,
-    Deleting,
-    VerifyDelete,
-    ReadingDisable,
-    Disabling,
-    VerifyingDisable,
-    Next,
-    Done,
-}
-#[derive(Serialize, Deserialize)]
-#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum WifiCleanup {
     Disable,
     Preserve,
@@ -316,6 +303,7 @@ pub enum WifiCleanup {
 
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct ProvisioningStatus {
     pub state: OperationPhase,
     pub items: Vec<SyncItem>,
@@ -403,6 +391,7 @@ pub struct ProvisioningStatus {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct NativeWanOwned {
     pub parent: u32,
     pub child: u32,
@@ -425,6 +414,7 @@ pub struct NetworkConfig {
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy)]
 pub enum NetworkPhase {
     Discovering,
     Comparing,

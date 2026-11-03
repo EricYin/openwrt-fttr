@@ -1,34 +1,7 @@
-use crate::mqtt_identity::Selection;
-use serde::{Deserialize, Serialize};
+pub use fttr_api::{HlAction as Action, HlCommandRequest as Request};
 use std::io;
 
 pub const MAX_REQUEST_BYTES: usize = 512 * 1024;
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Request {
-    pub schema_version: u8,
-    pub target: Selection,
-    pub action: Action,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Action {
-    Exec {
-        script: String,
-        timeout_seconds: u16,
-    },
-    AccountsRead,
-    AccountSetPassword {
-        entry: u8,
-        password: String,
-    },
-    AccountSetActive {
-        entry: u8,
-        active: bool,
-    },
-}
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)

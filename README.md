@@ -80,7 +80,15 @@ cargo run --locked --manifest-path h3c-fttr-tools/src/crates/fttr-api/Cargo.toml
 
 其他布局追加 `--out-dir FRONTEND/src/api/generated`。`--check` 只检查生成
 一致性，不写文件。完整链路在前端运行 `pnpm sdk:generate`，自动生成
-Rust 类型、客户端、ACL 和 Zod mini 校验；`pnpm check` 依次检查生成一致性、
+TypeScript 类型、客户端、ACL 和 Zod mini 校验；`pnpm check` 依次检查生成一致性、
 类型、回归测试及生产构建。非相邻目录设置 `FTTR_BACKEND_DIR`。
 
 CI 同时检查前端生成文件和 ACL；可用 `FTTR_FRONTEND_REF` 仓库变量或手动运行时的 ref 选择配套前端版本。
+
+共享 wire 类型定义在 `h3c-fttr-tools/src/crates/fttr-api/src/`。后端状态模型、
+注册状态、测量证据、HL202 选择器/请求/结果/遥测及校准结果直接使用这些类型；
+原内部路径通过 `pub use` 兼容，不再复制结构。开通流程复用共享阶段枚举。
+新增固定字段时修改共享类型并在生产端直接构造，前端导入
+`src/api/generated/types` 和 `schemas`，随后执行上述生成及检查命令。
+设备定义的遥测值保留开放 JSON；开通内部状态、协议静态定义与 MIB 解码模型
+仍有专用表示，通过边界转换接入共享 wire 契约。

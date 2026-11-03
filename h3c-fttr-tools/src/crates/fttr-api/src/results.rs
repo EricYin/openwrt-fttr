@@ -197,6 +197,7 @@ pub struct MibSnapshot {
 
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct HlTelemetryMember {
     pub name: String,
     pub bytes: usize,
@@ -206,6 +207,7 @@ pub struct HlTelemetryMember {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct HlTelemetryField {
     // Device-specific telemetry values are intentionally open JSON, unlike envelopes.
     #[cfg_attr(feature = "codegen", ts(type = "unknown"))]
@@ -215,6 +217,7 @@ pub struct HlTelemetryField {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct HlTelemetry {
     pub schema_version: u8,
     pub compressed_bytes: usize,
@@ -225,6 +228,7 @@ pub struct HlTelemetry {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone, Default)]
 pub struct HlReportState {
     #[cfg_attr(feature = "codegen", ts(type = "number"))]
     pub revision: u64,
@@ -274,6 +278,7 @@ pub enum HlReportReply {
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HlCommandStatus {
     Executed,
     Dispatched,
@@ -282,6 +287,7 @@ pub enum HlCommandStatus {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug)]
 pub struct HlCommandResult {
     pub target: String,
     pub status: HlCommandStatus,
@@ -301,6 +307,7 @@ pub struct HlCommandResult {
 }
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug)]
 pub struct HlOperation {
     pub target: crate::MqttSource,
     pub result: HlCommandResult,

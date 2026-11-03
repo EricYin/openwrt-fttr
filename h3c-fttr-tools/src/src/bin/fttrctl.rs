@@ -193,6 +193,13 @@ fn handle_offload(args: &[String]) {
     }
 }
 
+fn wire_name(value: &impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 fn print_status_table(status: &FttrSystemStatus) {
     println!("==========================================================================================");
     println!(
@@ -211,16 +218,14 @@ fn print_status_table(status: &FttrSystemStatus) {
         "[*] FPGA Micro-OLT Core:    {} (Status: {})",
         fpga_badge, status.fpga_status
     );
-    if !status.provisioning.is_null() {
+    if let Some(provisioning) = &status.provisioning {
         println!(
             "[*] Provisioning: {} / {} / revision {}",
-            status.provisioning["enabled"],
-            status.provisioning["mode"].as_str().unwrap_or("unknown"),
-            status.provisioning["revision"]
-                .as_str()
-                .unwrap_or("unknown")
+            provisioning.enabled,
+            wire_name(&provisioning.mode),
+            provisioning.revision
         );
-        if let Some(error) = status.provisioning["error"].as_str() {
+        if let Some(error) = &provisioning.error {
             println!("    Config error: {error}");
         }
     }
@@ -342,20 +347,23 @@ fn print_status_table(status: &FttrSystemStatus) {
                 sg.state
             );
             println!("    Business:       {}", sg.business_status);
-            if !sg.provisioning.is_null() {
+            if let Some(provisioning) = &sg.provisioning {
                 println!(
                     "    CWMP:           {} | Sync: {} | Wi-Fi: {}",
-                    sg.management["state"].as_str().unwrap_or("unknown"),
-                    sg.provisioning["state"].as_str().unwrap_or("not_started"),
-                    sg.wifi_sync
+                    sg.management
+                        .as_ref()
+                        .map(|m| wire_name(&m.state))
+                        .unwrap_or_else(|| "unknown".into()),
+                    wire_name(&provisioning.state),
+                    wire_name(&sg.wifi_sync)
                 );
                 for item in sg.services.iter().chain(sg.ssids.iter()) {
                     println!(
                         "      {} [{}]: {} {}",
-                        item["id"].as_str().unwrap_or("?"),
-                        item["service_type"].as_str().unwrap_or("?"),
-                        item["state"].as_str().unwrap_or("?"),
-                        item["reason"].as_str().unwrap_or("")
+                        item.id,
+                        item.service_type,
+                        item.state,
+                        item.reason.as_deref().unwrap_or("")
                     );
                 }
             }

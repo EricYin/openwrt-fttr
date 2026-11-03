@@ -14,6 +14,27 @@ pub struct MeasurementEvidence {
 }
 pub type Measurements = BTreeMap<String, MeasurementEvidence>;
 
+impl MeasurementEvidence {
+    pub fn unavailable(source: impl Into<String>, unit: &str, reason: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            unit: unit.into(),
+            reason: Some(reason.into()),
+            raw: None,
+            age_seconds: None,
+        }
+    }
+    pub fn observed(source: impl Into<String>, unit: &str, raw: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            unit: unit.into(),
+            reason: None,
+            raw: Some(raw.into()),
+            age_seconds: Some(0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct OpticalTransceiverStatus {
@@ -144,7 +165,7 @@ pub struct OnuIdentity {
     pub omcc_version: Option<u8>,
     pub errors: Vec<String>,
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub enum RegistrationState {
@@ -154,13 +175,14 @@ pub enum RegistrationState {
     O4Ranging,
     O5Operation,
     #[serde(rename = "o6_intermittent_lods")]
-    O6IntermittentLods,
+    O6IntermittentLODS,
     O7EmergencyStop,
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub enum BusinessPhase {
+    #[default]
     NotStarted,
     CollectingIdentity,
     RetryingIdentity,
@@ -172,7 +194,7 @@ pub enum BusinessPhase {
     Retrying,
     Offline,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct BusinessStatus {
     pub phase: BusinessPhase,
@@ -180,8 +202,35 @@ pub struct BusinessStatus {
     pub generation: u64,
     pub error: Option<String>,
 }
+
+impl std::fmt::Display for BusinessPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotStarted => "Not started",
+            Self::CollectingIdentity => "Collecting identity",
+            Self::RetryingIdentity => "Retrying identity",
+            Self::Unsupported => "Adapter not compiled or unsupported device",
+            Self::Configuring => "Configuring",
+            Self::Verifying => "Verifying",
+            Self::WanBootstrapPending => "WAN bootstrap pending",
+            Self::Verified => "Verified",
+            Self::Retrying => "Retrying",
+            Self::Offline => "Offline",
+        })
+    }
+}
+impl std::fmt::Display for BusinessStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (generation {})", self.phase, self.generation)?;
+        if let Some(error) = &self.error {
+            write!(f, ": {error}")?;
+        }
+        Ok(())
+    }
+}
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[derive(Debug, Clone)]
 pub struct SubGatewayStatus {
     pub onu_id: u8,
     pub vendor: String,

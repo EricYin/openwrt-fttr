@@ -88,6 +88,7 @@ impl SyncRequest {
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy)]
 pub enum OperationMode {
     Plan,
     Apply,

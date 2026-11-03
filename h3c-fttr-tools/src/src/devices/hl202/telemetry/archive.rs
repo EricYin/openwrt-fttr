@@ -68,7 +68,7 @@ pub(super) fn read(input: &[u8]) -> io::Result<(Vec<Member>, usize)> {
         members.push(Member {
             name,
             bytes: size,
-            encoding,
+            encoding: encoding.into(),
             text,
             text_omitted,
         });

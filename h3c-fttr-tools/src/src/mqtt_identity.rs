@@ -1,7 +1,6 @@
 //! Fresh MQTT source identities, independent of ACS configuration and Inform readiness.
 mod registry;
 pub use registry::Registry;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,13 +13,7 @@ pub(crate) struct Transport {
     pub epoch: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Selection {
-    pub optical_sn: String,
-    pub onu_id: u16,
-    pub binding_generation: String,
-}
+pub use fttr_api::HlOpticalSelection as Selection;
 
 pub use fttr_api::MqttSource as Snapshot;
 

@@ -9,26 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const STATE_FILE: &str = "/var/lib/fttr/acs-bootstrap.json";
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Phase {
-    #[default]
-    WaitingTransport,
-    WaitingIdentity,
-    Reading,
-    Configuring,
-    Verifying,
-    WaitingInform,
-    Ready,
-    RetryWait,
-    ManualRequired,
-    NotConfigured,
-    WaitingAcs,
-    AwaitingApply,
-    DiscoveringManagementWan,
-    ConfiguringManagementWan,
-    VerifyingManagementWan,
-}
+use fttr_api::BootstrapPhase as Phase;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]

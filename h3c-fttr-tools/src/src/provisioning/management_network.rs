@@ -21,23 +21,7 @@ use verification::{verify_bridge, verify_dhcp, verify_firewall, verify_network};
 
 const JOURNAL: &str = "/etc/fttr/management-applied.json";
 type Sections = BTreeMap<String, Section>;
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Phase {
-    Discovering,
-    Comparing,
-    Planning,
-    Applying,
-    Verifying,
-    ConfiguringListener,
-    CleaningPrevious,
-    WaitingDevices,
-    Ready,
-    AwaitingApply,
-    Verified,
-    Blocked,
-    RetryWait,
-}
+use fttr_api::NetworkPhase as Phase;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Desired {

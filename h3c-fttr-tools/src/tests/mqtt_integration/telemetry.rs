@@ -68,7 +68,8 @@ fn mqtt_telemetry_real_delivery_validation_and_reconnect() {
         let task = tokio::spawn(mqtt::run(addrs[0], devices.clone()));
         deliver_until(addrs[1], &payload, || {
             store::snapshot("02AABBCCDDEE")
-                .is_some_and(|s| s["report"]["fields"]["ip"]["value"] == "192.0.2.10")
+                .and_then(|s| s.report)
+                .is_some_and(|r| r.fields.get("ip").is_some_and(|f| f.value == "192.0.2.10"))
         })
         .await;
         {
@@ -97,18 +98,23 @@ fn mqtt_telemetry_real_delivery_validation_and_reconnect() {
         assert!(ready(&rx));
         // Different receipt length proves delivery after the new clean subscription.
         deliver_until(addrs[1], b"malformed archive", || {
-            store::snapshot("02AABBCCDDEE").is_some_and(|s| !s["error"].is_null())
+            store::snapshot("02AABBCCDDEE").is_some_and(|s| s.error.is_some())
         })
         .await;
         assert_eq!(devices.lock().unwrap()[0].payload_bytes, 17);
         // A bad archive retains the last valid report, and ingestion keeps working.
         assert_eq!(
-            store::snapshot("02AABBCCDDEE").unwrap()["report"]["fields"]["ip"]["value"],
+            store::snapshot("02AABBCCDDEE")
+                .unwrap()
+                .report
+                .unwrap()
+                .fields["ip"]
+                .value,
             "192.0.2.10"
         );
         deliver_until(addrs[1], &payload, || {
             store::snapshot("02AABBCCDDEE")
-                .is_some_and(|s| s["error"].is_null() && s["last_good"].is_number())
+                .is_some_and(|s| s.error.is_none() && s.last_good.is_some())
         })
         .await;
         task.abort();

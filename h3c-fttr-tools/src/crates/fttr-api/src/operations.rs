@@ -257,19 +257,12 @@ pub struct JobReleaseRequest {
     pub job: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub enum HlTarget {
-    Optical {
-        optical_sn: String,
-        onu_id: u16,
-        binding_generation: String,
-    },
-    Source {
-        mqtt_mac: String,
-        binding_generation: String,
-    },
+    Optical(crate::HlOpticalSelection),
+    Source(crate::HlSourceSelection),
 }
 
 #[derive(Debug, Deserialize)]

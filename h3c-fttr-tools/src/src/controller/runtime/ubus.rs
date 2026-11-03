@@ -52,13 +52,17 @@ impl Handlers {
     fn npu_set(&self, request: NpuSetRequest) -> Result<NpuSetReply, i32> {
         #[cfg(feature = "npu")]
         {
-            response(
+            Ok(
                 match crate::npu::settings::set(
                     request.enabled,
                     (!request.bridge.is_empty()).then_some(request.bridge.as_str()),
                 ) {
-                    Ok(()) => serde_json::json!({"status":"success","enabled":request.enabled}),
-                    Err(error) => serde_json::json!({"status":"error","error":error.to_string()}),
+                    Ok(()) => NpuSetReply::Success {
+                        enabled: request.enabled,
+                    },
+                    Err(error) => NpuSetReply::Error {
+                        error: error.to_string(),
+                    },
                 },
             )
         }
@@ -146,17 +150,11 @@ impl Handlers {
     fn job_release(&self, request: JobReleaseRequest) -> Result<JobReleaseReply, i32> {
         response(self.jobs.release(&request.job))
     }
-    fn hl_query(
-        &self,
-        value: serde_json::Value,
-        background: bool,
-    ) -> Result<serde_json::Value, i32> {
+    fn hl_query(&self, query: HlQuery, background: bool) -> Result<serde_json::Value, i32> {
         #[cfg(feature = "device-hl202")]
         {
-            let input = value.to_string();
-            if input.len() > crate::hl202_ipc::MAX_REQUEST_BYTES
-                || serde_json::from_str::<crate::devices::hl202::api::Query>(&input).is_err()
-            {
+            let input = serde_json::to_string(&query).map_err(|_| 2)?;
+            if input.len() > crate::hl202_ipc::MAX_REQUEST_BYTES {
                 return Err(2);
             }
             if !background {
@@ -166,14 +164,25 @@ impl Handlers {
                     &self.services,
                 ));
             }
-            let method = value["method"].as_str().unwrap_or_default().to_owned();
-            let exec = value["request"]["action"]["kind"] == "exec";
+            let report = matches!(
+                &query,
+                HlQuery::Report { .. } | HlQuery::SourceReport { .. }
+            );
+            let exec = matches!(
+                &query,
+                HlQuery::Run {
+                    request: HlCommandRequest {
+                        action: HlAction::Exec { .. },
+                        ..
+                    }
+                }
+            );
             let handler = self.clone();
             Ok(self.jobs.start("hl202", move || {
                 let result =
                     crate::controller::hl202::control(&input, &handler.engine, &handler.services);
                 // Validate the final payload before publishing it into the job store.
-                let result = if method == "report" || method == "source_report" {
+                let result = if report {
                     normalize::<HlReportReply>(result)
                 } else if exec {
                     normalize::<HlExecReply>(result)
@@ -185,51 +194,79 @@ impl Handlers {
         }
         #[cfg(not(feature = "device-hl202"))]
         {
-            let _ = (value, background);
+            let _ = (query, background);
             Err(4)
         }
     }
     fn hl202_list(&self, _: EmptyRequest) -> Result<HlListReply, i32> {
-        response(self.hl_query(serde_json::json!({"method":"list"}), false)?)
+        response(self.hl_query(HlQuery::List, false)?)
     }
     fn hl202_report(&self, request: HlReportRequest) -> Result<JobStartReply, i32> {
-        let source = matches!(&request.target, HlTarget::Source { .. });
-        response(self.hl_query(serde_json::json!({"method":if source {"source_report"} else {"report"},"target":target(request.target)}), true)?)
+        let query = match request.target {
+            HlTarget::Optical(target) => HlQuery::Report { target },
+            HlTarget::Source(target) => HlQuery::SourceReport { target },
+        };
+        response(self.hl_query(query, true)?)
     }
     fn hl202_accounts_start(&self, request: HlAccountsRequest) -> Result<JobStartReply, i32> {
-        self.hl_run(request.target, serde_json::json!({"kind":"accounts_read"}))
+        self.hl_run(request.target, HlAction::AccountsRead)
     }
     fn hl202_account_update(&self, request: HlUpdateRequest) -> Result<JobStartReply, i32> {
+        let entry = u8::try_from(request.entry).map_err(|_| 2)?;
         let action = match request.kind {
-            AccountChange::AccountSetPassword => {
-                serde_json::json!({"kind":"account_set_password","entry":request.entry,"password":request.password})
-            }
-            AccountChange::AccountSetActive => {
-                serde_json::json!({"kind":"account_set_active","entry":request.entry,"active":request.active})
-            }
+            AccountChange::AccountSetPassword => HlAction::AccountSetPassword {
+                entry,
+                password: request.password,
+            },
+            AccountChange::AccountSetActive => HlAction::AccountSetActive {
+                entry,
+                active: request.active,
+            },
         };
         self.hl_run(request.target, action)
     }
     fn hl202_exec_start(&self, request: HlExecRequest) -> Result<JobStartReply, i32> {
-        self.hl_run(request.target, serde_json::json!({"kind":"exec","script":request.script,"timeout_seconds":request.timeout_seconds}))
+        self.hl_run(
+            request.target,
+            HlAction::Exec {
+                script: request.script,
+                timeout_seconds: request.timeout_seconds,
+            },
+        )
     }
-    fn hl_run(&self, selection: HlTarget, action: serde_json::Value) -> Result<JobStartReply, i32> {
-        if matches!(selection, HlTarget::Source { .. }) {
+    fn hl_run(&self, selection: HlTarget, action: HlAction) -> Result<JobStartReply, i32> {
+        let HlTarget::Optical(target) = selection else {
             return Err(2);
-        }
-        response(self.hl_query(serde_json::json!({"method":"run","request":{"schema_version":1,"target":target(selection),"action":action}}), true)?)
+        };
+        response(self.hl_query(
+            HlQuery::Run {
+                request: HlCommandRequest {
+                    schema_version: 1,
+                    target,
+                    action,
+                },
+            },
+            true,
+        )?)
     }
     fn get_calibration(&self, _: EmptyRequest) -> Result<CalibrationInfoReply, i32> {
-        response(super::calibration::get().unwrap_or_else(|e| fttr_jobs::error(&e.to_string())))
+        Ok(match super::calibration::get() {
+            Ok(info) => CalibrationInfoReply::Info(info),
+            Err(error) => CalibrationInfoReply::Error(CommandError {
+                error: error.to_string(),
+            }),
+        })
     }
     fn save_calibration(
         &self,
         request: CalibrationSaveRequest,
     ) -> Result<CalibrationSaveReply, i32> {
-        response(
-            super::calibration::save(&request.data)
-                .unwrap_or_else(|e| fttr_jobs::error(&e.to_string())),
-        )
+        Ok(match super::calibration::save(&request.data) {
+            Ok(saved) => CalibrationSaveReply::Saved(saved),
+            Err(error) => CalibrationSaveReply::Error(CommandError {
+                error: error.to_string(),
+            }),
+        })
     }
     fn apply_calibration(&self, _: EmptyRequest) -> Result<JobStartReply, i32> {
         let optics = self.optics.clone();
@@ -285,21 +322,18 @@ impl Handlers {
         )
     }
     fn get_status(&self, _: EmptyRequest) -> Result<StatusReply, i32> {
-        let provisioning = crate::provisioning::snapshot();
+        let provisioning =
+            serde_json::from_value(crate::provisioning::snapshot()).map_err(|_| 9)?;
         let devices = self.devices.lock().map_err(|_| 9)?;
         let engine = self.engine.lock().map_err(|_| 9)?;
-        let status =
+        let mut status =
             crate::controller::status::snapshot(&engine, &self.services, (&devices, provisioning));
-        let mut value = serde_json::to_value(status).map_err(|_| 9)?;
         if let Some(jobs) = self.jobs.snapshot() {
-            value["jobs"] = jobs;
+            status.jobs = Some(serde_json::from_value(jobs).map_err(|_| 9)?);
         }
-        if let Some(stats) = metrics::snapshot() {
-            value["ubus"] = serde_json::to_value(stats).map_err(|_| 9)?;
-        }
-        value["ipc"] =
-            serde_json::to_value(super::ipc_server::metrics::snapshot()).map_err(|_| 9)?;
-        serde_json::from_value(value).map_err(|_| 9)
+        status.ubus = metrics::snapshot();
+        status.ipc = Some(super::ipc_server::metrics::snapshot());
+        Ok(status)
     }
     fn get_sync(&self, _: EmptyRequest) -> Result<SyncStatusReply, i32> {
         serde_json::from_value(crate::provisioning::snapshot()).map_err(|_| 9)
@@ -383,22 +417,6 @@ pub(super) fn methods(
         };
     }
     fttr_methods!(register)
-}
-
-fn target(selection: HlTarget) -> serde_json::Value {
-    match selection {
-        HlTarget::Optical {
-            optical_sn,
-            onu_id,
-            binding_generation,
-        } => {
-            serde_json::json!({"optical_sn":optical_sn,"onu_id":onu_id,"binding_generation":binding_generation})
-        }
-        HlTarget::Source {
-            mqtt_mac,
-            binding_generation,
-        } => serde_json::json!({"mqtt_mac":mqtt_mac,"binding_generation":binding_generation}),
-    }
 }
 
 fn response<R: DeserializeOwned>(value: serde_json::Value) -> Result<R, i32> {

@@ -53,7 +53,7 @@ fn telemetry_producer_preserves_open_values_inside_typed_envelopes() {
         compressed_bytes: 12,
         decompressed_bytes: 24,
         fields: [(
-            "extension",
+            "extension".into(),
             telemetry::Field {
                 value: json!({"vendor": [false, null, 3]}),
                 member: "test.json".into(),
@@ -64,7 +64,7 @@ fn telemetry_producer_preserves_open_values_inside_typed_envelopes() {
         members: vec![telemetry::Member {
             name: "test.json".into(),
             bytes: 24,
-            encoding: "utf8",
+            encoding: "utf8".into(),
             text: None,
             text_omitted: true,
         }],

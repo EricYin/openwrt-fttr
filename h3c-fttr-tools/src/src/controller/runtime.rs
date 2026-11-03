@@ -15,7 +15,7 @@ use super::activation::{clear_offline_hardware, RangingSession};
 use crate::bosa;
 use crate::fpga;
 use crate::ipc::{self, SubDevice};
-use crate::model::{FttrSystemStatus, IpcResponse};
+use crate::model::IpcResponse;
 use crate::pon_engine::ploam::OnuState;
 use crate::pon_engine::ploam::PloamFrame;
 use crate::pon_engine::PonEngine;
@@ -566,21 +566,21 @@ fn ipc_handler(
         } else if line == "CAPABILITIES" {
             let _ = writeln!(stream, "{}", crate::capabilities::json());
         } else if line == "STATUS" {
-            let provisioning = crate::provisioning::snapshot();
+            let provisioning = match serde_json::from_value(crate::provisioning::snapshot()) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    let _ = stream.write_all(
+                        IpcResponse::err("Invalid provisioning snapshot contract")
+                            .to_json_line()
+                            .as_bytes(),
+                    );
+                    return;
+                }
+            };
             let devs = devices.lock().unwrap();
             let engine = pon_engine.lock().unwrap();
-            let sys_status = super::status::snapshot(&engine, &services, (&devs, provisioning));
-
-            #[derive(serde::Serialize)]
-            struct Status<'a> {
-                #[serde(flatten)]
-                system: &'a FttrSystemStatus,
-                ipc: ipc_server::metrics::Snapshot,
-            }
-            let status = Status {
-                system: &sys_status,
-                ipc: ipc_server::metrics::snapshot(),
-            };
+            let mut status = super::status::snapshot(&engine, &services, (&devs, provisioning));
+            status.ipc = Some(ipc_server::metrics::snapshot());
             if let Ok(json_str) = serde_json::to_string_pretty(&status) {
                 let _ = stream.write_all(json_str.as_bytes());
                 let _ = stream.write_all(b"\n");
