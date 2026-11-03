@@ -3,18 +3,26 @@ use super::{OpticalClient, OpticalCommand, OpticalReplyExt};
 use fttr_api::*;
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::atomic::Ordering;
+mod metrics;
 
 fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
     method: &Method<Q, R>,
     handler: impl Fn(Q) -> Result<R, i32> + Send + Sync + 'static,
 ) -> (String, openwrt_ubus::MethodHandler) {
+    let name = method.name;
     (
         method.name.into(),
         Box::new(move |_, message| {
-            let request =
-                serde_json::from_value(message.cloned().unwrap_or_else(|| serde_json::json!({})))
-                    .map_err(|_| 2)?;
-            serde_json::to_value(handler(request)?).map_err(|_| 9)
+            let started = std::time::Instant::now();
+            let result = (|| {
+                let request = serde_json::from_value(
+                    message.cloned().unwrap_or_else(|| serde_json::json!({})),
+                )
+                .map_err(|_| 2)?;
+                serde_json::to_value(handler(request)?).map_err(|_| 9)
+            })();
+            metrics::record(name, started.elapsed(), result.is_err());
+            result
         }),
     )
 }
@@ -103,20 +111,22 @@ impl Handlers {
         let states = self.services.clone();
         let id = request.onu_id;
         let tables = request.tables;
-        response(self.jobs.start(
-            "mib",
-            move || match crate::controller::inventory::control_guarded(
+        response(self.jobs.start_with_progress("mib", move |progress| {
+            progress.update(fttr_jobs::Phase::Starting, 0, None);
+            match crate::controller::inventory::control_guarded(
                 id,
                 tables,
-                None,
+                Some(crate::controller::inventory::MibProgressReporter::Job(
+                    progress,
+                )),
                 &states,
                 Some(guard.clone()),
             ) {
                 Ok(report) if guard() => serde_json::json!({"status":"ready","report":report}),
                 Ok(_) => fttr_jobs::error("Device registration changed during MIB read"),
                 Err(error) => fttr_jobs::error(&error.to_string()),
-            },
-        ))
+            }
+        }))
     }
     fn mib_result(&self, request: JobRequest) -> Result<JobChunkReply, i32> {
         response(self.jobs.result(&request.job, request.chunk, Some("mib")))
@@ -233,6 +243,12 @@ impl Handlers {
         let status =
             crate::controller::status::snapshot(&engine, &self.services, (&devices, provisioning));
         let mut value = serde_json::to_value(status).map_err(|_| 9)?;
+        if let Some(jobs) = self.jobs.snapshot() {
+            value["jobs"] = jobs;
+        }
+        if let Some(stats) = metrics::snapshot() {
+            value["ubus"] = serde_json::to_value(stats).map_err(|_| 9)?;
+        }
         value["ipc"] =
             serde_json::to_value(super::ipc_server::metrics::snapshot()).map_err(|_| 9)?;
         serde_json::from_value(value).map_err(|_| 9)
@@ -294,6 +310,7 @@ pub(super) fn methods(
     devices: std::sync::Arc<std::sync::Mutex<Vec<crate::ipc::SubDevice>>>,
     engine: std::sync::Arc<std::sync::Mutex<crate::pon_engine::PonEngine>>,
     services: crate::controller::service::States,
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Vec<(String, openwrt_ubus::MethodHandler)> {
     let handlers = Handlers {
         optics,
@@ -302,7 +319,8 @@ pub(super) fn methods(
         services,
         jobs: {
             static JOBS: std::sync::OnceLock<fttr_jobs::Jobs> = std::sync::OnceLock::new();
-            JOBS.get_or_init(fttr_jobs::Jobs::default).clone()
+            JOBS.get_or_init(|| fttr_jobs::Jobs::with_shutdown(stopping))
+                .clone()
         },
     };
     macro_rules! register {

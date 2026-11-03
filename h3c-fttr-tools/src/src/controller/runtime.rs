@@ -456,9 +456,10 @@ fn start_ubus_server(
     let create_methods = |devices: Arc<Mutex<Vec<SubDevice>>>,
                           pon_engine: Arc<Mutex<PonEngine>>,
                           services: super::service::States,
-                          optics: OpticalClient|
+                          optics: OpticalClient,
+                          stopping: Arc<AtomicBool>|
      -> Vec<(String, openwrt_ubus::MethodHandler)> {
-        ubus::methods(optics, devices, pon_engine, services)
+        ubus::methods(optics, devices, pon_engine, services, stopping)
     };
 
     std::thread::Builder::new()
@@ -479,9 +480,9 @@ fn start_ubus_server(
                     pon_engine.clone(),
                     services.clone(),
                     optics.clone(),
+                    stopping.clone(),
                 );
-                // Exclusively register native system 'fttr' object.
-                // Compatibility 'luci.fttr' is owned by the rpcd shell plugin.
+                // Exclusively register the native system 'fttr' object.
                 if let Err(e) = server.add_object(fttr_api::OBJECT, methods) {
                     eprintln!("[-] Failed to register 'fttr' ubus object: {e}; retrying in 3s");
                     std::thread::sleep(Duration::from_secs(3));

@@ -28,8 +28,9 @@ pub(super) struct MibProgress {
 }
 
 #[derive(Clone)]
-pub(super) struct MibProgressReporter {
-    path: PathBuf,
+pub(super) enum MibProgressReporter {
+    File(PathBuf),
+    Job(fttr_jobs::Progress),
 }
 
 impl MibProgressReporter {
@@ -45,13 +46,26 @@ impl MibProgressReporter {
                 "invalid MIB progress identifier",
             ));
         }
-        Ok(Self {
-            path: PathBuf::from(format!("/tmp/fttr-mib.{id}/progress")),
-        })
+        Ok(Self::File(PathBuf::from(format!(
+            "/tmp/fttr-mib.{id}/progress"
+        ))))
     }
 
     pub fn update(&self, progress: &MibProgress) -> io::Result<()> {
-        let directory = self.path.parent().expect("MIB progress path has a parent");
+        let path = match self {
+            Self::File(path) => path,
+            Self::Job(reporter) => {
+                let phase = match progress.phase {
+                    "starting" => fttr_jobs::Phase::Starting,
+                    "upload" => fttr_jobs::Phase::Upload,
+                    "tables" => fttr_jobs::Phase::Tables,
+                    _ => return Err(io::Error::other("Invalid MIB progress phase")),
+                };
+                reporter.update(phase, progress.received, progress.expected);
+                return Ok(());
+            }
+        };
+        let directory = path.parent().expect("MIB progress path has a parent");
         if !fs::symlink_metadata(directory)?.file_type().is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -66,7 +80,7 @@ impl MibProgressReporter {
             .open(&temporary)?;
         serde_json::to_writer(&mut file, progress).map_err(io::Error::other)?;
         file.write_all(b"\n")?;
-        fs::rename(temporary, &self.path)
+        fs::rename(temporary, path)
     }
 }
 

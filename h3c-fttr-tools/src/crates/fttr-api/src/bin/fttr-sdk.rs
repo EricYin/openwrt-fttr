@@ -65,6 +65,39 @@ fn render() -> BTreeMap<&'static str, String> {
     BTreeMap::from([("types.ts", type_source), ("luci-client.ts", client)])
 }
 
+fn render_acl(template: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut acl: serde_json::Value = serde_json::from_str(template)?;
+    let group = acl
+        .get_mut("luci-app-fttr")
+        .ok_or("missing FTTR ACL group")?;
+    for access in ["read", "write"] {
+        let ubus = group[access]["ubus"]
+            .as_object_mut()
+            .ok_or("missing ubus ACL object")?;
+        if ubus.contains_key(OBJECT) {
+            return Err(
+                "native FTTR grants belong to shared declarations, not the ACL template".into(),
+            );
+        }
+        ubus.insert(OBJECT.into(), serde_json::json!([]));
+    }
+    macro_rules! grant {
+        ($( $id:ident, $wire:ident, $sdk:ident, $req:ident, $res:ident, $access:ident, $availability:ident, [$($param:ident),*]; )*) => {$(
+            let access = match $id.access { Access::Read => "read", Access::Write => "write" };
+            group[access]["ubus"][OBJECT].as_array_mut().unwrap().push(serde_json::json!($id.name));
+        )*};
+    }
+    fttr_methods!(grant);
+    let mut bytes = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"\t");
+    serde::Serialize::serialize(
+        &acl,
+        &mut serde_json::Serializer::with_formatter(&mut bytes, formatter),
+    )?;
+    bytes.push(b'\n');
+    Ok(String::from_utf8(bytes)?)
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut check = false;
     let mut output = None;
@@ -110,24 +143,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     let mut drift = Vec::new();
-    let files = render();
+    let mut files: BTreeMap<PathBuf, String> = render()
+        .into_iter()
+        .map(|(name, source)| (output.join(name), source))
+        .collect();
+    files.insert(
+        frontend.join("package/luci-app-fttr/root/usr/share/rpcd/acl.d/luci-app-fttr.json"),
+        render_acl(&fs::read_to_string(frontend.join("src/api/acl-base.json"))?)?,
+    );
     // Check every output before changing any of them. --check never writes.
     for (name, source) in &files {
-        match fs::read_to_string(output.join(name)) {
+        match fs::read_to_string(name) {
             Ok(current) if current == *source => {}
-            Ok(_) => drift.push(*name),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => drift.push(*name),
+            Ok(_) => drift.push(name.clone()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => drift.push(name.clone()),
             Err(e) => return Err(e.into()),
         }
     }
     if check && !drift.is_empty() {
-        return Err(format!("SDK drift at {}: {}", output.display(), drift.join(", ")).into());
+        return Err(format!(
+            "SDK/ACL drift: {}",
+            drift
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .into());
     }
     if !check {
         fs::create_dir_all(&output)?;
         for name in &drift {
-            let path = output.join(name);
-            let temporary = output.join(format!(".{name}.{}.tmp", std::process::id()));
+            let path = name;
+            fs::create_dir_all(path.parent().ok_or("invalid output path")?)?;
+            let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
             fs::write(&temporary, &files[name])?;
             fs::rename(&temporary, &path)?;
         }
@@ -164,5 +213,22 @@ mod tests {
         assert!(!types.contains("bigint"));
         assert!(types.contains("optical_transceiver: unknown"));
         assert!(client.contains("method: \"npu_status\", access: \"read\", feature: \"npu\""));
+    }
+
+    #[test]
+    fn acl_preserves_external_grants_and_rejects_duplicate_native_sources() {
+        let template = r#"{"luci-app-fttr":{"read":{"uci":["fttr"],"ubus":{"luci-rpc":["getNetworkDevices"]}},"write":{"uci":["fttr"],"ubus":{}}}}"#;
+        let acl: serde_json::Value = serde_json::from_str(&render_acl(template).unwrap()).unwrap();
+        let group = &acl["luci-app-fttr"];
+        assert_eq!(group["read"]["ubus"]["luci-rpc"][0], "getNetworkDevices");
+        assert!(group["read"]["ubus"][OBJECT]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(MIB_START.name)));
+        assert!(group["write"]["ubus"][OBJECT]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(NPU_SET.name)));
+        assert!(render_acl(&acl.to_string()).is_err());
     }
 }

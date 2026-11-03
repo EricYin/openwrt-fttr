@@ -15,6 +15,51 @@ pub enum ReadyStatus {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub enum JobPhase {
+    Starting,
+    Upload,
+    Tables,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct JobProgress {
+    pub phase: JobPhase,
+    pub received: u32,
+    pub expected: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct JobStats {
+    pub accepting: bool,
+    pub running: u32,
+    pub stored: u32,
+    pub bytes: u32,
+    pub running_limit: u32,
+    pub stored_limit: u32,
+    pub bytes_limit: u32,
+    pub result_bytes_limit: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct UbusMethodStats {
+    #[cfg_attr(feature = "codegen", ts(type = "number"))]
+    pub calls: u64,
+    #[cfg_attr(feature = "codegen", ts(type = "number"))]
+    pub failures: u64,
+    #[cfg_attr(feature = "codegen", ts(type = "number"))]
+    pub last_us: u64,
+    #[cfg_attr(feature = "codegen", ts(type = "number"))]
+    pub max_us: u64,
+    #[cfg_attr(feature = "codegen", ts(type = "number"))]
+    pub total_us: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub enum JobStartReply {
@@ -28,6 +73,9 @@ pub enum JobStartReply {
 pub enum JobChunkReply {
     Pending {
         status: PendingStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "codegen", ts(optional))]
+        progress: Option<JobProgress>,
     },
     Ready {
         status: ReadyStatus,
@@ -109,7 +157,31 @@ pub enum CalibrationSaveReply {
     Error(CommandError),
 }
 
-// Nested device models remain owned and validated by the existing adapter.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct MqttSource {
+    pub mqtt_mac: String,
+    pub optical_sn: Option<String>,
+    pub onu_id: Option<u16>,
+    pub binding_generation: String,
+    #[cfg_attr(feature = "codegen", ts(type = "number"))]
+    pub last_seen: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct HlDevice {
+    pub optical_sn: String,
+    pub onu_id: u16,
+    pub model: String,
+    pub optical_online: bool,
+    pub can_execute: bool,
+    pub mqtt: Option<MqttSource>,
+    #[cfg_attr(feature = "codegen", ts(type = "number | null"))]
+    pub report_revision: Option<u64>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
@@ -117,10 +189,8 @@ pub enum HlListReply {
     List {
         #[cfg_attr(feature = "codegen", ts(type = "1"))]
         schema_version: u8,
-        #[cfg_attr(feature = "codegen", ts(type = "Array<unknown>"))]
-        devices: Vec<serde_json::Value>,
-        #[cfg_attr(feature = "codegen", ts(type = "Array<unknown>"))]
-        sources: Vec<serde_json::Value>,
+        devices: Vec<HlDevice>,
+        sources: Vec<MqttSource>,
     },
     Error {
         schema_version: u8,

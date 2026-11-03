@@ -22,15 +22,7 @@ pub struct Selection {
     pub binding_generation: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct Snapshot {
-    pub mqtt_mac: String,
-    pub optical_sn: Option<String>,
-    pub onu_id: Option<u16>,
-    pub binding_generation: String,
-    pub last_seen: u64,
-    pub reason: String,
-}
+pub use fttr_api::MqttSource as Snapshot;
 
 pub(crate) fn normalize_target(topic: &str) -> Option<String> {
     let value = topic.strip_suffix("/fttr_data.tar.gz").unwrap_or(topic);

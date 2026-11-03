@@ -67,15 +67,27 @@ pub fn control(input: &str, devices: &[Device]) -> Value {
                 Ok(state) => state.snapshots(now),
                 Err(_) => return error("unavailable", "MQTT identity state unavailable"),
             };
-            let rows: Vec<Value> = devices.iter().map(|device| {
-                let mqtt = sources.iter().find(|source| source.reason == "ready"
-                    && source.optical_sn.as_deref() == Some(&device.optical_sn)
-                    && source.onu_id == Some(device.onu_id));
-                let report_revision = mqtt.and_then(|source| super::telemetry::store::revision(&source.mqtt_mac));
-                json!({"optical_sn":device.optical_sn,"onu_id":device.onu_id,"model":device.model,
-                    "optical_online":device.online,"can_execute":cfg!(feature = "mqtt") && device.online && mqtt.is_some(),
-                    "mqtt":mqtt,"report_revision":report_revision})
-            }).collect();
+            let rows: Vec<fttr_api::HlDevice> = devices
+                .iter()
+                .map(|device| {
+                    let mqtt = sources.iter().find(|source| {
+                        source.reason == "ready"
+                            && source.optical_sn.as_deref() == Some(&device.optical_sn)
+                            && source.onu_id == Some(device.onu_id)
+                    });
+                    let report_revision =
+                        mqtt.and_then(|source| super::telemetry::store::revision(&source.mqtt_mac));
+                    fttr_api::HlDevice {
+                        optical_sn: device.optical_sn.clone(),
+                        onu_id: device.onu_id,
+                        model: device.model.clone(),
+                        optical_online: device.online,
+                        can_execute: cfg!(feature = "mqtt") && device.online && mqtt.is_some(),
+                        mqtt: mqtt.cloned(),
+                        report_revision,
+                    }
+                })
+                .collect();
             json!({"schema_version":1,"devices":rows,"sources":sources})
         }
         Query::Report { target } => match registry.lock() {

@@ -8,6 +8,12 @@ use serde_json::Value;
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct StatusReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub ubus: Option<std::collections::BTreeMap<String, crate::UbusMethodStats>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub jobs: Option<crate::JobStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "codegen", ts(type = "unknown", optional))]
     pub onu_pinning: Option<Value>,
     pub fpga_status: String,
