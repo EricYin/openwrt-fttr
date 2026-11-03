@@ -213,11 +213,38 @@ impl Handlers {
     fn apply_calibration(&self, _: EmptyRequest) -> Result<JobStartReply, i32> {
         let optics = self.optics.clone();
         response(self.jobs.start("calibration", move || {
-            match optical(&optics, OpticalCommand::Reinitialize) {
-                Ok(reply) if reply.status == ReplyStatus::Success => serde_json::json!({"success":true,"output":if reply.desired_enabled == Some(true) {"Calibration applied by optical owner"} else {"Optical TX remains disabled; calibration will load on next enable"}}),
-                Ok(reply) => serde_json::json!({"success":false,"error":reply.error.map(|e|e.message).unwrap_or_else(||"Calibration failed".into())}),
-                Err(_) => serde_json::json!({"success":false,"error":"Optical owner unavailable; execution outcome may be unknown"}),
-            }
+            let result = match optical(&optics, OpticalCommand::Reinitialize) {
+                Ok(reply) if reply.status == ReplyStatus::Success => CalibrationApplied {
+                    success: true,
+                    output: Some(
+                        if reply.desired_enabled == Some(true) {
+                            "Calibration applied by optical owner"
+                        } else {
+                            "Optical TX remains disabled; calibration will load on next enable"
+                        }
+                        .into(),
+                    ),
+                    error: None,
+                },
+                Ok(reply) => CalibrationApplied {
+                    success: false,
+                    output: None,
+                    error: Some(
+                        reply
+                            .error
+                            .map(|e| e.message)
+                            .unwrap_or_else(|| "Calibration failed".into()),
+                    ),
+                },
+                Err(_) => CalibrationApplied {
+                    success: false,
+                    output: None,
+                    error: Some(
+                        "Optical owner unavailable; execution outcome may be unknown".into(),
+                    ),
+                },
+            };
+            serde_json::to_value(result).expect("calibration result is JSON serializable")
         }))
     }
     fn get_capabilities(&self, _: EmptyRequest) -> Result<Capabilities, i32> {

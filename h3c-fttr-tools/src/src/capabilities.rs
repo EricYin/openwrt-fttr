@@ -1,6 +1,7 @@
 //! Compile-time support, deliberately independent of UCI, hardware and liveness.
 pub use fttr_api::{AdapterCapability, Capabilities};
-use std::{collections::BTreeMap, fs, io, path::Path};
+use fttr_api::{CapabilityFeatures, CapabilityFunctions, CapabilityPages};
+use std::{fs, io, path::Path};
 
 pub fn compiled() -> Capabilities {
     let acs = cfg!(feature = "acs");
@@ -41,34 +42,34 @@ pub fn compiled() -> Capabilities {
     Capabilities {
         schema_version: 1,
         version: env!("CARGO_PKG_VERSION"),
-        features: BTreeMap::from([
-            ("acs", acs),
-            ("mqtt", mqtt),
-            ("npu", cfg!(feature = "npu")),
-            ("device-hl202", hl202),
-            ("device-hwtc", hwtc),
-            ("device-star", star),
-            ("device-zte", zte),
-        ]),
-        functions: BTreeMap::from([
-            ("optical", true),
-            ("bridge_offload", cfg!(feature = "npu")),
-            ("omci_mib", true),
-            ("mqtt_telemetry", mqtt),
-            ("hl202_management", hl202 && mqtt),
-            ("cwmp", acs),
-            ("command_provisioning", hl202 && mqtt),
-        ]),
+        features: CapabilityFeatures {
+            acs,
+            mqtt,
+            npu: cfg!(feature = "npu"),
+            device_hl202: hl202,
+            device_hwtc: hwtc,
+            device_star: star,
+            device_zte: zte,
+        },
+        functions: CapabilityFunctions {
+            optical: true,
+            bridge_offload: cfg!(feature = "npu"),
+            omci_mib: true,
+            mqtt_telemetry: mqtt,
+            hl202_management: hl202 && mqtt,
+            cwmp: acs,
+            command_provisioning: hl202 && mqtt,
+        },
         // Configuration and synchronization are the ACS/CWMP workflow in LuCI.
-        pages: BTreeMap::from([
-            ("status", true),
-            ("hardware", true),
-            ("calibration", true),
-            ("about", true),
-            ("config", acs || (hl202 && mqtt)),
-            ("sync", acs || (hl202 && mqtt)),
-            ("hl202", hl202 && mqtt),
-        ]),
+        pages: CapabilityPages {
+            status: true,
+            hardware: true,
+            calibration: true,
+            about: true,
+            config: acs || (hl202 && mqtt),
+            sync: acs || (hl202 && mqtt),
+            hl202: hl202 && mqtt,
+        },
         adapters,
     }
 }
@@ -86,7 +87,7 @@ pub fn publish_menu() -> io::Result<()> {
 fn publish_menu_at(directory: &Path, cache_directory: &Path) -> io::Result<()> {
     fs::create_dir_all(directory)?;
     let mut changed = false;
-    for (page, supported) in compiled().pages {
+    for (page, supported) in compiled().pages.entries() {
         let path = directory.join(page);
         if supported && !path.is_file() {
             fs::write(&path, b"")?;
@@ -119,7 +120,7 @@ mod tests {
         let markers = root.join("markers");
         fs::create_dir_all(&markers).unwrap();
         // Seed the opposite build's marker set.
-        for (page, supported) in compiled().pages {
+        for (page, supported) in compiled().pages.entries() {
             if !supported {
                 fs::write(markers.join(page), b"").unwrap();
             }
@@ -129,7 +130,7 @@ mod tests {
         let unrelated = root.join("keep.json");
         fs::write(&unrelated, b"{}").unwrap();
         publish_menu_at(&markers, &root).unwrap();
-        for (page, supported) in compiled().pages {
+        for (page, supported) in compiled().pages.entries() {
             assert_eq!(markers.join(page).is_file(), supported, "{page}");
         }
         assert!(!cache.exists());

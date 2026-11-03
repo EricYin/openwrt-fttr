@@ -59,6 +59,8 @@ fn render() -> BTreeMap<&'static str, String> {
         )*};
     }
     fttr_methods!(generate);
+    // Async envelopes contain serialized JSON; register their final payloads too.
+    add::<CalibrationApplied>(&mut types);
     let type_names = imports.into_iter().collect::<Vec<_>>().join(", ");
     let type_source = format!("{banner}{}", types.values().cloned().collect::<String>());
     let client = format!("{banner}import type {{ {type_names} }} from \"./types\";\n\nexport const fttrMethods = [\n{metadata}] as const;\n\nexport function createFttrClient<{}>(\n  rpc: typeof L.rpc,\n  validators: {{\n{}  }},\n) {{\n{declarations}  return {{\n{calls}  }};\n}}\n", generics.join(", "), validators.concat());

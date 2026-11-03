@@ -21,6 +21,7 @@ fn operation_parameters_and_job_transport_reject_wrong_types() {
     }
     for value in [
         json!({"status":"pending"}),
+        json!({"status":"pending","progress":{"phase":"tables","received":2,"expected":null}}),
         json!({"status":"ready","chunk":0,"chunks":1,"bytes":2,"data":"e30="}),
         json!({"error":"expired"}),
     ] {
@@ -31,4 +32,18 @@ fn operation_parameters_and_job_transport_reject_wrong_types() {
         serde_json::from_value::<JobChunkReply>(json!({"status":"ready","data":"e30="})).is_err()
     );
     assert!(serde_json::from_value::<NpuSetReply>(json!({"status":"success"})).is_err());
+}
+
+#[test]
+fn calibration_final_payload_keeps_business_failure_and_omits_absent_fields() {
+    for value in [
+        json!({"success":true,"output":"calibration applied"}),
+        json!({"success":false,"error":"calibration warning"}),
+    ] {
+        let reply: CalibrationApplied = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(reply).unwrap(), value);
+    }
+    assert!(
+        serde_json::from_value::<CalibrationApplied>(json!({"error":"worker failure"})).is_err()
+    );
 }

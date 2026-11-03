@@ -63,14 +63,21 @@ pub struct UbusMethodStats {
 #[serde(untagged)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub enum JobStartReply {
-    Pending { status: PendingStatus, job: String },
+    Pending(JobPending),
     Error(CommandError),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct JobPending {
+    pub status: PendingStatus,
+    pub job: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
-pub enum JobChunkReply {
+pub enum JobChunk {
     Pending {
         status: PendingStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,6 +91,13 @@ pub enum JobChunkReply {
         bytes: u32,
         data: String,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub enum JobChunkReply {
+    Chunk(JobChunk),
     Error(CommandError),
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,13 +162,30 @@ pub enum CalibrationInfoReply {
 #[serde(untagged)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub enum CalibrationSaveReply {
-    Saved {
-        success: bool,
-        path: String,
-        size: u32,
-        sha256: String,
-    },
+    Saved(CalibrationSaved),
     Error(CommandError),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct CalibrationSaved {
+    pub success: bool,
+    pub path: String,
+    pub size: u32,
+    pub sha256: String,
+}
+
+/// The final calibration job result; success=false is a business warning.
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct CalibrationApplied {
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

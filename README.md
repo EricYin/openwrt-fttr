@@ -79,6 +79,8 @@ cargo run --locked --manifest-path h3c-fttr-tools/src/crates/fttr-api/Cargo.toml
 ```
 
 其他布局追加 `--out-dir FRONTEND/src/api/generated`。`--check` 只检查生成
-一致性，不写文件。更新后在前端运行 `pnpm typecheck`、`pnpm test`。
+一致性，不写文件。完整链路在前端运行 `pnpm sdk:generate`，自动生成
+Rust 类型、客户端、ACL 和 Zod mini 校验；`pnpm check` 依次检查生成一致性、
+类型、回归测试及生产构建。非相邻目录设置 `FTTR_BACKEND_DIR`。
 
 CI 同时检查前端生成文件和 ACL；可用 `FTTR_FRONTEND_REF` 仓库变量或手动运行时的 ref 选择配套前端版本。

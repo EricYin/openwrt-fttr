@@ -1,6 +1,6 @@
 //! Wire contracts shared by the native ubus server and the host-side SDK generator.
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, marker::PhantomData};
+use std::marker::PhantomData;
 
 pub const OBJECT: &str = "fttr";
 
@@ -24,10 +24,64 @@ pub struct Capabilities {
     #[cfg_attr(feature = "codegen", ts(type = "1"))]
     pub schema_version: u32,
     pub version: &'static str,
-    pub features: BTreeMap<&'static str, bool>,
-    pub functions: BTreeMap<&'static str, bool>,
-    pub pages: BTreeMap<&'static str, bool>,
+    pub features: CapabilityFeatures,
+    pub functions: CapabilityFunctions,
+    pub pages: CapabilityPages,
     pub adapters: Vec<AdapterCapability>,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct CapabilityFeatures {
+    pub acs: bool,
+    pub mqtt: bool,
+    pub npu: bool,
+    #[serde(rename = "device-hl202")]
+    pub device_hl202: bool,
+    #[serde(rename = "device-hwtc")]
+    pub device_hwtc: bool,
+    #[serde(rename = "device-star")]
+    pub device_star: bool,
+    #[serde(rename = "device-zte")]
+    pub device_zte: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct CapabilityFunctions {
+    pub optical: bool,
+    pub bridge_offload: bool,
+    pub omci_mib: bool,
+    pub mqtt_telemetry: bool,
+    pub hl202_management: bool,
+    pub cwmp: bool,
+    pub command_provisioning: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct CapabilityPages {
+    pub status: bool,
+    pub config: bool,
+    pub sync: bool,
+    pub hardware: bool,
+    pub calibration: bool,
+    pub hl202: bool,
+    pub about: bool,
+}
+
+impl CapabilityPages {
+    pub fn entries(self) -> [(&'static str, bool); 7] {
+        [
+            ("status", self.status),
+            ("config", self.config),
+            ("sync", self.sync),
+            ("hardware", self.hardware),
+            ("calibration", self.calibration),
+            ("hl202", self.hl202),
+            ("about", self.about),
+        ]
+    }
 }
 
 #[derive(Serialize, Deserialize)]

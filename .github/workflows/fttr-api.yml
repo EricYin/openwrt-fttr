@@ -1,9 +1,9 @@
 name: FTTR API contract
 on:
   push:
-    paths: ['h3c-fttr-tools/src/crates/fttr-api/**', 'h3c-fttr-tools/src/crates/fttr-jobs/**', 'h3c-fttr-tools/src/crates/openwrt-ubus/**', '.github/workflows/fttr-api.yml']
+    paths: ['h3c-fttr-tools/src/crates/fttr-api/**', 'h3c-fttr-tools/src/crates/fttr-jobs/**', 'h3c-fttr-tools/src/crates/openwrt-ubus/**', 'h3c-fttr-tools/src/src/capabilities.rs', 'h3c-fttr-tools/src/src/controller/runtime/ubus.rs', '.github/workflows/fttr-api.yml']
   pull_request:
-    paths: ['h3c-fttr-tools/src/crates/fttr-api/**', 'h3c-fttr-tools/src/crates/fttr-jobs/**', 'h3c-fttr-tools/src/crates/openwrt-ubus/**', '.github/workflows/fttr-api.yml']
+    paths: ['h3c-fttr-tools/src/crates/fttr-api/**', 'h3c-fttr-tools/src/crates/fttr-jobs/**', 'h3c-fttr-tools/src/crates/openwrt-ubus/**', 'h3c-fttr-tools/src/src/capabilities.rs', 'h3c-fttr-tools/src/src/controller/runtime/ubus.rs', '.github/workflows/fttr-api.yml']
   workflow_dispatch:
     inputs:
       frontend_ref:
@@ -28,12 +28,11 @@ jobs:
       - run: cargo test --locked --manifest-path openwrt-fttr/h3c-fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen
       - run: cargo test --locked --manifest-path openwrt-fttr/h3c-fttr-tools/src/crates/fttr-jobs/Cargo.toml
       - run: cargo test --locked --manifest-path openwrt-fttr/h3c-fttr-tools/src/crates/openwrt-ubus/Cargo.toml
-      - run: cargo run --locked --manifest-path openwrt-fttr/h3c-fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --check
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: luci-app-fttr/package.json
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: pnpm install --frozen-lockfile && pnpm typecheck && pnpm test
+      - run: pnpm install --frozen-lockfile && pnpm check && git diff --exit-code -- package/luci-app-fttr/htdocs
         working-directory: luci-app-fttr
