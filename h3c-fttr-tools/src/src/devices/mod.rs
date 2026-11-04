@@ -19,6 +19,8 @@ pub mod generic;
 pub mod hl202;
 #[cfg(feature = "device-hwtc")]
 pub mod hwtc;
+#[cfg(feature = "device-scty")]
+pub(crate) mod scty;
 #[cfg(feature = "device-star")]
 pub(crate) mod star;
 #[cfg(feature = "device-zte")]
@@ -80,6 +82,8 @@ pub enum Adapter {
     Star,
     #[cfg(feature = "device-zte")]
     Zte,
+    #[cfg(feature = "device-scty")]
+    Scty,
     GenericBridge,
     Unavailable,
 }
@@ -222,6 +226,11 @@ impl Adapter {
                 business: true,
                 shell_commands: false,
             },
+            #[cfg(feature = "device-scty")]
+            Self::Scty => Capabilities {
+                business: true,
+                shell_commands: false,
+            },
             _ => Capabilities {
                 business: false,
                 shell_commands: false,
@@ -239,6 +248,8 @@ impl Adapter {
             #[cfg(feature = "device-zte")]
             Self::Zte => BusinessPhase::Configuring,
             Self::GenericBridge => BusinessPhase::Configuring,
+            #[cfg(feature = "device-scty")]
+            Self::Scty => BusinessPhase::Configuring,
             Self::Unavailable => BusinessPhase::Unsupported,
         }
     }
@@ -255,6 +266,8 @@ impl Adapter {
             #[cfg(feature = "device-zte")]
             Self::Zte => BusinessPhase::Verifying,
             Self::GenericBridge => BusinessPhase::Verifying,
+            #[cfg(feature = "device-scty")]
+            Self::Scty => BusinessPhase::Verifying,
             Self::Unavailable => BusinessPhase::Verifying,
         }
     }
@@ -276,6 +289,8 @@ impl Adapter {
             Self::Star => generic::service::configure(id, Some(token)),
             #[cfg(feature = "device-zte")]
             Self::Zte => zte::configure(id, Some(token)),
+            #[cfg(feature = "device-scty")]
+            Self::Scty => scty::configure(id, Some(token)),
             Self::GenericBridge => generic::service::configure(id, Some(token)),
             _ => {
                 let _ = (id, token);
@@ -336,6 +351,10 @@ pub fn select_with_serial(
         return Adapter::Zte;
     }
     let _ = (vendor, equipment);
+    #[cfg(feature = "device-scty")]
+    if scty::matches(vendor, equipment) {
+        return Adapter::Scty;
+    }
     if serial.is_some_and(crate::provisioning::allows_generic_bridge)
         || std::env::var("FTTR_ALLOW_UNSUPPORTED_AS_BRIDGE")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -471,6 +490,37 @@ mod tests {
         assert_eq!(select("HWTC", &identity), Adapter::Unavailable);
     }
 
+    #[test]
+    fn scty_selection_is_model_scoped_and_does_not_claim_cwmp() {
+        let identity = crate::model::OnuIdentity {
+            equipment_id: Some("COMHEART TY-FS803G".into()),
+            ..Default::default()
+        };
+        let adapter = select("SCTY", &identity);
+        #[cfg(feature = "device-scty")]
+        assert_eq!(adapter, Adapter::Scty);
+        #[cfg(not(feature = "device-scty"))]
+        assert_eq!(adapter, Adapter::Unavailable);
+        assert_eq!(
+            adapter.capabilities().business,
+            cfg!(feature = "device-scty")
+        );
+        assert!(!adapter.capabilities().shell_commands);
+        assert_eq!(select("OTHER", &identity), Adapter::Unavailable);
+        let wrong_model = crate::model::OnuIdentity {
+            equipment_id: Some("COMHEART OTHER".into()),
+            ..Default::default()
+        };
+        assert_eq!(select("SCTY", &wrong_model), Adapter::Unavailable);
+        assert_eq!(select("SCTY", &Default::default()), Adapter::Unavailable);
+        // No observed Inform exists: do not invent an identity alias or contract.
+        assert!(!matches_cwmp_adapter(
+            "scty",
+            "SCTY12345678",
+            "COMHEART TY-FS803G",
+            "SCTY12345678"
+        ));
+    }
     #[test]
     fn mqtt_connected_dispatch_reports_unsupported_identities() {
         assert!(configure_authenticated_cwmp_settings(

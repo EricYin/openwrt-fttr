@@ -196,7 +196,15 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
                 println!("GENERIC_EVTO_DOWNSTREAM_MODE_SKIPPED instance={evto_inst:04x}: {error}")
             }
         }
-        if let Err(error) = apply_transparent_evto_table(&mut session, evto_inst) {
+        if let Err(error) = session.with_timeout(std::time::Duration::from_secs(30), |session| {
+            apply_transparent_evto_table(session, evto_inst)
+        }) {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotConnected | io::ErrorKind::Interrupted
+            ) {
+                return Err(error);
+            }
             println!("GENERIC_EVTO_TABLE_SKIPPED instance={evto_inst:04x}: {error}");
         }
         if is_veip {

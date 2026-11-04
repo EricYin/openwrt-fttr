@@ -54,6 +54,19 @@ impl OmciSession {
     pub fn finish_before(&mut self, deadline: Instant) {
         self.deadline = Some(deadline);
     }
+    /// Bound an optional operation without extending or poisoning the caller's deadline.
+    pub fn with_timeout<T>(
+        &mut self,
+        timeout: Duration,
+        operation: impl FnOnce(&mut Self) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let previous = self.deadline;
+        let deadline = Instant::now() + timeout;
+        self.deadline = Some(previous.map_or(deadline, |outer| outer.min(deadline)));
+        let result = operation(self);
+        self.deadline = previous;
+        result
+    }
     fn check_active(&self) -> io::Result<()> {
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(io::Error::new(

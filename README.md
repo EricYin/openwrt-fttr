@@ -36,6 +36,8 @@ make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
 | `CONFIG_FTTR_DEVICE_HL202` | `device-hl202` | 开 | 开 |
 | `CONFIG_FTTR_DEVICE_HWTC` | `device-hwtc` | 开 | 关 |
 | `CONFIG_FTTR_DEVICE_STAR` | `device-star` | 开 | 关 |
+| `CONFIG_FTTR_DEVICE_ZTE` | `device-zte` | 开 | 关 |
+| `CONFIG_FTTR_DEVICE_SCTY` | `device-scty` | 开 | 关 |
 | `CONFIG_FTTR_ACS` | `acs` | 开 | 关 |
 | `CONFIG_FTTR_MQTT` | `mqtt` | 开 | 开 |
 | `CONFIG_FTTR_NPU` | `npu` | 开 | 开 |
@@ -49,6 +51,10 @@ cargo check --locked --all-targets --no-default-features --features all-devices,
 cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt
 cargo check --locked --all-targets --no-default-features --features all-devices,acs
 ```
+
+SCTY 仅精确匹配 `COMHEART TY-FS803G`，复用按 MIB 发现资源的标准 OMCI
+桥接流程。当前为桥接适配入口；双向 GEM、管理网络与 CWMP/Wi-Fi 尚待独立
+现场验收，不包含推测的 CWMP 串号规则或私有参数路径。
 
 ### Workspace 与诊断工具
 

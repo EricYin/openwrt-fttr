@@ -10,6 +10,7 @@ pub fn compiled() -> Capabilities {
     let hwtc = cfg!(feature = "device-hwtc");
     let star = cfg!(feature = "device-star");
     let zte = cfg!(feature = "device-zte");
+    let scty = cfg!(feature = "device-scty");
     let mut adapters = Vec::new();
     if hl202 {
         adapters.push(AdapterCapability {
@@ -35,6 +36,12 @@ pub fn compiled() -> Capabilities {
             name: "ZTE G1612",
         });
     }
+    if scty {
+        adapters.push(AdapterCapability {
+            id: "scty",
+            name: "SCTY TY-FS803G (OMCI bridge only)",
+        });
+    }
     adapters.push(AdapterCapability {
         id: "generic",
         name: "Generic G.988 Bridge",
@@ -50,6 +57,7 @@ pub fn compiled() -> Capabilities {
             device_hwtc: hwtc,
             device_star: star,
             device_zte: zte,
+            device_scty: scty,
         },
         functions: CapabilityFunctions {
             optical: true,

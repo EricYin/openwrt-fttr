@@ -52,6 +52,8 @@ pub struct CapabilityFeatures {
     pub device_star: bool,
     #[serde(rename = "device-zte")]
     pub device_zte: bool,
+    #[serde(rename = "device-scty")]
+    pub device_scty: bool,
 }
 
 #[derive(Debug, Serialize)]

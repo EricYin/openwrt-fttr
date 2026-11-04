@@ -490,3 +490,51 @@ fn session_guards_reject_before_any_transaction() {
         io::ErrorKind::NotConnected
     );
 }
+
+#[test]
+fn optional_operation_timeout_restores_session_for_later_requests() {
+    let mut session = OmciSession::new(Script {
+        responses: VecDeque::new(),
+    });
+    assert_eq!(
+        session
+            .with_timeout(std::time::Duration::ZERO, |s| s.get(256, 0, 0x8000))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    // The expired optional deadline must not poison later operations.
+    session.delete(45, 1).unwrap();
+}
+
+#[test]
+fn optional_operation_cannot_extend_outer_deadline_or_bypass_registration() {
+    let mut session = OmciSession::new(Script {
+        responses: VecDeque::new(),
+    });
+    session.finish_before(Instant::now());
+    assert_eq!(
+        session
+            .with_timeout(std::time::Duration::from_secs(30), |s| s
+                .get(256, 0, 0x8000))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(
+        session.delete(45, 1).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    let mut session = OmciSession::new(Script {
+        responses: VecDeque::new(),
+    });
+    session.guard_registration(|| false);
+    assert_eq!(
+        session
+            .with_timeout(std::time::Duration::from_secs(30), |s| s
+                .get(256, 0, 0x8000))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotConnected
+    );
+}

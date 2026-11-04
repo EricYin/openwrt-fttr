@@ -16,7 +16,9 @@ pub(super) fn collect(
     let expected = report.entities.iter().filter(|e| e.class_id == 171).count();
     let mut received = 0;
     for entity in report.entities.iter().filter(|e| e.class_id == 171) {
-        let result = session.get_table(171, entity.entity_id, attr.mask);
+        let result = session.with_timeout(std::time::Duration::from_secs(30), |session| {
+            session.get_table(171, entity.entity_id, attr.mask)
+        });
         let result = match result {
             Err(error)
                 if matches!(

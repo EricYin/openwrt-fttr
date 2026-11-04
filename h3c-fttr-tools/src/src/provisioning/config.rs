@@ -276,6 +276,7 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
             "hwtc" | "k155" if cfg!(feature = "device-hwtc") => "hwtc",
             "star" if cfg!(feature = "device-star") => "star",
             "zte" if cfg!(feature = "device-zte") => "zte",
+            "scty" if cfg!(feature = "device-scty") => "scty",
             "generic" => "generic",
             _ => return Err(format!("{id}: adapter unknown or not compiled")),
         };
