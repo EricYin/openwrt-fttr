@@ -12,6 +12,9 @@ pub struct StatusReply {
     #[cfg_attr(feature = "codegen", ts(optional))]
     pub onu_pinning: Option<crate::OnuPinning>,
     pub fpga_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub pon_mac: Option<crate::PonMacStatus>,
     pub provisioning: Option<SyncStatusReply>,
     pub optical_transceiver: crate::OpticalTransceiverStatus,
     pub switch_ports: Vec<crate::SwitchPortStatus>,

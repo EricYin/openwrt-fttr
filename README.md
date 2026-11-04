@@ -95,37 +95,61 @@ STAR 观察工具要求传入源 MAC；不再内置现场设备地址。独立 r
 结果未知的写入仍需先核实。非法的新请求取消旧的待加载版本并返回校验错误；
 服务重启直接读取持久化配置。
 
-### FEC 诊断（实验性）
+### 光链路控制
 
-全局开关位于 LuCI **配置 → 基本设置 → Enable FEC support (experimental)**，
-对应 provisioning 节的 `fec_enabled`，默认 `0`（旧配置缺省也关闭）。保存并应用后通过
-现有配置热加载生效，无需重新注册 ONU。启用后允许后台下行 PM 采集和显式诊断；
-关闭后不再发起 FEC PM GET/CREATE，并隐藏旧的统计缓存，不删除已经存在的 PM 实体。
-该开关启用的是统计支持，不代表 FPGA 编解码器开启；上下行硬件启用状态仍为未知。
+LuCI **状态页面最上方**集中提供 FPGA 总开关、GPON 下行发送、下行 FEC 三项设置，
+同时显示保存值、硬件读回、应用错误和各 ONU 的 OMCI FEC PM 状态。
+三项配置仅属于 `config optical 'optical'`：
+
+| optical 选项 | 默认 | 含义 |
+| --- | --- | --- |
+| `enabled` | `1` | FPGA 总开关，控制现有光输出复位与发现流程，并非板卡电源 |
+| `downstream_tx_enabled` | `1` | GPON 下行发送，`0x01000004` Bit 1 |
+| `fec_enabled` | `0` | 下行纠错，`0x01000004` Bit 3，同时启用 OMCI PM 自动准备、统计与诊断 |
+
+不读取或迁移 provisioning 中的旧 FEC/下行字段；旧字段会被配置校验拒绝。
+`optical_status` 回读整组保存配置及硬件状态，`optical_set` 要求传入全部三个布尔值。
+保存使用独立 UCI 快照和原子替换，保留其他设置，不消费共享的未提交编辑。
+同一 PLOAM 硬件所有者按顺序持久化和应用请求；这些配置不进入 WAN/Wi-Fi 同步计划、
+不改变业务配置版本，也不等待正在运行的业务同步操作。重启与服务 reload 都恢复保存值。
+
+关闭总开关或下行发送会停止发现、取消 ONU 服务、降低 carrier 并标记离线；重新开启后
+重新注册。总开关关闭时实际发送与 FEC 均关闭，但保留两项子开关的保存值。
+只切换 FEC 不会主动重新注册 ONU。寄存器读改写保留其他位并读回校验；硬件置位按开启
+下行纠错处理，ONU 的 OMCI PM 不可用单独显示，不改变硬件开启状态。不控制上行 FEC。
+
+### FEC 统计用法
 
 ```sh
-uci set fttr.provisioning.fec_enabled='1'  # 默认配置的节名；使用 0 关闭
+uci set fttr.optical.enabled='1'
+uci set fttr.optical.downstream_tx_enabled='1'
+uci set fttr.optical.fec_enabled='1'
 uci commit fttr
-fttrctl config reload
+fttrctl optical reload --json
 ```
 
 ```sh
 fttrctl status --json          # sub_gateways[].fec：当前代次的状态与证据
 fttrctl fec 0 --json           # 对当前 ONU 0 串行执行标准下行 PM GET
-fttrctl fec 0 --create-pm       # 显式允许创建缺失的 class 312 PM 实例
+fttrctl fec 0 --create-pm       # 手动重试创建缺失的 class 312 PM 实例
 ```
 
 先用状态确认当前 ONU ID；CLI 将请求绑定到串号、注册代次和已发现的 ANI-G。
-后台最多增加一次 2 秒 GET，失败后退避 5 分钟；不影响活体判定，也不自动创建实体。
-`--create-pm` 仅在 GET 返回 unknown instance（结果 5）时 CREATE，阈值指针为 0；
+FEC 开启后，当前和新注册 ONU 由各自串行 OMCI worker 读取实际 ANI-G 及 class 312 PM。
+标准 ANI-G 定义没有通用的可写 FEC 总开关，不伪造能力属性或写入只读属性。
+实例存在时只读；仅在 GET 返回 unknown instance（结果 5）时自动 CREATE，阈值指针为 0，
+随后 GET 验证并读取计数。单次请求超时 2 秒，准备与采集总预算 8 秒；失败按 ONU
+退避 5 分钟，不作为活体失败。切换 FEC 会刷新配置代次，及时唤起采集，
+取消旧代次排队请求，并隐藏旧统计；关闭后不再发送后续 FEC 请求。
+`--create-pm` 使用相同的 unknown-instance 限制；
 不重置已有 PM，不改既有阈值，不自动删除创建的 PM。返回 `created_pm` 标明是否创建，
 后续正常遥测会读取它。若设备拒绝该语义，保留原始结果码，不按成功处理。
 
 class 312 的 GET 是**最近完成的 15 分钟下行 PM 区间**，不是实时、累计或上行计数；
 区间结束前可能没有有效的新结果。实例缺失、拒绝或超时不等于 ONU 不支持 FEC。
-`control_supported=false` 表示当前软件尚无已验证的 FPGA 控制路径；
-`downstream_enabled` / `upstream_enabled` 保持 `null`，计数为零也不推断开关关闭。
-当前没有 FEC enable 命令：库存固件的抽象寄存器号尚未映射到本板 FPGA 原始地址。
+`control_supported=true` 表示提供下行板级控制；`downstream_enabled` 来自所有者最近一次
+寄存器读回，未初始化或应用失败时为 `null`。`upstream_enabled` 仍为 `null`；
+计数为零不推断开关关闭。
 
 正常保留配置的 sysupgrade 会同时备份 `/lib/firmware/modified_UX3326.bin`
 校准文件（若存在），保留项由 `/lib/upgrade/keep.d/fttr` 声明。
