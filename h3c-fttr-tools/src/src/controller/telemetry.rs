@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(super) mod fec;
 mod inventory;
 mod network;
 mod poll;
@@ -25,6 +26,7 @@ pub(super) struct Snapshot {
     pub rx: Option<f64>,
     pub tx: Option<f64>,
     pub uptime: Option<f64>,
+    pub fec: fttr_api::FecStatus,
     pub inventory: Option<inventory::InventorySample>,
     pub measurements: Measurements,
 }
@@ -35,6 +37,7 @@ impl Snapshot {
             rx: None,
             tx: None,
             uptime: None,
+            fec: fec::unavailable(reason),
             inventory: None,
             measurements: [
                 ("optical_rx_power_dbm", "dBm"),
@@ -65,6 +68,14 @@ fn cache() -> &'static Mutex<BTreeMap<u8, Cached>> {
 }
 
 pub(super) fn snapshot(id: u8, online: bool) -> Snapshot {
+    let mut snapshot = cached_snapshot(id, online);
+    if !crate::provisioning::controller::fec_enabled() {
+        snapshot.fec = fec::unavailable("fec_support_disabled");
+    }
+    snapshot
+}
+
+fn cached_snapshot(id: u8, online: bool) -> Snapshot {
     if !online {
         return Snapshot::unavailable("onu_not_operational");
     }
@@ -77,6 +88,9 @@ pub(super) fn snapshot(id: u8, online: bool) -> Snapshot {
                 && sample.at.elapsed() < Duration::from_secs(90) =>
         {
             let mut snapshot = sample.snapshot.clone();
+            if snapshot.fec.measurement.age_seconds.is_some() {
+                snapshot.fec.measurement.age_seconds = Some(sample.at.elapsed().as_secs());
+            }
             for evidence in snapshot.measurements.values_mut() {
                 evidence.age_seconds = Some(sample.at.elapsed().as_secs());
             }
@@ -92,6 +106,7 @@ pub(super) struct Collector {
     token: Arc<AtomicBool>,
     ani: Option<Result<u16, String>>,
     inventory: Option<inventory::InventorySample>,
+    fec: fec::Poll,
 }
 
 impl Collector {
@@ -101,6 +116,7 @@ impl Collector {
             token,
             ani: None,
             inventory: None,
+            fec: fec::Poll::default(),
         }
     }
 
@@ -163,6 +179,13 @@ impl Collector {
                         snapshot
                             .measurements
                             .insert("optical_tx_power_dbm".into(), evidence);
+                        session.finish_before(Instant::now() + Duration::from_secs(2));
+                        if crate::provisioning::controller::fec_enabled() {
+                            snapshot.fec = self.fec.read(&mut session, *entity);
+                        } else {
+                            self.fec = fec::Poll::default();
+                            snapshot.fec = fec::unavailable("fec_support_disabled");
+                        }
                     }
                     Some(Err(error)) => {
                         for field in ["optical_rx_power_dbm", "optical_tx_power_dbm"] {

@@ -81,6 +81,38 @@ STAR 观察工具要求传入源 MAC；不再内置现场设备地址。独立 r
 `fttrd`，OMCI MIB 入口复用控制器 inventory 核心。CLI 的受支持命令以
 `fttrctl help` 为准，手动 `discover/register/auth/sync-wifi/provision` 入口已移除。
 
+### FEC 诊断（实验性）
+
+全局开关位于 LuCI **配置 → 基本设置 → Enable FEC support (experimental)**，
+对应 provisioning 节的 `fec_enabled`，默认 `0`（旧配置缺省也关闭）。保存并应用后通过
+现有配置热加载生效，无需重新注册 ONU。启用后允许后台下行 PM 采集和显式诊断；
+关闭后不再发起 FEC PM GET/CREATE，并隐藏旧的统计缓存，不删除已经存在的 PM 实体。
+该开关启用的是统计支持，不代表 FPGA 编解码器开启；上下行硬件启用状态仍为未知。
+
+```sh
+uci set fttr.provisioning.fec_enabled='1'  # 默认配置的节名；使用 0 关闭
+uci commit fttr
+fttrctl config reload
+```
+
+```sh
+fttrctl status --json          # sub_gateways[].fec：当前代次的状态与证据
+fttrctl fec 0 --json           # 对当前 ONU 0 串行执行标准下行 PM GET
+fttrctl fec 0 --create-pm       # 显式允许创建缺失的 class 312 PM 实例
+```
+
+先用状态确认当前 ONU ID；CLI 将请求绑定到串号、注册代次和已发现的 ANI-G。
+后台最多增加一次 2 秒 GET，失败后退避 5 分钟；不影响活体判定，也不自动创建实体。
+`--create-pm` 仅在 GET 返回 unknown instance（结果 5）时 CREATE，阈值指针为 0；
+不重置已有 PM，不改既有阈值，不自动删除创建的 PM。返回 `created_pm` 标明是否创建，
+后续正常遥测会读取它。若设备拒绝该语义，保留原始结果码，不按成功处理。
+
+class 312 的 GET 是**最近完成的 15 分钟下行 PM 区间**，不是实时、累计或上行计数；
+区间结束前可能没有有效的新结果。实例缺失、拒绝或超时不等于 ONU 不支持 FEC。
+`control_supported=false` 表示当前软件尚无已验证的 FPGA 控制路径；
+`downstream_enabled` / `upstream_enabled` 保持 `null`，计数为零也不推断开关关闭。
+当前没有 FEC enable 命令：库存固件的抽象寄存器号尚未映射到本板 FPGA 原始地址。
+
 正常保留配置的 sysupgrade 会同时备份 `/lib/firmware/modified_UX3326.bin`
 校准文件（若存在），保留项由 `/lib/upgrade/keep.d/fttr` 声明。
 

@@ -166,6 +166,7 @@ pub(super) fn snapshot(
                     .and_then(|value| value.hardware_version.clone())
                     .unwrap_or_else(|| onu.hardware_version.clone()),
                 uptime_seconds: telemetry.uptime,
+                fec: Some(telemetry.fec),
                 data_path: super::telemetry::data_path(
                     onu.onu_id,
                     &sn_str,

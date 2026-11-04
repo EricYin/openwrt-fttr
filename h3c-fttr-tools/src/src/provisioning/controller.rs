@@ -140,6 +140,10 @@ static CONTROLLER: OnceLock<Mutex<Controller>> = OnceLock::new();
 fn controller() -> &'static Mutex<Controller> {
     CONTROLLER.get_or_init(|| Mutex::new(Controller::default()))
 }
+pub(crate) fn fec_enabled() -> bool {
+    controller().lock().unwrap().config.fec_enabled
+}
+
 pub(crate) fn allows_generic_bridge(serial: &str) -> bool {
     let c = controller().lock().unwrap();
     if c.config.allow_unsupported_as_bridge {

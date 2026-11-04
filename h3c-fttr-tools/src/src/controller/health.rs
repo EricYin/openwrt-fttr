@@ -329,6 +329,12 @@ fn run(
         }
         if let Some(request) = requests.and_then(|requests| requests.try_recv().ok()) {
             match request {
+                super::inventory::WorkerRequest::Fec(request) => {
+                    let result = super::fec::run(&request, cancellation.clone());
+                    let responsive = result.is_ok();
+                    let _ = request.reply.send(result);
+                    next_get = resume_after_omci(&mut last_get, &mut watchdog_start, responsive);
+                }
                 super::inventory::WorkerRequest::Attribute(request) => {
                     let result = super::attribute_probe::run(&request, cancellation.clone());
                     let responsive = result.is_ok();

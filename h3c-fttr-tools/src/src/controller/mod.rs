@@ -2,6 +2,7 @@
 mod activation;
 mod attribute_probe;
 pub mod business;
+pub mod fec;
 pub mod health;
 #[cfg(feature = "device-hl202")]
 mod hl202;

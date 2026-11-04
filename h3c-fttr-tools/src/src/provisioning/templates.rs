@@ -111,6 +111,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
             "provisioning" => &[
                 "enabled",
                 "allow_unsupported_as_bridge",
+                "fec_enabled",
                 "mode",
                 "trigger",
                 "interval_minutes",
@@ -598,6 +599,16 @@ mod tests {
     }
 
     use crate::provisioning::model::ItemKind;
+    #[test]
+    fn global_fec_policy_survives_validation_and_changes_revision() {
+        let disabled = super::compile("config provisioning 'global'\n").unwrap();
+        let enabled =
+            super::compile("config provisioning 'global'\n option fec_enabled '1'\n").unwrap();
+        assert!(!disabled.fec_enabled);
+        assert!(enabled.fec_enabled);
+        assert_ne!(disabled.revision, enabled.revision);
+    }
+
     #[test]
     fn omci_management_is_opt_in_per_device_and_changes_revision() {
         if !cfg!(feature = "all-devices") {

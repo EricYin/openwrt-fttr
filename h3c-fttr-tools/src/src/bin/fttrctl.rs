@@ -29,6 +29,7 @@ Commands:\n  \
   optical on|off|status|reload|shutdown|shutdown-offline [--json]\n  \
   status [--json|-j]   Display active FTTR optical link and DSA switch ports (table or JSON)\n  \
   mib ONU_ID [--summary|--json] [--tables]  Read structured OMCI inventory (default: JSON)\n  \
+  fec ONU_ID [--json] [--create-pm]  Read downstream FEC PM; optionally create missing PM instance\n  \
   fpga-read <addr>     Directly read 32-bit FPGA hardware register\n  \
   fpga-write <a> <v>   Directly write 32-bit FPGA hardware register\n  \
   bosa-diag [--json]   Read calibrated UX3326 optical diagnostics (Temp, Vcc, Bias, TX)\n  \
@@ -805,6 +806,27 @@ fn main() {
                     }
                     exit(1);
                 }
+            }
+        }
+        "fec" => {
+            let id = args
+                .get(2)
+                .and_then(|value| value.parse::<u8>().ok())
+                .filter(|id| *id < 16);
+            let Some(id) = id.filter(|_| {
+                args[3..]
+                    .iter()
+                    .all(|arg| matches!(arg.as_str(), "--json" | "--create-pm"))
+            }) else {
+                eprintln!("Usage: fttrctl fec ONU_ID [--json] [--create-pm]");
+                exit(1);
+            };
+            if let Err(error) = h3c_fttr_tools::controller::fec::read(
+                id,
+                args.iter().any(|arg| arg == "--create-pm"),
+            ) {
+                eprintln!("[-] FEC PM diagnostic failed: {error}");
+                exit(1);
             }
         }
         "mib" => {

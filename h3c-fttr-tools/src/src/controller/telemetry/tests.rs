@@ -123,6 +123,7 @@ fn unavailable_when_cached_registration_cancelled() {
         249,
         Cached {
             snapshot: Snapshot {
+                fec: fec::unavailable("test_sample"),
                 rx: Some(-12.5),
                 tx: Some(2.0),
                 uptime: Some(42.0),

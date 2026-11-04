@@ -191,6 +191,7 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
     if let Some(s) = globals.first() {
         cfg.enabled = boolean(s.get("enabled"), false)?;
         cfg.allow_unsupported_as_bridge = boolean(s.get("allow_unsupported_as_bridge"), false)?;
+        cfg.fec_enabled = boolean(s.get("fec_enabled"), false)?;
         cfg.automatic = match s.get("mode") {
             "" | "manual" => false,
             "auto" => true,
@@ -717,6 +718,19 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn parses_fec_support_default_and_explicit_policy() {
+        assert!(!parse_expanded("").unwrap().fec_enabled);
+        for (value, expected) in [("0", false), ("1", true)] {
+            let text = format!("config provisioning 'global'\n option fec_enabled '{value}'\n");
+            assert_eq!(parse_expanded(&text).unwrap().fec_enabled, expected);
+        }
+        assert!(
+            parse_expanded("config provisioning 'global'\n option fec_enabled 'invalid'\n")
+                .is_err()
+        );
+    }
+
     #[test]
     fn parses_allow_unsupported_as_bridge_and_generic_adapter() {
         let text = "config provisioning 'global'\n option allow_unsupported_as_bridge '1'\nconfig device 'child'\n option optical_sn 'ZTEG12345678'\n option cwmp_id 'child-id'\n option adapter 'generic'\n";

@@ -14,6 +14,30 @@ pub struct MeasurementEvidence {
 }
 pub type Measurements = BTreeMap<String, MeasurementEvidence>;
 
+/// Completed 15-minute downstream PM interval, not lifetime or upstream counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct FecPmCounters {
+    pub entity_id: u16,
+    pub interval_end_time: u8,
+    pub corrected_bytes: u32,
+    pub corrected_code_words: u32,
+    pub uncorrectable_code_words: u32,
+    pub total_code_words: u32,
+    pub fec_seconds: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct FecStatus {
+    pub ani_entity_id: Option<u16>,
+    pub control_supported: bool,
+    pub downstream_enabled: Option<bool>,
+    pub upstream_enabled: Option<bool>,
+    pub downstream_pm: Option<FecPmCounters>,
+    pub measurement: MeasurementEvidence,
+}
+
 impl MeasurementEvidence {
     pub fn unavailable(source: impl Into<String>, unit: &str, reason: impl Into<String>) -> Self {
         Self {
@@ -255,6 +279,9 @@ pub struct SubGatewayStatus {
     pub firmware_version: String,
     pub hardware_version: String,
     pub uptime_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub fec: Option<FecStatus>,
     pub data_path: DataPathStatus,
     pub wifi_mesh: WifiMeshStatus,
     pub connected_clients: Option<Vec<MeshClientStatus>>,

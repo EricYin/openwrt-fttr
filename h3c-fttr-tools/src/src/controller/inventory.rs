@@ -174,6 +174,7 @@ pub(super) type RegistrationGuard = Arc<dyn Fn() -> bool + Send + Sync>;
 pub(super) enum WorkerRequest {
     Mib(MibRequest),
     Attribute(super::attribute_probe::Request),
+    Fec(super::fec::Request),
 }
 
 /// Default output is one JSON document; human-readable summary is a client view.
