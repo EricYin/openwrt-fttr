@@ -24,7 +24,7 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let _lease = StockOmccLease::open(id)?;
+    let mut lease = StockOmccLease::open(id)?;
     let _channel = ChannelLease::open(id, 0)?;
 
     let port = 0x100u16 + id as u16;
@@ -217,6 +217,8 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
         "GENERIC_BRIDGE_SERVICE_READBACK_OK gem={port:04x} endpoints={:?}; data evidence still required",
         inventory.endpoints
     );
+    lease.disarm();
+    println!("GENERIC_LEASE_PERSISTED id={id}");
     Ok(())
 }
 

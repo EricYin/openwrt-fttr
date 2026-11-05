@@ -39,7 +39,7 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let _lease = StockOmccLease::open(id)?;
+    let mut lease = StockOmccLease::open(id)?;
     let _channel = ChannelLease::open(id, 0)?;
 
     let port = 0x100u16 + id as u16;
@@ -165,6 +165,8 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
 
     verify(&mut session, 256, 0, 0x8000, &vendor_bytes)?;
     println!("ZTE_G1612_BRIDGE_SERVICE_READBACK_OK gem={port:04x} veip={G1612_VEIP_ENDPOINT:04x}");
+    lease.disarm();
+    println!("ZTE_G1612_LEASE_PERSISTED id={id}");
     Ok(())
 }
 

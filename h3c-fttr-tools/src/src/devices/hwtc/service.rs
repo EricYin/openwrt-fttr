@@ -32,7 +32,7 @@ pub(super) fn configure_profile(
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let _lease = StockOmccLease::open(id)?;
+    let mut lease = StockOmccLease::open(id)?;
     let _channel = ChannelLease::open(id, 0)?;
     verify(&mut session, 256, 0, 0x8000, b"HWTC")?;
     if profile == super::Profile::V152 {
@@ -71,6 +71,8 @@ pub(super) fn configure_profile(
     verify(&mut session, 256, 0, 0x8000, b"HWTC")?;
     println!("HWTC_SERVICE_READBACK_OK gem={port:04x}; data evidence still required");
     crate::controller::management::bootstrap(&mut session, id, 0x601);
+    lease.disarm();
+    println!("HWTC_LEASE_PERSISTED id={id}");
     Ok(())
 }
 

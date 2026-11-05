@@ -141,7 +141,7 @@ pub fn configure(
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let _lease = StockOmccLease::open(id)?;
+    let mut lease = StockOmccLease::open(id)?;
     let port = 0x100u16 + id as u16;
     let _channel = ChannelLease::open(id, 0)?;
     if restore_initial {
@@ -313,5 +313,7 @@ pub fn configure(
             println!("OMCC_HEARTBEAT_OK channel={channel:04x}; data plane still requires packet evidence");
         }
     }
+    lease.disarm();
+    println!("HL202_LEASE_PERSISTED id={id}");
     Ok(())
 }

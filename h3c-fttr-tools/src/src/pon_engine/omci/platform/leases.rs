@@ -64,6 +64,7 @@ impl Drop for ChannelLease {
 pub struct StockOmccLease {
     id: u8,
     saved: Vec<(u32, u32)>,
+    disarmed: bool,
 }
 impl StockOmccLease {
     pub fn open(id: u8) -> io::Result<Self> {
@@ -81,7 +82,11 @@ impl StockOmccLease {
         ] {
             saved.push((addr, bosa::read_fpga_reg(addr)?));
         }
-        let lease = Self { id, saved };
+        let lease = Self {
+            id,
+            saved,
+            disarmed: false,
+        };
         for (i, &(addr, old)) in lease.saved.iter().enumerate() {
             let value = if i == 0 { old | (1 << id) } else { 0x11000000 };
             println!("STOCK_OMCC {addr:08x}: {old:08x}->{value:08x}");
@@ -95,6 +100,13 @@ impl StockOmccLease {
         std::thread::sleep(Duration::from_millis(500));
         Ok(lease)
     }
+
+    /// Disarm the lease teardown when transitioning to a persistent business service.
+    /// This prevents dropping the Alloc-ID and FPGA hardware mappings when configuration succeeds.
+    pub fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+
     fn configure_port(&self, enable: bool) -> io::Result<()> {
         let port = 0x100u16 + self.id as u16;
         let mut p = [0; 10];
@@ -109,6 +121,9 @@ impl StockOmccLease {
 }
 impl Drop for StockOmccLease {
     fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
         if let Err(e) = self.configure_port(false) {
             eprintln!("OMCC disable failed: {e}");
         }

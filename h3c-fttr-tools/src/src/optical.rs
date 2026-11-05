@@ -101,25 +101,35 @@ impl UciSession {
                 std::env::temp_dir().join(format!("fttr-optical-{}-{nonce}", std::process::id()));
             match fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => {
-                    let conf_dir = path.join("config");
-                    let delta_dir = path.join("delta");
-                    fs::create_dir(&conf_dir)?;
-                    fs::create_dir(&delta_dir)?;
-                    let package = format!("optical_{}_{stamp}_{nonce}", std::process::id());
-                    fs::write(conf_dir.join(&package), &original)?;
-                    let mut uci =
-                        openwrt_uci::Uci::new().map_err(|e| io::Error::other(e.to_string()))?;
-                    uci.set_confdir(&conf_dir)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    uci.set_savedir(&delta_dir)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    return Ok(Self {
-                        dir: path,
-                        conf_dir,
-                        package,
-                        original,
-                        uci,
-                    });
+                    let setup = (|| -> io::Result<Self> {
+                        let conf_dir = path.join("config");
+                        let delta_dir = path.join("delta");
+                        fs::create_dir(&conf_dir)?;
+                        fs::create_dir(&delta_dir)?;
+                        let package = format!("optical_{}_{stamp}_{nonce}", std::process::id());
+                        fs::write(conf_dir.join(&package), &original)?;
+                        let mut uci = openwrt_uci::Uci::new()
+                            .map_err(|e| io::Error::other(format!("Uci::new: {e}")))?;
+                        uci.set_confdir(&conf_dir)
+                            .map_err(|e| io::Error::other(format!("set_confdir: {e}")))?;
+                        uci.set_savedir(&delta_dir)
+                            .map_err(|e| io::Error::other(format!("set_savedir: {e}")))?;
+                        Ok(Self {
+                            dir: path.clone(),
+                            conf_dir,
+                            package,
+                            original,
+                            uci,
+                        })
+                    })();
+                    match setup {
+                        Ok(session) => return Ok(session),
+                        Err(e) => {
+                            let _ = fs::remove_dir_all(&path);
+                            eprintln!("[-] UciSession setup failed at {path:?}: {e}");
+                            return Err(e);
+                        }
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),

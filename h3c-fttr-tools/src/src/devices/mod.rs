@@ -324,6 +324,10 @@ pub fn select_with_serial(
         if crate::provisioning::is_device_adapter(sn, "zte") {
             return Adapter::Zte;
         }
+        #[cfg(feature = "device-scty")]
+        if crate::provisioning::is_device_adapter(sn, "scty") {
+            return Adapter::Scty;
+        }
     }
     #[cfg(feature = "device-hl202")]
     if hl202::matches(vendor, equipment) {
