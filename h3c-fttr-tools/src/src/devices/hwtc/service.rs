@@ -60,7 +60,14 @@ pub(super) fn configure_profile(
     verify_credential(&mut session, 0x0040, "LOID", &loid)?;
     verify_credential(&mut session, 0x0020, "password", &password)?;
     // G.988 ONU-G credentials status, not H3C private class 65530.
-    session.set(256, 0, 0x0010, &[1])?;
+    session.set_attributes(
+        256,
+        0,
+        &[(
+            12,
+            crate::pon_engine::omci::attributes::AttributeValue::number(1),
+        )],
+    )?;
     verify(&mut session, 256, 0, 0x0010, &[1])?;
     println!("HWTC_CREDENTIALS_STATUS_READBACK_OK");
     let port = 0x100u16 + id as u16;

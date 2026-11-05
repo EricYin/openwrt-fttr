@@ -18,7 +18,9 @@
 //! Broadcom will observe `old_alloc == 255` and execute `rutGpon_createPriorityQueueByTcont`,
 //! which initializes `tmctl_portTmInit` on RDPA.
 
+use crate::controller::business as me;
 use crate::controller::business::{create_verified_lenient, verify};
+use crate::pon_engine::omci::attributes::AttributeValue as V;
 use crate::pon_engine::omci::{
     platform::leases::{lock_onu, ChannelLease, StockOmccLease},
     FmcsTransport, OmciSession,
@@ -78,10 +80,10 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     );
 
     // Set ONU-G credential status=1 if supported
-    let _ = session.set(256, 0, 0x0010, &[1]);
+    let _ = session.set_attributes(256, 0, &[(12, V::number(1))]);
 
     // Retire stale ANI/GEM entries from other slots
-    retire_stale_ani(&mut session, port);
+    retire_stale_ani(&mut session, port)?;
 
     // Clean up any stale current_port entities before T-CONT transition
     let _ = session.delete(47, port);
@@ -106,12 +108,19 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
 
     if current_alloc != Some(255) {
         println!("SCTY_TY_FS803G_TCONT_RESET_255 instance={TY_FS803G_TCONT:04x}");
-        let _ = session.set(262, TY_FS803G_TCONT, 0x8000, &255u16.to_be_bytes());
+        session.set_attributes(262, TY_FS803G_TCONT, &[(1, V::number(255))])?;
+        verify(
+            &mut session,
+            262,
+            TY_FS803G_TCONT,
+            0x8000,
+            &255u16.to_be_bytes(),
+        )?;
         std::thread::sleep(Duration::from_millis(50));
     }
 
     println!("SCTY_TY_FS803G_TCONT_SET_TARGET instance={TY_FS803G_TCONT:04x} alloc={port:04x}");
-    session.set(262, TY_FS803G_TCONT, 0x8000, &port.to_be_bytes())?;
+    session.set_attributes(262, TY_FS803G_TCONT, &[(1, V::number(port.into()))])?;
     std::thread::sleep(Duration::from_millis(50));
     verify(
         &mut session,
@@ -121,37 +130,29 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
         &port.to_be_bytes(),
     )?;
 
-    // Priority Queue ME 277 0x8000: bind TrafficSchedulerGPointer (mask 0x0400) to 0x8000
-    if let Err(error) = session.set(
+    // TrafficSchedulerPointer is attribute 7 (0x0200); attribute 6 is RelatedPort (4 bytes).
+    if let Err(error) = session.set_attributes(
         277,
         TY_FS803G_PRIO_QUEUE,
-        0x0400,
-        &TY_FS803G_TRAFFIC_SCHEDULER.to_be_bytes(),
+        &[(7, V::number(TY_FS803G_TRAFFIC_SCHEDULER.into()))],
     ) {
         println!("SCTY_TY_FS803G_PRIO_QUEUE_SCHED_SKIPPED: {error}");
     }
 
     // GAL Ethernet profile (ME 272)
-    if let Err(error) = create_verified_lenient(
-        &mut session,
-        272,
-        TY_FS803G_GAL_PROFILE,
-        &[0, 48],
-        0x8000,
-        &[0, 48],
-    ) {
+    if let Err(error) =
+        create_verified_lenient(&mut session, 272, TY_FS803G_GAL_PROFILE, &me::gal(), &[1])
+    {
         println!("SCTY_TY_FS803G_GAL_REUSED instance={TY_FS803G_GAL_PROFILE:04x}: {error}");
     }
 
     // MAC Bridge Service Profile (ME 45)
-    let bridge_data = [0, 1, 0, 0x80, 0, 0x14, 0, 2, 0, 0x0f, 0, 0];
     if let Err(error) = create_verified_lenient(
         &mut session,
         45,
         TY_FS803G_BRIDGE_PROFILE,
-        &bridge_data,
-        0xe000,
-        &[0, 1, 0],
+        &me::bridge_profile(),
+        &[1, 2, 3],
     ) {
         println!(
             "SCTY_TY_FS803G_BRIDGE_PROFILE_REUSED instance={TY_FS803G_BRIDGE_PROFILE:04x}: {error}"
@@ -171,25 +172,44 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
 
     // Uplink ANI Bridge Port (ME 47, tp=5 GEM IW TP, port_num=6)
     let ani_port_num = 6u8;
-    let mut network = TY_FS803G_BRIDGE_PROFILE.to_be_bytes().to_vec();
-    network.push(ani_port_num);
-    network.push(5);
-    network.extend(port.to_be_bytes());
-    network.extend([0, 0, 0, 1, 0, 0, 0]);
-    create_verified_lenient(&mut session, 47, port, &network, 0xf000, &network[..6])?;
+    create_verified_lenient(
+        &mut session,
+        47,
+        port,
+        &me::bridge_port(TY_FS803G_BRIDGE_PROFILE, ani_port_num, 5, port),
+        &[1, 2, 3, 4],
+    )?;
 
     // Optional VLAN Tagging Filter Data (ME 84)
-    let _ = create_verified_lenient(&mut session, 84, port, &[0; 26], 0xc000, &[0; 25]);
+    let _ = create_verified_lenient(&mut session, 84, port, &me::vlan_filter(), &[1, 2]);
 
     // Check or create VEIP Bridge Port (ME 47 instance 0x0201)
     let bp_inst = TY_FS803G_VEIP_BP;
-    if session.get(47, bp_inst, 0x8000).is_err() {
-        let mut attrs = TY_FS803G_BRIDGE_PROFILE.to_be_bytes().to_vec();
-        attrs.push(1); // port_num 1
-        attrs.push(11); // tp_type 11 (VEIP)
-        attrs.extend(TY_FS803G_VEIP_ENDPOINT.to_be_bytes());
-        attrs.extend([0, 0, 0, 1, 0, 0, 0]);
-        create_verified_lenient(&mut session, 47, bp_inst, &attrs, 0xf000, &attrs[..6])?;
+    let bp_present = match session.get(47, bp_inst, 0xf000) {
+        Ok(frame) => {
+            let data = &frame.payload[3..9];
+            if data[..2] != TY_FS803G_BRIDGE_PROFILE.to_be_bytes()
+                || data[3] != 11
+                || data[4..6] != TY_FS803G_VEIP_ENDPOINT.to_be_bytes()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VEIP bridge port association mismatch",
+                ));
+            }
+            true
+        }
+        Err(error) if crate::pon_engine::omci::error::is_absent(&error) => false,
+        Err(error) => return Err(error),
+    };
+    if !bp_present {
+        create_verified_lenient(
+            &mut session,
+            47,
+            bp_inst,
+            &me::bridge_port(TY_FS803G_BRIDGE_PROFILE, 1, 11, TY_FS803G_VEIP_ENDPOINT),
+            &[1, 2, 3, 4],
+        )?;
         println!("SCTY_TY_FS803G_VEIP_BP_CREATED instance={bp_inst:04x}");
     } else {
         println!("SCTY_TY_FS803G_VEIP_BP_REUSED instance={bp_inst:04x}");
@@ -197,17 +217,34 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
 
     // Check or create EVTO (ME 171 instance 0x0201)
     let evto_inst = TY_FS803G_VEIP_EVTO;
-    if session.get(171, evto_inst, 0x8000).is_err() {
-        let mut evto = vec![10]; // association type 10 (VEIP)
-        evto.extend(TY_FS803G_VEIP_ENDPOINT.to_be_bytes());
-        create_verified_lenient(&mut session, 171, evto_inst, &evto, 0x8200, &evto)?;
+    let evto_present = match session.get(171, evto_inst, 0x8200) {
+        Ok(frame) => {
+            if frame.payload[3..6] != [10, 0x04, 0x01] {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VEIP EVTO association mismatch",
+                ));
+            }
+            true
+        }
+        Err(error) if crate::pon_engine::omci::error::is_absent(&error) => false,
+        Err(error) => return Err(error),
+    };
+    if !evto_present {
+        create_verified_lenient(
+            &mut session,
+            171,
+            evto_inst,
+            &me::evto(10, TY_FS803G_VEIP_ENDPOINT),
+            &[1, 7],
+        )?;
         println!("SCTY_TY_FS803G_EVTO_CREATED instance={evto_inst:04x}");
     } else {
         println!("SCTY_TY_FS803G_EVTO_REUSED instance={evto_inst:04x}");
     }
 
     // Downstream mode transparent
-    match session.set(171, evto_inst, 0x0800, &[1]) {
+    match session.set_attributes(171, evto_inst, &[(5, V::number(1))]) {
         Ok(()) => {
             let _ = verify(&mut session, 171, evto_inst, 0x0800, &[1]);
         }
@@ -218,7 +255,7 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
         }
     }
 
-    if let Err(error) = session.with_timeout(Duration::from_secs(5), |session| {
+    if let Err(error) = session.with_timeout(Duration::from_secs(30), |session| {
         apply_transparent_evto_table(session, evto_inst)
     }) {
         if matches!(
@@ -231,13 +268,13 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     }
 
     // Ensure VEIP ME 329 administrative state is unlocked (0) to trigger Broadcom rutRgFull_configVeip
-    if let Err(error) = session.set(329, TY_FS803G_VEIP_ENDPOINT, 0x8000, &[0]) {
+    if let Err(error) = session.set_attributes(329, TY_FS803G_VEIP_ENDPOINT, &[(1, V::number(0))]) {
         println!("SCTY_TY_FS803G_VEIP_UNLOCK_SKIPPED: {error}");
     }
 
     // Unlock LAN Ethernet UNIs (ME 11 instances 0xff03, 0xff04)
     for uni in [0xff03u16, 0xff04] {
-        let _ = session.set(11, uni, 0x2000, &[0]);
+        let _ = session.set_attributes(11, uni, &[(5, V::number(0))]);
     }
 
     // Bootstrap TR-069 ME 340 management server
@@ -255,20 +292,39 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     Ok(())
 }
 
-fn retire_stale_ani(session: &mut OmciSession, current_port: u16) {
+fn retire_stale_ani(session: &mut OmciSession, current_port: u16) -> io::Result<()> {
     for old in 0x100u16..=0x10f {
         if old == current_port {
             continue;
         }
-        // Only attempt deletion if GEM CTP (ME 268) or ANI BP (ME 47) actually exists
-        if session.get(268, old, 0x8000).is_ok() || session.get(47, old, 0x8000).is_ok() {
+        // A successful GET alone does not prove ownership. Some firmware returns
+        // zero/default values for unused instances. Only retire our bridge's ANI
+        // binding to the corresponding slot GEM, not arbitrary existing entities.
+        let frame = match session.get(47, old, 0xf000) {
+            Ok(frame) => frame,
+            Err(error) if crate::pon_engine::omci::error::is_absent(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let binding = &frame.payload[3..9];
+        if stale_ani_binding(binding, old) {
             println!("SCTY_TY_FS803G_RETIRE_STALE_ANI instance={old:04x}");
-            let _ = session.delete(47, old);
-            let _ = session.delete(266, old);
-            let _ = session.delete(268, old);
-            let _ = session.delete(84, old);
+            for class in [47, 266, 268, 84] {
+                match session.delete(class, old) {
+                    Ok(()) => println!("SCTY_TY_FS803G_RETIRED class={class} instance={old:04x}"),
+                    Err(error) if crate::pon_engine::omci::error::is_absent(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
         }
     }
+    Ok(())
+}
+
+fn stale_ani_binding(binding: &[u8], gem: u16) -> bool {
+    binding.len() == 6
+        && binding[..2] == TY_FS803G_BRIDGE_PROFILE.to_be_bytes()
+        && binding[3] == 5
+        && binding[4..6] == gem.to_be_bytes()
 }
 
 fn create_gem_port(
@@ -280,21 +336,16 @@ fn create_gem_port(
     bridge: u16,
     gal: u16,
 ) -> io::Result<()> {
-    let mut ctp = Vec::with_capacity(16);
-    ctp.extend(port.to_be_bytes());
-    ctp.extend(tcont.to_be_bytes());
-    ctp.push(3);
-    ctp.extend(prio_queue.to_be_bytes());
-    ctp.extend([0, 0]);
-    ctp.push(0);
-    ctp.extend([0, 0]);
-    ctp.push(0);
-    ctp.extend([0, 0]);
-    ctp.push(0);
-    create_verified_lenient(session, 268, instance, &ctp, 0xe000, &ctp[..5])?;
+    create_verified_lenient(
+        session,
+        268,
+        instance,
+        &me::gem_ctp(port, tcont, prio_queue),
+        &[1, 2, 3],
+    )?;
     match session.get(268, instance, 0x1000) {
-        Ok(frame) if frame.payload.get(3..5) != Some(&ctp[5..7]) => {
-            session.set(268, instance, 0x1000, &ctp[5..7])?;
+        Ok(frame) if frame.payload[3..5] != prio_queue.to_be_bytes() => {
+            session.set_attributes(268, instance, &[(4, V::number(prio_queue.into()))])?;
             println!(
                 "GEM_UPSTREAM_TM_REPAIRED instance={instance:04x} prio_queue={prio_queue:04x}"
             );
@@ -302,13 +353,13 @@ fn create_gem_port(
         Ok(_) => {}
         Err(_) => {}
     }
-    let mut iw = Vec::new();
-    iw.extend(instance.to_be_bytes());
-    iw.push(1);
-    iw.extend(bridge.to_be_bytes());
-    iw.extend([0, 0]);
-    iw.extend(gal.to_be_bytes());
-    create_verified_lenient(session, 266, instance, &iw, 0xf200, &iw)
+    create_verified_lenient(
+        session,
+        266,
+        instance,
+        &me::gem_iw(instance, bridge, gal),
+        &[1, 2, 3, 4, 7],
+    )
 }
 
 fn apply_transparent_evto_table(session: &mut OmciSession, instance: u16) -> io::Result<()> {
@@ -317,22 +368,146 @@ fn apply_transparent_evto_table(session: &mut OmciSession, instance: u16) -> io:
         "SCTY_TY_FS803G_EVTO_TABLE instance={instance:04x} len={}",
         before.len()
     );
-    // Ensure all 3 transparent rules (untagged, priority tagged, single tagged) are present
-    for (outer, inner) in [
-        (0xf8000000u32, 0xf8000000u32),
-        (0xf8000000, 0xe8000000),
-        (0xe8000000, 0xe8000000),
-    ] {
-        let row: Vec<u8> = [outer, inner, 0x000f0000, 0x000f0000]
-            .into_iter()
-            .flat_map(u32::to_be_bytes)
-            .collect();
-        let _ = session.set(171, instance, 0x0400, &row);
+    let rules = transparent_rules();
+    validate_evto_table(&before)?;
+    // Preserve unrelated factory rules and avoid rewriting already correct rows.
+    for (index, row) in rules.iter().enumerate() {
+        if before.chunks_exact(16).any(|existing| existing == row) {
+            continue;
+        }
+        session
+            .set_attributes(171, instance, &[(6, V::octets(row))])
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("EVTO SET instance={instance:04x} row={index}: {error}"),
+                )
+            })?;
+        println!("SCTY_TY_FS803G_EVTO_ROW_SET instance={instance:04x} row={index}");
     }
     let after = session.get_table(171, instance, 0x0400)?;
+    validate_evto_table(&after)?;
+    if !rules
+        .iter()
+        .all(|row| after.chunks_exact(16).any(|existing| existing == row))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("EVTO readback missing transparent rules instance={instance:04x}"),
+        ));
+    }
     println!(
         "SCTY_TY_FS803G_EVTO_TRANSPARENT_READY instance={instance:04x} len={}",
         after.len()
     );
     Ok(())
+}
+
+fn validate_evto_table(table: &[u8]) -> io::Result<()> {
+    if table.len() % 16 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "EVTO table has incomplete row",
+        ));
+    }
+    Ok(())
+}
+
+fn transparent_rules() -> Vec<Vec<u8>> {
+    [
+        (0xf8000000u32, 0xf8000000u32),
+        (0xf8000000, 0xe8000000),
+        (0xe8000000, 0xe8000000),
+    ]
+    .into_iter()
+    .map(|(outer, inner)| {
+        [outer, inner, 0x000f0000, 0x000f0000]
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect()
+    })
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pon_engine::omci::{session::OmciTransport, wire::BaselineFrame};
+    use std::collections::VecDeque;
+
+    // Script complete GET/GET NEXT exchanges, including ONU-side SET rejection
+    // and accepted writes that fail to appear in a subsequent table snapshot.
+    struct Script {
+        replies: VecDeque<(u8, [u8; 32])>,
+        pending: Option<BaselineFrame>,
+    }
+    impl OmciTransport for Script {
+        fn send(&mut self, request: &BaselineFrame) -> io::Result<()> {
+            let (kind, payload) = self.replies.pop_front().expect("unexpected OMCI operation");
+            assert_eq!(request.message_type, kind);
+            self.pending = Some(BaselineFrame::new(
+                request.transaction_id,
+                kind & !0x40 | 0x20,
+                request.class_id,
+                request.instance_id,
+                payload,
+            ));
+            Ok(())
+        }
+        fn receive(&mut self) -> io::Result<Option<BaselineFrame>> {
+            Ok(self.pending.take())
+        }
+    }
+    fn table_replies(table: &[u8]) -> Vec<(u8, [u8; 32])> {
+        let mut payload = [0; 32];
+        payload[1..3].copy_from_slice(&0x0400u16.to_be_bytes());
+        payload[3..7].copy_from_slice(&(table.len() as u32).to_be_bytes());
+        let mut replies = vec![(0x49, payload)];
+        for chunk in table.chunks(29) {
+            let mut payload = [0; 32];
+            payload[1..3].copy_from_slice(&0x0400u16.to_be_bytes());
+            payload[3..3 + chunk.len()].copy_from_slice(chunk);
+            replies.push((0x5a, payload));
+        }
+        replies
+    }
+    fn session(replies: Vec<(u8, [u8; 32])>) -> OmciSession {
+        OmciSession::new(Script {
+            replies: replies.into(),
+            pending: None,
+        })
+    }
+    #[test]
+    fn complete_factory_rules_are_reused_without_set() {
+        let table = transparent_rules().concat();
+        let mut replies = table_replies(&table);
+        replies.extend(table_replies(&table));
+        apply_transparent_evto_table(&mut session(replies), 0x0201).unwrap();
+    }
+    #[test]
+    fn rejected_write_stops_before_reporting_ready() {
+        let mut replies = table_replies(&[]);
+        let mut rejected = [0; 32];
+        rejected[0] = 3;
+        replies.push((0x48, rejected));
+        let error = apply_transparent_evto_table(&mut session(replies), 0x0201).unwrap_err();
+        assert!(error.to_string().contains("row=0"));
+        assert!(error.to_string().contains("result=3"));
+    }
+    #[test]
+    fn accepted_writes_require_matching_readback() {
+        let mut replies = table_replies(&[]);
+        replies.extend([(0x48, [0; 32]); 3]);
+        replies.extend(table_replies(&[]));
+        let error = apply_transparent_evto_table(&mut session(replies), 0x0201).unwrap_err();
+        assert!(error.to_string().contains("missing transparent rules"));
+    }
+    #[test]
+    fn stale_cleanup_requires_owned_ani_binding() {
+        assert!(stale_ani_binding(&[0, 1, 6, 5, 1, 3], 0x0103));
+        assert!(!stale_ani_binding(&[0; 6], 0x0103));
+        assert!(!stale_ani_binding(&[0, 2, 6, 5, 1, 3], 0x0103));
+        assert!(!stale_ani_binding(&[0, 1, 1, 11, 4, 1], 0x0103));
+        assert!(!stale_ani_binding(&[0, 1, 6, 5, 1, 4], 0x0103));
+    }
 }

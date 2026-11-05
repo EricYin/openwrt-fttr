@@ -148,7 +148,14 @@ pub(super) fn ensure_pm(session: &mut OmciSession, ani: u16, create_pm: bool) ->
     match session.get_attributes(312, ani, 0x8000) {
         Ok(_) => Ok(false),
         Err(error) if create_pm && error::is_unknown_instance(&error) => {
-            session.create(312, ani, &[0, 0])?;
+            session.create_attributes(
+                312,
+                ani,
+                &[(
+                    2,
+                    crate::pon_engine::omci::attributes::AttributeValue::number(0),
+                )],
+            )?;
             session.get_attributes(312, ani, 0x8000)?;
             Ok(true)
         }
