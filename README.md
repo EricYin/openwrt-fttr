@@ -77,6 +77,14 @@ STAR 观察工具要求传入源 MAC；不再内置现场设备地址。独立 r
 `fttrd`，OMCI MIB 入口复用控制器 inventory 核心。CLI 的受支持命令以
 `fttrctl help` 为准，手动 `discover/register/auth/sync-wifi/provision` 入口已移除。
 
+### miniOLT 只读 FPGA 诊断
+
+`fttrctl fpga-diag [ONU_ID|all] [--samples N] [--interval-ms N] [--json]`
+通过 daemon 读取原厂 `moltdbg` 已确认的授权配置、LoB/BIP 和全局错误计数；
+`--offline` 显式直接读取。JSON 为逐行快照及模差，跨注册代次不计算 ONU 差值。
+计数可能回绕、清零或饱和；寄存器不是原子快照，不能单凭累计值判定故障。
+字段来源、地址与解释边界见本地 `EVIDENCE/moltdbg-readonly-diagnostics.md`。
+
 ## Windows Rust 交叉编译
 
 在 `h3c-fttr-tools/src` 中使用已安装的 Rust target、Zig 和 cargo-zigbuild：
