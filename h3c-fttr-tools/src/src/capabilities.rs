@@ -52,6 +52,12 @@ pub fn compiled() -> Capabilities {
             name: "FiberHome HG6371F-C (experimental SCTY grant trial; existing bridge only)",
         });
     }
+    if cfg!(feature = "device-realtek") {
+        adapters.push(AdapterCapability {
+            id: "realtek",
+            name: "Realtek TYFCA1 (diagnostic probe & bridge)",
+        });
+    }
     Capabilities {
         schema_version: 1,
         version: env!("CARGO_PKG_VERSION"),

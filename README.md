@@ -41,6 +41,7 @@ make package/feeds/fttr/luci-app-fttr/compile V=s -j2
 | `CONFIG_FTTR_DEVICE_ZTE` | `device-zte` | 开 | 关 |
 | `CONFIG_FTTR_DEVICE_SCTY` | `device-scty` | 开 | 关 |
 | `CONFIG_FTTR_DEVICE_FIBERHOME` | `device-fiberhome` | 关 | 关 |
+| `CONFIG_FTTR_DEVICE_REALTEK` | `device-realtek` | 关 | 关 |
 | `CONFIG_FTTR_ACS` | `acs` | 开 | 关 |
 | `CONFIG_FTTR_MQTT` | `mqtt` | 开 | 开 |
 | `CONFIG_FTTR_NPU` | `npu` | 开 | 开 |

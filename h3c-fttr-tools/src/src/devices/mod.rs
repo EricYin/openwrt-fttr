@@ -21,6 +21,8 @@ pub mod generic;
 pub mod hl202;
 #[cfg(feature = "device-hwtc")]
 pub mod hwtc;
+#[cfg(feature = "device-realtek")]
+pub(crate) mod realtek;
 #[cfg(feature = "device-scty")]
 pub(crate) mod scty;
 #[cfg(feature = "device-star")]
@@ -88,6 +90,8 @@ pub enum Adapter {
     Scty,
     #[cfg(feature = "device-fiberhome")]
     Fiberhome,
+    #[cfg(feature = "device-realtek")]
+    Realtek,
     GenericBridge,
     Unavailable,
 }
@@ -240,6 +244,11 @@ impl Adapter {
                 business: true,
                 shell_commands: false,
             },
+            #[cfg(feature = "device-realtek")]
+            Self::Realtek => Capabilities {
+                business: true,
+                shell_commands: false,
+            },
             _ => Capabilities {
                 business: false,
                 shell_commands: false,
@@ -261,6 +270,8 @@ impl Adapter {
             Self::Scty => BusinessPhase::Configuring,
             #[cfg(feature = "device-fiberhome")]
             Self::Fiberhome => BusinessPhase::Configuring,
+            #[cfg(feature = "device-realtek")]
+            Self::Realtek => BusinessPhase::Configuring,
             Self::Unavailable => BusinessPhase::Unsupported,
         }
     }
@@ -281,6 +292,8 @@ impl Adapter {
             Self::Scty => BusinessPhase::Verifying,
             #[cfg(feature = "device-fiberhome")]
             Self::Fiberhome => BusinessPhase::Verifying,
+            #[cfg(feature = "device-realtek")]
+            Self::Realtek => BusinessPhase::Verifying,
             Self::Unavailable => BusinessPhase::Verifying,
         }
     }
@@ -306,6 +319,8 @@ impl Adapter {
             Self::Scty => scty::configure(id, Some(token)),
             #[cfg(feature = "device-fiberhome")]
             Self::Fiberhome => fiberhome::configure(id, Some(token)),
+            #[cfg(feature = "device-realtek")]
+            Self::Realtek => realtek::configure(id, Some(token)),
             Self::GenericBridge => generic::service::configure(id, Some(token)),
             _ => {
                 let _ = (id, token);
@@ -351,6 +366,14 @@ pub fn select_with_serial(
                 Adapter::Unavailable
             };
         }
+        #[cfg(feature = "device-realtek")]
+        if crate::provisioning::is_device_adapter(sn, "realtek") {
+            return if realtek::matches(vendor, equipment) {
+                Adapter::Realtek
+            } else {
+                Adapter::Unavailable
+            };
+        }
     }
     #[cfg(feature = "device-hl202")]
     if hl202::matches(vendor, equipment) {
@@ -381,6 +404,10 @@ pub fn select_with_serial(
     #[cfg(feature = "device-scty")]
     if scty::matches(vendor, equipment) {
         return Adapter::Scty;
+    }
+    #[cfg(feature = "device-realtek")]
+    if realtek::matches(vendor, equipment) {
+        return Adapter::Realtek;
     }
     if serial.is_some_and(crate::provisioning::allows_generic_bridge)
         || std::env::var("FTTR_ALLOW_UNSUPPORTED_AS_BRIDGE")
