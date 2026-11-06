@@ -1,0 +1,38 @@
+name: Update LuCI Nightly Hash
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [luci-nightly-updated]
+
+permissions:
+  contents: write
+
+jobs:
+  update-hash:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run update_hash.sh
+        run: bash scripts/update_hash.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit and push if changed
+        run: |
+          if git diff --quiet --exit-code luci-app-fttr/Makefile; then
+            echo "No changes to luci-app-fttr/Makefile; skipping commit."
+          else
+            git add luci-app-fttr/Makefile
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: update luci-app-fttr nightly hash [skip ci]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi

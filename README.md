@@ -7,6 +7,7 @@ https://github.com/LazuliKao/openwrt-fttr 。
 
 - `h3c-fmcs/`：内核驱动、FPGA 初始化、PLOAM/OMCI/GEM 通道及驱动测试。
 - `h3c-fttr-tools/`：Rust 控制器 `fttrd`、命令入口 `fttrctl`、设备适配和可裁剪 ACS。
+- `luci-app-fttr/`：LuCI Web 管理界面软件包定义（基于 Release Tarball）。
 
 ## 接入 PonWrt
 
@@ -20,13 +21,14 @@ src-git fttr https://github.com/LazuliKao/openwrt-fttr.git
 
 ```sh
 ./scripts/feeds update -a
-# 已有构建树先移除旧 feed 的两个包链接；不删除其他 PON 包。
-./scripts/feeds uninstall h3c-fmcs h3c-fttr-tools
-./scripts/feeds install -p fttr h3c-fmcs h3c-fttr-tools
+# 已有构建树先移除旧 feed 的包链接；不删除其他 PON 包。
+./scripts/feeds uninstall h3c-fmcs h3c-fttr-tools luci-app-fttr
+./scripts/feeds install -p fttr h3c-fmcs h3c-fttr-tools luci-app-fttr
 ./scripts/feeds install -a
 make defconfig
 make package/feeds/fttr/h3c-fmcs/compile V=s -j2
 make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
+make package/feeds/fttr/luci-app-fttr/compile V=s -j2
 ```
 
 ## 编译选项
