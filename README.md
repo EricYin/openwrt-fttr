@@ -52,10 +52,6 @@ cargo check --locked --all-targets --no-default-features --features all-devices,
 cargo check --locked --all-targets --no-default-features --features all-devices,acs
 ```
 
-SCTY 仅精确匹配 `COMHEART TY-FS803G`，复用按 MIB 发现资源的标准 OMCI
-桥接流程。当前为桥接适配入口；双向 GEM、管理网络与 CWMP/Wi-Fi 尚待独立
-现场验收，不包含推测的 CWMP 串号规则或私有参数路径。
-
 ### Workspace 与诊断工具
 
 `h3c-fttr-tools/src/Cargo.toml` 是 workspace 根，所有内部 crate 共用根目录

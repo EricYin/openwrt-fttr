@@ -3,20 +3,11 @@
 //! Direct OMCI provisioning bypasses the 309-entity MIB upload which takes minutes
 //! on Broadcom CMS protocol stacks and times out.
 //!
-//! Broadcom BCM68252 RDPA Root TM Transition Rule:
-//! In `rcl_tContObject` (0x0002f664), Broadcom checks whether the previous Alloc-ID was
-//! 255 (0x00FF, unassigned initial value) via `rutGpon_isAllocIdInitValue`.
-//! If old Alloc-ID != 255, Broadcom skips `rutGpon_createPriorityQueueByTcont`, leaving `wan0`
-//! without a root TM on RDPA hardware.
-//! Any CPU frame sent out via `wan0` (such as DHCP Discover from the sub-gateway) then fails in
-//! `_rdpa_cpu_send_sysb: send pkt failed, rc -5` (BDMF_ERR_NOENT).
-//!
-//! To trigger Root TM and queue allocation in RDPA hardware:
-//! 1. Set ME 262 Alloc-ID to 255 (0x00FF).
-//! 2. Short delay (50ms).
-//! 3. Set ME 262 Alloc-ID to target (0x100 + id).
-//! Broadcom will observe `old_alloc == 255` and execute `rutGpon_createPriorityQueueByTcont`,
-//! which initializes `tmctl_portTmInit` on RDPA.
+//! Firmware analysis shows `rutGpon_isAllocIdInitValue` accepts 0xffff in all
+//! application modes, whereas 0x00ff is initial only in mode 0. Reset to the
+//! standard unassigned value before binding the business allocation. This
+//! transition and successful OMCI readback do not prove RDPA or GEM forwarding;
+//! those require independent live data-plane evidence.
 
 use crate::controller::business as me;
 use crate::controller::business::{create_verified_lenient, verify};
@@ -34,7 +25,6 @@ use std::{
 
 pub const TY_FS803G_TCONT: u16 = 0x8000;
 pub const TY_FS803G_PRIO_QUEUE: u16 = 0x8000;
-pub const TY_FS803G_TRAFFIC_SCHEDULER: u16 = 0x8000;
 pub const TY_FS803G_VEIP_ENDPOINT: u16 = 0x0401;
 pub const TY_FS803G_VEIP_BP: u16 = 0x0201;
 pub const TY_FS803G_VEIP_EVTO: u16 = 0x0201;
@@ -91,9 +81,7 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     let _ = session.delete(268, port);
     let _ = session.delete(84, port);
 
-    // Broadcom BCM68252 Root TM transition:
-    // rcl_tContObject requires old Alloc-ID to be 255 (0x00FF) to call
-    // rutGpon_createPriorityQueueByTcont and initialize wan0 hardware Root TM.
+    // Use the mode-independent unassigned value, not the mode-0-only 0x00ff.
     let current_alloc = session
         .get(262, TY_FS803G_TCONT, 0x8000)
         .ok()
@@ -106,15 +94,15 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
 
     println!("SCTY_TY_FS803G_TCONT_CURRENT instance={TY_FS803G_TCONT:04x} alloc={current_alloc:?}");
 
-    if current_alloc != Some(255) {
-        println!("SCTY_TY_FS803G_TCONT_RESET_255 instance={TY_FS803G_TCONT:04x}");
-        session.set_attributes(262, TY_FS803G_TCONT, &[(1, V::number(255))])?;
+    if current_alloc != Some(0xffff) {
+        println!("SCTY_TY_FS803G_TCONT_RESET_UNASSIGNED instance={TY_FS803G_TCONT:04x}");
+        session.set_attributes(262, TY_FS803G_TCONT, &[(1, V::number(0xffff))])?;
         verify(
             &mut session,
             262,
             TY_FS803G_TCONT,
             0x8000,
-            &255u16.to_be_bytes(),
+            &0xffffu16.to_be_bytes(),
         )?;
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -130,14 +118,10 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
         &port.to_be_bytes(),
     )?;
 
-    // TrafficSchedulerPointer is attribute 7 (0x0200); attribute 6 is RelatedPort (4 bytes).
-    if let Err(error) = session.set_attributes(
-        277,
-        TY_FS803G_PRIO_QUEUE,
-        &[(7, V::number(TY_FS803G_TRAFFIC_SCHEDULER.into()))],
-    ) {
-        println!("SCTY_TY_FS803G_PRIO_QUEUE_SCHED_SKIPPED: {error}");
-    }
+    // Preserve the factory queue scheduler association. This firmware accepts
+    // a null pointer in its queue setup path, but rejects changing 0000 to 8000
+    // once the queue is in use (rcl_priorityQueueGObject, ret=9002). Neither a
+    // matching scheduler entity number nor SET success proves it is writable.
 
     // GAL Ethernet profile (ME 272)
     if let Err(error) =
@@ -186,19 +170,7 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     // Check or create VEIP Bridge Port (ME 47 instance 0x0201)
     let bp_inst = TY_FS803G_VEIP_BP;
     let bp_present = match session.get(47, bp_inst, 0xf000) {
-        Ok(frame) => {
-            let data = &frame.payload[3..9];
-            if data[..2] != TY_FS803G_BRIDGE_PROFILE.to_be_bytes()
-                || data[3] != 11
-                || data[4..6] != TY_FS803G_VEIP_ENDPOINT.to_be_bytes()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "VEIP bridge port association mismatch",
-                ));
-            }
-            true
-        }
+        Ok(frame) => veip_bridge_present(&frame.payload[3..9])?,
         Err(error) if crate::pon_engine::omci::error::is_absent(&error) => false,
         Err(error) => return Err(error),
     };
@@ -218,15 +190,7 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     // Check or create EVTO (ME 171 instance 0x0201)
     let evto_inst = TY_FS803G_VEIP_EVTO;
     let evto_present = match session.get(171, evto_inst, 0x8200) {
-        Ok(frame) => {
-            if frame.payload[3..6] != [10, 0x04, 0x01] {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "VEIP EVTO association mismatch",
-                ));
-            }
-            true
-        }
+        Ok(frame) => veip_evto_present(&frame.payload[3..6])?,
         Err(error) if crate::pon_engine::omci::error::is_absent(&error) => false,
         Err(error) => return Err(error),
     };
@@ -290,6 +254,36 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     lease.disarm();
     println!("SCTY_TY_FS803G_LEASE_PERSISTED id={id} port={port:04x}");
     Ok(())
+}
+
+fn veip_bridge_present(data: &[u8]) -> io::Result<bool> {
+    // An entirely empty factory record has no ownership to preserve. Never
+    // replace a nonempty foreign binding, including a partially initialized one.
+    if data == [0; 6] {
+        return Ok(false);
+    }
+    if data.len() == 6
+        && data[..2] == TY_FS803G_BRIDGE_PROFILE.to_be_bytes()
+        && data[3] == 11
+        && data[4..6] == TY_FS803G_VEIP_ENDPOINT.to_be_bytes()
+    {
+        return Ok(true);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "VEIP bridge port association mismatch",
+    ))
+}
+
+fn veip_evto_present(data: &[u8]) -> io::Result<bool> {
+    match data {
+        [0, 0, 0] => Ok(false),
+        [10, 0x04, 0x01] => Ok(true),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VEIP EVTO association mismatch",
+        )),
+    }
 }
 
 fn retire_stale_ani(session: &mut OmciSession, current_port: u16) -> io::Result<()> {
@@ -501,6 +495,21 @@ mod tests {
         replies.extend(table_replies(&[]));
         let error = apply_transparent_evto_table(&mut session(replies), 0x0201).unwrap_err();
         assert!(error.to_string().contains("missing transparent rules"));
+    }
+    #[test]
+    fn factory_recovery_never_authorizes_replacing_a_foreign_veip_binding() {
+        assert!(!veip_bridge_present(&[0; 6]).unwrap());
+        assert!(!veip_evto_present(&[0; 3]).unwrap());
+        assert!(veip_bridge_present(&[0, 1, 1, 11, 4, 1]).unwrap());
+        // Reuse the actual port number rather than overwriting a valid endpoint.
+        assert!(veip_bridge_present(&[0, 1, 7, 11, 4, 1]).unwrap());
+        assert!(veip_evto_present(&[10, 4, 1]).unwrap());
+        for foreign in [[0, 2, 1, 11, 4, 1], [0, 1, 1, 11, 4, 2], [0, 0, 1, 0, 0, 0]] {
+            assert!(veip_bridge_present(&foreign).is_err());
+        }
+        assert!(veip_bridge_present(&[]).is_err());
+        assert!(veip_evto_present(&[10, 4, 2]).is_err());
+        assert!(veip_evto_present(&[0, 4, 1]).is_err());
     }
     #[test]
     fn stale_cleanup_requires_owned_ani_binding() {
