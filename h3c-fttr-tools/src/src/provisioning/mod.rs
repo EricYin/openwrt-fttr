@@ -9,7 +9,7 @@ mod config;
 pub(crate) use config::words as uci_words;
 pub(crate) mod controller;
 pub(crate) mod health_watch;
-mod link_identity;
+pub(crate) mod link_identity;
 mod management_network;
 pub mod model;
 mod policy;

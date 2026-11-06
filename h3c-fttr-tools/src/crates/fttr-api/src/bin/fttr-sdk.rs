@@ -225,6 +225,19 @@ mod tests {
         assert!(types.contains("report: MibReport"));
         assert!(!types.contains("Array<unknown>"));
         assert!(client.contains("method: \"npu_status\", access: \"read\", feature: \"npu\""));
+        for name in [
+            GET_TOPOLOGY.name,
+            GET_TOPOLOGY_NODE.name,
+            GET_TOPOLOGY_CLIENTS.name,
+        ] {
+            assert!(client.contains(&format!(
+                "method: \"{}\", access: \"read\", feature: null",
+                name
+            )));
+        }
+        assert!(types.contains("hl202: TopologyHl202 | null"));
+        assert!(types.contains("snapshot_id?: string"));
+        assert!(client.contains("raw_getTopologyClients(request.node_id, request.snapshot_id, request.cursor, request.limit)"));
     }
 
     #[test]
@@ -242,5 +255,19 @@ mod tests {
             .unwrap()
             .contains(&serde_json::json!(NPU_SET.name)));
         assert!(render_acl(&acl.to_string()).is_err());
+        for name in [
+            GET_TOPOLOGY.name,
+            GET_TOPOLOGY_NODE.name,
+            GET_TOPOLOGY_CLIENTS.name,
+        ] {
+            assert!(group["read"]["ubus"][OBJECT]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(name)));
+            assert!(!group["write"]["ubus"][OBJECT]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(name)));
+        }
     }
 }

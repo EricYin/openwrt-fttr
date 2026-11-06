@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 mod metrics;
 #[cfg(test)]
 mod tests;
+mod topology;
 
 fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
     method: &Method<Q, R>,
@@ -48,6 +49,7 @@ struct Handlers {
     engine: std::sync::Arc<std::sync::Mutex<crate::pon_engine::PonEngine>>,
     services: crate::controller::service::States,
     jobs: fttr_jobs::Jobs,
+    topology: std::sync::Arc<std::sync::Mutex<crate::controller::topology::Cache>>,
 }
 
 impl Handlers {
@@ -371,6 +373,7 @@ pub(super) fn methods(
         devices,
         engine,
         services,
+        topology: Default::default(),
         jobs: {
             static JOBS: std::sync::OnceLock<fttr_jobs::Jobs> = std::sync::OnceLock::new();
             JOBS.get_or_init(|| fttr_jobs::Jobs::with_shutdown(stopping))

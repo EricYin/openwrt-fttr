@@ -6,7 +6,7 @@ use std::io::{self, Read};
 const MAX_FDB_BYTES: u64 = 1024 * 1024;
 const MAX_AGE_TICKS: u32 = 60 * 100; // Linux bridge sysfs exposes USER_HZ (100) ticks.
 
-pub(super) fn discover(onus: &BTreeMap<u16, String>) -> Result<BTreeMap<String, String>, String> {
+pub(crate) fn discover(onus: &BTreeMap<u16, String>) -> Result<BTreeMap<String, String>, String> {
     read_links(onus).map_err(|e| format!("ONU source-link discovery: {e}"))
 }
 

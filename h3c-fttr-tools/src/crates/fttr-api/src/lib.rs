@@ -18,6 +18,8 @@ mod commands;
 mod operations;
 pub use commands::*;
 pub use operations::*;
+mod topology;
+pub use topology::*;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
@@ -219,6 +221,9 @@ macro_rules! fttr_methods {
             OPTICAL_STATUS, optical_status, opticalStatus, EmptyRequest, OpticalReply, Read, Always, [];
             OPTICAL_SET, optical_set, opticalSet, OpticalSettings, OpticalReply, Write, Always, [enabled, downstream_tx_enabled, fec_enabled];
             GET_STATUS, get_status, getStatus, EmptyRequest, StatusReply, Read, Always, [];
+            GET_TOPOLOGY, get_topology, getTopology, EmptyRequest, TopologyReply, Read, Always, [];
+            GET_TOPOLOGY_NODE, get_topology_node, getTopologyNode, TopologyNodeRequest, TopologyNodeReply, Read, Always, [node_id, snapshot_id];
+            GET_TOPOLOGY_CLIENTS, get_topology_clients, getTopologyClients, TopologyClientsRequest, TopologyClientsReply, Read, Always, [node_id, snapshot_id, cursor, limit];
             GET_SYNC, get_sync, getSync, EmptyRequest, SyncStatusReply, Read, Always, [];
             CONFIG_CHECK, config_check, configCheck, EmptyRequest, ConfigCheckReply, Read, Always, [];
             NPU_STATUS, npu_status, npuStatus, EmptyRequest, NpuStatus, Read, Npu, [];

@@ -17,4 +17,5 @@ mod runtime;
 pub(crate) mod service;
 mod status;
 mod telemetry;
+mod topology;
 pub use runtime::run;
