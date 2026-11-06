@@ -250,6 +250,12 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     // most shared upstream bandwidth available to other ONUs. Keep this policy
     // model-local; the platform lease preserves it across temporary diagnostics.
     lease.set_business_grant_floor(1300)?;
+    // The measured two-byte OMCC polling allocation causes receive errors when
+    // followed by this ONU's business allocation. A 60-byte allocation preserved
+    // both IDs and eliminated BIP growth in bounded field comparisons. Persist
+    // it through the same reversible lease, and require the final OMCI GET below
+    // to succeed before committing ownership. This is not a proof of IP service.
+    lease.set_management_grant_floor(60)?;
     println!("SCTY_TY_FS803G_BUSINESS_GRANT_FLOOR id={id} bytes=1300");
 
     verify(&mut session, 256, 0, 0x8000, &vendor_bytes)?;
