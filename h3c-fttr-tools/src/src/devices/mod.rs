@@ -14,6 +14,8 @@ pub fn observe_mqtt_report(source: &str, payload: Vec<u8>, received: u64) -> boo
         false
     }
 }
+#[cfg(feature = "device-fiberhome")]
+pub(crate) mod fiberhome;
 pub mod generic;
 #[cfg(feature = "device-hl202")]
 pub mod hl202;
@@ -84,6 +86,8 @@ pub enum Adapter {
     Zte,
     #[cfg(feature = "device-scty")]
     Scty,
+    #[cfg(feature = "device-fiberhome")]
+    Fiberhome,
     GenericBridge,
     Unavailable,
 }
@@ -231,6 +235,11 @@ impl Adapter {
                 business: true,
                 shell_commands: false,
             },
+            #[cfg(feature = "device-fiberhome")]
+            Self::Fiberhome => Capabilities {
+                business: true,
+                shell_commands: false,
+            },
             _ => Capabilities {
                 business: false,
                 shell_commands: false,
@@ -250,6 +259,8 @@ impl Adapter {
             Self::GenericBridge => BusinessPhase::Configuring,
             #[cfg(feature = "device-scty")]
             Self::Scty => BusinessPhase::Configuring,
+            #[cfg(feature = "device-fiberhome")]
+            Self::Fiberhome => BusinessPhase::Configuring,
             Self::Unavailable => BusinessPhase::Unsupported,
         }
     }
@@ -268,6 +279,8 @@ impl Adapter {
             Self::GenericBridge => BusinessPhase::Verifying,
             #[cfg(feature = "device-scty")]
             Self::Scty => BusinessPhase::Verifying,
+            #[cfg(feature = "device-fiberhome")]
+            Self::Fiberhome => BusinessPhase::Verifying,
             Self::Unavailable => BusinessPhase::Verifying,
         }
     }
@@ -291,6 +304,8 @@ impl Adapter {
             Self::Zte => zte::configure(id, Some(token)),
             #[cfg(feature = "device-scty")]
             Self::Scty => scty::configure(id, Some(token)),
+            #[cfg(feature = "device-fiberhome")]
+            Self::Fiberhome => fiberhome::configure(id, Some(token)),
             Self::GenericBridge => generic::service::configure(id, Some(token)),
             _ => {
                 let _ = (id, token);
@@ -327,6 +342,14 @@ pub fn select_with_serial(
         #[cfg(feature = "device-scty")]
         if crate::provisioning::is_device_adapter(sn, "scty") {
             return Adapter::Scty;
+        }
+        #[cfg(feature = "device-fiberhome")]
+        if crate::provisioning::is_device_adapter(sn, "fiberhome") {
+            return if fiberhome::matches(vendor, equipment) {
+                Adapter::Fiberhome
+            } else {
+                Adapter::Unavailable
+            };
         }
     }
     #[cfg(feature = "device-hl202")]
