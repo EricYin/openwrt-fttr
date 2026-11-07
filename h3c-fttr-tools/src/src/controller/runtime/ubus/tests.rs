@@ -3,6 +3,48 @@ use serde_json::json;
 use std::sync::{atomic::AtomicUsize, Arc};
 
 #[test]
+fn http_session_metadata_is_not_a_topology_business_argument() {
+    let (_, node) = bind(&GET_TOPOLOGY_NODE, |request| {
+        assert_eq!(request.node_id, "controller");
+        assert_eq!(request.snapshot_id.as_deref(), Some("test-snapshot"));
+        Ok(TopologyNodeReply::Error {
+            code: TopologyQueryError::SnapshotExpired,
+        })
+    });
+    let (_, clients) = bind(&GET_TOPOLOGY_CLIENTS, |request| {
+        assert_eq!(request.node_id, "controller");
+        assert_eq!(request.snapshot_id.as_deref(), Some("test-snapshot"));
+        assert_eq!(request.limit, Some(100));
+        assert_eq!(request.cursor, None);
+        Ok(TopologyClientsReply::Error {
+            code: TopologyQueryError::SnapshotExpired,
+        })
+    });
+    for (name, handler, mut payload) in [
+        (
+            "get_topology_node",
+            node,
+            json!({"node_id":"controller", "snapshot_id":"test-snapshot"}),
+        ),
+        (
+            "get_topology_clients",
+            clients,
+            json!({"node_id":"controller", "snapshot_id":"test-snapshot", "limit":100}),
+        ),
+    ] {
+        let expected = handler(name, Some(&payload));
+        assert_eq!(
+            expected,
+            Ok(json!({"status":"error", "code":"snapshot_expired"}))
+        );
+        payload["ubus_rpc_session"] = json!("REDACTED_TEST_SESSION");
+        assert_eq!(handler(name, Some(&payload)), expected);
+        payload["unexpected_argument"] = json!(true);
+        assert_eq!(handler(name, Some(&payload)), Err(2));
+    }
+}
+
+#[test]
 fn invalid_native_write_requests_never_reach_the_handler() {
     let calls = Arc::new(AtomicUsize::new(0));
     let invoked = calls.clone();

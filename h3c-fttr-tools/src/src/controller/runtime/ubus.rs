@@ -18,10 +18,13 @@ fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
         Box::new(move |_, message| {
             let started = std::time::Instant::now();
             let result = (|| {
-                let request = serde_json::from_value(
-                    message.cloned().unwrap_or_else(|| serde_json::json!({})),
-                )
-                .map_err(|_| 2)?;
+                let mut payload = message.cloned().unwrap_or_else(|| serde_json::json!({}));
+                // uhttpd adds authenticated session metadata to forwarded calls.
+                // It is transport-owned, not part of the typed business request.
+                if let Some(object) = payload.as_object_mut() {
+                    object.remove("ubus_rpc_session");
+                }
+                let request = serde_json::from_value(payload).map_err(|_| 2)?;
                 serde_json::to_value(handler(request)?).map_err(|_| 9)
             })();
             metrics::record(name, started.elapsed(), result.is_err());
