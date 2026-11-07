@@ -1,14 +1,14 @@
 //! Shell-over-MQTT command transport. Separate connections from fttrd telemetry.
-#[cfg(feature = "mqtt")]
+#[cfg(feature = "mqtt-hl202")]
 use crate::mqtt::session::CommandSession;
 pub use fttr_api::{HlCommandResult as CommandResult, HlCommandStatus as CommandStatus};
-#[cfg(any(feature = "mqtt", test))]
+#[cfg(any(feature = "mqtt-hl202", test))]
 use std::fs::{File, OpenOptions};
 use std::io;
-#[cfg(any(feature = "mqtt", test))]
+#[cfg(any(feature = "mqtt-hl202", test))]
 use std::os::fd::AsRawFd;
 use std::time::Duration;
-#[cfg(any(feature = "mqtt", test))]
+#[cfg(any(feature = "mqtt-hl202", test))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn normalize_mac(value: &str) -> io::Result<String> {
@@ -29,7 +29,7 @@ pub fn normalize_mac(value: &str) -> io::Result<String> {
     Ok(mac.to_ascii_uppercase())
 }
 
-#[cfg(any(feature = "mqtt", test))]
+#[cfg(any(feature = "mqtt-hl202", test))]
 pub(super) fn request_id() -> String {
     format!(
         "{:x}_{:x}",
@@ -41,18 +41,18 @@ pub(super) fn request_id() -> String {
     )
 }
 
-#[cfg(any(feature = "mqtt", test))]
+#[cfg(any(feature = "mqtt-hl202", test))]
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\"'\"'"))
 }
 
-#[cfg(any(feature = "mqtt", test))]
+#[cfg(any(feature = "mqtt-hl202", test))]
 pub(super) fn framed_script(command: &str, id: &str) -> String {
     format!("printf '__FTTR_BEGIN_{id}__\\n'; sh -c {} 2>&1; fttr_rc=$?; printf '\\n__FTTR_END_{id}__=%s\\n' \"$fttr_rc\"",
         shell_quote(command))
 }
 
-#[cfg(any(feature = "mqtt", test))]
+#[cfg(any(feature = "mqtt-hl202", test))]
 pub(super) fn parse_reply(payload: &[u8], id: &str) -> Option<(String, i32, bool)> {
     let text = String::from_utf8_lossy(payload);
     let body = text.strip_prefix(&format!("__FTTR_BEGIN_{id}__\n"))?;
@@ -195,11 +195,11 @@ mod tests {
 }
 
 // Explicit unlock also releases descriptors briefly inherited by concurrent fork/exec.
-#[cfg(any(feature = "mqtt", test))]
+#[cfg(any(feature = "mqtt-hl202", test))]
 #[derive(Debug)]
 pub(super) struct CommandLock(File);
 
-#[cfg(any(feature = "mqtt", test))]
+#[cfg(any(feature = "mqtt-hl202", test))]
 impl Drop for CommandLock {
     fn drop(&mut self) {
         extern "C" {
@@ -213,7 +213,7 @@ impl Drop for CommandLock {
 
 // Advisory locks survive file reuse and are released automatically on process exit.
 // Do not unlink the lock file: doing so would let clients lock different inodes.
-#[cfg(any(feature = "mqtt", test))]
+#[cfg(any(feature = "mqtt-hl202", test))]
 pub(super) fn lock_target(target: &str) -> io::Result<CommandLock> {
     let file = OpenOptions::new()
         .read(true)
@@ -234,8 +234,9 @@ pub(super) fn lock_target(target: &str) -> io::Result<CommandLock> {
 }
 
 /// QoS 0 dispatch only. Success reports a socket write, not device execution.
-#[cfg(feature = "mqtt")]
+#[cfg(feature = "mqtt-hl202")]
 pub fn dispatch(target: &str, command: &str) -> io::Result<CommandResult> {
+    crate::mqtt_settings::require_hl202()?;
     let target = if target == "all" {
         "all".to_string()
     } else {
@@ -274,17 +275,18 @@ pub fn dispatch(target: &str, command: &str) -> io::Result<CommandResult> {
 }
 
 /// Wait for a fresh, matching response frame containing combined output and exit code.
-#[cfg(feature = "mqtt")]
+#[cfg(feature = "mqtt-hl202")]
 pub fn execute(target: &str, command: &str, timeout: Duration) -> io::Result<CommandResult> {
     crate::runtime::block_on(execute_async(target, command, timeout))
 }
 
-#[cfg(feature = "mqtt")]
+#[cfg(feature = "mqtt-hl202")]
 pub async fn execute_async(
     target: &str,
     command: &str,
     timeout: Duration,
 ) -> io::Result<CommandResult> {
+    crate::mqtt_settings::require_hl202()?;
     let target = normalize_mac(target)?;
     if command.trim().is_empty() {
         return Err(io::Error::new(
@@ -307,18 +309,18 @@ pub async fn execute_async(
     .await
 }
 
-#[cfg(not(feature = "mqtt"))]
+#[cfg(not(feature = "mqtt-hl202"))]
 pub fn dispatch(_: &str, _: &str) -> io::Result<CommandResult> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "MQTT commands unavailable: build requires mqtt",
+        "MQTT commands unavailable: build requires mqtt-hl202",
     ))
 }
 
-#[cfg(not(feature = "mqtt"))]
+#[cfg(not(feature = "mqtt-hl202"))]
 pub fn execute(_: &str, _: &str, _: Duration) -> io::Result<CommandResult> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "MQTT commands unavailable: build requires mqtt",
+        "MQTT commands unavailable: build requires mqtt-hl202",
     ))
 }

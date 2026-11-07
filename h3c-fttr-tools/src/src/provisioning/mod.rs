@@ -9,7 +9,7 @@ mod config;
 pub(crate) use config::words as uci_words;
 pub(crate) mod controller;
 pub(crate) mod health_watch;
-mod link_identity;
+pub(crate) mod link_identity;
 mod management_network;
 pub mod model;
 mod policy;
@@ -18,7 +18,7 @@ mod templates;
 mod wan;
 mod wifi;
 
-#[cfg(feature = "mqtt")]
+#[cfg(feature = "mqtt-hl202")]
 pub(crate) use bootstrap::observe_mqtt;
 use controller::acs;
 #[cfg(feature = "acs")]

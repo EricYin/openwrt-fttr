@@ -41,6 +41,8 @@ make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
 | `CONFIG_FTTR_DEVICE_FIBERHOME` | `device-fiberhome` | 关 | 关 |
 | `CONFIG_FTTR_ACS` | `acs` | 开 | 关 |
 | `CONFIG_FTTR_MQTT` | `mqtt` | 开 | 开 |
+| `CONFIG_FTTR_MQTT_HL202` | `mqtt-hl202` | 开 | 开 |
+| `CONFIG_FTTR_MQTT_TY_FS803G` | `mqtt-ty-fs803g` | 关 | 关 |
 | `CONFIG_FTTR_NPU` | `npu` | 开 | 开 |
 
 OpenWrt 使用 `--no-default-features`，逐项显式映射上述选项。设备及 ACS
@@ -48,8 +50,8 @@ feature 不会隐式开启 MQTT；`all-devices` 组合上述全部设备模块�
 `h3c-fttr-tools/src` 验证全部目标：
 
 ```sh
-cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt,npu
-cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt
+cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt-hl202,mqtt-ty-fs803g,npu
+cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt-hl202
 cargo check --locked --all-targets --no-default-features --features all-devices,acs
 ```
 
@@ -61,8 +63,8 @@ cargo check --locked --all-targets --no-default-features --features all-devices,
 
 ```sh
 cargo test --locked --workspace --features fttr-api/codegen
-cargo test --locked --lib --no-default-features --features all-devices,acs,mqtt,npu
-cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt,npu,diagnostics
+cargo test --locked --lib --no-default-features --features all-devices,acs,mqtt-hl202,mqtt-ty-fs803g,npu
+cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt-hl202,mqtt-ty-fs803g,npu,diagnostics
 ```
 
 `fttr-platform-probe`、`fttr-omci-mib`、`fttr-omci-probe`、`fttr-omci-service`、
@@ -94,7 +96,7 @@ STAR 观察工具要求传入源 MAC；不再内置现场设备地址。独立 r
 $previous = $env:RUSTFLAGS
 try {
     $env:RUSTFLAGS = '-C target-feature=-crt-static -C link-arg=-dynamic'
-    cargo zigbuild --release --locked --target aarch64-unknown-linux-musl --no-default-features --features all-devices,acs,mqtt,npu --bin fttrd --bin fttrctl
+    cargo zigbuild --release --locked --target aarch64-unknown-linux-musl --no-default-features --features all-devices,acs,mqtt-hl202,npu --bin fttrd --bin fttrctl
 } finally {
     $env:RUSTFLAGS = $previous
 }

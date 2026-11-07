@@ -85,7 +85,9 @@ pub fn control_query(query: Query, devices: &[Device]) -> Value {
                         onu_id: device.onu_id,
                         model: device.model.clone(),
                         optical_online: device.online,
-                        can_execute: cfg!(feature = "mqtt") && device.online && mqtt.is_some(),
+                        can_execute: crate::mqtt_settings::hl202_enabled()
+                            && device.online
+                            && mqtt.is_some(),
                         mqtt: mqtt.cloned(),
                         report_revision,
                     }
@@ -122,15 +124,15 @@ pub fn control_query(query: Query, devices: &[Device]) -> Value {
             Err(_) => error("unavailable", "MQTT identity state unavailable"),
         },
         Query::Run { request } => {
-            #[cfg(not(feature = "mqtt"))]
+            #[cfg(not(feature = "mqtt-hl202"))]
             {
                 let _ = request;
                 error(
                     "mqtt_unavailable",
-                    "MQTT commands unavailable: build requires mqtt",
+                    "MQTT commands unavailable: build requires mqtt-hl202",
                 )
             }
-            #[cfg(feature = "mqtt")]
+            #[cfg(feature = "mqtt-hl202")]
             {
                 if !devices.iter().any(|device| {
                     device.online

@@ -79,7 +79,7 @@ fn now() -> u64 {
         .as_secs()
 }
 
-#[cfg(feature = "mqtt")]
+#[cfg(feature = "mqtt-hl202")]
 pub(crate) fn observe_mqtt(topic: &str, time: u64) {
     if let Ok(mut registry) = crate::mqtt_identity::shared().lock() {
         registry.observe(topic, time);
@@ -331,7 +331,7 @@ impl Coordinator {
         // currently authorized ACS credentials have been written to the CPE.
         // Require a post-readback Inform before declaring the bootstrap ready.
         let settings_verified = device.adapter != "hl202"
-            || !cfg!(all(feature = "device-hl202", feature = "mqtt"))
+            || !cfg!(feature = "mqtt-hl202")
             || r.settings_verified_at
                 .is_some_and(|verified| at.is_some_and(|at| at >= verified));
         let fresh = acs_available

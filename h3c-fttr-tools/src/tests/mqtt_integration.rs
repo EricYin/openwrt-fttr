@@ -6,15 +6,15 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "device-hl202")]
+#[cfg(feature = "mqtt-hl202")]
 #[path = "mqtt_integration/commands.rs"]
 mod commands;
 #[path = "mqtt_integration/limits.rs"]
 mod limits;
-#[cfg(feature = "device-hl202")]
+#[cfg(feature = "mqtt-hl202")]
 #[path = "mqtt_integration/resources.rs"]
 mod resources;
-#[cfg(feature = "device-hl202")]
+#[cfg(feature = "mqtt-hl202")]
 #[path = "mqtt_integration/telemetry.rs"]
 mod telemetry;
 

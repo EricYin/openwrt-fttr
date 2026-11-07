@@ -9,7 +9,7 @@ mod hl202;
 pub mod inventory;
 mod lifetime;
 pub mod management;
-#[cfg(feature = "mqtt")]
+#[cfg(feature = "mqtt-hl202")]
 pub mod mqtt;
 mod pon_mac;
 pub mod profile;
@@ -17,4 +17,6 @@ mod runtime;
 pub(crate) mod service;
 mod status;
 mod telemetry;
+#[cfg(feature = "mqtt-ty-fs803g")]
+mod ty_mqtt;
 pub use runtime::run;

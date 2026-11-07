@@ -36,6 +36,8 @@ Commands:\n  \
   bosa-diag [--json]   Read calibrated UX3326 optical diagnostics (Temp, Vcc, Bias, TX)\n  \
   bosa-read <addr>     Directly read 8-bit BOSA UX3326 optical register\n  \
   bosa-write <a> <v>   Directly write 8-bit BOSA UX3326 optical register\n  \
+  mqtt status         Show daemon MQTT compiled/configured/effective switches\n  \
+  ty-fs803g list|cpu|wifi|radio|iptv <MAC>  Structured TY MQTT reports and reads\n  \
   hl202 <subcommand>   HL202 device reports, commands and accounts (hl202 help)\n  \
   exec [options] <mac> <command>  Execute, wait for combined output and exit status\n  \
   cmd [options] <mac> <command>   Dispatch without waiting for device execution\n  \
@@ -573,6 +575,39 @@ fn main() {
     };
 
     match args[1].as_str() {
+        "mqtt" | "ty-fs803g" => {
+            let command = match (
+                args[1].as_str(),
+                args.get(2).map(String::as_str),
+                args.get(3),
+            ) {
+                ("mqtt", Some("status"), None) => "MQTT_STATUS".to_string(),
+                ("ty-fs803g", Some("list"), None) => "TY_MQTT {\"action\":\"list\"}".to_string(),
+                ("ty-fs803g", Some(action @ ("cpu" | "wifi" | "radio" | "iptv")), Some(mac))
+                    if args.len() == 4 =>
+                {
+                    format!("TY_MQTT {}", serde_json::json!({"action":action,"mac":mac}))
+                }
+                _ => {
+                    eprintln!("Usage: fttrctl mqtt status | ty-fs803g list | ty-fs803g cpu|wifi|radio|iptv <MAC>");
+                    exit(2);
+                }
+            };
+            match ipc::send_ipc_command(&command) {
+                Ok(reply) => {
+                    println!("{reply}");
+                    if serde_json::from_str::<serde_json::Value>(&reply)
+                        .map_or(true, |v| v.get("error").is_some())
+                    {
+                        exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    exit(1);
+                }
+            }
+        }
         "capabilities" => {
             if args[2..]
                 .iter()

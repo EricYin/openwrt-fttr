@@ -1,5 +1,7 @@
 //! SCTY dispatch; only the observed TY-FS803G model is enrolled.
 mod ty_fs803g;
+#[cfg(feature = "mqtt-ty-fs803g")]
+pub(crate) use ty_fs803g::mqtt;
 
 pub(super) fn matches(vendor: &str, equipment: Option<&str>) -> bool {
     vendor == "SCTY" && ty_fs803g::matches(equipment)

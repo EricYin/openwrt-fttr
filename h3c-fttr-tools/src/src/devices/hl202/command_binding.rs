@@ -54,6 +54,7 @@ pub async fn execute_async(
     script: &str,
     timeout: Duration,
 ) -> io::Result<SelectedResult> {
+    crate::mqtt_settings::require_hl202()?;
     if script.trim().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

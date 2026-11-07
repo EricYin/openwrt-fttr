@@ -12,7 +12,7 @@ default-members = ["."]
 resolver = "2"
 
 [features]
-default = ["device-hl202", "mqtt", "npu"]
+default = ["device-hl202", "mqtt-hl202", "npu"]
 npu = ["tokio/process"]
 device-hl202 = ["dep:flate2", "dep:tar"]
 device-hwtc = []
@@ -23,6 +23,8 @@ device-fiberhome = []
 all-devices = ["device-hl202", "device-hwtc", "device-star", "device-zte", "device-scty", "device-fiberhome"]
 acs = ["dep:quick-xml", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:digest_auth", "dep:hyper-rustls", "dep:tokio-io-timeout"]
 mqtt = ["dep:rumqttd", "dep:rumqttc"]
+mqtt-hl202 = ["mqtt", "device-hl202"]
+mqtt-ty-fs803g = ["mqtt", "device-scty"]
 allocator-mimalloc = ["dep:mimalloc"]
 diagnostics = []
 

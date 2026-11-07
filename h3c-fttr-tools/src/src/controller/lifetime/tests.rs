@@ -29,6 +29,12 @@ fn child(mode: &str) -> (ChildGuard, mpsc::Receiver<String>) {
         .env("FTTR_LIFETIME_MODE", mode)
         .env("FTTR_LIFETIME_SOCKET", &path)
         .env("FTTR_MQTT_LAN_ADDR", "invalid")
+        .env(
+            "FTTR_MQTT_ENABLED",
+            if mode == "disabled" { "0" } else { "1" },
+        )
+        .env("FTTR_MQTT_HL202_ENABLED", "1")
+        .env("FTTR_MQTT_TY_FS803G_ENABLED", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -63,7 +69,7 @@ fn controller_mqtt_lifetime_child() {
     #[cfg(feature = "mqtt")]
     let mode = std::env::var("FTTR_LIFETIME_MODE").unwrap();
     #[cfg(feature = "mqtt")]
-    let lifetime = if mode == "invalid" {
+    let lifetime = if mode == "invalid" || mode == "disabled" {
         crate::runtime::block_on(Lifetime::start()).unwrap()
     } else {
         // Fixture-only listener addresses; production always validates LAN env.
@@ -79,12 +85,29 @@ fn controller_mqtt_lifetime_child() {
             broker.inject_finished_thread();
         }
         Lifetime {
-            broker,
+            broker: Some(broker),
             address: addresses[0],
+            settings: crate::mqtt_settings::Settings::default(),
         }
     };
     #[cfg(not(feature = "mqtt"))]
     let lifetime = crate::runtime::block_on(Lifetime::start()).unwrap();
+    #[cfg(feature = "mqtt-hl202")]
+    if mode == "disabled" {
+        use crate::devices::hl202::command;
+        assert_eq!(
+            command::dispatch("020000000001", "fixture-only")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            command::execute("020000000001", "fixture-only", Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
     let path = std::env::var("FTTR_LIFETIME_SOCKET").unwrap();
     let listener = UnixListener::bind(path).unwrap();
     std::thread::spawn(move || {
@@ -147,10 +170,28 @@ fn controller_mqtt_lifetime_runtime_broker_failure_is_fatal() {
     }
 }
 
-#[cfg(feature = "mqtt")]
+#[cfg(feature = "mqtt-hl202")]
 #[test]
 fn controller_mqtt_lifetime_invalid_lan_never_reports_ready() {
     let (mut child, rx) = child("invalid");
     assert!(!child.0.wait().unwrap().success());
     assert!(!rx.iter().any(|line| line == "LIFETIME_READY"));
+}
+
+#[cfg(feature = "mqtt")]
+#[test]
+fn controller_mqtt_disabled_ignores_invalid_lan_and_opens_no_broker() {
+    let _port = crate::MQTT_TEST_PORT.lock().unwrap();
+    let _hl = std::net::TcpListener::bind("127.0.0.1:1883").unwrap();
+    let _ty = std::net::TcpListener::bind("127.0.0.1:11883").unwrap();
+    let (mut child, rx) = child("disabled");
+    ready(&rx);
+    assert!(child.0.try_wait().unwrap().is_none());
+    let mut socket = UnixStream::connect(&child.1).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut reply = String::new();
+    socket.read_to_string(&mut reply).unwrap();
+    assert_eq!(reply, "{\"status\":\"ok\"}");
 }

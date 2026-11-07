@@ -21,6 +21,7 @@ fn reload_pruning_marks_saved_history_pending() {
 }
 
 #[test]
+#[cfg(feature = "device-hl202")] // This fixture resolves a concrete HL202 identity.
 fn identity_pruning_marks_saved_history_pending() {
     let mut c = Controller::default();
     let op = operation(OperationPhase::Completed, false);

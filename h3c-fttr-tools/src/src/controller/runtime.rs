@@ -607,7 +607,22 @@ fn ipc_handler(
     optics: OpticalClient,
 ) -> impl Fn(std::os::unix::net::UnixStream, &str) + Send + Sync + 'static {
     move |mut stream, line| {
-        if let Some(request) = line.strip_prefix("HL202 ") {
+        if line == "MQTT_STATUS" {
+            let _ = writeln!(stream, "{}", crate::mqtt_settings::status());
+        } else if let Some(request) = line.strip_prefix("TY_MQTT ") {
+            #[cfg(feature = "mqtt-ty-fs803g")]
+            super::ty_mqtt::start(
+                stream,
+                request.to_owned(),
+                pon_engine.clone(),
+                services.clone(),
+            );
+            #[cfg(not(feature = "mqtt-ty-fs803g"))]
+            {
+                let _ = request;
+                let _ = stream.write_all(b"{\"error\":\"TY MQTT adapter not compiled\"}\n");
+            }
+        } else if let Some(request) = line.strip_prefix("HL202 ") {
             #[cfg(feature = "device-hl202")]
             super::hl202::start(
                 stream,

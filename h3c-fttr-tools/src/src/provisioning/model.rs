@@ -300,7 +300,7 @@ mod backend_tests {
             wifi_cleanup: "preserve".into(),
             wifi_preserve: BTreeSet::new(),
         };
-        let expected = if cfg!(all(feature = "device-hl202", feature = "mqtt")) {
+        let expected = if cfg!(feature = "mqtt-hl202") {
             "command"
         } else {
             "acs"

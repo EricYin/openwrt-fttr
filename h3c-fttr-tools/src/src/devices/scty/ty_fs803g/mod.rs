@@ -3,6 +3,8 @@
 //! Direct OMCI bridge profile with Broadcom BCM68252 RDPA Root TM activation.
 //! This is an OMCI bridge profile, not a CWMP identity or Wi-Fi contract.
 
+#[cfg(feature = "mqtt-ty-fs803g")]
+pub(crate) mod mqtt;
 pub mod service;
 
 pub(super) fn matches(equipment: Option<&str>) -> bool {

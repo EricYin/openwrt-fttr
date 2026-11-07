@@ -21,13 +21,13 @@ impl Job {
         let job = Self::default();
         let result = job.clone();
         crate::runtime::spawn(async move {
-            #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
+            #[cfg(feature = "mqtt-hl202")]
             let outcome = if device.adapter == "hl202" {
                 super::hl202::provisioning::run(device, apply, full, revision, operation_id).await
             } else {
                 Err("command provisioning unsupported by this adapter".into())
             };
-            #[cfg(not(all(feature = "device-hl202", feature = "mqtt")))]
+            #[cfg(not(feature = "mqtt-hl202"))]
             let outcome = {
                 let _ = (device, apply, full, revision, operation_id);
                 Err("command provisioning not compiled".into())

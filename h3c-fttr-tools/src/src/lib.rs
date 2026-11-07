@@ -16,6 +16,7 @@ pub mod model;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
 pub mod mqtt_identity;
+pub mod mqtt_settings;
 #[cfg(feature = "npu")]
 pub mod npu;
 #[cfg(not(feature = "npu"))]
@@ -33,9 +34,9 @@ pub mod pon_engine;
 pub mod provisioning;
 pub mod provisioning_cli;
 mod runtime;
-#[cfg(any(feature = "mqtt", test))]
+#[cfg(any(feature = "mqtt-hl202", test))]
 mod telemetry_sources;
 
 // Unit fixtures which prove the MQTT-off boundary share the production port.
-#[cfg(all(test, not(feature = "mqtt")))]
+#[cfg(test)]
 pub(crate) static MQTT_TEST_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());

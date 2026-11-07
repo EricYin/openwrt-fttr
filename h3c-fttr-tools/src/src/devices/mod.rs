@@ -4,11 +4,11 @@ pub mod cwmp;
 use crate::model::BusinessPhase;
 
 pub fn observe_mqtt_report(source: &str, payload: Vec<u8>, received: u64) -> bool {
-    #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
+    #[cfg(feature = "mqtt-hl202")]
     {
         hl202::telemetry::store::observe(source, payload, received)
     }
-    #[cfg(not(all(feature = "device-hl202", feature = "mqtt")))]
+    #[cfg(not(feature = "mqtt-hl202"))]
     {
         let _ = (source, payload, received);
         false
@@ -23,6 +23,8 @@ pub mod hl202;
 pub mod hwtc;
 #[cfg(feature = "device-scty")]
 pub(crate) mod scty;
+#[cfg(feature = "mqtt-ty-fs803g")]
+pub(crate) use scty::mqtt as ty_mqtt;
 #[cfg(feature = "device-star")]
 pub(crate) mod star;
 #[cfg(feature = "device-zte")]
@@ -104,14 +106,14 @@ pub fn ensure_mqtt_management_wan(
     persist_matching: bool,
     progress: impl FnMut(ManagementWanStage) -> bool,
 ) -> Result<u32, String> {
-    #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
+    #[cfg(feature = "mqtt-hl202")]
     {
         hl202::management_wan::ensure(device_id, vlans, priority, persist_matching, progress)
     }
-    #[cfg(not(all(feature = "device-hl202", feature = "mqtt")))]
+    #[cfg(not(feature = "mqtt-hl202"))]
     {
         let _ = (device_id, vlans, priority, persist_matching, progress);
-        Err("MQTT management WAN unavailable: build requires mqtt and device-hl202".into())
+        Err("MQTT management WAN unavailable: build requires mqtt-hl202".into())
     }
 }
 #[derive(Clone, Default)]
@@ -126,15 +128,15 @@ pub async fn ensure_mqtt_management_wan_async<F: std::future::Future<Output = bo
     persist_matching: bool,
     progress: impl FnMut(ManagementWanStage) -> F,
 ) -> Result<u32, String> {
-    #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
+    #[cfg(feature = "mqtt-hl202")]
     {
         hl202::management_wan::ensure_async(device_id, vlans, priority, persist_matching, progress)
             .await
     }
-    #[cfg(not(all(feature = "device-hl202", feature = "mqtt")))]
+    #[cfg(not(feature = "mqtt-hl202"))]
     {
         let _ = (device_id, vlans, priority, persist_matching, progress);
-        Err("MQTT management WAN unavailable: build requires mqtt and device-hl202".into())
+        Err("MQTT management WAN unavailable: build requires mqtt-hl202".into())
     }
 }
 pub async fn read_authenticated_cwmp_settings_async(
@@ -142,14 +144,14 @@ pub async fn read_authenticated_cwmp_settings_async(
     url: &str,
     credentials: &CwmpCredentials,
 ) -> Result<bool, String> {
-    #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
+    #[cfg(feature = "mqtt-hl202")]
     {
         hl202::mqtt_lifecycle::read_authenticated_settings_async(target, url, credentials).await
     }
-    #[cfg(not(all(feature = "device-hl202", feature = "mqtt")))]
+    #[cfg(not(feature = "mqtt-hl202"))]
     {
         let _ = (target, url, credentials);
-        Err("MQTT CWMP unavailable: build requires mqtt and device-hl202".into())
+        Err("MQTT CWMP unavailable: build requires mqtt-hl202".into())
     }
 }
 pub async fn configure_authenticated_cwmp_settings_async(
@@ -157,14 +159,14 @@ pub async fn configure_authenticated_cwmp_settings_async(
     url: &str,
     credentials: &CwmpCredentials,
 ) -> Result<(), String> {
-    #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
+    #[cfg(feature = "mqtt-hl202")]
     {
         hl202::mqtt_lifecycle::configure_settings_async(target, url, credentials).await
     }
-    #[cfg(not(all(feature = "device-hl202", feature = "mqtt")))]
+    #[cfg(not(feature = "mqtt-hl202"))]
     {
         let _ = (target, url, credentials);
-        Err("MQTT CWMP unavailable: build requires mqtt and device-hl202".into())
+        Err("MQTT CWMP unavailable: build requires mqtt-hl202".into())
     }
 }
 pub fn read_authenticated_cwmp_settings(
@@ -172,14 +174,14 @@ pub fn read_authenticated_cwmp_settings(
     url: &str,
     credentials: &CwmpCredentials,
 ) -> Result<bool, String> {
-    #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
+    #[cfg(feature = "mqtt-hl202")]
     {
         hl202::mqtt_lifecycle::read_authenticated_settings(target, url, credentials)
     }
-    #[cfg(not(all(feature = "device-hl202", feature = "mqtt")))]
+    #[cfg(not(feature = "mqtt-hl202"))]
     {
         let _ = (target, url, credentials);
-        Err("MQTT CWMP unavailable: build requires mqtt and device-hl202".into())
+        Err("MQTT CWMP unavailable: build requires mqtt-hl202".into())
     }
 }
 pub fn configure_authenticated_cwmp_settings(
@@ -187,14 +189,14 @@ pub fn configure_authenticated_cwmp_settings(
     url: &str,
     credentials: &CwmpCredentials,
 ) -> Result<(), String> {
-    #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
+    #[cfg(feature = "mqtt-hl202")]
     {
         hl202::mqtt_lifecycle::configure_settings(target, url, credentials)
     }
-    #[cfg(not(all(feature = "device-hl202", feature = "mqtt")))]
+    #[cfg(not(feature = "mqtt-hl202"))]
     {
         let _ = (target, url, credentials);
-        Err("MQTT CWMP unavailable: build requires mqtt and device-hl202".into())
+        Err("MQTT CWMP unavailable: build requires mqtt-hl202".into())
     }
 }
 
@@ -209,7 +211,7 @@ impl Adapter {
             #[cfg(feature = "device-hl202")]
             Self::Hl202 => Capabilities {
                 business: true,
-                shell_commands: cfg!(feature = "mqtt"),
+                shell_commands: cfg!(feature = "mqtt-hl202"),
             },
             #[cfg(feature = "device-hwtc")]
             Self::Hwtc(_) => Capabilities {
@@ -395,7 +397,7 @@ pub fn select_with_serial(
 mod tests {
     use super::*;
     #[test]
-    #[cfg(not(feature = "mqtt"))]
+    #[cfg(not(feature = "mqtt-hl202"))]
     fn mqtt_disabled_commands_are_local_and_inventory_remains_available() {
         let _port = crate::MQTT_TEST_PORT.lock().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:1883").unwrap();
@@ -694,5 +696,5 @@ mod tests {
     }
 }
 pub fn supports_command_provisioning(adapter: &str) -> bool {
-    cfg!(all(feature = "device-hl202", feature = "mqtt")) && adapter == "hl202"
+    cfg!(feature = "mqtt-hl202") && adapter == "hl202"
 }

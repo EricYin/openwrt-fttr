@@ -39,6 +39,11 @@ pub fn create_socket_listener() -> io::Result<UnixListener> {
 
 pub fn send_ipc_command(cmd: &str) -> io::Result<String> {
     let mut stream = UnixStream::connect(SOCKET_PATH)?;
+    let ty_query = cmd.starts_with("TY_MQTT ");
+    if ty_query || cmd == "MQTT_STATUS" {
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(1)))?;
+    }
     if cmd.starts_with("OPTICAL ") || cmd.starts_with("FPGA_DIAG ") {
         stream.set_read_timeout(Some(std::time::Duration::from_secs(8)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(1)))?;
@@ -46,7 +51,17 @@ pub fn send_ipc_command(cmd: &str) -> io::Result<String> {
     stream.write_all(format!("{cmd}\n").as_bytes())?;
 
     let mut response = String::new();
-    stream.read_to_string(&mut response)?;
+    if ty_query || cmd == "MQTT_STATUS" {
+        (&mut stream).take(131_073).read_to_string(&mut response)?;
+        if response.len() > 131_072 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MQTT response too large",
+            ));
+        }
+    } else {
+        stream.read_to_string(&mut response)?;
+    }
     Ok(response)
 }
 

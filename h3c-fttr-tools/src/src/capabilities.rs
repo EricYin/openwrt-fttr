@@ -6,6 +6,7 @@ use std::{fs, io, path::Path};
 pub fn compiled() -> Capabilities {
     let acs = cfg!(feature = "acs");
     let mqtt = cfg!(feature = "mqtt");
+    let hl202_mqtt = cfg!(feature = "mqtt-hl202");
     let hl202 = cfg!(feature = "device-hl202");
     let hwtc = cfg!(feature = "device-hwtc");
     let star = cfg!(feature = "device-star");
@@ -39,7 +40,7 @@ pub fn compiled() -> Capabilities {
     if scty {
         adapters.push(AdapterCapability {
             id: "scty",
-            name: "SCTY TY-FS803G (OMCI bridge only)",
+            name: "SCTY TY-FS803G (OMCI bridge; optional experimental MQTT)",
         });
     }
     adapters.push(AdapterCapability {
@@ -58,6 +59,8 @@ pub fn compiled() -> Capabilities {
         features: CapabilityFeatures {
             acs,
             mqtt,
+            mqtt_hl202: hl202_mqtt,
+            mqtt_ty_fs803g: cfg!(feature = "mqtt-ty-fs803g"),
             npu: cfg!(feature = "npu"),
             device_hl202: hl202,
             device_hwtc: hwtc,
@@ -69,10 +72,10 @@ pub fn compiled() -> Capabilities {
             optical: true,
             bridge_offload: cfg!(feature = "npu"),
             omci_mib: true,
-            mqtt_telemetry: mqtt,
-            hl202_management: hl202 && mqtt,
+            mqtt_telemetry: hl202_mqtt || cfg!(feature = "mqtt-ty-fs803g"),
+            hl202_management: hl202_mqtt,
             cwmp: acs,
-            command_provisioning: hl202 && mqtt,
+            command_provisioning: hl202_mqtt,
         },
         // Configuration and synchronization are the ACS/CWMP workflow in LuCI.
         pages: CapabilityPages {
@@ -80,9 +83,9 @@ pub fn compiled() -> Capabilities {
             hardware: true,
             calibration: true,
             about: true,
-            config: acs || (hl202 && mqtt),
-            sync: acs || (hl202 && mqtt),
-            hl202: hl202 && mqtt,
+            config: acs || hl202_mqtt,
+            sync: acs || hl202_mqtt,
+            hl202: hl202_mqtt,
         },
         adapters,
     }

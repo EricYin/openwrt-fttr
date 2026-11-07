@@ -46,6 +46,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
     // Optical state belongs to the controller, not the expanded provisioning plan.
     // Share its validation so config check and optical startup accept the same input.
     crate::optical::parse_export(text).map_err(|error| error.to_string())?;
+    crate::mqtt_settings::Settings::parse(text)?;
     let all = config::parse_sections(text)?;
     if all.iter().filter(|(_, s)| s.kind == "management").count() > 1 {
         return Err("only one management network allowed".into());
@@ -55,6 +56,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
         if !matches!(
             s.kind.as_str(),
             "optical"
+                | "mqtt"
                 | "acs"
                 | "provisioning"
                 | "management"
@@ -69,6 +71,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
         }
         let allowed: &[&str] = match s.kind.as_str() {
             "optical" => &["enabled", "downstream_tx_enabled", "fec_enabled"],
+            "mqtt" => &["enabled", "hl202_enabled", "ty_fs803g_enabled"],
             "device" => &[
                 "name",
                 "optical_sn",

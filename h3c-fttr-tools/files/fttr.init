@@ -6,9 +6,16 @@ USE_PROCD=1
 PROG=/usr/sbin/fttrd
 LAN_STATE=/var/run/fttr-mqtt-lan
 
+mqtt_policy() {
+	config_get_bool mqtt_enabled mqtt enabled 1
+	config_get_bool mqtt_hl202 mqtt hl202_enabled 1
+	config_get_bool mqtt_ty mqtt ty_fs803g_enabled 0
+}
+
 start_service() {
-	local acs_state acs_username acs_password lan_addr board dev i
+	local acs_state acs_username acs_password lan_addr board dev i mqtt_enabled mqtt_hl202 mqtt_ty
 	config_load fttr
+	mqtt_policy
 	config_get acs_state acs state_file /var/lib/fttr/acs-state.json
 	config_get acs_username acs username ""
 	config_get acs_password acs password ""
@@ -36,7 +43,7 @@ start_service() {
 	procd_open_instance
 	procd_set_param command "$PROG"
 	# ACS listener activation is coordinated by fttrd after management authorization.
-	procd_set_param env FTTR_ACS_STATE="$acs_state" FTTR_ACS_USERNAME="$acs_username" FTTR_ACS_PASSWORD="$acs_password" FTTR_MQTT_LAN_ADDR="$lan_addr"
+	procd_set_param env FTTR_ACS_STATE="$acs_state" FTTR_ACS_USERNAME="$acs_username" FTTR_ACS_PASSWORD="$acs_password" FTTR_MQTT_LAN_ADDR="$lan_addr" FTTR_MQTT_ENABLED="$mqtt_enabled" FTTR_MQTT_HL202_ENABLED="$mqtt_hl202" FTTR_MQTT_TY_FS803G_ENABLED="$mqtt_ty"
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1
@@ -44,7 +51,7 @@ start_service() {
 	procd_close_instance
 	# Record the listener value handed to this process, including an empty value.
 	# MQTT-enabled fttrd validates it and fails before reporting broker readiness.
-	printf '%s\n' "$lan_addr" > "$LAN_STATE"
+	printf '%s\n' "$lan_addr|$mqtt_enabled|$mqtt_hl202|$mqtt_ty" > "$LAN_STATE"
 }
 
 stop_service() {
@@ -66,13 +73,15 @@ service_triggers() {
 }
 
 reload_service() {
-	local lan_addr applied_lan
+	local lan_addr applied_lan mqtt_enabled mqtt_hl202 mqtt_ty
+	config_load fttr
+	mqtt_policy
 	lan_addr=$(uci -q get network.lan.ipaddr)
 	lan_addr=${lan_addr%%/*}
 	# A stopped service has no applied listeners. Do not start it via reload.
 	[ -f "$LAN_STATE" ] || return 0
 	IFS= read -r applied_lan < "$LAN_STATE"
-	if [ "$lan_addr" != "$applied_lan" ]; then
+	if [ "$lan_addr|$mqtt_enabled|$mqtt_hl202|$mqtt_ty" != "$applied_lan" ]; then
 		# rc.common restart supplies the normal stop/start context; it is not a
 		# recursive reload. start_service records the new value exactly once.
 		restart

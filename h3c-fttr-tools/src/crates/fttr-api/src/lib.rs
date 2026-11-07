@@ -43,6 +43,10 @@ pub struct Capabilities {
 pub struct CapabilityFeatures {
     pub acs: bool,
     pub mqtt: bool,
+    #[serde(rename = "mqtt-hl202")]
+    pub mqtt_hl202: bool,
+    #[serde(rename = "mqtt-ty-fs803g")]
+    pub mqtt_ty_fs803g: bool,
     pub npu: bool,
     #[serde(rename = "device-hl202")]
     pub device_hl202: bool,

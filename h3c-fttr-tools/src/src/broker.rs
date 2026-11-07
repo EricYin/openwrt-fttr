@@ -16,16 +16,24 @@ pub struct EmbeddedBroker {
 
 /// Production addresses are fixed to loopback and the configured LAN IPv4.
 pub fn lan_addresses(lan: &str) -> Result<Vec<SocketAddr>, String> {
+    adapter_addresses(lan, true, false)
+}
+
+pub fn adapter_addresses(lan: &str, hl202: bool, ty: bool) -> Result<Vec<SocketAddr>, String> {
     let ip: Ipv4Addr = lan
         .parse()
         .map_err(|_| "FTTR_MQTT_LAN_ADDR must be a LAN IPv4 address")?;
     if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() {
         return Err("FTTR_MQTT_LAN_ADDR must be a non-loopback unicast LAN IPv4 address".into());
     }
-    Ok(vec![
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 1883)),
-        SocketAddr::from((ip, 1883)),
-    ])
+    let mut addresses = Vec::new();
+    for (enabled, port) in [(hl202, 1883), (ty, 11883)] {
+        if enabled {
+            addresses.push(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+            addresses.push(SocketAddr::from((ip, port)));
+        }
+    }
+    Ok(addresses)
 }
 
 fn configuration(addresses: &[SocketAddr]) -> rumqttd::Config {
@@ -93,7 +101,7 @@ impl EmbeddedBroker {
     }
 
     /// Fixture callers may choose isolated ports/loopback aliases. Production
-    /// must pass only `lan_addresses`. No caller may treat a failure as fallback.
+    /// must pass only `adapter_addresses`. No caller may treat a failure as fallback.
     pub async fn start(listen_addrs: &[SocketAddr]) -> Result<Self, String> {
         Self::start_with(listen_addrs, |config| {
             let mut broker = rumqttd::Broker::new(config);
@@ -261,6 +269,26 @@ async fn cross_listener_probe(addresses: &[SocketAddr]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_listener_matrix_uses_only_enabled_ports() {
+        for (hl, ty, expected) in [
+            (false, false, vec![]),
+            (true, false, vec![1883, 1883]),
+            (false, true, vec![11883, 11883]),
+            (true, true, vec![1883, 1883, 11883, 11883]),
+        ] {
+            let addresses = adapter_addresses("192.0.2.1", hl, ty).unwrap();
+            assert_eq!(
+                addresses.iter().map(SocketAddr::port).collect::<Vec<_>>(),
+                expected
+            );
+            let config = configuration(&addresses);
+            assert_eq!(config.v4.unwrap().len(), addresses.len());
+        }
+        assert!(adapter_addresses("0.0.0.0", true, true).is_err());
+        assert!(adapter_addresses("127.0.0.1", false, true).is_err());
+    }
 
     #[test]
     #[ignore = "reaped child helper for broker thread failure injection"]
