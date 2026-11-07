@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 mod metrics;
 #[cfg(test)]
 mod tests;
+mod topology;
 
 fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
     method: &Method<Q, R>,
@@ -17,10 +18,13 @@ fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
         Box::new(move |_, message| {
             let started = std::time::Instant::now();
             let result = (|| {
-                let request = serde_json::from_value(
-                    message.cloned().unwrap_or_else(|| serde_json::json!({})),
-                )
-                .map_err(|_| 2)?;
+                let mut payload = message.cloned().unwrap_or_else(|| serde_json::json!({}));
+                // uhttpd adds authenticated session metadata to forwarded calls.
+                // It is transport-owned, not part of the typed business request.
+                if let Some(object) = payload.as_object_mut() {
+                    object.remove("ubus_rpc_session");
+                }
+                let request = serde_json::from_value(payload).map_err(|_| 2)?;
                 serde_json::to_value(handler(request)?).map_err(|_| 9)
             })();
             metrics::record(name, started.elapsed(), result.is_err());
@@ -48,6 +52,7 @@ struct Handlers {
     engine: std::sync::Arc<std::sync::Mutex<crate::pon_engine::PonEngine>>,
     services: crate::controller::service::States,
     jobs: fttr_jobs::Jobs,
+    topology: std::sync::Arc<std::sync::Mutex<crate::controller::topology::Cache>>,
 }
 
 impl Handlers {
@@ -371,6 +376,7 @@ pub(super) fn methods(
         devices,
         engine,
         services,
+        topology: Default::default(),
         jobs: {
             static JOBS: std::sync::OnceLock<fttr_jobs::Jobs> = std::sync::OnceLock::new();
             JOBS.get_or_init(|| fttr_jobs::Jobs::with_shutdown(stopping))

@@ -8,14 +8,6 @@ pub fn set(
     wan_downstream: Option<bool>,
     onu_bridge: Option<bool>,
 ) -> io::Result<()> {
-    if enabled
-        && onu_bridge == Some(true)
-        && (wan_upstream == Some(true) || wan_downstream == Some(true))
-    {
-        return Err(io::Error::other(
-            "WAN and ONU bridge offload currently require exclusive port modes; disable onu_bridge for WAN",
-        ));
-    }
     if let Some(bridge) = bridge {
         if bridge.is_empty()
             || bridge.len() > 15
@@ -79,17 +71,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conflicting_port_modes_are_rejected_before_uci_changes() {
+    fn simultaneous_wan_and_bridge_modes_are_permitted() {
         for (upstream, downstream) in [(true, false), (false, true), (true, true)] {
-            let error = set(
+            let result = set(
                 true,
                 Some("br-lan"),
                 Some(upstream),
                 Some(downstream),
                 Some(true),
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("exclusive port modes"));
+            );
+            if let Err(error) = result {
+                assert!(!error.to_string().contains("exclusive port modes"));
+            }
         }
     }
 

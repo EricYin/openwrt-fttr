@@ -14,6 +14,16 @@ use std::{
 };
 
 pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {
+    configure_with_grant_floors(id, cancellation, None)
+}
+
+/// Explicit platform policy supplied by an opt-in adapter, under the same lock
+/// and reversible lease as discovery and provisioning. Tuple is (management, business).
+pub(crate) fn configure_with_grant_floors(
+    id: u8,
+    cancellation: Option<Arc<AtomicBool>>,
+    floors: Option<(u16, u16)>,
+) -> io::Result<()> {
     if id >= crate::pon_engine::ONU_SLOTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -28,6 +38,10 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     }
     let mut lease = StockOmccLease::open(id)?;
     let _channel = ChannelLease::open(id, 0)?;
+    if let Some((management, business)) = floors {
+        lease.set_management_grant_floor(management)?;
+        lease.set_business_grant_floor(business)?;
+    }
 
     let port = 0x100u16 + id as u16;
 

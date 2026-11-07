@@ -10,13 +10,13 @@ use std::{
 // Access is serialized by lock_onu; offline cleanup clears ownership before reuse.
 static BUSINESS_ALLOCATIONS: AtomicU16 = AtomicU16::new(0);
 static BUSINESS_GRANT_FLOORS: [AtomicU16; 16] = [const { AtomicU16::new(0) }; 16];
-static MANAGEMENT_GRANT_FLOORS: [AtomicU16; 16] = [const { AtomicU16::new(0) }; 16];
+static MANAGEMENT_GRANT_FLOORS: [AtomicU16; 16] = [const { AtomicU16::new(60) }; 16];
 
 pub fn forget_business_allocation(id: u8) {
     if id < 16 {
         BUSINESS_ALLOCATIONS.fetch_and(!(1u16 << id), Ordering::SeqCst);
         BUSINESS_GRANT_FLOORS[id as usize].store(0, Ordering::SeqCst);
-        MANAGEMENT_GRANT_FLOORS[id as usize].store(0, Ordering::SeqCst);
+        MANAGEMENT_GRANT_FLOORS[id as usize].store(60, Ordering::SeqCst);
     }
 }
 

@@ -27,53 +27,73 @@ pub fn status() -> NpuStatus {
         Path::new("/sys/module/h3c_fmcs/parameters"),
     );
 
-    // Inspect the selected mode's real flowtable, independently of its mask.
+    // Inspect active modes' flowtables.
     let routed = status.wan_upstream || status.wan_downstream;
-    let (family, name) = if routed {
-        ("inet", "ft")
-    } else {
-        ("bridge", "fb")
-    };
+    let bridge = status.onu_bridge;
     let hooks = (|| -> io::Result<bool> {
-        let json = command::run_sync(
-            "nft",
-            &["-j", "list", "flowtable", family, "fw4", name],
-            Duration::from_secs(2),
-        )?;
-        let table: serde_json::Value = serde_json::from_str(&json).map_err(io::Error::other)?;
-        if !(if routed {
-            status.routed_mask_valid
-        } else {
-            status.mask_valid
-        }) {
-            return Err(io::Error::other("admitted port mask unavailable"));
-        }
-        let ports = status
-            .active_ports
-            .iter()
-            .map(|p| (p.clone(), Vec::new()))
-            .collect::<Vec<_>>();
-
-        let has_flags = table["nftables"].as_array().is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|entry| entry["flowtable"].get("flags").is_some())
-        });
-        let text = if has_flags {
-            String::new()
-        } else {
-            command::run_sync(
+        let mut all_ready = true;
+        if routed {
+            if !status.routed_mask_valid {
+                return Err(io::Error::other("routed port mask unavailable"));
+            }
+            let json = command::run_sync(
                 "nft",
-                &["list", "flowtable", family, "fw4", name],
+                &["-j", "list", "flowtable", "inet", "fw4", "ft"],
                 Duration::from_secs(2),
-            )?
-        };
-
-        Ok(if routed {
-            reconciler::routed_hooks_ready(&table, &text)
-        } else {
-            hooks_ready(&table, &ports, &text)
-        })
+            )?;
+            let table: serde_json::Value = serde_json::from_str(&json).map_err(io::Error::other)?;
+            let has_flags = table["nftables"].as_array().is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry["flowtable"].get("flags").is_some())
+            });
+            let text = if has_flags {
+                String::new()
+            } else {
+                command::run_sync(
+                    "nft",
+                    &["list", "flowtable", "inet", "fw4", "ft"],
+                    Duration::from_secs(2),
+                )?
+            };
+            if !reconciler::routed_hooks_ready(&table, &text) {
+                all_ready = false;
+            }
+        }
+        if bridge {
+            if !status.mask_valid {
+                return Err(io::Error::other("bridge port mask unavailable"));
+            }
+            let json = command::run_sync(
+                "nft",
+                &["-j", "list", "flowtable", "bridge", "fw4", "fb"],
+                Duration::from_secs(2),
+            )?;
+            let table: serde_json::Value = serde_json::from_str(&json).map_err(io::Error::other)?;
+            let ports = status
+                .active_ports
+                .iter()
+                .map(|p| (p.clone(), Vec::new()))
+                .collect::<Vec<_>>();
+            let has_flags = table["nftables"].as_array().is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry["flowtable"].get("flags").is_some())
+            });
+            let text = if has_flags {
+                String::new()
+            } else {
+                command::run_sync(
+                    "nft",
+                    &["list", "flowtable", "bridge", "fw4", "fb"],
+                    Duration::from_secs(2),
+                )?
+            };
+            if !hooks_ready(&table, &ports, &text) {
+                all_ready = false;
+            }
+        }
+        Ok(all_ready)
     })();
 
     match hooks {
