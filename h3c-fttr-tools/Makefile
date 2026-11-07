@@ -51,13 +51,13 @@ define Package/h3c-fttr-tools/config
     depends on PACKAGE_h3c-fttr-tools
     default y
   config FTTR_DEVICE_FIBERHOME
-    bool "Compile experimental FiberHome HG6371F-C SCTY grant trial (explicit opt-in)"
+    bool "Compile experimental FiberHome HG6371F-C / HG6371F bridge (explicit opt-in)"
     depends on PACKAGE_h3c-fttr-tools
-    default n
+    default y
   config FTTR_DEVICE_REALTEK
     bool "Compile experimental Realtek TYFCA1 OMCI bridge adapter"
     depends on PACKAGE_h3c-fttr-tools
-    default n
+    default y
   config FTTR_MQTT
     bool "Compile controller-owned MQTT broker and clients"
     depends on PACKAGE_h3c-fttr-tools

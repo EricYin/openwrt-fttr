@@ -1,15 +1,42 @@
-//! Explicit opt-in experimental FiberHome profiles; no automatic enrollment.
+//! Explicit opt-in FiberHome bridges; no automatic enrollment.
+mod hg6371f;
 mod hg6371f_c;
+mod service;
 
 pub(super) fn matches(vendor: &str, equipment: Option<&str>) -> bool {
-    vendor == "FHTT" && equipment == Some("HG6371F-C")
+    vendor == "FHTT" && matches!(equipment, Some("HG6371F-C" | "HG6371F"))
 }
 
 pub(super) fn configure(
     id: u8,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::io::Result<()> {
-    hg6371f_c::configure(id, cancellation)
+    let mut session = crate::pon_engine::omci::OmciSession::new(
+        crate::pon_engine::omci::FmcsTransport::open(id)?,
+    );
+    let equipment = {
+        let _lock = crate::pon_engine::omci::platform::leases::lock_onu(id)?;
+        let _lease = crate::pon_engine::omci::platform::leases::StockOmccLease::open(id)?;
+        let _channel = crate::pon_engine::omci::platform::leases::ChannelLease::open(id, 0)?;
+        session.guard_registration(move || crate::controller::service::operation_confirmed(id));
+        if let Some(token) = &cancellation {
+            session.cancel_when(token.clone());
+        }
+        crate::controller::business::verify(&mut session, 256, 0, 0x8000, b"FHTT")?;
+        let block = session.get_attributes(257, 0, 0x8000)?;
+        block
+            .attributes
+            .first()
+            .and_then(|a| a.value.text())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    match equipment.as_str() {
+        "HG6371F-C" => hg6371f_c::configure(id, cancellation),
+        "HG6371F" => hg6371f::configure(id, cancellation),
+        _ => Err(std::io::Error::other("unsupported FiberHome equipment")),
+    }
 }
 
 #[cfg(test)]
@@ -20,7 +47,8 @@ mod tests {
     fn trial_requires_exact_vendor_and_model_and_is_not_auto_selected() {
         assert!(matches("FHTT", Some("HG6371F-C")));
         assert!(!matches("SCTY", Some("HG6371F-C")));
-        assert!(!matches("FHTT", Some("HG6371F")));
+        assert!(matches("FHTT", Some("HG6371F")));
+        assert!(!matches("FHTT", Some("HG6371F-X")));
         assert!(!matches("FHTT", None));
         let identity = crate::model::OnuIdentity {
             equipment_id: Some("HG6371F-C".into()),
