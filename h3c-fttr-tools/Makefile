@@ -65,7 +65,7 @@ define Package/h3c-fttr-tools/config
   config FTTR_MIMALLOC
     bool "Use mimalloc for fttrd Rust allocations (experimental)"
     depends on PACKAGE_h3c-fttr-tools
-    default n
+    default y
     help
       Select mimalloc 3.5.3 for the daemon only, without explicit THP advice.
       Compare target RSS, swap and service behavior before enabling in production.
