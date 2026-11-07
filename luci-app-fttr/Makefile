@@ -5,11 +5,11 @@ PKG_VERSION:=nightly
 PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0
 
-PKG_SOURCE_DATE:=2026-11-06
-PKG_SOURCE_VERSION:=main
+PKG_SOURCE_DATE:=2026-11-07
+PKG_SOURCE_VERSION:=94c38c4b15e491335b72fca5c1877d556f9d6314
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://github.com/LazuliKao/luci-app-fttr/releases/download/nightly/
-PKG_HASH:=skip
+PKG_HASH:=541035d76e6d2c7f60defdb208df1bb472209f380039a733f122a35a114dc8d6
 
 # Support local source directory override for local development if FTTR_LUCI_SRC is provided
 ifneq ($(FTTR_LUCI_SRC),)
