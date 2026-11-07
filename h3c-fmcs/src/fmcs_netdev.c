@@ -53,10 +53,6 @@ static int fmcs_offload_mask_set(const char *val, const struct kernel_param *kp)
 	if (mask & ~GENMASK(FMCS_MAX_FTTR_PORTS - 1, 0))
 		return -ERANGE;
 	rtnl_lock();
-	if (mask & READ_ONCE(bridge_offload_mask)) {
-		rtnl_unlock();
-		return -EBUSY;
-	}
 	WRITE_ONCE(routed_offload_mask, 0);
 	/* Finish path users before deleting the old logical/physical keys. */
 	synchronize_net();
@@ -153,10 +149,6 @@ static int fmcs_bridge_mask_set(const char *val, const struct kernel_param *kp)
 	if (mask && hweight32(mask) < 2)
 		return -EINVAL;
 	rtnl_lock();
-	if (mask & routed_offload_mask) {
-		ret = -EBUSY;
-		goto unlock;
-	}
 	fmcs_bridge_revoke();
 	spin_lock_irqsave(&fmcs_bridge_gate_lock, flags);
 	epoch = fmcs_bridge_epoch;
@@ -170,7 +162,6 @@ static int fmcs_bridge_mask_set(const char *val, const struct kernel_param *kp)
 	else
 		ret = -EAGAIN;
 	spin_unlock_irqrestore(&fmcs_bridge_gate_lock, flags);
-unlock:
 	rtnl_unlock();
 	return ret;
 }
@@ -611,6 +602,19 @@ static int fmcs_fttr_change_mtu(struct net_device *dev, int mtu)
 	return 0;
 }
 
+static inline bool fmcs_in_bridge_path(void)
+{
+	void *ret0 = __builtin_return_address(0);
+	void *ret1 = __builtin_return_address(1);
+	void *fn = (void *)dev_fill_bridge_path;
+
+	if ((ret0 >= fn && ret0 < fn + 0x400) ||
+	    (ret1 >= fn && ret1 < fn + 0x400))
+		return true;
+
+	return false;
+}
+
 static int fmcs_fttr_fill_forward_path(struct net_device_path_ctx *ctx,
 				      struct net_device_path *path)
 {
@@ -620,11 +624,13 @@ static int fmcs_fttr_fill_forward_path(struct net_device_path_ctx *ctx,
 	unsigned int mask = READ_ONCE(routed_offload_mask);
 	int i;
 
-	/* This logical endpoint owns its TC adapter. Keep software bridge tuples
-	 * on fttrN; only the hardware rule gets transport VLAN/physical redirect.
+	/* If called within bridge path resolution (dev_fill_bridge_path),
+	 * keep software bridge tuples on fttrN; only the hardware rule gets
+	 * transport VLAN/physical redirect via fmcs_bridge_setup_tc.
 	 */
-	if (fmcs_bridge_port_enabled(port->priv, port->port_idx)) {
-		if (ctx->num_vlans || !lower || !netif_running(lower) ||
+	if (fmcs_in_bridge_path()) {
+		if (!fmcs_bridge_port_enabled(port->priv, port->port_idx) ||
+		    ctx->num_vlans || !lower || !netif_running(lower) ||
 		    !netif_carrier_ok(lower))
 			return -EOPNOTSUPP;
 		path->type = DEV_PATH_ETHERNET;
@@ -632,6 +638,8 @@ static int fmcs_fttr_fill_forward_path(struct net_device_path_ctx *ctx,
 		ctx->dev = NULL;
 		return 0;
 	}
+
+	/* Routed path resolution (e.g. WAN <-> FTTR ONU). */
 	if (!(mask & BIT(port->port_idx - 1)) || !lower ||
 	    !netif_running(dev) || !netif_carrier_ok(dev) ||
 	    !netif_running(lower) || !netif_carrier_ok(lower))

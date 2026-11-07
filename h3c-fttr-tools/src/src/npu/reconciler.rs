@@ -17,6 +17,7 @@ const FULL_CHECK: Duration = Duration::from_secs(30);
 pub struct Topology {
     pub bridge: String,
     pub routed: bool,
+    pub onu_bridge: bool,
     pub mask: u16,
     // Includes ifindex, MTU, MAC and learning: even same-mask changes must drain.
     pub ports: Vec<(String, Vec<String>)>,
@@ -89,6 +90,7 @@ pub fn topology(policy: &Policy, net: &Path, mask: &Path) -> io::Result<Topology
     let mut topology = Topology {
         bridge: bridge.into(),
         routed: policy.directions() & 3 != 0,
+        onu_bridge: policy.directions() & 4 != 0,
         mask: 0,
         ports: Vec::new(),
     };
@@ -97,20 +99,12 @@ pub fn topology(policy: &Policy, net: &Path, mask: &Path) -> io::Result<Topology
         && bridge
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
-    if topology.routed && policy.directions() & 4 != 0 {
-        return Err(io::Error::other(
-            "WAN and ONU bridge offload currently require exclusive port modes; set onu_bridge=0 for WAN",
-        ));
-    }
     if !valid_bridge || policy.directions() == 0 {
         return Ok(topology);
     }
     if !policy.firewall_offload
-        || !if topology.routed {
-            mask.with_file_name("routed_offload_mask").exists()
-        } else {
-            mask.exists()
-        }
+        || (topology.routed && !mask.with_file_name("routed_offload_mask").exists())
+        || (topology.onu_bridge && !mask.exists())
         || text(net.join("fttr0/carrier")).ok().as_deref() != Some("1")
         || text(net.join(bridge).join("bridge/vlan_filtering"))
             .ok()
@@ -136,7 +130,8 @@ pub fn topology(policy: &Policy, net: &Path, mask: &Path) -> io::Result<Topology
         topology.mask |= 1 << (port - 1);
         topology.ports.push((name, identity));
     }
-    if topology.ports.len() < if topology.routed { 1 } else { 2 } {
+    let min_ports = if topology.routed { 1 } else { 2 };
+    if topology.ports.len() < min_ports {
         topology.mask = 0;
     }
     Ok(topology)
@@ -373,7 +368,20 @@ pub async fn reconcile(
         .cache
         .as_ref()
         .is_some_and(|cache| cache.policy.directions() & 3 != 0);
-    let current_mask = admission.lock().unwrap().current_mode(routed)?;
+    let onu_bridge = state
+        .cache
+        .as_ref()
+        .is_some_and(|cache| cache.policy.directions() & 4 != 0);
+    let current_mask = {
+        let adm = admission.lock().unwrap();
+        let r = if routed { adm.current_mode(true)? } else { 0 };
+        let b = if onu_bridge {
+            adm.current_mode(false)?
+        } else {
+            0
+        };
+        r | b
+    };
     let files = policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))?;
 
     // Fast-path: When already armed and the driver hasn't revoked the mask,
@@ -410,10 +418,14 @@ pub async fn reconcile(
     }
     let topology = topology(&policy, net, mask_path)?;
     {
-        let mut admission = admission.lock().unwrap();
-        // Drain the previous mode before enabling the new one.
-        admission.set_mode(!topology.routed, 0)?;
-        admission.set_directions(policy.directions())?;
+        let mut adm = admission.lock().unwrap();
+        if !topology.routed {
+            adm.set_routed(0)?;
+        }
+        if !topology.onu_bridge {
+            adm.set(0)?;
+        }
+        adm.set_directions(policy.directions())?;
     }
     // Timestamp is refreshed only after hooks pass, never by a cheap probe.
     let verified = state
@@ -426,61 +438,119 @@ pub async fn reconcile(
         files,
         verified,
     });
-    let current = admission.lock().unwrap().current_mode(topology.routed)?;
+    let current = {
+        let adm = admission.lock().unwrap();
+        let r = if topology.routed {
+            adm.current_mode(true)?
+        } else {
+            0
+        };
+        let b = if topology.onu_bridge {
+            adm.current_mode(false)?
+        } else {
+            0
+        };
+        r | b
+    };
 
-    if !state.observe(topology, current) {
-        let routed = state.last.as_ref().unwrap().routed;
-        admission.lock().unwrap().set_mode(routed, 0)?;
+    if !state.observe(topology.clone(), current) {
+        let mut adm = admission.lock().unwrap();
+        if topology.routed {
+            adm.set_routed(0)?;
+        }
+        if topology.onu_bridge {
+            adm.set(0)?;
+        }
         return Ok(POLL_FAST);
     }
 
     let topology = state.last.as_ref().unwrap();
-    let (family, flowtable) = if topology.routed {
-        ("inet", "ft")
-    } else {
-        ("bridge", "fb")
-    };
 
-    // Query flowtable hooks with lazy text fallback (avoid duplicate nft listing)
-    let json_table = command::run_async(
-        "nft",
-        &["-j", "list", "flowtable", family, "fw4", flowtable],
-        Duration::from_secs(5),
-    )
-    .await;
-
-    let ready = match json_table {
-        Ok(ref json_str) => match serde_json::from_str::<serde_json::Value>(json_str) {
-            Ok(ref table) => {
-                let has_flags = table["nftables"].as_array().is_some_and(|entries| {
-                    entries
-                        .iter()
-                        .any(|entry| entry["flowtable"].get("flags").is_some())
-                });
-                let text_listing = if has_flags {
-                    String::new()
-                } else {
-                    command::run_async(
-                        "nft",
-                        &["list", "flowtable", family, "fw4", flowtable],
-                        Duration::from_secs(5),
-                    )
-                    .await
-                    .unwrap_or_default()
-                };
-                if topology.routed {
+    let mut ready = true;
+    if topology.routed {
+        let json_table = command::run_async(
+            "nft",
+            &["-j", "list", "flowtable", "inet", "fw4", "ft"],
+            Duration::from_secs(5),
+        )
+        .await;
+        let routed_ready = match json_table {
+            Ok(ref json_str) => match serde_json::from_str::<serde_json::Value>(json_str) {
+                Ok(ref table) => {
+                    let has_flags = table["nftables"].as_array().is_some_and(|entries| {
+                        entries
+                            .iter()
+                            .any(|entry| entry["flowtable"].get("flags").is_some())
+                    });
+                    let text_listing = if has_flags {
+                        String::new()
+                    } else {
+                        command::run_async(
+                            "nft",
+                            &["list", "flowtable", "inet", "fw4", "ft"],
+                            Duration::from_secs(5),
+                        )
+                        .await
+                        .unwrap_or_default()
+                    };
                     routed_hooks_ready(table, &text_listing)
-                } else {
+                }
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        if !routed_ready {
+            ready = false;
+        }
+    }
+
+    if topology.onu_bridge && topology.ports.len() >= 2 {
+        let json_table = command::run_async(
+            "nft",
+            &["-j", "list", "flowtable", "bridge", "fw4", "fb"],
+            Duration::from_secs(5),
+        )
+        .await;
+        let bridge_ready = match json_table {
+            Ok(ref json_str) => match serde_json::from_str::<serde_json::Value>(json_str) {
+                Ok(ref table) => {
+                    let has_flags = table["nftables"].as_array().is_some_and(|entries| {
+                        entries
+                            .iter()
+                            .any(|entry| entry["flowtable"].get("flags").is_some())
+                    });
+                    let text_listing = if has_flags {
+                        String::new()
+                    } else {
+                        command::run_async(
+                            "nft",
+                            &["list", "flowtable", "bridge", "fw4", "fb"],
+                            Duration::from_secs(5),
+                        )
+                        .await
+                        .unwrap_or_default()
+                    };
                     hooks_ready(table, &topology.ports, &text_listing)
                 }
-            }
+                Err(_) => false,
+            },
             Err(_) => false,
-        },
-        Err(_) => false,
-    };
+        };
+        if !bridge_ready {
+            ready = false;
+        }
+    }
 
     if !ready {
-        admission.lock().unwrap().set_mode(topology.routed, 0)?;
+        {
+            let mut adm = admission.lock().unwrap();
+            if topology.routed {
+                adm.set_routed(0)?;
+            }
+            if topology.onu_bridge {
+                adm.set(0)?;
+            }
+        }
         state.armed = false;
         if !state.reload_requested {
             state.reload_requested = true;
@@ -496,12 +566,24 @@ pub async fn reconcile(
     }
 
     state.reload_requested = false;
-    // Commands can suspend for seconds. Do not publish a snapshot invalidated
-    // during hook inspection (including a kernel withdrawal with the same mask).
     let cache = state.cache.as_ref().unwrap();
+    let current_check = {
+        let adm = admission.lock().unwrap();
+        let r = if topology.routed {
+            adm.current_mode(true)?
+        } else {
+            0
+        };
+        let b = if topology.onu_bridge {
+            adm.current_mode(false)?
+        } else {
+            0
+        };
+        r | b
+    };
     if policy_files(Path::new("/etc/config"), Path::new("/tmp/.uci"))? != cache.files
         || self::topology(&cache.policy, net, mask_path)? != *topology
-        || admission.lock().unwrap().current_mode(topology.routed)? != current
+        || current_check != current
     {
         admission.lock().unwrap().withdraw()?;
         state.last = None;
@@ -509,10 +591,15 @@ pub async fn reconcile(
         state.stable = 0;
         return Ok(POLL_FAST);
     }
-    admission
-        .lock()
-        .unwrap()
-        .set_mode(topology.routed, topology.mask)?;
+    {
+        let mut adm = admission.lock().unwrap();
+        if topology.routed {
+            adm.set_routed(topology.mask)?;
+        }
+        if topology.onu_bridge && topology.ports.len() >= 2 {
+            adm.set(topology.mask)?;
+        }
+    }
     state.armed = true;
     state.cache.as_mut().unwrap().verified = Instant::now();
     Ok(POLL_STEADY)
@@ -523,11 +610,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn typed_policy_defaults_disable_wan_and_conflicting_modes_are_rejected() {
+    fn typed_policy_defaults_disable_wan_and_coexistence_is_allowed() {
         let mut policy = Policy::default();
         assert_eq!(policy.directions(), 4);
         policy.wan_upstream = true;
-        assert!(topology(&policy, Path::new("/unused"), Path::new("/unused")).is_err());
+        assert!(topology(&policy, Path::new("/unused"), Path::new("/unused")).is_ok());
         policy.onu_bridge = false;
         assert_eq!(policy.directions(), 1);
         policy.wan_downstream = true;
@@ -540,6 +627,7 @@ mod tests {
         Topology {
             bridge: "br-lan".into(),
             routed: false,
+            onu_bridge: true,
             mask: 3,
             ports: vec![
                 ("fttr1".into(), vec![identity.into()]),

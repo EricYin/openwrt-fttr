@@ -203,16 +203,16 @@ pub fn status_from(
             .errors
             .push("routed_offload_mask: read or parse failed".into());
     }
-    let (mask, valid) = if status.wan_upstream || status.wan_downstream {
-        (status.routed_offload_mask, status.routed_mask_valid)
-    } else {
-        (status.bridge_offload_mask, status.mask_valid)
-    };
-    if valid {
-        for i in 0..16 {
-            if mask & (1 << i) != 0 {
-                status.active_ports.push(format!("fttr{}", i + 1));
-            }
+    let mut mask = 0;
+    if (status.wan_upstream || status.wan_downstream) && status.routed_mask_valid {
+        mask |= status.routed_offload_mask;
+    }
+    if status.onu_bridge && status.mask_valid {
+        mask |= status.bridge_offload_mask;
+    }
+    for i in 0..16 {
+        if mask & (1 << i) != 0 {
+            status.active_ports.push(format!("fttr{}", i + 1));
         }
     }
 
