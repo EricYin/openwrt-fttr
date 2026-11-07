@@ -24,6 +24,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Validate LuCI package metadata
+        run: bash scripts/check_luci_package_metadata.sh
+
       - name: Commit and push if changed
         run: |
           if git diff --quiet --exit-code luci-app-fttr/Makefile; then
