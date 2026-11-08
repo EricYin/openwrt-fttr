@@ -1,5 +1,5 @@
-use h3c_fttr_tools::devices::hl202::api::{Query, SourceSelection};
-use h3c_fttr_tools::{hl202_ipc, mqtt_identity::Selection};
+use openwrt_fttr::devices::hl202::api::{Query, SourceSelection};
+use openwrt_fttr::{hl202_ipc, mqtt_identity::Selection};
 use std::path::Path;
 use std::time::Duration;
 
@@ -71,7 +71,7 @@ fn parse(args: &[String]) -> Result<Query, String> {
         }
         "run" if serial.is_none() && onu.is_none() && generation.is_none() && source.is_none() => {
             let path = path.ok_or(usage)?;
-            let request = h3c_fttr_tools::devices::hl202::request::read_file(Path::new(&path))
+            let request = openwrt_fttr::devices::hl202::request::read_file(Path::new(&path))
                 .map_err(|error| error.to_string())?;
             Ok(Query::Run { request })
         }
@@ -83,7 +83,7 @@ pub fn handle(args: &[String]) -> Result<i32, String> {
     let query = parse(args)?;
     let timeout = match &query {
         Query::Run { request } => match &request.action {
-            h3c_fttr_tools::devices::hl202::request::Action::Exec {
+            openwrt_fttr::devices::hl202::request::Action::Exec {
                 timeout_seconds, ..
             } => u64::from(*timeout_seconds) + 15,
             _ => 45,

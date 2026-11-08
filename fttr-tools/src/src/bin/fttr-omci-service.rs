@@ -12,7 +12,7 @@ fn main() -> std::io::Result<()> {
         .get(2)
         .map(|value| value.parse().map_err(std::io::Error::other))
         .transpose()?;
-    h3c_fttr_tools::controller::profile::configure(
+    openwrt_fttr::controller::profile::configure(
         id,
         seconds,
         args.iter().any(|s| s == "--transparent-defaults"),

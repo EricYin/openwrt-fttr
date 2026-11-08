@@ -85,7 +85,7 @@
 通用 MIB 发现和桥接继续复用；复合串号匹配属于型号专属规则，不能放入 `generic/`。
 随后工作区将规则调整到 `devices/star/sg631/`，由 `devices/star/mod.rs` 分派，
 通过厂商级 `device-star` 裁剪；代码结构以仓库
-`h3c-fttr-tools/src/src/devices/AGENTS.md` 为准。该结构调整在启用/关闭厂商 feature
+`fttr-tools/src/src/devices/AGENTS.md` 为准。该结构调整在启用/关闭厂商 feature
 两种配置下各通过 18 项控制器测试，**尚未部署，不能当作已运行版本**。
 ME 134 标准解码来自固定版本 schema 导入器，保留手工地址与只读当前地址的区别。
 

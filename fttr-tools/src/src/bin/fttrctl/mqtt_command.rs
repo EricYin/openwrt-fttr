@@ -1,8 +1,8 @@
-use h3c_fttr_tools::devices::hl202::{
+use openwrt_fttr::devices::hl202::{
     command::{self, CommandResult},
     script,
 };
-use h3c_fttr_tools::{ipc, model::FttrSystemStatus};
+use openwrt_fttr::{ipc, model::FttrSystemStatus};
 use std::{path::Path, time::Duration};
 
 fn usage() {

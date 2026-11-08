@@ -1,12 +1,12 @@
 # OpenWrt FTTR
 
-H3C HM2004-DU 下联 Micro-OLT 的 OpenWrt feed。源码仓库：
+包含 H3C HM2004-DU Micro-OLT 平台组件及多厂商 FTTR 用户态控制器的 OpenWrt feed。源码仓库：
 https://github.com/LazuliKao/openwrt-fttr 。
 
 ## 目录
 
 - `h3c-fmcs/`：内核驱动、FPGA 初始化、PLOAM/OMCI/GEM 通道及驱动测试。
-- `h3c-fttr-tools/`：Rust 控制器 `fttrd`、命令入口 `fttrctl`、设备适配和可裁剪 ACS。
+- `fttr-tools/`：Rust FTTR 控制器 `fttrd`、命令入口 `fttrctl`、多厂商设备适配和可裁剪 ACS。
 
 ## 接入 PonWrt
 
@@ -20,13 +20,14 @@ src-git fttr https://github.com/LazuliKao/openwrt-fttr.git
 
 ```sh
 ./scripts/feeds update -a
-# 已有构建树先移除旧 feed 的包链接；不删除其他 PON 包。
-./scripts/feeds uninstall h3c-fmcs h3c-fttr-tools
-./scripts/feeds install -p fttr h3c-fmcs h3c-fttr-tools
+# 已有构建树先移除旧用户态包链接；不删除其他 PON 包。
+# 设备上的 ipk 包改名升级流程需先移除旧 h3c-fttr-tools 包，再安装 openwrt-fttr。
+./scripts/feeds uninstall h3c-fmcs h3c-fttr-tools openwrt-fttr
+./scripts/feeds install -p fttr h3c-fmcs openwrt-fttr
 ./scripts/feeds install -a
 make defconfig
 make package/feeds/fttr/h3c-fmcs/compile V=s -j2
-make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
+make package/feeds/fttr/openwrt-fttr/compile V=s -j2
 ```
 
 ### LuCI 管理界面
@@ -66,7 +67,7 @@ make package/luci-app-fttr/compile V=s -j2
 
 ### Workspace 与诊断工具
 
-`h3c-fttr-tools/src/Cargo.toml` 是 workspace 根，所有内部 crate 共用根目录
+`fttr-tools/src/Cargo.toml` 是 workspace 根，所有内部 crate 共用根目录
 `Cargo.lock`。普通 `cargo build` 只构建主包，默认二进制为 `fttrd` 和
 `fttrctl`；OpenWrt 打包也显式限定这两个入口。完整主机测试在该目录执行：
 
@@ -99,7 +100,7 @@ STAR 观察工具要求传入源 MAC；不再内置现场设备地址。独立 r
 
 ## Windows Rust 交叉编译
 
-在 `h3c-fttr-tools/src` 中使用已安装的 Rust target、Zig 和 cargo-zigbuild：
+在 `fttr-tools/src` 中使用已安装的 Rust target、Zig 和 cargo-zigbuild：
 
 ```powershell
 $previous = $env:RUSTFLAGS
@@ -120,8 +121,8 @@ try {
 `../luci-app-fttr/src/api/generated/`。在仓库根目录执行：
 
 ```sh
-cargo run --locked --manifest-path h3c-fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --generate
-cargo run --locked --manifest-path h3c-fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --check
+cargo run --locked --manifest-path fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --generate
+cargo run --locked --manifest-path fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --check
 ```
 
 其他布局追加 `--out-dir FRONTEND/src/api/generated`。`--check` 只检查生成

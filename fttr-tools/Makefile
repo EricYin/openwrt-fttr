@@ -1,9 +1,9 @@
 include $(TOPDIR)/rules.mk
 
-PKG_NAME:=h3c-fttr-tools
+PKG_NAME:=openwrt-fttr
 PKG_VERSION:=0.1.0
 PKG_RELEASE:=1
-PKG_URL:=https://github.com/LazuliKao/openwrt-fttr/tree/main/h3c-fttr-tools
+PKG_URL:=https://github.com/LazuliKao/openwrt-fttr/tree/main/fttr-tools
 
 PKG_BUILD_DEPENDS:=rust/host
 PKG_BUILD_PARALLEL:=1
@@ -12,66 +12,66 @@ PKG_CONFIG_DEPENDS:=CONFIG_FTTR_DEVICE_HL202 CONFIG_FTTR_DEVICE_HWTC CONFIG_FTTR
 include $(INCLUDE_DIR)/package.mk
 include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk
 
-define Package/h3c-fttr-tools
+define Package/openwrt-fttr
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=PON
-  TITLE:=H3C HM2004-DU FTTR Micro-OLT utilities and controller daemon
+  TITLE:=OpenWrt FTTR controller and device management tools
   DEPENDS:=$(RUST_ARCH_DEPENDS) +kmod-h3c-fmcs +FTTR_NPU:airoha-en7581-npu-firmware +uci +ubus +firewall4 +dnsmasq
 endef
 
-define Package/h3c-fttr-tools/description
- Pure-Rust userspace FPGA programmer, optical BOSA management, and FTTR controller daemon for H3C HM2004-DU.
- Manages downlinked stock HL202-DU sub-gateways over optical bridge and MQTT.
+define Package/openwrt-fttr/description
+ Pure-Rust FTTR userspace controller, optical platform management, and device adapters.
+ Supports multiple downstream FTTR device vendors through compile-time selectable adapters.
 endef
 
-define Package/h3c-fttr-tools/config
+define Package/openwrt-fttr/config
   config FTTR_DEVICE_HL202
     bool "Compile HL202-DU-C adapter (verified business and MQTT commands)"
-    depends on PACKAGE_h3c-fttr-tools
+    depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_DEVICE_HWTC
     bool "Compile HWTC adapters (standard OMCI and model profiles)"
-    depends on PACKAGE_h3c-fttr-tools
+    depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_DEVICE_STAR
     bool "Compile STAR adapter (SG631Z-C identity, generic OMCI bridge)"
-    depends on PACKAGE_h3c-fttr-tools
+    depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_DEVICE_ZTE
     bool "Compile ZTE adapter (ZXHN G1612 identity, generic OMCI bridge)"
-    depends on PACKAGE_h3c-fttr-tools
+    depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_DEVICE_SCTY
     bool "Compile SCTY TY-FS803G adapter (OMCI bridge only; CWMP unverified)"
-    depends on PACKAGE_h3c-fttr-tools
+    depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_ACS
     bool "Compile embedded minimal CWMP ACS (runtime UCI switch)"
-    depends on PACKAGE_h3c-fttr-tools
+    depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_DEVICE_FIBERHOME
     bool "Compile experimental FiberHome HG6371F-C / HG6371F bridge (explicit opt-in)"
-    depends on PACKAGE_h3c-fttr-tools
+    depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_DEVICE_REALTEK
     bool "Compile experimental Realtek TYFCA1 OMCI bridge adapter"
-    depends on PACKAGE_h3c-fttr-tools
+    depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_MQTT
     bool "Compile controller-owned MQTT broker and clients"
-    depends on PACKAGE_h3c-fttr-tools
+    depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_MIMALLOC
     bool "Use mimalloc for fttrd Rust allocations (experimental)"
-    depends on PACKAGE_h3c-fttr-tools
+    depends on PACKAGE_openwrt-fttr
     default y
     help
       Select mimalloc 3.5.3 for the daemon only, without explicit THP advice.
       Compare target RSS, swap and service behavior before enabling in production.
   config FTTR_NPU
     bool "Compile fttrd NPU bridge offload coordination (runtime UCI switch)"
-    depends on PACKAGE_h3c-fttr-tools
+    depends on PACKAGE_openwrt-fttr
     default y
     help
       Coordinate driver admission and existing fw4 hooks inside fttrd.
@@ -99,7 +99,7 @@ define Build/Configure
 		--manifest-path $(PKG_BUILD_DIR)/Cargo.toml
 endef
 
-define Package/h3c-fttr-tools/install
+define Package/openwrt-fttr/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/bin/fttrctl $(1)/usr/sbin/
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/bin/fttrd $(1)/usr/sbin/
@@ -111,9 +111,9 @@ define Package/h3c-fttr-tools/install
 	$(INSTALL_DATA) ./files/fttr.keep $(1)/lib/upgrade/keep.d/fttr
 endef
 
-define Package/h3c-fttr-tools/conffiles
+define Package/openwrt-fttr/conffiles
 /etc/config/fttr
 endef
 
-$(eval $(call RustBinPackage,h3c-fttr-tools))
-$(eval $(call BuildPackage,h3c-fttr-tools))
+$(eval $(call RustBinPackage,openwrt-fttr))
+$(eval $(call BuildPackage,openwrt-fttr))

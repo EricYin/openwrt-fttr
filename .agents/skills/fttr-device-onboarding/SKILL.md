@@ -9,7 +9,7 @@ description: Use when onboarding a new FTTR ONU or sub-gateway in openwrt-fttr, 
 
 ## 开始前
 
-1. 阅读仓库根目录 `AGENTS.md`、`README.md`、`EVIDENCE/ENV.md`，核实本轮源码、构建 feature、服务归属和现场版本。修改设备代码前再读 `h3c-fttr-tools/src/src/devices/AGENTS.md`，按注册层、厂商层、型号层组织代码。环境文件含私有信息，只在授权环境使用，禁止复制进共享记录。
+1. 阅读仓库根目录 `AGENTS.md`、`README.md`、`EVIDENCE/ENV.md`，核实本轮源码、构建 feature、服务归属和现场版本。修改设备代码前再读 `fttr-tools/src/src/devices/AGENTS.md`，按注册层、厂商层、型号层组织代码。环境文件含私有信息，只在授权环境使用，禁止复制进共享记录。
 2. 检查已有工作区变更并保留；确认本轮目标是发现、实现还是现场部署，以及用户允许的操作。独占窗口不自动等于允许恢复出厂、覆盖配置或固件升级。
 3. 从[记录模板](templates/onboarding-record.md)建立本轮记录。以完整设备身份定位，但共享记录只使用 `<ONU_A_SN>` 等稳定别名。
 4. 开始发现/适配前读[能力发现与适配决策](references/discovery-and-adapter.md)；开始现场实验前读[现场验证](references/field-validation.md)；出现重试循环或"配置成功但不通"时读[OMCI 结果码与数据面定位](references/omci-failure-triage.md)。

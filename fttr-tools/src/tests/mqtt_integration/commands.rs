@@ -1,5 +1,5 @@
 use super::*;
-use h3c_fttr_tools::mqtt::session;
+use openwrt_fttr::mqtt::session;
 use rumqttc::{AsyncClient, Event, Outgoing, Packet, QoS, SubscribeReasonCode};
 
 static CLI_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());

@@ -1,5 +1,5 @@
 //! Bounded hardware ranging diagnostic. Run with fttrd stopped (sole RX owner).
-use h3c_fttr_tools::{bosa, pon_engine::ploam::PloamFrame};
+use openwrt_fttr::{bosa, pon_engine::ploam::PloamFrame};
 use std::{
     io, thread,
     time::{Duration, Instant},

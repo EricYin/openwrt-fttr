@@ -8,16 +8,16 @@
 | 职责 | 入口 |
 | --- | --- |
 | 项目约定与构建 | `AGENTS.md`、`README.md`、`EVIDENCE/ENV.md` |
-| 设备选择、feature 裁剪 | `h3c-fttr-tools/src/src/devices/mod.rs`、`h3c-fttr-tools/src/Cargo.toml` |
-| 设备代码分层约定 | `h3c-fttr-tools/src/src/devices/AGENTS.md` |
-| STAR 厂商入口、SG631Z-C 身份规则 | `h3c-fttr-tools/src/src/devices/star/mod.rs`、`h3c-fttr-tools/src/src/devices/star/sg631/mod.rs` |
-| 通用发现与配置 | `h3c-fttr-tools/src/src/devices/generic/inventory.rs`、`h3c-fttr-tools/src/src/devices/generic/service.rs` |
-| 业务对象与管理关联 | `h3c-fttr-tools/src/src/controller/business.rs`、`h3c-fttr-tools/src/src/controller/management.rs` |
-| 注册、调度和健康 | `h3c-fttr-tools/src/src/controller/runtime.rs`、`h3c-fttr-tools/src/src/controller/service.rs`、`h3c-fttr-tools/src/src/controller/health.rs` |
-| MIB、传输和资源租约 | `h3c-fttr-tools/src/src/pon_engine/omci/mib.rs`、`h3c-fttr-tools/src/src/pon_engine/omci/platform/fmcs.rs`、`h3c-fttr-tools/src/src/pon_engine/omci/platform/leases.rs` |
-| CWMP 命令边界 | `h3c-fttr-tools/src/src/acs_cli.rs` |
+| 设备选择、feature 裁剪 | `fttr-tools/src/src/devices/mod.rs`、`fttr-tools/src/Cargo.toml` |
+| 设备代码分层约定 | `fttr-tools/src/src/devices/AGENTS.md` |
+| STAR 厂商入口、SG631Z-C 身份规则 | `fttr-tools/src/src/devices/star/mod.rs`、`fttr-tools/src/src/devices/star/sg631/mod.rs` |
+| 通用发现与配置 | `fttr-tools/src/src/devices/generic/inventory.rs`、`fttr-tools/src/src/devices/generic/service.rs` |
+| 业务对象与管理关联 | `fttr-tools/src/src/controller/business.rs`、`fttr-tools/src/src/controller/management.rs` |
+| 注册、调度和健康 | `fttr-tools/src/src/controller/runtime.rs`、`fttr-tools/src/src/controller/service.rs`、`fttr-tools/src/src/controller/health.rs` |
+| MIB、传输和资源租约 | `fttr-tools/src/src/pon_engine/omci/mib.rs`、`fttr-tools/src/src/pon_engine/omci/platform/fmcs.rs`、`fttr-tools/src/src/pon_engine/omci/platform/leases.rs` |
+| CWMP 命令边界 | `fttr-tools/src/src/acs_cli.rs` |
 | 内核收发与通道映射 | `h3c-fmcs/src/fmcs_netdev.c`、`h3c-fmcs/src/fmcs_main.c` |
-| 持久化服务与打包 | `h3c-fttr-tools/files/fttr.init`、`h3c-fttr-tools/files/fttr.config`、`h3c-fttr-tools/Makefile` |
+| 持久化服务与打包 | `fttr-tools/files/fttr.init`、`fttr-tools/files/fttr.config`、`fttr-tools/Makefile` |
 
 ## 发现顺序
 
@@ -60,7 +60,7 @@
 
 优先按当前 `README.md` 执行构建，而不是复用历史命令。当前 `all-devices` 仅组合设备 feature；`acs`、`mqtt` 需显式选择。默认 MQTT 为 fttrd 进程内 rumqttd；现场是否迁移须另查，不能照旧假设独立 Mosquitto。
 
-当前 Windows 示例在 `h3c-fttr-tools/src`：
+当前 Windows 示例在 `fttr-tools/src`：
 
 ```powershell
 $previous = $env:RUSTFLAGS

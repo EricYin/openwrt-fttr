@@ -1,7 +1,7 @@
 //! Ignored subprocess workload driven by the resource evidence recorder.
 //! It never invokes a shell or contacts a gateway.
 use super::*;
-use h3c_fttr_tools::mqtt::session::{self, CommandSession};
+use openwrt_fttr::mqtt::session::{self, CommandSession};
 use rumqttc::{AsyncClient, Event, Outgoing, Packet, QoS};
 
 fn stage(name: &str) {

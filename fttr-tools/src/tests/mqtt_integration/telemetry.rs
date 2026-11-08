@@ -1,5 +1,5 @@
 use super::*;
-use h3c_fttr_tools::{
+use openwrt_fttr::{
     controller::mqtt,
     devices::hl202::telemetry::store,
     mqtt::session::{self, CommandSession},
@@ -79,12 +79,12 @@ fn mqtt_telemetry_real_delivery_validation_and_reconnect() {
             assert_eq!(devs[0].payload_bytes, payload.len());
         }
         let status: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(h3c_fttr_tools::ipc::STATUS_FILE).unwrap())
+            serde_json::from_slice(&std::fs::read(openwrt_fttr::ipc::STATUS_FILE).unwrap())
                 .unwrap();
         assert_eq!(status["devices"][0]["id"], "02AABBCCDDEE");
         assert_eq!(status["devices"][0]["last_payload_bytes"], payload.len());
         // The public inventory observes transport receipt without asserting execution.
-        let list = h3c_fttr_tools::devices::hl202::api::control("{\"method\":\"list\"}", &[]);
+        let list = openwrt_fttr::devices::hl202::api::control("{\"method\":\"list\"}", &[]);
         assert!(list["sources"]
             .as_array()
             .unwrap()

@@ -1,9 +1,9 @@
 [package]
-name = "h3c-fttr-tools"
+name = "openwrt-fttr"
 version = "0.1.0"
 edition = "2021"
 autobins = false
-description = "H3C HM2004-DU FTTR Micro-OLT utilities and controller daemon"
+description = "OpenWrt FTTR controller and multi-vendor device management tools"
 repository = "https://github.com/LazuliKao/openwrt-fttr"
 
 [workspace]

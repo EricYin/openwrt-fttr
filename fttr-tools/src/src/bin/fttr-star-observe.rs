@@ -1,4 +1,4 @@
-use h3c_fttr_tools::pon_engine::omci::platform::fmcs::PacketSocket;
+use openwrt_fttr::pon_engine::omci::platform::fmcs::PacketSocket;
 use std::{
     collections::BTreeMap,
     io,

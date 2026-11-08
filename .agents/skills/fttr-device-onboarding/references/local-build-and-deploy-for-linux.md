@@ -1,6 +1,6 @@
 # 本地交叉构建与部署（只改 userspace）
 
-本参考按 2026-10-28 的现场条件整理：主猫是 aarch64 OpenWrt，本轮只改 `h3c-fttr-tools`。
+本参考按 2026-10-28 的现场条件整理：主猫是 aarch64 OpenWrt，用户态源码目录现为 `fttr-tools`。
 产物是**临时验证件**，不是交付固件；正式发布仍按 `README.md` 用 feed 构建。
 
 ## 何时使用

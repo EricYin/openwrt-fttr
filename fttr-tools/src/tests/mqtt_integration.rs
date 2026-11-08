@@ -1,5 +1,5 @@
 #![cfg(feature = "mqtt")]
-use h3c_fttr_tools::broker::{lan_addresses, EmbeddedBroker};
+use openwrt_fttr::broker::{lan_addresses, EmbeddedBroker};
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};

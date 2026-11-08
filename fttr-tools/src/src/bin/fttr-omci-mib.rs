@@ -13,7 +13,7 @@ fn main() -> std::io::Result<()> {
             "usage: fttr-omci-mib ONU_ID [--summary] [--tables]",
         ));
     }
-    h3c_fttr_tools::controller::inventory::read(
+    openwrt_fttr::controller::inventory::read(
         id,
         args.iter().any(|arg| arg == "--summary"),
         args.iter().any(|arg| arg == "--tables"),

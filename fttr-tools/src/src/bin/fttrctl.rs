@@ -2,10 +2,10 @@ use std::env;
 use std::path::Path;
 use std::process::{exit, Command};
 
-use h3c_fttr_tools::bosa;
-use h3c_fttr_tools::fpga;
-use h3c_fttr_tools::ipc;
-use h3c_fttr_tools::model::FttrSystemStatus;
+use openwrt_fttr::bosa;
+use openwrt_fttr::fpga;
+use openwrt_fttr::ipc;
+use openwrt_fttr::model::FttrSystemStatus;
 #[cfg(feature = "device-hl202")]
 #[path = "fttrctl/hl202.rs"]
 mod hl202;
@@ -76,7 +76,7 @@ fn handle_offload(args: &[String]) {
     let is_json = args.iter().any(|a| a == "--json" || a == "-j");
     match sub {
         "status" => {
-            let status = h3c_fttr_tools::npu::status();
+            let status = openwrt_fttr::npu::status();
             if is_json {
                 println!(
                     "{}",
@@ -152,7 +152,7 @@ fn handle_offload(args: &[String]) {
                 .position(|a| a == "--bridge")
                 .map(|i| args.get(i + 1).map(String::as_str).unwrap_or(""));
             #[cfg(feature = "npu")]
-            let result = h3c_fttr_tools::npu::settings::set(enabled, bridge, None, None, None);
+            let result = openwrt_fttr::npu::settings::set(enabled, bridge, None, None, None);
             #[cfg(not(feature = "npu"))]
             let result: std::io::Result<()> = Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -201,7 +201,7 @@ fn wire_name(value: &impl serde::Serialize) -> String {
 fn print_status_table(status: &FttrSystemStatus) {
     println!("==========================================================================================");
     println!(
-        "                   H3C HM2004-DU FTTR Micro-OLT Subsystem Status                         "
+        "                         FTTR Micro-OLT Subsystem Status                               "
     );
     println!("==========================================================================================");
 
@@ -340,7 +340,7 @@ fn print_status_table(status: &FttrSystemStatus) {
             );
             println!(
                 "    Switch Port:    {} (GEM: 0x{:03x}, State: {:?})",
-                h3c_fttr_tools::pon_engine::onu_interface(sg.onu_id),
+                openwrt_fttr::pon_engine::onu_interface(sg.onu_id),
                 0x100u16 + u16::from(sg.onu_id),
                 sg.state
             );
@@ -485,12 +485,12 @@ fn handle_optical_command(cmd: &str, is_json: bool) {
     let result = if cmd == "OFFLINE SHUTDOWN" {
         let start = std::time::Instant::now();
         loop {
-            match h3c_fttr_tools::optical::claim_owner() {
+            match openwrt_fttr::optical::claim_owner() {
                 Ok(_owner) => {
                     let reset = bosa::set_optical_tx_enable(false);
                     let tx = bosa::get_optical_tx_enable().ok();
                     let reply = serde_json::json!({"schema_version":1,"status":if reset.is_ok() {"success"} else {"error"},"action":"optical_shutdown",
-                        "desired_enabled":h3c_fttr_tools::optical::load_enabled().ok(),"tx_enabled":tx,"actor_state":if reset.is_ok() {"disabled"} else {"unknown"},
+                        "desired_enabled":openwrt_fttr::optical::load_enabled().ok(),"tx_enabled":tx,"actor_state":if reset.is_ok() {"disabled"} else {"unknown"},
                         "hardware_ready":false,"discovery_active":false,"cleanup_pending":true,
                         "error":reset.err().map(|e| serde_json::json!({"code":format!("{:?}",e.kind()),"message":e.to_string()}))});
                     break Ok(reply.to_string());
@@ -563,7 +563,7 @@ fn main() {
 
     let _hardware_owner = if matches!(args[1].as_str(), "load-fpga" | "fpga-write" | "bosa-write") {
         Some(
-            h3c_fttr_tools::optical::claim_owner().unwrap_or_else(|error| {
+            openwrt_fttr::optical::claim_owner().unwrap_or_else(|error| {
                 eprintln!("[-] Direct hardware write refused: {error}");
                 exit(1);
             }),
@@ -590,17 +590,17 @@ fn main() {
                     }
                 }
             } else {
-                println!("{}", h3c_fttr_tools::capabilities::json());
+                println!("{}", openwrt_fttr::capabilities::json());
             }
         }
-        "acs" => match h3c_fttr_tools::acs_cli::run(&args[2..]) {
+        "acs" => match openwrt_fttr::acs_cli::run(&args[2..]) {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("ACS: {e}");
                 std::process::exit(1);
             }
         },
-        "config" | "sync" => match h3c_fttr_tools::provisioning_cli::run(&args[1], &args[2..]) {
+        "config" | "sync" => match openwrt_fttr::provisioning_cli::run(&args[1], &args[2..]) {
             Ok(code) => exit(code),
             Err(e) => {
                 eprintln!("Provisioning: {e}");
@@ -633,7 +633,7 @@ fn main() {
             }
         },
         "fpga-diag" => {
-            if let Err(error) = h3c_fttr_tools::fpga_diag_cli::run(&args[2..]) {
+            if let Err(error) = openwrt_fttr::fpga_diag_cli::run(&args[2..]) {
                 eprintln!("FPGA diagnostics: {error}");
                 exit(1);
             }
@@ -828,10 +828,9 @@ fn main() {
                 eprintln!("Usage: fttrctl fec ONU_ID [--json] [--create-pm]");
                 exit(1);
             };
-            if let Err(error) = h3c_fttr_tools::controller::fec::read(
-                id,
-                args.iter().any(|arg| arg == "--create-pm"),
-            ) {
+            if let Err(error) =
+                openwrt_fttr::controller::fec::read(id, args.iter().any(|arg| arg == "--create-pm"))
+            {
                 eprintln!("[-] FEC PM diagnostic failed: {error}");
                 exit(1);
             }
@@ -870,7 +869,7 @@ fn main() {
                 );
                 exit(1);
             }
-            if let Err(error) = h3c_fttr_tools::controller::inventory::read_with_progress(
+            if let Err(error) = openwrt_fttr::controller::inventory::read_with_progress(
                 id,
                 summary,
                 args.iter().any(|arg| arg == "--tables"),

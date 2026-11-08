@@ -21,7 +21,7 @@ start_service() {
 		return 0
 	fi
 
-	echo "[*] Initializing H3C FTTR Micro-OLT Subsystem..."
+	echo "[*] Initializing FTTR Micro-OLT Subsystem..."
 	# FPGA and BOSA initialization belong exclusively to fttrd.
 	# Setup downstream DSA switch ports (fttr1 ~ fttr16)
 	for i in $(seq 1 16); do
@@ -48,7 +48,7 @@ start_service() {
 }
 
 stop_service() {
-	echo "[*] Stopping H3C FTTR Subsystem..."
+	echo "[*] Stopping FTTR Subsystem..."
 	/usr/sbin/fttrctl optical shutdown --json || logger -t fttr "Owner shutdown failed; checking reset after termination"
 	rm -f "$LAN_STATE"
 }

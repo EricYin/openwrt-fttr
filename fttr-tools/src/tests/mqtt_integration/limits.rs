@@ -1,5 +1,5 @@
 use super::*;
-use h3c_fttr_tools::mqtt::session::{self, CommandSession};
+use openwrt_fttr::mqtt::session::{self, CommandSession};
 use rumqttc::{Event, Packet, Publish, QoS};
 use std::io::Write;
 

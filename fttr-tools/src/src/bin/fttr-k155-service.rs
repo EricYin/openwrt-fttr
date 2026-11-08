@@ -9,7 +9,7 @@ fn main() -> std::io::Result<()> {
                 "usage: fttr-k155-service ONU_ID",
             )
         })?;
-    h3c_fttr_tools::devices::hwtc::k155::service::configure(id, None)
+    openwrt_fttr::devices::hwtc::k155::service::configure(id, None)
 }
 #[cfg(not(feature = "device-hwtc"))]
 fn main() -> std::io::Result<()> {

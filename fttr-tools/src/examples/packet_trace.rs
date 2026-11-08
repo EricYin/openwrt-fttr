@@ -1,5 +1,5 @@
 //! Bounded, passive field diagnostic. Output can contain private packet data.
-use h3c_fttr_tools::pon_engine::omci::platform::fmcs::PacketSocket;
+use openwrt_fttr::pon_engine::omci::platform::fmcs::PacketSocket;
 use std::{
     io,
     time::{Duration, Instant},

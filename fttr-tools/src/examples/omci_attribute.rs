@@ -5,7 +5,7 @@ fn main() -> std::io::Result<()> {
     let _: serde_json::Value = serde_json::from_str(&command).map_err(std::io::Error::other)?;
     println!(
         "{}",
-        h3c_fttr_tools::ipc::send_ipc_command(&format!("OMCI_ATTRIBUTE {command}"))?
+        openwrt_fttr::ipc::send_ipc_command(&format!("OMCI_ATTRIBUTE {command}"))?
     );
     Ok(())
 }

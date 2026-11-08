@@ -1,9 +1,9 @@
 name: FTTR API contract
 on:
   push:
-    paths: ['h3c-fttr-tools/src/**', 'h3c-fttr-tools/files/**', 'h3c-fttr-tools/Makefile', '.github/workflows/fttr-api.yml']
+    paths: ['fttr-tools/src/**', 'fttr-tools/files/**', 'fttr-tools/Makefile', '.github/workflows/fttr-api.yml']
   pull_request:
-    paths: ['h3c-fttr-tools/src/**', 'h3c-fttr-tools/files/**', 'h3c-fttr-tools/Makefile', '.github/workflows/fttr-api.yml']
+    paths: ['fttr-tools/src/**', 'fttr-tools/files/**', 'fttr-tools/Makefile', '.github/workflows/fttr-api.yml']
   workflow_dispatch:
     inputs:
       frontend_ref:
@@ -25,12 +25,12 @@ jobs:
           ref: ${{ inputs.frontend_ref || vars.FTTR_FRONTEND_REF || 'main' }}
           path: luci-app-fttr
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo fmt --all --check --manifest-path openwrt-fttr/h3c-fttr-tools/src/Cargo.toml
-      - run: cargo test --locked --workspace --manifest-path openwrt-fttr/h3c-fttr-tools/src/Cargo.toml --features fttr-api/codegen
-      - run: cargo test --locked --manifest-path openwrt-fttr/h3c-fttr-tools/src/Cargo.toml --lib --no-default-features --features all-devices,acs,mqtt,npu
-      - run: cargo check --locked --manifest-path openwrt-fttr/h3c-fttr-tools/src/Cargo.toml --all-targets --no-default-features --features all-devices,acs,mqtt,npu,diagnostics
-      - run: cargo check --locked --manifest-path openwrt-fttr/h3c-fttr-tools/src/Cargo.toml --all-targets --no-default-features --features all-devices,acs,diagnostics
-      - run: cargo check --locked --manifest-path openwrt-fttr/h3c-fttr-tools/src/Cargo.toml --all-targets --no-default-features
+      - run: cargo fmt --all --check --manifest-path openwrt-fttr/fttr-tools/src/Cargo.toml
+      - run: cargo test --locked --workspace --manifest-path openwrt-fttr/fttr-tools/src/Cargo.toml --features fttr-api/codegen
+      - run: cargo test --locked --manifest-path openwrt-fttr/fttr-tools/src/Cargo.toml --lib --no-default-features --features all-devices,acs,mqtt,npu
+      - run: cargo check --locked --manifest-path openwrt-fttr/fttr-tools/src/Cargo.toml --all-targets --no-default-features --features all-devices,acs,mqtt,npu,diagnostics
+      - run: cargo check --locked --manifest-path openwrt-fttr/fttr-tools/src/Cargo.toml --all-targets --no-default-features --features all-devices,acs,diagnostics
+      - run: cargo check --locked --manifest-path openwrt-fttr/fttr-tools/src/Cargo.toml --all-targets --no-default-features
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: luci-app-fttr/package.json
