@@ -7,7 +7,7 @@ PROG=/usr/sbin/fttrd
 LAN_STATE=/var/run/fttr-mqtt-lan
 
 start_service() {
-	local acs_state acs_username acs_password lan_addr board dev i
+	local acs_state acs_username acs_password lan_addr dev i
 	config_load fttr
 	config_get acs_state acs state_file /var/lib/fttr/acs-state.json
 	config_get acs_username acs username ""
@@ -15,9 +15,8 @@ start_service() {
 	lan_addr=$(uci -q get network.lan.ipaddr)
 	lan_addr=${lan_addr%%/*}
 
-	# Only start on H3C HM2004-DU
-	board=$(cat /tmp/sysinfo/board_name 2>/dev/null)
-	if [ "$board" != "h3c,hm2004-du" ]; then
+	# Let fttrd's exact platform registry fail closed before touching hardware.
+	if ! "$PROG" --platform-check >/dev/null 2>&1; then
 		return 0
 	fi
 
@@ -49,14 +48,18 @@ start_service() {
 
 stop_service() {
 	echo "[*] Stopping FTTR Subsystem..."
-	/usr/sbin/fttrctl optical shutdown --json || logger -t fttr "Owner shutdown failed; checking reset after termination"
+	if "$PROG" --platform-check >/dev/null 2>&1; then
+		/usr/sbin/fttrctl optical shutdown --json || logger -t fttr "Owner shutdown failed; checking reset after termination"
+	fi
 	rm -f "$LAN_STATE"
 }
 
 service_stopped() {
 	# procd deletion is asynchronous. The CLI waits boundedly for ownership;
 	# it never writes hardware while a daemon still owns it.
-	/usr/sbin/fttrctl optical shutdown-offline --json || logger -t fttr "Optical reset not confirmed after stop"
+	if "$PROG" --platform-check >/dev/null 2>&1; then
+		/usr/sbin/fttrctl optical shutdown-offline --json || logger -t fttr "Optical reset not confirmed after stop"
+	fi
 }
 
 service_triggers() {
