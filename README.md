@@ -52,26 +52,17 @@ make package/luci-app-fttr/compile V=s -j2
 
 | OpenWrt 配置 | Cargo feature | OpenWrt 默认 | Cargo 默认 |
 | --- | --- | --- | --- |
-| `CONFIG_FTTR_DEVICE_HL202` | `device-hl202` | 开 | 开 |
-| `CONFIG_FTTR_DEVICE_HWTC` | `device-hwtc` | 开 | 关 |
-| `CONFIG_FTTR_DEVICE_STAR` | `device-star` | 开 | 关 |
-| `CONFIG_FTTR_DEVICE_ZTE` | `device-zte` | 开 | 关 |
-| `CONFIG_FTTR_DEVICE_SCTY` | `device-scty` | 开 | 关 |
-| `CONFIG_FTTR_DEVICE_FIBERHOME` | `device-fiberhome` | 关 | 关 |
-| `CONFIG_FTTR_DEVICE_REALTEK` | `device-realtek` | 关 | 关 |
-| `CONFIG_FTTR_ACS` | `acs` | 开 | 关 |
-| `CONFIG_FTTR_MQTT` | `mqtt` | 开 | 开 |
-| `CONFIG_FTTR_NPU` | `npu` | 开 | 开 |
-
-OpenWrt 使用 `--no-default-features`，逐项显式映射上述选项。设备及 ACS
-feature 不会隐式开启 MQTT；`all-devices` 组合上述全部设备模块。Linux 下在
-`h3c-fttr-tools/src` 验证全部目标：
-
-```sh
-cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt,npu
-cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt
-cargo check --locked --all-targets --no-default-features --features all-devices,acs
-```
+| `CONFIG_FTTR_DEVICE_HL202` | `device-hl202` | ✅ | ✅ |
+| `CONFIG_FTTR_DEVICE_HWTC` | `device-hwtc` | ✅ | ❌ |
+| `CONFIG_FTTR_DEVICE_STAR` | `device-star` | ✅ | ❌ |
+| `CONFIG_FTTR_DEVICE_ZTE` | `device-zte` | ✅ | ❌ |
+| `CONFIG_FTTR_DEVICE_SCTY` | `device-scty` | ✅ | ❌ |
+| `CONFIG_FTTR_DEVICE_FIBERHOME` | `device-fiberhome` | ✅ | ❌ |
+| `CONFIG_FTTR_DEVICE_REALTEK` | `device-realtek` | ✅ | ❌ |
+| `CONFIG_FTTR_ACS` | `acs` | ✅ | ❌ |
+| `CONFIG_FTTR_MQTT` | `mqtt` | ✅ | ✅ |
+| `CONFIG_FTTR_NPU` | `npu` | ✅ | ✅ |
+| `CONFIG_FTTR_MIMALLOC` | `allocator-mimalloc` | ✅ | ❌ |
 
 ### Workspace 与诊断工具
 
