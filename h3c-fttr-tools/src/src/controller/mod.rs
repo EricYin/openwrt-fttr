@@ -17,7 +17,7 @@ mod runtime;
 pub(crate) mod service;
 mod status;
 mod telemetry;
+mod topology;
 #[cfg(feature = "mqtt-ty-fs803g")]
 mod ty_mqtt;
-mod topology;
 pub use runtime::run;

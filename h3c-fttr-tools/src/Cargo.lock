@@ -546,6 +546,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fttr-ty-agent"
+version = "1.0.0"
+dependencies = [
+ "rumqttc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -7,7 +7,6 @@ https://github.com/LazuliKao/openwrt-fttr 。
 
 - `h3c-fmcs/`：内核驱动、FPGA 初始化、PLOAM/OMCI/GEM 通道及驱动测试。
 - `h3c-fttr-tools/`：Rust 控制器 `fttrd`、命令入口 `fttrctl`、设备适配和可裁剪 ACS。
-- `luci-app-fttr/`：LuCI Web 管理界面软件包定义（基于 Release Tarball）。
 
 ## 接入 PonWrt
 
@@ -22,14 +21,32 @@ src-git fttr https://github.com/LazuliKao/openwrt-fttr.git
 ```sh
 ./scripts/feeds update -a
 # 已有构建树先移除旧 feed 的包链接；不删除其他 PON 包。
-./scripts/feeds uninstall h3c-fmcs h3c-fttr-tools luci-app-fttr
-./scripts/feeds install -p fttr h3c-fmcs h3c-fttr-tools luci-app-fttr
+./scripts/feeds uninstall h3c-fmcs h3c-fttr-tools
+./scripts/feeds install -p fttr h3c-fmcs h3c-fttr-tools
 ./scripts/feeds install -a
 make defconfig
 make package/feeds/fttr/h3c-fmcs/compile V=s -j2
 make package/feeds/fttr/h3c-fttr-tools/compile V=s -j2
-make package/feeds/fttr/luci-app-fttr/compile V=s -j2
 ```
+
+### LuCI 管理界面
+
+LuCI 包由 [luci-app-fttr](https://github.com/LazuliKao/luci-app-fttr) 独立维护。
+该仓库的 `package` 分支根目录包含完整 Makefile、构建后的 JS、菜单、ACL 和翻译，
+本 feed 不再保存 LuCI 包或同步 nightly 哈希。
+
+确认前端 CI 已发布 `package` 分支后，在构建树中执行：
+
+```sh
+# 旧构建树先卸载旧 feed 的 LuCI 包链接，再导入独立包。
+./scripts/feeds uninstall luci-app-fttr
+git clone --single-branch --branch package https://github.com/LazuliKao/luci-app-fttr.git package/luci-app-fttr
+make defconfig
+make package/luci-app-fttr/compile V=s -j2
+```
+
+按需选择独立的 `luci-i18n-fttr-zh-cn` 翻译包。可复现构建应固定 `package`
+分支上的提交。前端开发与发布方法见前端仓库 README。
 
 ## 编译选项
 
