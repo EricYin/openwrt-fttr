@@ -64,6 +64,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 | "network"
                 | "wifi"
                 | "offload"
+                | "mqtt"
         ) {
             return Err(format!("unsupported section: {}", s.kind));
         }
@@ -131,6 +132,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 "wan_downstream",
                 "onu_bridge",
             ],
+            "mqtt" => &["enabled", "hl202_enabled", "ty_fs803g_enabled"],
             _ => &[],
         };
         if let Some(key) = s.options.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -517,6 +519,14 @@ mod tests {
         );
         assert!(super::compile(&disabled).is_ok());
         assert!(super::compile("config acs 'acs'\n option enabled '0'\n").is_ok());
+    }
+
+    #[test]
+    fn legacy_mqtt_switches_are_accepted_and_ignored() {
+        let config = "config mqtt 'mqtt'\n option enabled '1'\n option hl202_enabled '1'\n option ty_fs803g_enabled '0'\n";
+        let compiled = super::compile(config).unwrap();
+        assert!(compiled.devices.is_empty());
+        assert!(compiled.management.is_none());
     }
 
     #[test]
