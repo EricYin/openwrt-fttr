@@ -14,7 +14,7 @@ use std::{
 };
 
 pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {
-    configure_with_grant_floors(id, cancellation, None)
+    configure_with_options(id, cancellation, None, None)
 }
 
 /// Explicit platform policy supplied by an opt-in adapter, under the same lock
@@ -23,6 +23,23 @@ pub(crate) fn configure_with_grant_floors(
     id: u8,
     cancellation: Option<Arc<AtomicBool>>,
     floors: Option<(u16, u16)>,
+) -> io::Result<()> {
+    configure_with_options(id, cancellation, floors, None)
+}
+
+pub(crate) fn configure_with_evto(
+    id: u8,
+    cancellation: Option<Arc<AtomicBool>>,
+    configure_evto: Option<fn(&mut OmciSession, u16) -> io::Result<()>>,
+) -> io::Result<()> {
+    configure_with_options(id, cancellation, None, configure_evto)
+}
+
+fn configure_with_options(
+    id: u8,
+    cancellation: Option<Arc<AtomicBool>>,
+    floors: Option<(u16, u16)>,
+    configure_evto: Option<fn(&mut OmciSession, u16) -> io::Result<()>>,
 ) -> io::Result<()> {
     if id >= crate::pon_engine::ONU_SLOTS {
         return Err(io::Error::new(
@@ -221,9 +238,15 @@ pub(crate) fn configure_with_grant_floors(
                 println!("GENERIC_EVTO_DOWNSTREAM_MODE_SKIPPED instance={evto_inst:04x}: {error}")
             }
         }
-        if let Err(error) = session.with_timeout(std::time::Duration::from_secs(30), |session| {
-            apply_transparent_evto_table(session, evto_inst)
-        }) {
+        if let Some(configure_evto) = configure_evto {
+            session.with_timeout(std::time::Duration::from_secs(30), |session| {
+                configure_evto(session, evto_inst)
+            })?;
+        } else if let Err(error) = session
+            .with_timeout(std::time::Duration::from_secs(30), |session| {
+                apply_transparent_evto_table(session, evto_inst)
+            })
+        {
             if matches!(
                 error.kind(),
                 io::ErrorKind::NotConnected | io::ErrorKind::Interrupted

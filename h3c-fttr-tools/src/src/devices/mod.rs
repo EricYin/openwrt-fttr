@@ -32,6 +32,9 @@ pub(crate) mod zte;
 
 /// Optional device identity rules, independent of the shared OMCI bridge implementation.
 pub(crate) fn matches_cwmp_identity(optical_sn: &str, product_class: &str, serial: &str) -> bool {
+    if cwmp::vendor::ct::matches_identity(optical_sn, product_class, serial) {
+        return true;
+    }
     #[cfg(feature = "device-zte")]
     {
         if zte::matches_cwmp(optical_sn, product_class, serial) {
@@ -85,7 +88,7 @@ pub enum Adapter {
     #[cfg(feature = "device-star")]
     Star,
     #[cfg(feature = "device-zte")]
-    Zte,
+    Zte(zte::Profile),
     #[cfg(feature = "device-scty")]
     Scty,
     #[cfg(feature = "device-fiberhome")]
@@ -226,7 +229,7 @@ impl Adapter {
                 shell_commands: false,
             },
             #[cfg(feature = "device-zte")]
-            Self::Zte => Capabilities {
+            Self::Zte(_) => Capabilities {
                 business: true,
                 shell_commands: false,
             },
@@ -264,7 +267,7 @@ impl Adapter {
             #[cfg(feature = "device-star")]
             Self::Star => BusinessPhase::Configuring,
             #[cfg(feature = "device-zte")]
-            Self::Zte => BusinessPhase::Configuring,
+            Self::Zte(_) => BusinessPhase::Configuring,
             Self::GenericBridge => BusinessPhase::Configuring,
             #[cfg(feature = "device-scty")]
             Self::Scty => BusinessPhase::Configuring,
@@ -286,7 +289,7 @@ impl Adapter {
             #[cfg(feature = "device-star")]
             Self::Star => BusinessPhase::Verifying,
             #[cfg(feature = "device-zte")]
-            Self::Zte => BusinessPhase::Verifying,
+            Self::Zte(_) => BusinessPhase::Verifying,
             Self::GenericBridge => BusinessPhase::Verifying,
             #[cfg(feature = "device-scty")]
             Self::Scty => BusinessPhase::Verifying,
@@ -314,7 +317,7 @@ impl Adapter {
             #[cfg(feature = "device-star")]
             Self::Star => generic::service::configure(id, Some(token)),
             #[cfg(feature = "device-zte")]
-            Self::Zte => zte::configure(id, Some(token)),
+            Self::Zte(profile) => zte::configure(profile, id, Some(token)),
             #[cfg(feature = "device-scty")]
             Self::Scty => scty::configure(id, Some(token)),
             #[cfg(feature = "device-fiberhome")]
@@ -352,7 +355,9 @@ pub fn select_with_serial(
         }
         #[cfg(feature = "device-zte")]
         if crate::provisioning::is_device_adapter(sn, "zte") {
-            return Adapter::Zte;
+            return Adapter::Zte(
+                zte::profile(vendor, equipment, serial).unwrap_or(zte::Profile::G1612),
+            );
         }
         #[cfg(feature = "device-scty")]
         if crate::provisioning::is_device_adapter(sn, "scty") {
@@ -397,8 +402,8 @@ pub fn select_with_serial(
         return Adapter::Star;
     }
     #[cfg(feature = "device-zte")]
-    if zte::matches(vendor, equipment, serial) {
-        return Adapter::Zte;
+    if let Some(profile) = zte::profile(vendor, equipment, serial) {
+        return Adapter::Zte(profile);
     }
     let _ = (vendor, equipment);
     #[cfg(feature = "device-scty")]
@@ -421,6 +426,29 @@ pub fn select_with_serial(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generic_bridge_associates_exact_ct_native_identity_without_enrolling_business() {
+        assert!(matches_cwmp_adapter(
+            "generic", "SCTY72ABCDEF", "TEWA-768G", "308618C8172ABCDEF",
+        ));
+        assert!(!matches_cwmp_adapter(
+            "generic", "SCTY72ABCDE0", "TEWA-768G", "308618C8172ABCDEF",
+        ));
+        assert!(!matches_cwmp_adapter(
+            "generic", "SCTY72ABCDEF", "TEWA-unknown", "308618C8172ABCDEF",
+        ));
+        assert!(!matches_cwmp_adapter(
+            "unavailable", "SCTY72ABCDEF", "TEWA-768G", "308618C8172ABCDEF",
+        ));
+        assert_eq!(
+            select("SCTY", &crate::model::OnuIdentity {
+                equipment_id: Some("TEWA-768G".into()),
+                ..Default::default()
+            }),
+            Adapter::Unavailable,
+        );
+    }
+
     #[test]
     #[cfg(not(feature = "mqtt"))]
     fn mqtt_disabled_commands_are_local_and_inventory_remains_available() {
@@ -575,6 +603,39 @@ mod tests {
             "SCTY12345678"
         ));
     }
+
+    #[test]
+    fn zte_f650a_selection_is_model_scoped_and_feature_gated() {
+        let mut identity = crate::model::OnuIdentity {
+            equipment_id: Some("ZXHN F650A(GPON ONU)".into()),
+            ..Default::default()
+        };
+        #[cfg(feature = "device-zte")]
+        assert_eq!(
+            select("ZTEG", &identity),
+            Adapter::Zte(zte::Profile::F650a)
+        );
+        #[cfg(not(feature = "device-zte"))]
+        assert_eq!(select("ZTEG", &identity), Adapter::Unavailable);
+        assert_eq!(select("OTHER", &identity), Adapter::Unavailable);
+        identity.equipment_id = Some("ZXHN F650A-OTHER".into());
+        assert_eq!(select("ZTEG", &identity), Adapter::Unavailable);
+        identity.equipment_id = Some("ZXHN G1612".into());
+        #[cfg(feature = "device-zte")]
+        assert_eq!(
+            select("ZTEG", &identity),
+            Adapter::Zte(zte::Profile::G1612)
+        );
+        #[cfg(not(feature = "device-zte"))]
+        assert_eq!(select("ZTEG", &identity), Adapter::Unavailable);
+        assert!(!matches_cwmp_adapter(
+            "zte",
+            "ZTEG12345678",
+            "F650A",
+            "ZTEG12345678"
+        ));
+    }
+
     #[test]
     fn mqtt_connected_dispatch_reports_unsupported_identities() {
         assert!(configure_authenticated_cwmp_settings(
