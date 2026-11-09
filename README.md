@@ -51,6 +51,18 @@ make package/luci-app-fttr/compile V=s -j2
 
 ## 编译选项
 
+### 网关 / OLT 平台
+
+| OpenWrt 配置 | Cargo feature | OpenWrt 默认 | Cargo 默认 | 状态 |
+| --- | --- | --- | --- | --- |
+| `CONFIG_FTTR_PLATFORM_H3C_HM2004_DU` | `platform-h3c-hm2004-du` | ✅ | ✅ | 依赖 H3C FMCS 驱动 |
+| `CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2` | `platform-fiberhome-an4475-g2` | ❌ | ❌ | 编译期 stub；板级身份及驱动尚未调查 |
+| `CONFIG_FTTR_PLATFORM_TIANYI_TYFZA1` | `platform-tianyi-tyfza1` | ❌ | ❌ | 编译期 stub；板级身份及驱动尚未调查 |
+| — | `all-platforms` | — | ❌ | Cargo 聚合 feature；OpenWrt 用以上独立开关支持任意子集 |
+
+
+### 下游 ONU 适配与服务
+
 | OpenWrt 配置 | Cargo feature | OpenWrt 默认 | Cargo 默认 |
 | --- | --- | --- | --- |
 | `CONFIG_FTTR_DEVICE_HL202` | `device-hl202` | ✅ | ✅ |
@@ -73,8 +85,8 @@ make package/luci-app-fttr/compile V=s -j2
 
 ```sh
 cargo test --locked --workspace --features fttr-api/codegen
-cargo test --locked --lib --no-default-features --features all-devices,acs,mqtt,npu
-cargo check --locked --all-targets --no-default-features --features all-devices,acs,mqtt,npu,diagnostics
+cargo test --locked --lib --no-default-features --features platform-h3c-hm2004-du,all-devices,acs,mqtt,npu
+cargo check --locked --all-targets --no-default-features --features all-platforms,all-devices,acs,mqtt,npu,diagnostics
 ```
 
 `fttr-platform-probe`、`fttr-omci-mib`、`fttr-omci-probe`、`fttr-omci-service`、
@@ -106,7 +118,7 @@ STAR 观察工具要求传入源 MAC；不再内置现场设备地址。独立 r
 $previous = $env:RUSTFLAGS
 try {
     $env:RUSTFLAGS = '-C target-feature=-crt-static -C link-arg=-dynamic'
-    cargo zigbuild --release --locked --target aarch64-unknown-linux-musl --no-default-features --features all-devices,acs,mqtt,npu --bin fttrd --bin fttrctl
+    cargo zigbuild --release --locked --target aarch64-unknown-linux-musl --no-default-features --features platform-h3c-hm2004-du,all-devices,acs,mqtt,npu --bin fttrd --bin fttrctl
 } finally {
     $env:RUSTFLAGS = $previous
 }
