@@ -13,14 +13,14 @@ description: Use when onboarding a new FTTR ONU or sub-gateway in openwrt-fttr, 
 2. 检查已有工作区变更并保留；确认本轮目标是发现、实现还是现场部署，以及用户允许的操作。独占窗口不自动等于允许恢复出厂、覆盖配置或固件升级。
 3. 从[记录模板](templates/onboarding-record.md)建立本轮记录。以完整设备身份定位，但共享记录只使用 `<ONU_A_SN>` 等稳定别名。
 4. 开始发现/适配前读[能力发现与适配决策](references/discovery-and-adapter.md)；开始现场实验前读[现场验证](references/field-validation.md)；出现重试循环或"配置成功但不通"时读[OMCI 结果码与数据面定位](references/omci-failure-triage.md)。
-5. 需要只改 userspace 就上机验证（不整包刷机）时读[Linux 本地交叉构建与部署](references/local-build-and-deploy-for-linux.md)，Windows 构建另见仓库 `README.md`；需要案例时读[STAR 脱敏案例](references/star-sg631z-c-case.md)与[HWTC/SPGMAC 脱敏案例](references/hwtc-hg8010c-spgmac-case.md)。
+5. 需要只改 userspace 就上机验证（不整包刷机）时读[Linux 本地交叉构建与部署](references/local-build-and-deploy-for-linux.md)，Windows 构建另见仓库 `README.md`；需要案例时读[STAR 脱敏案例](references/star-sg631z-c-case.md)、[HWTC/SPGMAC 脱敏案例](references/hwtc-hg8010c-spgmac-case.md)与[TY-FS803G 授权/原生桥接案例](references/scty-ty-fs803g-case.md)。队列积压、只有 OMCI 上行、授权改变后仍不通时优先读后者。
 
 ## 执行阶段
 
 | 阶段 | 必做动作 | 阶段产物 |
 | --- | --- | --- |
 | 基线 | 身份、注册、进程版本、其他 ONU、现有配置、当前症状 | 带采集时间的基线；明确未知项 |
-| 发现 | 完整 MIB、关键属性、端点与资源关系、读写能力 | 能力清单与阻断位置 |
+| 发现 | 先读关键属性与端点/资源关系，再按需要补完整 MIB；记录上传完整性与耗时 | 能力清单与阻断位置，避免上传长期占锁阻塞恢复 |
 | 定位 | 失败的操作、类、实例、掩码、结果码；请求/响应成对报文；宿主侧门控与接线 | 阻断层级判定（OMCI 语义 / 宿主门控 / 数据面 / 接线） |
 | 决策 | 判断标准实体布局差异、标准流程差异或厂商私有行为 | 通用改进或独立适配的证据理由 |
 | 实现 | 最小改动、资源归属、重试幂等性、已有设备兼容性 | 针对性回归验证与构建产物 |
@@ -35,15 +35,21 @@ description: Use when onboarding a new FTTR ONU or sub-gateway in openwrt-fttr, 
 - **PLOAM 串号里的厂商码与 OMCI ME 256 的 ONU-G VendorId 是两个值**（案例中 `SPTC` 与 `SPGA`）。不要用其中一个校验另一个，也不要据此判定"不是同一台设备"。
 - ONU ID 会变化；每次有副作用的操作前重新核对目标身份和注册代次。ONU 自身的 MIB 是持久的，**换槽位后旧槽位的 GEM/ANI 绑定仍在**，必须先退役再建，且实体编号要幂等。
 - **优先复用 ONU 已有的桥端口与 EVTO**（按 TpPointer / AssociatedMePointer 匹配）；给同一个 UNI 再建一套会撞 PortNum，并覆盖厂商自己的管理 VLAN 计划。
+- “探测不明确”不是删除授权：只替换已证明归属本服务、且允许重建的实体；全零未绑定记录与非零外部绑定分别处理。历史案例的删除策略不能无条件套用。
 - 宿主侧也有门控：`fttrN` 没有 carrier 时内核直接丢弃下行帧，而健康监控又会因活体判定失败拆掉 carrier。先证明门控条件，再怀疑 OMCI。
 - 现场接线可能把 ONT 的 LAN 环路接回主猫 LAN，形成广播风暴并挤掉 OMCC 授权窗口，表现像"数据通了又断"。先查环路与风暴，再看协议。
 - O5、配置回读、历史计数、carrier 或 UI 的 verified 标志均不能单独证明当前双向转发。
+- **从队列到线上逐跳取证**：同步比较 ONU WAN/队列、业务 GEM、实际 BWmap、主猫接收和目标响应；全局 GEM 可能包含 OMCC。DBRu 轮询存在不代表有数据授权，授权变长、队列出队也不等于主猫正确接收。
+- **逆向结论分级**：标准条文、精确版本静态路径、当前运行态读数、受控实验分别记来源。符号名、历史 Root TM 错误、默认字符串或固件日志不能单独证明当前故障；未联网也不能先断定必需私有协议。
+- **资源生命周期属于适配的一部分**：核查临时诊断 lease、配置提交、重试与离线清理是否会重置持续业务状态；专属策略留在型号层，公共层只提供有界、可恢复的机制。
 - 不把业务 VLAN、管理 VLAN、内部 GEM 封装标签和 ONU ID 当成同一个概念。
+- **现有配置不等于出厂配置**：先问是否改过 WAN 模式；分别验证原生接口、桥成员、租约和路由。临时别名/host route 通信只定位路径，不算原生适配成功；恢复出厂由用户明确决定，之后重新发现全部实例与注册代次。
 - 原生 CWMP ACS URL、OMCI ACS 关联、Connection Request URL 分别记录；当前配置不等于出厂默认值。
 - ME 134 的地址字段不能独立证明厂商管理 WAN 的状态；先确认其关联，以设备 WAN、租约和实际请求响应交叉验证，不向任意 IP Host 实例盲写开关。
 - `waiting_inform` 要区分传输、HTTP/SOAP 会话与身份关联：真实 Inform 可能已到 ACS，但光侧与 CWMP 标识尚未匹配。只对有证据的厂商/型号建立规则，并拒绝歧义匹配。
 - 抓包点的静默不是设备未发包的充分证据；核查管理桥路径，按当前目标过滤并记录窗口。配置的上报周期也不等于已测量的实际节奏。
 - 不根据一次报文、安静窗口或代码推测宣布根因；受控复现不足时明确标为假设。
+- 计数记录位宽、回绕、清零/饱和与采样连续性；全局增量不直接归因目标。暂停管理授权只能是有界区分实验，最终必须同时验证 OMCI 活体、数据流量和其他 ONU 共存。
 - 对现场配置决策确有阻塞时说明最小下一步及影响；对能通过只读证据回答的问题继续调查。
 
 ## 脱敏与输出
