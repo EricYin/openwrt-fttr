@@ -225,6 +225,7 @@ impl Device {
 pub struct Config {
     pub onu_pins: BTreeMap<String, u8>,
     pub revision: String,
+    pub business_revision: Option<String>,
     pub enabled: bool,
     pub automatic: bool,
     pub triggers: BTreeSet<String>,
@@ -240,6 +241,11 @@ pub struct Config {
 }
 
 pub use fttr_api::ManagementDesired as Management;
+impl Config {
+    pub fn business_revision(&self) -> &str {
+        self.business_revision.as_deref().unwrap_or(&self.revision)
+    }
+}
 
 #[cfg(test)]
 mod backend_tests {

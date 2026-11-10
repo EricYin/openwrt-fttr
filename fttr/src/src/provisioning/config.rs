@@ -275,10 +275,10 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
         let omci_adapter = s.get("omci_adapter");
         crate::adapters::omci::validate(omci_adapter).map_err(|e| format!("{id}: {e}"))?;
         let provisioning_adapter = s.get("provisioning_adapter");
-        let selected = crate::adapters::provisioning::lookup(provisioning_adapter)
+        crate::adapters::provisioning::lookup(provisioning_adapter)
             .map_err(|e| format!("{id}: {e}"))?;
         let bootstrap_adapter = s.get("bootstrap_adapter");
-        crate::adapters::bootstrap::validate(bootstrap_adapter, selected.transport)
+        crate::adapters::bootstrap::validate(bootstrap_adapter)
             .map_err(|e| format!("{id}: {e}"))?;
         let wifi_cleanup = match s.get("wifi_cleanup") {
             "" | "preserve" => "preserve",
@@ -308,23 +308,6 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
                 || s.get("connection_request_password").is_empty(),
         )
         .map_err(|error| format!("{id}: connection_request_defaults: {error}"))?;
-        let (cr_username, cr_password, cr_defaults) = if use_defaults {
-            if matches!(provisioning_adapter, "hl202-cu" | "hl202-mqtt") {
-                ("rms".to_string(), "rms".to_string(), false)
-            } else {
-                (
-                    s.get("connection_request_username").into(),
-                    s.get("connection_request_password").into(),
-                    true,
-                )
-            }
-        } else {
-            (
-                s.get("connection_request_username").into(),
-                s.get("connection_request_password").into(),
-                false,
-            )
-        };
         let port = if s.get("connection_request_port").is_empty() {
             super::model::ConnectionRequest::default().port
         } else {
@@ -335,9 +318,9 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
         let connection_request = super::model::ConnectionRequest {
             enabled: boolean(s.get("connection_request"), true)
                 .map_err(|error| format!("{id}: connection_request: {error}"))?,
-            defaults: cr_defaults,
-            username: cr_username,
-            password: cr_password,
+            defaults: use_defaults,
+            username: s.get("connection_request_username").into(),
+            password: s.get("connection_request_password").into(),
             port,
             ..Default::default()
         };
@@ -670,15 +653,11 @@ mod tests {
         assert!(parse("config provisioning 'global'\n option interval '3600'").is_err());
     }
     #[test]
-    fn revision_excludes_acs_credentials() {
-        assert_eq!(
-            parse("config acs 'acs'\n option password 'one'")
-                .unwrap()
-                .revision,
-            parse("config acs 'acs'\n option password 'two'")
-                .unwrap()
-                .revision
-        );
+    fn listener_changes_reload_configuration_without_changing_business_revision() {
+        let first = parse("config acs 'acs'\n option password 'one'").unwrap();
+        let second = parse("config acs 'acs'\n option password 'two'").unwrap();
+        assert_ne!(first.revision, second.revision);
+        assert_eq!(first.business_revision(), second.business_revision());
     }
     #[test]
     fn hwtc_selection_is_explicit_and_legacy_alias_is_rejected() {

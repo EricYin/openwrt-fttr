@@ -367,6 +367,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
         desired.devices = cfg
             .devices
             .iter()
+            .filter(|d| d.bootstrap_adapter != "none")
             .map(|d| (d.id.clone(), d.optical_sn.clone()))
             .collect();
         if all.iter().any(|(_, n)| {
@@ -425,15 +426,25 @@ pub fn compile(text: &str) -> Result<Config, String> {
         d.items
             .sort_by_key(|i| order[&d.id].iter().position(|id| id == &i.id).unwrap());
     }
-    // Listener credentials and owner-managed optical policy do not schedule business sync.
+    // Listener changes activate host configuration without scheduling business sync.
     let mut canonical = String::new();
+    let mut business_canonical = String::new();
     for (id, s) in &all {
-        if !matches!(s.kind.as_str(), "acs" | "optical" | "calibration") {
+        if !matches!(s.kind.as_str(), "optical" | "calibration") {
             let mut business = s.clone();
             if business.kind == "device" {
                 business.options.remove("onu_id");
             }
             canonical_section(&mut canonical, id, &business);
+            if !matches!(business.kind.as_str(), "management" | "acs") {
+                if business.kind == "device" {
+                    business.options.retain(|key, _| {
+                        !matches!(key.as_str(), "omci_adapter" | "bootstrap_adapter")
+                            && !key.starts_with("connection_request")
+                    });
+                }
+                canonical_section(&mut business_canonical, id, &business);
+            }
         }
     }
     cfg.revision = format!(
@@ -443,6 +454,14 @@ pub fn compile(text: &str) -> Result<Config, String> {
             .fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64)
                 .wrapping_mul(0x100000001b3))
     );
+    cfg.business_revision = Some(format!(
+        "{:016x}",
+        business_canonical
+            .bytes()
+            .chain(crate::cwmp::registry::VERSION.to_le_bytes())
+            .fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64)
+                .wrapping_mul(0x100000001b3))
+    ));
     Ok(cfg)
 }
 
@@ -674,10 +693,41 @@ mod tests {
         let enabled = compile(&config(" option bootstrap_adapter 'omci-acs'\n")).unwrap();
         assert!(enabled.devices.iter().all(|d| d.omci_management()));
         assert_ne!(explicit_off.revision, enabled.revision);
+        assert_eq!(
+            explicit_off.business_revision(),
+            enabled.business_revision()
+        );
         assert!(compile(&config(" option bootstrap_adapter 'invalid'\n"))
             .err()
             .unwrap()
             .contains("bootstrap adapter"));
+    }
+    #[test]
+    fn bootstrap_and_business_choices_are_independent_and_only_business_changes_schedule_sync() {
+        for bootstrap in crate::adapters::bootstrap::available() {
+            for provisioning in crate::adapters::provisioning::available() {
+                let text = format!("config management 'management'\n option address '192.0.2.1/24'\n list vlan '46'\nconfig template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT1234ABCD'\n option group 'g'\n option omci_adapter 'generic'\n option bootstrap_adapter '{}'\n option provisioning_adapter '{}'\n", bootstrap.id, provisioning.id);
+                let config = super::compile(&text).unwrap();
+                assert_eq!(config.devices[0].bootstrap_adapter, bootstrap.id);
+                assert_eq!(config.devices[0].provisioning_adapter, provisioning.id);
+                let host = config.management_network.as_ref().unwrap();
+                assert_eq!(host.devices.contains_key("d"), bootstrap.id != "none");
+                let no_bootstrap = super::compile(&text.replace(
+                    &format!("option bootstrap_adapter '{}'", bootstrap.id),
+                    "option bootstrap_adapter 'none'",
+                ))
+                .unwrap();
+                assert_eq!(config.business_revision(), no_bootstrap.business_revision());
+                let disabled = super::compile(&text.replace(
+                    &format!("option provisioning_adapter '{}'", provisioning.id),
+                    "option provisioning_adapter 'none'",
+                ))
+                .unwrap();
+                if provisioning.id != "none" {
+                    assert_ne!(config.business_revision(), disabled.business_revision());
+                }
+            }
+        }
     }
     #[test]
     #[cfg_attr(

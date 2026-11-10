@@ -426,7 +426,7 @@ fn finish_spawn<T>(c: &mut Coordinator, result: std::io::Result<T>) -> Result<()
         }
     }
 }
-pub(super) fn tick(desired: Option<&Desired>) {
+pub(super) fn tick(desired: Option<&Desired>, cwmp_business_ready: bool) {
     let Some(desired) = desired else {
         let mut c = coordinator().lock().unwrap();
         if c.busy || now() < c.next_retry || now().saturating_sub(c.last_discovery) < 15 {
@@ -450,14 +450,15 @@ pub(super) fn tick(desired: Option<&Desired>) {
             && c.journal.applied.as_ref().is_some_and(|a| {
                 !a.enabled
                     || !a.acs_enabled
-                    || a.devices.iter().all(|(id, sn)| {
-                        super::bootstrap::is_ready_for_management(
-                            id,
-                            sn,
-                            &a.management.acs_url,
-                            c.journal.applied_epoch,
-                        )
-                    })
+                    || (cwmp_business_ready
+                        && a.devices.iter().all(|(id, sn)| {
+                            super::bootstrap::is_ready_for_management(
+                                id,
+                                sn,
+                                &a.management.acs_url,
+                                c.journal.applied_epoch,
+                            )
+                        }))
             }))
     {
         if let Some(applied) = c.journal.applied.clone() {

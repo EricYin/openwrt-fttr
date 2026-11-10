@@ -27,12 +27,9 @@ pub fn available() -> Vec<AdapterCapability> {
     entries
 }
 
-pub fn validate(id: &str, transport: super::provisioning::Transport) -> Result<(), String> {
+pub fn validate(id: &str) -> Result<(), String> {
     if !available().iter().any(|entry| entry.id == id) {
         return Err(format!("bootstrap adapter unavailable: {id}"));
-    }
-    if (transport == super::provisioning::Transport::Acs) == (id == "none") {
-        return Err("ACS provisioning requires an ACS bootstrap; MQTT/disabled provisioning requires bootstrap none".into());
     }
     Ok(())
 }

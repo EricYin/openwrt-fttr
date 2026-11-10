@@ -60,31 +60,37 @@ make package/luci-app-fttr/compile V=s -j2
 | --- | --- | --- |
 | A | `omci_adapter` | 光侧业务配置：`generic`、`hl202`、`hwtc` 等 |
 | B | `bootstrap_adapter` | 单一管理引导策略：`none`、`manual-acs`、`omci-acs`、`hl202-mqtt-acs` |
-| C | `provisioning_adapter` | 业务传输与参数契约：`none`、`hl202-mqtt`、`hl202-cu`、`hwtc-hw`、`cu`、`ct` 等 |
+| C | `provisioning_adapter` | 业务传输与参数契约：`none`、`hl202-mqtt`、`hl202-cu`、`hwtc-hw`、`vendor-cu-candidate`、`vendor-ct-candidate` 等 |
 
 例如 HL202 通过 MQTT 下发 ACS 地址、再使用联通参数契约配置业务：
 
 ```uci
 config device 'child'
 	option optical_sn 'H3CT1234ABCD'
-	option cwmp_id 'pending:H3CT1234ABCD'
 	option omci_adapter 'hl202'
 	option bootstrap_adapter 'hl202-mqtt-acs'
 	option provisioning_adapter 'hl202-cu'
 ```
 
-直接 MQTT 配置选择 B=`none`、C=`hl202-mqtt`；禁用用户态业务配置选择
-B=`none`、C=`none`。ACS 配置必须选择一个 ACS 引导策略；`manual-acs`
+三个选择独立校验。C=`none` 仅禁用用户态业务配置，不停止 B 引导；
+C=`hl202-mqtt` 可与任一可用 B 策略组合；已有可达 ACS 的设备可以选择
+B=`none`、C=对应 CWMP 契约。`manual-acs`
 等待手工配置后的新 Inform，`omci-acs` 在管理网络授权后执行标准 OMCI
 ACS 关联，`hl202-mqtt-acs` 可执行管理 WAN 和 ACS 设置等多个引导步骤。
 更改 A 不会改变 B/C；明确选择不可用时返回错误，不自动切换传输或其他适配器。
+公共 CWMP 身份通过已证实的设备身份规则唯一关联，不依赖所选业务契约；
+公共配置不填写 `cwmp_id`。Connection Request 默认凭据按观察到的设备型号解析，
+显式配置的账户不会被业务适配器选择覆盖。
 旧 `adapter`、`provisioning_method`、`cwmp_contract`、`omci_management`
 配置项不再使用，已有设备配置需改为上述三个字段。
 
 通用运营商契约中的候选参数仍受发现、可写性和验证证据约束，选择契约本身
 不授予写入能力。OMCI 回读、真实 GEM 数据、管理网络连通性及真实 CWMP
-Inform/RPC 分别记录与验收。切换适配组合会使旧操作失效并要求重新发现，
-已有资源归属仍按设备身份管理。
+Inform/RPC 分别记录与验收。状态分别展示 CWMP/MQTT 通道观测、管理引导和业务操作。
+业务 ACS 调度依据当前 CWMP 可达性及宿主管理网络，MQTT 调度依据自身通道，
+不以引导状态代替连通证据。仅切换 C 会使旧业务操作失效并要求重新发现；
+切换 A/B 或管理设置保留业务历史及其配置版本，相关通道仍须满足当前依赖。
+完整配置版本用于加载一致性，业务版本仅跟踪业务意图；已有资源归属仍按设备身份管理。
 
 用户态源码按职责组织在 `fttr/src/src/`：`domain/` 保存业务意图，
 `adapters/` 注册 A/B/C 能力，`devices/<vendor>/<model>/` 保存设备差异，

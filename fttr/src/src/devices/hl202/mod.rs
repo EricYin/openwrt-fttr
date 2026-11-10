@@ -16,6 +16,12 @@ pub mod request;
 pub mod script;
 pub mod service;
 pub mod telemetry;
+pub(super) fn cwmp_credentials(product_class: &str) -> Option<super::CwmpCredentials> {
+    (product_class == "HL202-DU-C").then(|| super::CwmpCredentials {
+        username: "rms".into(),
+        password: "rms".into(),
+    })
+}
 pub(super) fn matches(vendor: &str, equipment: Option<&str>) -> bool {
     vendor == "H3CT" && equipment == Some("HL202-DU-C")
 }

@@ -31,14 +31,13 @@ pub(crate) mod zte;
 
 /// Optional device identity rules, independent of the shared OMCI bridge implementation.
 pub(crate) fn matches_cwmp_identity(optical_sn: &str, product_class: &str, serial: &str) -> bool {
-    if cwmp::vendor::ct::matches_identity(optical_sn, product_class, serial) {
-        return true;
-    }
-    #[cfg(feature = "device-zte")]
-    {
-        if zte::matches_cwmp(optical_sn, product_class, serial) {
+    for family in ["hl202", "hwtc", "star", "zte"] {
+        if matches_cwmp_adapter(family, optical_sn, product_class, serial) {
             return true;
         }
+    }
+    if cwmp::vendor::ct::matches_identity(optical_sn, product_class, serial) {
+        return true;
     }
     let _ = (optical_sn, product_class, serial);
     false
@@ -53,7 +52,11 @@ pub fn matches_cwmp_adapter(
 ) -> bool {
     match adapter {
         #[cfg(feature = "device-hl202")]
-        "hl202" => product_class == "HL202-DU-C" && serial.contains(optical_sn),
+        "hl202" => {
+            optical_sn.starts_with("H3CT")
+                && product_class == "HL202-DU-C"
+                && serial.contains(optical_sn)
+        }
         #[cfg(feature = "device-hwtc")]
         "hwtc" => {
             if !optical_sn.starts_with("HWTC") || optical_sn.len() < 4 {
@@ -73,7 +76,16 @@ pub fn matches_cwmp_adapter(
         "star" => star::matches_cwmp(optical_sn, product_class, serial),
         #[cfg(feature = "device-zte")]
         "zte" => zte::matches_cwmp(optical_sn, product_class, serial),
-        "generic" => matches_cwmp_identity(optical_sn, product_class, serial),
+        "generic" => {
+            if cwmp::vendor::ct::matches_identity(optical_sn, product_class, serial) {
+                return true;
+            }
+            #[cfg(feature = "device-zte")]
+            if zte::matches_cwmp(optical_sn, product_class, serial) {
+                return true;
+            }
+            false
+        }
         _ => false,
     }
 }
@@ -124,6 +136,14 @@ pub fn ensure_mqtt_management_wan(
 pub struct CwmpCredentials {
     pub username: String,
     pub password: String,
+}
+pub(crate) fn cwmp_credentials(product_class: &str) -> Option<CwmpCredentials> {
+    #[cfg(feature = "device-hl202")]
+    if let Some(credentials) = hl202::cwmp_credentials(product_class) {
+        return Some(credentials);
+    }
+    let _ = product_class;
+    None
 }
 pub async fn ensure_mqtt_management_wan_async<F: std::future::Future<Output = bool>>(
     device_id: &str,

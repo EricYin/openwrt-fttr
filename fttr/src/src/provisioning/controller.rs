@@ -124,6 +124,7 @@ struct Controller {
     next_id: u64,
     operations: BTreeMap<String, Operation>,
     management: BTreeMap<String, Value>,
+    mqtt: BTreeMap<String, Value>,
     last_online: BTreeSet<String>,
     startup_pending: BTreeSet<String>,
     last_boot: BTreeMap<String, u64>,
@@ -299,14 +300,13 @@ impl Controller {
         }
         if apply
             && self.config.management_network.as_ref().is_some_and(|d| {
-                (devices.iter().any(|device| device.backend() == "acs")
-                    && !super::management_network::matches_desired(d))
-                    || devices.iter().any(|device| {
-                        device.backend() == "acs" && !super::bootstrap::is_ready(&device.id)
-                    })
+                devices.iter().any(|device| device.backend() == "acs")
+                    && !super::management_network::matches_desired(d)
             })
         {
-            return Err("apply and verify management configuration and fresh device Inform before business synchronization".into());
+            return Err(
+                "apply the host management network before ACS business synchronization".into(),
+            );
         }
         if devices.iter().any(|d| {
             self.operations.get(&d.id).is_some_and(|o| {
@@ -322,7 +322,7 @@ impl Controller {
             let mut op = Operation::new(
                 self.next_id,
                 d.clone(),
-                self.config.revision.clone(),
+                self.config.business_revision().to_owned(),
                 apply,
                 management,
             );
@@ -369,11 +369,15 @@ impl Controller {
     fn business_snapshot(&self) -> Value {
         let devices: Vec<_> = self.config.devices.iter().map(|d| {
             let mut operation = self.operations.get(&d.id).map(Operation::view).or_else(|| self.recovered.get(&d.id).cloned()).unwrap_or_else(|| json!({"state":"not_started","items":d.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":"not_started"})).collect::<Vec<_>>() }));
-            operation["current_revision"] = json!(operation["revision"] == self.config.revision);
+            operation["backend"] = d.backend_view();
+            if d.backend() == "disabled" {
+                operation = json!({"state":"disabled","items":[],"backend":d.backend_view(),"reason":"business provisioning is disabled for this device"});
+            }
+            operation["current_revision"] = json!(operation["revision"] == self.config.business_revision());
             if self.resets.blocks(&d.optical_sn) {
                 operation = json!({"state":"reset_pending","items":[],"reason":self.resets.reason(&d.optical_sn)});
             }
-            let management_fresh = self.management.get(&d.id).is_some_and(|m| m["state"] == "online");
+            let management_fresh = self.business_ready(d);
             operation["management_fresh"] = json!(management_fresh);
             if let Some(attempts) = self.attempts.get(&d.id) {
                 operation["attempts"] = json!(attempts);
@@ -387,10 +391,10 @@ impl Controller {
             if let Some(owned)=self.owned.get(&d.cwmp_id) { operation["wan_objects"]=json!(owned); }
             if let Some(owned)=self.wifi_owned.get(&d.cwmp_id) { operation["wifi_objects"]=json!(owned); }
             let previous=operation["items"].as_array().cloned().unwrap_or_default();
-            let items: Vec<_>=d.items.iter().map(|desired| {
+            let items: Vec<_>=d.items.iter().filter(|_| d.backend() != "disabled").map(|desired| {
                 let mut item=previous.iter().find(|i| i["id"] == desired.id).cloned().unwrap_or_else(|| json!({"id":desired.id,"kind":desired.kind,"service_type":desired.service_type,"state":"not_started"}));
                 item["name"]=json!(self.config.labels.get(desired.id.rsplit("__").next().unwrap_or(&desired.id)));
-                item["current_revision"]=json!(item["revision"] == self.config.revision);
+                item["current_revision"]=json!(item["revision"] == self.config.business_revision());
                 item["management_fresh"]=operation["management_fresh"].clone();
                 if item.get("service_type").is_none() {
                     item["service_type"] = json!(desired.service_type);
@@ -400,7 +404,7 @@ impl Controller {
             operation["items"]=json!(items);
             let ssids: Vec<_> = items.iter().filter(|i| i["kind"] == "ssid").cloned().collect();
             let services: Vec<_> = items.iter().filter(|i| i["kind"] != "ssid").cloned().collect();
-            let wifi_sync=if operation["wifi_lifecycle"].as_object().is_some_and(|m|m.values().any(|i|matches!(ItemOutcome::from_result(i),Some(ItemOutcome::Blocked|ItemOutcome::Failed|ItemOutcome::Unknown)))) {
+            let wifi_sync=if d.backend() == "disabled" { "disabled" } else if operation["wifi_lifecycle"].as_object().is_some_and(|m|m.values().any(|i|matches!(ItemOutcome::from_result(i),Some(ItemOutcome::Blocked|ItemOutcome::Failed|ItemOutcome::Unknown)))) {
                 "attention_required"
             } else if operation["state"] == "recovering" || ssids.iter().any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::ReconcileRequired)) {
                 "recovering"
@@ -412,24 +416,39 @@ impl Controller {
                 aggregate(&ssids)
             };
             let assignment=self.config.assignments.get(&d.id);
-            json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"omci_adapter":d.omci_adapter,"bootstrap_adapter":d.bootstrap_adapter,"provisioning_adapter":d.provisioning_adapter,"omci_management":self.omci_management_view(d),"management":self.management.get(&d.id),"acs_bootstrap":super::bootstrap::view(d,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
+            json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"omci_adapter":d.omci_adapter,"bootstrap_adapter":d.bootstrap_adapter,"provisioning_adapter":d.provisioning_adapter,"omci_management":self.omci_management_view(d),"management":self.management.get(&d.id),"mqtt":self.mqtt.get(&d.id),"acs_bootstrap":super::bootstrap::view(d,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
         }).collect();
-        json!({"enabled":self.config.enabled,"mode":if self.config.automatic {"auto"} else {"manual"},"method":"diff","revision":self.config.revision,"triggers":self.config.triggers,"interval_minutes":self.config.interval_seconds / 60,"omci_management":{"desired":self.config.management,"state":"not_verified"},"management_network":super::management_network::view(self.config.management_network.as_ref()),"groups":self.config.groups.iter().map(|(id,t)|json!({"id":id,"name":self.config.labels.get(id),"template":t})).collect::<Vec<_>>(),"error":self.failure,"devices":devices,"pending_devices":devices.iter().filter(|d| d["provisioning"]["state"] != "completed").map(|d| d["device"].clone()).collect::<Vec<_>>()})
+        json!({"enabled":self.config.enabled,"mode":if self.config.automatic {"auto"} else {"manual"},"method":"diff","revision":self.config.revision,"triggers":self.config.triggers,"interval_minutes":self.config.interval_seconds / 60,"omci_management":{"desired":self.config.management,"state":"not_verified"},"management_network":super::management_network::view(self.config.management_network.as_ref()),"groups":self.config.groups.iter().map(|(id,t)|json!({"id":id,"name":self.config.labels.get(id),"template":t})).collect::<Vec<_>>(),"error":self.failure,"devices":devices,"pending_devices":devices.iter().filter(|d| !matches!(d["provisioning"]["state"].as_str(),Some("completed" | "disabled"))).map(|d| d["device"].clone()).collect::<Vec<_>>()})
+    }
+
+    fn business_ready(&self, device: &Device) -> bool {
+        match device.backend() {
+            "command" => self
+                .mqtt
+                .get(&device.id)
+                .is_some_and(|s| s["state"] == "online"),
+            "acs" => {
+                self.management
+                    .get(&device.id)
+                    .is_some_and(|s| s["state"] == "online")
+                    && self
+                        .config
+                        .management_network
+                        .as_ref()
+                        .is_none_or(super::management_network::matches_desired)
+            }
+            _ => false,
+        }
     }
 }
-fn discovered_identity(devices: &Value, optical_sn: &str, adapter: &str) -> Option<String> {
+fn discovered_identity(devices: &Value, optical_sn: &str) -> Option<String> {
     let matches: Vec<_> = devices["devices"]
         .as_object()?
         .iter()
         .filter(|(_, d)| {
             let product_class = d["product_class"].as_str().unwrap_or("");
             let serial = d["serial"].as_str().unwrap_or("");
-            crate::adapters::provisioning::matches_identity(
-                adapter,
-                optical_sn,
-                product_class,
-                serial,
-            )
+            crate::devices::matches_cwmp_identity(optical_sn, product_class, serial)
         })
         .map(|(id, _)| id.clone())
         .collect();
@@ -484,8 +503,26 @@ pub(crate) fn connection_request_devices() -> BTreeMap<String, super::model::Con
         .devices
         .iter()
         .filter(|d| !c.resets.blocks(&d.optical_sn))
-        .map(|d| (d.cwmp_id.clone(), d.connection_request.clone()))
+        .map(|d| (d.cwmp_id.clone(), c.connection_request_policy(d)))
         .collect()
+}
+impl Controller {
+    fn connection_request_policy(&self, device: &Device) -> super::model::ConnectionRequest {
+        let mut policy = device.connection_request.clone();
+        if policy.defaults {
+            if let Some(credentials) = self
+                .management
+                .get(&device.id)
+                .and_then(|m| m["product_class"].as_str())
+                .and_then(crate::devices::cwmp_credentials)
+            {
+                policy.username = credentials.username;
+                policy.password = credentials.password;
+                policy.defaults = false;
+            }
+        }
+        policy
+    }
 }
 pub fn control(request: &str) -> String {
     let mut changed = false;
@@ -702,29 +739,71 @@ mod tests {
             "child":{"product_class":"SG631Z-C","serial":"MODEL-STAR1234ABCD-SUFFIX"}
         }});
         assert_eq!(
-            discovered_identity(&devices, "STAR1234ABCD", "cu"),
+            discovered_identity(&devices, "STAR1234ABCD"),
             cfg!(feature = "device-star").then(|| "child".into())
         );
-        assert_eq!(
-            discovered_identity(&devices, "STAR1234ABCD", "generic"),
-            None
-        );
         for serial in ["STAR1234ABCE", "STAR1234ABC0", "HWTC1234ABCD"] {
-            assert_eq!(discovered_identity(&devices, serial, "cu"), None);
+            assert_eq!(discovered_identity(&devices, serial), None);
         }
-        assert_eq!(discovered_identity(&devices, "STAR1234ABCD", "hl202"), None);
         let wrong_model = json!({"devices":{
             "child":{"product_class":"OTHER","serial":"MODEL-STAR1234ABCD-SUFFIX"}
         }});
-        assert_eq!(
-            discovered_identity(&wrong_model, "STAR1234ABCD", "cu"),
-            None
-        );
+        assert_eq!(discovered_identity(&wrong_model, "STAR1234ABCD"), None);
         let ambiguous = json!({"devices":{
             "one":{"product_class":"SG631Z-C","serial":"MODEL-STAR1234ABCD-SUFFIX"},
             "two":{"product_class":"SG631Z-C","serial":"OTHER-STAR1234ABCD-SUFFIX"}
         }});
-        assert_eq!(discovered_identity(&ambiguous, "STAR1234ABCD", "cu"), None);
+        assert_eq!(discovered_identity(&ambiguous, "STAR1234ABCD"), None);
+    }
+    #[test]
+    fn business_status_uses_its_own_channel_and_disabled_devices_are_not_pending() {
+        let mut c = Controller::default();
+        let mut d = operation(OperationPhase::Completed, false).device;
+        c.management
+            .insert(d.id.clone(), json!({"state":"waiting_inform"}));
+        c.mqtt.insert(
+            d.id.clone(),
+            json!({"state":"online","optical_online":true}),
+        );
+        d.provisioning_adapter = "hl202-mqtt".into();
+        assert!(c.business_ready(&d));
+        d.provisioning_adapter = "hl202-cu".into();
+        assert!(!c.business_ready(&d));
+        c.management.get_mut(&d.id).unwrap()["state"] = json!("online");
+        d.bootstrap_adapter = "none".into();
+        assert!(c.business_ready(&d));
+        d.provisioning_adapter = "none".into();
+        d.bootstrap_adapter = "manual-acs".into();
+        c.config.devices.push(d);
+        let view = c.business_snapshot();
+        assert_eq!(view["devices"][0]["provisioning"]["state"], "disabled");
+        assert_eq!(view["devices"][0]["wifi_sync"], "disabled");
+        assert_eq!(view["devices"][0]["management"]["state"], "online");
+        assert_eq!(view["devices"][0]["mqtt"]["state"], "online");
+        assert_eq!(view["pending_devices"], json!([]));
+        assert_ne!(view["devices"][0]["acs_bootstrap"]["state"], "not_required");
+    }
+    #[test]
+    fn connection_request_defaults_follow_observed_identity_and_preserve_explicit_credentials() {
+        let mut c = Controller::default();
+        let mut d = operation(OperationPhase::Completed, false).device;
+        d.connection_request.defaults = true;
+        assert!(c.connection_request_policy(&d).defaults);
+        c.management
+            .insert(d.id.clone(), json!({"product_class":"HL202-DU-C"}));
+        for adapter in ["none", "hl202-mqtt", "hl202-cu", "vendor-ct-candidate"] {
+            d.provisioning_adapter = adapter.into();
+            let policy = c.connection_request_policy(&d);
+            assert_eq!(policy.defaults, !cfg!(feature = "device-hl202"));
+            if cfg!(feature = "device-hl202") {
+                assert!(policy.credentials_available());
+            }
+        }
+        d.connection_request.defaults = false;
+        d.connection_request.username = "explicit-user".into();
+        d.connection_request.password = "example-secret".into();
+        assert_eq!(c.connection_request_policy(&d).username, "explicit-user");
+        assert_eq!(c.connection_request_policy(&d).password, "example-secret");
     }
     #[test]
     fn hwtc_identity_matches_serial_across_models() {
@@ -732,31 +811,22 @@ mod tests {
             let devices =
                 json!({"devices":{"child":{"product_class":model,"serial":"485754431234ABCD"}}});
             assert_eq!(
-                discovered_identity(&devices, "HWTC1234ABCD", "hwtc-hw"),
+                discovered_identity(&devices, "HWTC1234ABCD"),
                 cfg!(feature = "device-hwtc").then(|| "child".into())
             );
-            assert_eq!(
-                discovered_identity(&devices, "HWTC9999ABCD", "hwtc-hw"),
-                None
-            );
+            assert_eq!(discovered_identity(&devices, "HWTC9999ABCD"), None);
         }
     }
     #[test]
     fn hwtc_identity_rejects_other_vendors_and_ambiguous_serials() {
         let devices =
             json!({"devices":{"child":{"product_class":"V152","serial":"483343543C6DE5B3"}}});
-        assert_eq!(
-            discovered_identity(&devices, "H3CT1234ABCD", "hwtc-hw"),
-            None
-        );
+        assert_eq!(discovered_identity(&devices, "H3CT1234ABCD"), None);
         let devices = json!({"devices":{
             "one":{"product_class":"V152","serial":"485754431234ABCD"},
             "two":{"product_class":"K155-11","serial":"485754431234ABCD"}
         }});
-        assert_eq!(
-            discovered_identity(&devices, "HWTC1234ABCD", "hwtc-hw"),
-            None
-        );
+        assert_eq!(discovered_identity(&devices, "HWTC1234ABCD"), None);
     }
     #[test]
     #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 contract")]

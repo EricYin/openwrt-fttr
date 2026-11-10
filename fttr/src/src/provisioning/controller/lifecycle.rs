@@ -61,9 +61,7 @@ impl Controller {
         let mut resolved = false;
         for d in &mut self.config.devices {
             if d.cwmp_id.starts_with("pending:") && !self.resets.blocks(&d.optical_sn) {
-                if let Some(id) =
-                    discovered_identity(devices, &d.optical_sn, &d.provisioning_adapter)
-                {
+                if let Some(id) = discovered_identity(devices, &d.optical_sn) {
                     d.cwmp_id = id;
                     resolved = true;
                 }
@@ -161,6 +159,20 @@ impl Controller {
             self.config_error = None;
             return;
         }
+        // A/bootstrap/host settings do not supersede an unrelated business transaction.
+        if config.business_revision() == self.config.business_revision()
+            && !self
+                .config
+                .devices
+                .iter()
+                .any(|d| self.resets.blocks(&d.optical_sn))
+        {
+            self.pending_config = None;
+            self.replace_config(config)
+                .expect("unchanged business configuration");
+            self.config_error = None;
+            return;
+        }
         // Never wait for an offline device's old, entirely unstarted plan.
         // Once discovery or a transport job starts, its owner must drain it.
         for op in self.operations.values_mut().filter(|op| {
@@ -227,20 +239,21 @@ impl Controller {
         {
             return Err("device reset pending; retry reset before reload".into());
         }
-        if self.operations.values().any(|op| {
-            !matches!(
-                op.stage,
-                OperationPhase::Completed | OperationPhase::Interrupted
-            )
-        }) {
+        if !(config.business_revision.is_some()
+            && config.business_revision == self.config.business_revision)
+            && self.operations.values().any(|op| {
+                !matches!(
+                    op.stage,
+                    OperationPhase::Completed | OperationPhase::Interrupted
+                )
+            })
+        {
             return Err("active synchronization: finish operation before reload".into());
         }
         for device in &mut config.devices {
             if device.cwmp_id.starts_with("pending:") {
                 if let Some(previous) = self.config.devices.iter().find(|previous| {
-                    previous.id == device.id
-                        && previous.optical_sn == device.optical_sn
-                        && previous.provisioning_adapter == device.provisioning_adapter
+                    previous.id == device.id && previous.optical_sn == device.optical_sn
                 }) {
                     device.cwmp_id.clone_from(&previous.cwmp_id);
                 }
@@ -253,6 +266,7 @@ impl Controller {
                     && d.cwmp_id == previous.cwmp_id
             }) {
                 self.management.remove(&previous.id);
+                self.mqtt.remove(&previous.id);
                 self.last_boot.remove(&previous.id);
                 self.last_online.remove(&previous.id);
             }
@@ -264,6 +278,7 @@ impl Controller {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         self.config = config;
+        super::super::bootstrap::configure(&self.config.devices);
         super::super::health_watch::config(
             self.config
                 .devices
@@ -293,9 +308,7 @@ impl Controller {
             if devices.iter().any(|d| {
                 &d.id == id
                     && view["optical_sn"] == d.optical_sn
-                    && (view["omci_adapter"] != d.omci_adapter
-                        || view["bootstrap_adapter"] != d.bootstrap_adapter
-                        || view["provisioning_adapter"] != d.provisioning_adapter)
+                    && view["provisioning_adapter"] != d.provisioning_adapter
             }) {
                 let mut retired = view;
                 retired["retired_reason"] =
@@ -311,8 +324,6 @@ impl Controller {
                 &d.id == id
                     && d.backend() == op.device.backend()
                     && d.provisioning_adapter == op.device.provisioning_adapter
-                    && d.bootstrap_adapter == op.device.bootstrap_adapter
-                    && d.omci_adapter == op.device.omci_adapter
                     && d.optical_sn == op.device.optical_sn
                     && (d.cwmp_id.starts_with("pending:")
                         || op.device.cwmp_id.starts_with("pending:")
@@ -325,13 +336,13 @@ impl Controller {
                     &d.id == id
                         && op["optical_sn"] == d.optical_sn
                         && op["backend"]["effective"].as_str().unwrap_or("acs") == d.backend()
-                        && op["omci_adapter"] == d.omci_adapter
-                        && op["bootstrap_adapter"] == d.bootstrap_adapter
                         && op["provisioning_adapter"] == d.provisioning_adapter
                         && (d.cwmp_id.starts_with("pending:") || op["cwmp_id"] == d.cwmp_id)
                 })
         });
         self.management
+            .retain(|id, _| devices.iter().any(|d| &d.id == id));
+        self.mqtt
             .retain(|id, _| devices.iter().any(|d| &d.id == id));
         self.last_boot
             .retain(|id, _| devices.iter().any(|d| &d.id == id));

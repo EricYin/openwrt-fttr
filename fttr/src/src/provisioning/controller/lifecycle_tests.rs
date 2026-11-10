@@ -47,7 +47,7 @@ fn disabled_provisioning_cannot_start_an_operation() {
 }
 
 #[test]
-fn changing_adapter_with_same_transport_retires_recovered_operation() {
+fn only_business_adapter_changes_retire_business_history_and_identity_is_preserved() {
     for layer in ["omci", "bootstrap", "provisioning"] {
         let mut c = configured();
         let mut config = c.config.clone();
@@ -56,10 +56,61 @@ fn changing_adapter_with_same_transport_retires_recovered_operation() {
             "bootstrap" => config.devices[0].bootstrap_adapter = "omci-acs".into(),
             _ => config.devices[0].provisioning_adapter = "cu".into(),
         }
+        config.devices[0].cwmp_id = "pending:H3CT12345678".into();
         c.replace_config(config).unwrap();
-        assert!(c.recovered.is_empty(), "{layer}");
-        assert_eq!(c.retired.len(), 1, "{layer}");
+        assert_eq!(c.recovered.is_empty(), layer == "provisioning", "{layer}");
+        assert_eq!(
+            c.retired.len(),
+            usize::from(layer == "provisioning"),
+            "{layer}"
+        );
+        assert_eq!(c.config.devices[0].cwmp_id, "id");
+        assert_eq!(c.management["child"]["state"], "online");
         assert!(c.owned.contains_key("id"), "{layer}");
+    }
+}
+
+#[test]
+fn bootstrap_reload_keeps_an_inflight_business_transaction_and_its_revision() {
+    let mut c = configured();
+    c.config.revision = "config-before".into();
+    c.config.business_revision = Some("business".into());
+    let mut op = operation(OperationPhase::Writing, true);
+    op.revision = "business".into();
+    op.work_started = true;
+    op.task = Some(42);
+    c.operations.insert("child".into(), op);
+    let mut config = c.config.clone();
+    config.revision = "config-after".into();
+    config.devices[0].bootstrap_adapter = "omci-acs".into();
+    c.request_config(config);
+    assert!(c.pending_config.is_none());
+    assert_eq!(c.config.revision, "config-after");
+    assert_eq!(c.operations["child"].task, Some(42));
+    assert_eq!(c.operations["child"].stage, OperationPhase::Writing);
+    assert!(c.retired.is_empty());
+}
+
+#[test]
+fn cwmp_binding_does_not_depend_on_business_transport_or_candidate_contract_id() {
+    let records =
+        json!({"devices":{"native":{"product_class":"TEWA-768G","serial":"308618C811234ABCD"}}});
+    for adapter in [
+        "none",
+        "hl202-mqtt",
+        "vendor-cu-candidate",
+        "vendor-cm-candidate",
+        "vendor-ct-candidate",
+        "vendor-hw-candidate",
+    ] {
+        let mut c = Controller::default();
+        let mut device = operation(OperationPhase::Completed, false).device;
+        device.optical_sn = "SCTY1234ABCD".into();
+        device.cwmp_id = "pending:SCTY1234ABCD".into();
+        device.provisioning_adapter = adapter.into();
+        c.config.devices.push(device);
+        c.resolve_pending_identities(&records);
+        assert_eq!(c.config.devices[0].cwmp_id, "native", "{adapter}");
     }
 }
 

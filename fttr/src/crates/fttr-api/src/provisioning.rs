@@ -17,6 +17,7 @@ macro_rules! wire_enum {
 }
 
 wire_enum!(OperationPhase {
+    Disabled => "disabled",
     Waiting => "waiting", WanReconciling => "wan_reconciling",
     WanVerifying => "wan_verifying", WifiReconciling => "wifi_reconciling",
     Discovering => "discovering", Reading => "reading", Disabling => "disabling",
@@ -30,6 +31,7 @@ wire_enum!(OperationPhase {
 #[serde(rename_all = "snake_case")]
 #[derive(Debug, Clone, Copy, Default)]
 pub enum WifiSync {
+    Disabled,
     #[default]
     NotConfigured,
     StaleRevision,
@@ -130,6 +132,12 @@ pub struct ManagementStatus {
     pub last_inform: Option<u64>,
     #[cfg_attr(feature = "codegen", ts(type = "number | null"))]
     pub age_seconds: Option<u64>,
+}
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct MqttStatus {
+    pub state: ManagementState,
+    pub optical_online: bool,
 }
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
@@ -504,6 +512,7 @@ pub struct DeviceSync {
     pub provisioning_adapter: String,
     pub omci_management: DeviceOmciManagement,
     pub management: Option<ManagementStatus>,
+    pub mqtt: Option<MqttStatus>,
     pub acs_bootstrap: AcsBootstrap,
     pub provisioning: ProvisioningStatus,
     pub services: Vec<SyncItem>,

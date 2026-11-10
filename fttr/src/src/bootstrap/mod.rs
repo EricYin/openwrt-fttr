@@ -97,9 +97,7 @@ fn retry_delay(attempts: u32) -> u64 {
 fn version(device: &Device, management: Option<&Management>, target: Option<&str>) -> String {
     let bytes = serde_json::to_vec(&(
         device.optical_sn.as_str(),
-        device.cwmp_id.as_str(),
         device.bootstrap_adapter.as_str(),
-        device.provisioning_adapter.as_str(),
         device.connection_request.enabled,
         management,
         target,
@@ -206,6 +204,13 @@ pub(super) fn retain_devices(ids: &std::collections::BTreeSet<String>) {
     c.persist();
 }
 
+/// Cancel obsolete bootstrap workers as soon as a new configuration is activated.
+pub(super) fn configure(devices: &[Device]) {
+    let mut c = coordinator().lock().unwrap();
+    c.configure(devices, now());
+    c.persist();
+}
+
 /// Scheduler entry point. Remote commands execute outside controller and bootstrap locks.
 pub(super) fn tick(observation: Observation<'_>) {
     let Ok(sources) = crate::mqtt_identity::shared().lock() else {
@@ -234,6 +239,26 @@ pub(super) fn tick(observation: Observation<'_>) {
 }
 
 impl Coordinator {
+    fn configure(&mut self, devices: &[Device], time: u64) {
+        for (id, r) in &mut self.records {
+            let selected = devices
+                .iter()
+                .find(|d| &d.id == id && d.bootstrap_adapter != "none");
+            if selected.is_none_or(|d| {
+                d.optical_sn != r.optical_sn
+                    || d.bootstrap_adapter != r.method
+                    || Some(d.connection_request.enabled) != r.connection_request_enabled
+            }) {
+                r.invalidate(
+                    time,
+                    "bootstrap selection or device changed; obsolete worker must exit",
+                );
+                r.removed = true;
+            }
+        }
+        self.records.retain(|_, r| !r.removed || r.worker.is_some());
+    }
+
     fn restart(&mut self, time: u64) {
         for record in self.records.values_mut() {
             record.invalidate(
@@ -345,12 +370,8 @@ impl Coordinator {
                 device.connection_request.effective_freshness(freshness),
                 online,
             );
-        if r.state == Phase::Ready && !fresh {
-            r.invalidate(
-                time,
-                "previous Inform expired; fresh management evidence required",
-            );
-        }
+        // Transport freshness is a separate observation, not a configuration change.
+        // Keep readback evidence when only the Inform expires.
         if fresh {
             if let Some((epoch, _)) = authorization {
                 r.completed_authorization = epoch;
@@ -375,6 +396,18 @@ impl Coordinator {
                 Phase::WaitingAcs,
                 time,
                 "local ACS is disabled, unavailable or has a listener error",
+            );
+        } else if device.bootstrap_adapter == "manual-acs" {
+            r.set_phase(
+                Phase::ManualRequired,
+                time,
+                "configure the selected manual ACS path and wait for a fresh Inform",
+            );
+        } else if r.settings_verified_at.is_some() && r.completed_authorization != 0 {
+            r.set_phase(
+                Phase::WaitingInform,
+                time,
+                "settings remain verified; waiting for current CWMP reachability evidence",
             );
         } else if authorization.is_none_or(|(epoch, automatic)| {
             !automatic && (epoch == 0 || epoch == r.completed_authorization)
@@ -619,14 +652,6 @@ fn public_url(url: &str) -> String {
     }
 }
 
-pub(super) fn is_ready(id: &str) -> bool {
-    coordinator()
-        .lock()
-        .unwrap()
-        .records
-        .get(id)
-        .is_some_and(|r| r.state == Phase::Ready)
-}
 pub(super) fn is_ready_for_management(id: &str, sn: &str, url: &str, epoch: u64) -> bool {
     coordinator()
         .lock()
@@ -649,7 +674,7 @@ pub(super) fn omci_write_allowed(id: &str, epoch: u64, automatic: bool) -> bool 
 
 pub(super) fn view(device: &Device, management: Option<&Management>, acs: &Value) -> Value {
     if device.bootstrap_adapter == "none" {
-        return json!({"state":"not_required","reason":"selected provisioning adapter requires no ACS bootstrap"});
+        return json!({"state":"not_required","reason":"management bootstrap is disabled for this device"});
     }
     let sources = if device.bootstrap_adapter == "hl202-mqtt-acs" {
         match crate::mqtt_identity::shared().lock() {
@@ -665,6 +690,9 @@ pub(super) fn view(device: &Device, management: Option<&Management>, acs: &Value
     let Some(r) = c.records.get(&device.id) else {
         return json!({"state":"pending","reason":"bootstrap observation not started"});
     };
+    if r.removed || r.optical_sn != device.optical_sn || r.method != device.bootstrap_adapter {
+        return json!({"state":"pending","reason":"waiting for observation of the selected bootstrap configuration"});
+    }
     let mut view = serde_json::to_value(r).unwrap_or_default();
     view["inflight"] = json!(r.worker.is_some());
     view["persistence_error"] = json!(c.persistence_error);
@@ -792,6 +820,123 @@ mod tests {
             acs_available: true,
             authorization: Some((1, true)),
         })
+    }
+    #[test]
+    fn disabling_or_replacing_bootstrap_invalidates_the_worker_before_it_can_publish() {
+        let original = device("independent", "hl202");
+        for change in ["disabled", "method", "identity", "removed"] {
+            let mut c = Coordinator::default();
+            c.records.insert(
+                original.id.clone(),
+                Record {
+                    optical_sn: original.optical_sn.clone(),
+                    method: original.bootstrap_adapter.clone(),
+                    connection_request_enabled: Some(original.connection_request.enabled),
+                    generation: 7,
+                    worker: Some(7),
+                    ..Default::default()
+                },
+            );
+            let mut selected = original.clone();
+            selected.provisioning_adapter = "none".into();
+            c.configure(&[selected.clone()], 100);
+            assert_eq!(c.records[&original.id].generation, 7);
+            match change {
+                "disabled" => selected.bootstrap_adapter = "none".into(),
+                "method" => selected.bootstrap_adapter = "manual-acs".into(),
+                "identity" => selected.optical_sn = "H3CT00000002".into(),
+                "removed" => (),
+                _ => unreachable!(),
+            }
+            let devices = if change == "removed" {
+                vec![]
+            } else {
+                vec![selected]
+            };
+            c.configure(&devices, 101);
+            let record = c.records.get_mut(&original.id).unwrap();
+            assert!(record.removed);
+            assert_ne!(record.generation, 7);
+            assert_eq!(record.worker, Some(7));
+            record.finish(7, Ok(true), 102);
+            assert_eq!(record.worker, None);
+            assert_eq!(record.settings_verified_at, None);
+            c.configure(&devices, 103);
+            assert!(!c.records.contains_key(&original.id));
+        }
+    }
+    #[test]
+    fn business_adapter_and_binding_changes_preserve_bootstrap_progress() {
+        let mut c = TestCoordinator::default();
+        let mut d = device("independent", "generic");
+        let m = Management {
+            vlans: vec![46],
+            vlan: 46,
+            priority: 0,
+            acs_url: "http://192.0.2.1/cwmp".into(),
+        };
+        schedule(&mut c, &d, &m, None, 100, None);
+        schedule(&mut c, &d, &m, None, 102, Some(101));
+        assert_eq!(c.records[&d.id].state, Phase::Ready);
+        let generation = c.records[&d.id].generation;
+        for adapter in ["none", "hl202-mqtt", "vendor-ct-candidate"] {
+            d.provisioning_adapter = adapter.into();
+            d.cwmp_id = "bound-native-identity".into();
+            schedule(&mut c, &d, &m, None, 103, Some(102));
+            assert_eq!(c.records[&d.id].generation, generation);
+            assert_eq!(c.records[&d.id].state, Phase::Ready);
+        }
+    }
+    #[test]
+    fn manual_bootstrap_observes_without_authorizing_a_remote_write() {
+        let mut c = TestCoordinator::default();
+        let d = device("manual-readonly", "generic");
+        let m = Management {
+            vlans: vec![46],
+            vlan: 46,
+            priority: 0,
+            acs_url: "http://192.0.2.1/cwmp".into(),
+        };
+        assert!(c
+            .schedule(Observation {
+                device: &d,
+                management: Some(&m),
+                last_inform: None,
+                online: true,
+                new_boot: false,
+                freshness: 180,
+                time: 100,
+                acs_available: true,
+                authorization: None
+            })
+            .is_none());
+        assert_eq!(c.records[&d.id].state, Phase::ManualRequired);
+    }
+    #[cfg(feature = "device-hl202")]
+    #[test]
+    fn stale_inform_does_not_erase_verified_bootstrap_settings() {
+        let mut c = TestCoordinator::default();
+        let d = device("stale-inform", "hl202");
+        let m = Management {
+            vlans: vec![46],
+            vlan: 46,
+            priority: 0,
+            acs_url: "http://192.0.2.1/cwmp".into(),
+        };
+        let mac = "02AABBCCDDEE";
+        c.sources.observe(mac, 100);
+        let first = schedule(&mut c, &d, &m, Some(mac), 100, None).unwrap();
+        c.records
+            .get_mut(&d.id)
+            .unwrap()
+            .finish(first.generation, Ok(true), 101);
+        schedule(&mut c, &d, &m, None, 103, Some(102));
+        assert_eq!(c.records[&d.id].state, Phase::Ready);
+        // Keep optical/MQTT observation time stable and remove only Inform freshness.
+        schedule(&mut c, &d, &m, None, 104, None);
+        assert_eq!(c.records[&d.id].state, Phase::WaitingInform);
+        assert_eq!(c.records[&d.id].settings_verified_at, Some(101));
+        assert_eq!(c.records[&d.id].generation, first.generation);
     }
     #[cfg(feature = "device-hl202")]
     #[test]

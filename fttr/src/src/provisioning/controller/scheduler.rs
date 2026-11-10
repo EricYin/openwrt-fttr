@@ -20,19 +20,25 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     let devices = acs(Command::Devices);
     let acs_status = acs(Command::Status);
     controller().lock().unwrap().activate_pending_config();
-    let desired = controller()
-        .lock()
-        .unwrap()
-        .config
-        .management_network
-        .clone();
-    management_network::tick(desired.as_ref());
+    let configured = controller().lock().unwrap().config.clone();
+    // Bootstrap-free ACS consumers must also reach the new listener before the
+    // old network is retired. They have no bootstrap record to satisfy that gate.
+    let cwmp_business_ready =
+        bootstrap_free_consumers_ready(&configured, &devices, &acs_status, &online, now());
+    management_network::tick(configured.management_network.as_ref(), cwmp_business_ready);
     let active_management = management_network::active();
     let mut c = controller().lock().unwrap();
     c.acs_status = acs_status.into_metadata();
     c.resolve_pending_identities(&devices);
     let config = c.config.clone();
-    bootstrap::retain_devices(&config.devices.iter().map(|d| d.id.clone()).collect());
+    bootstrap::retain_devices(
+        &config
+            .devices
+            .iter()
+            .filter(|d| d.bootstrap_adapter != "none" && !c.resets.blocks(&d.optical_sn))
+            .map(|d| d.id.clone())
+            .collect(),
+    );
     let time = now();
     c.optical_epochs.retain(|serial, _| {
         online.contains(serial) && config.devices.iter().any(|d| &d.optical_sn == serial)
@@ -56,21 +62,56 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     c.begin_history_tick();
     let mut history_changed = false;
     for d in &config.devices {
-        if d.backend() == "disabled" {
-            c.management.insert(d.id.clone(), json!({"state":"disabled","optical_online":online.contains(&d.optical_sn),"cwmp_id":d.cwmp_id,"last_inform":null,"age_seconds":null,"backend":d.backend_view()}));
-            continue;
-        }
         if c.resets.blocks(&d.optical_sn) {
             continue;
         }
-        if d.backend() == "command" {
-            let reachable = crate::mqtt_identity::shared()
+        // Observe both channels and advance bootstrap independently of business transport.
+        let observed = &devices["devices"][&d.cwmp_id];
+        let at = current_inform(observed, &c.acs_status);
+        let cwmp_reachable = online.contains(&d.optical_sn)
+            && at.is_some_and(|at| {
+                at <= time
+                    && time - at <= d.connection_request.effective_freshness(config.freshness)
+            });
+        c.management.insert(d.id.clone(), json!({"cwmp_id":d.cwmp_id,"product_class":observed["product_class"],"state":if cwmp_reachable {"online"} else if at.is_none() {"waiting_inform"} else {"offline_or_stale"},"optical_online":online.contains(&d.optical_sn),"last_inform":at,"age_seconds":at.map(|at| time.saturating_sub(at))}));
+        let mqtt_reachable = online.contains(&d.optical_sn)
+            && crate::mqtt_identity::shared()
                 .lock()
                 .unwrap()
                 .snapshots(time)
                 .iter()
                 .any(|s| s.optical_sn.as_deref() == Some(&d.optical_sn) && s.reason == "ready");
-            c.management.insert(d.id.clone(), json!({"state":if reachable {"online"} else {"waiting_transport"},"optical_online":online.contains(&d.optical_sn),"cwmp_id":d.cwmp_id,"last_inform":null,"age_seconds":null,"backend":d.backend_view()}));
+        c.mqtt.insert(d.id.clone(), json!({"state":if mqtt_reachable {"online"} else {"waiting_transport"},"optical_online":online.contains(&d.optical_sn)}));
+        let boot = observed["inform"]["events"].as_array().is_some_and(|a| {
+            a.iter()
+                .any(|e| matches!(e.as_str(), Some("0 BOOTSTRAP" | "1 BOOT")))
+        });
+        let new_boot = boot && at.is_some() && at != c.last_boot.get(&d.id).copied();
+        if boot {
+            if let Some(at) = at {
+                c.last_boot.insert(d.id.clone(), at);
+            }
+        }
+        if d.bootstrap_adapter != "none" {
+            bootstrap::tick(bootstrap::Observation {
+                device: d,
+                management: active_management.as_ref(),
+                last_inform: at,
+                online: online.contains(&d.optical_sn),
+                new_boot,
+                freshness: d.connection_request.effective_freshness(config.freshness),
+                time,
+                acs_available: active_management.is_some()
+                    && c.acs_status["enabled"] == true
+                    && c.acs_status["error"].is_null(),
+                authorization: management_network::grant(&d.id, &d.optical_sn),
+            });
+        }
+        if d.backend() == "disabled" {
+            continue;
+        }
+        if d.backend() == "command" {
+            let reachable = mqtt_reachable;
             if reachable {
                 fresh.insert(d.id.clone());
             }
@@ -98,61 +139,13 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
             }
             continue;
         }
-        let observed = &devices["devices"][&d.cwmp_id];
-        let at = (observed["endpoint_id"] == c.acs_status["endpoint_id"]
-            && c.acs_status["endpoint_id"]
-                .as_str()
-                .is_some_and(|id| !id.is_empty()))
-        .then(|| observed["last_inform"].as_u64())
-        .flatten();
-        let reachable = online.contains(&d.optical_sn)
-            && at.is_some_and(|at| {
-                time.saturating_sub(at)
-                    <= d.connection_request.effective_freshness(config.freshness)
-            });
-        c.management.insert(d.id.clone(), json!({"cwmp_id":d.cwmp_id,"state":if reachable {"online"} else if at.is_none() {"waiting_inform"} else {"offline_or_stale"},"optical_online":online.contains(&d.optical_sn),"last_inform":at,"age_seconds":at.map(|at| time.saturating_sub(at))}));
-        if reachable {
-            fresh.insert(d.id.clone());
-        }
-        let boot = observed["inform"]["events"].as_array().is_some_and(|a| {
-            a.iter()
-                .any(|e| matches!(e.as_str(), Some("0 BOOTSTRAP" | "1 BOOT")))
-        });
-        let new_boot = boot && at != c.last_boot.get(&d.id).copied();
-        if boot {
-            if let Some(at) = at {
-                c.last_boot.insert(d.id.clone(), at);
-            }
-        }
-        bootstrap::tick(bootstrap::Observation {
-            device: d,
-            management: active_management.as_ref(),
-            last_inform: at,
-            online: online.contains(&d.optical_sn),
-            new_boot,
-            freshness: d.connection_request.effective_freshness(config.freshness),
-            time,
-            acs_available: active_management.is_some()
-                && c.acs_status["enabled"] == true
-                && c.acs_status["error"].is_null(),
-            authorization: management_network::grant(&d.id, &d.optical_sn),
-        });
         let host_matches = config
             .management_network
             .as_ref()
             .is_none_or(management_network::matches_desired);
-        let reachable = host_matches && reachable && bootstrap::is_ready(&d.id);
-        if let Some(m) = c.management.get_mut(&d.id) {
-            m["state"] = json!(if reachable {
-                "online"
-            } else if at.is_none() {
-                "waiting_inform"
-            } else {
-                "offline_or_stale"
-            });
-        }
-        if !reachable {
-            fresh.remove(&d.id);
+        let reachable = host_matches && cwmp_reachable;
+        if reachable {
+            fresh.insert(d.id.clone());
         }
         schedule(&mut c, d, reachable, new_boot, time);
         let capability_identity = identity(d, observed);
@@ -287,6 +280,81 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     )
 }
 
+fn bootstrap_free_consumers_ready(
+    config: &Config,
+    devices: &Value,
+    acs: &Value,
+    online: &BTreeSet<String>,
+    time: u64,
+) -> bool {
+    config
+        .devices
+        .iter()
+        .filter(|d| d.bootstrap_adapter == "none" && d.backend() == "acs")
+        .all(|d| {
+            let id =
+                discovered_identity(devices, &d.optical_sn).unwrap_or_else(|| d.cwmp_id.clone());
+            current_inform(&devices["devices"][&id], acs).is_some_and(|at| {
+                online.contains(&d.optical_sn)
+                    && at <= time
+                    && time - at <= d.connection_request.effective_freshness(config.freshness)
+            })
+        })
+}
+
+fn current_inform(observed: &Value, acs: &Value) -> Option<u64> {
+    (observed["endpoint_id"] == acs["endpoint_id"]
+        && acs["enabled"] == true
+        && acs["error"].is_null()
+        && acs["endpoint_id"].as_str().is_some_and(|id| !id.is_empty()))
+    .then(|| observed["last_inform"].as_u64())
+    .flatten()
+}
+
+#[cfg(test)]
+#[test]
+fn bootstrap_free_acs_consumers_require_current_listener_evidence_before_network_cleanup() {
+    let mut device = tests::operation(OperationPhase::Completed, false).device;
+    device.bootstrap_adapter = "none".into();
+    let mut config = Config::default();
+    config.devices.push(device.clone());
+    let online = BTreeSet::from([device.optical_sn.clone()]);
+    let mut devices = json!({"devices":{}});
+    devices["devices"][&device.cwmp_id] = json!({"endpoint_id":"new-listener","last_inform":100});
+    let acs = json!({"enabled":true,"endpoint_id":"new-listener","error":null});
+    assert!(bootstrap_free_consumers_ready(
+        &config, &devices, &acs, &online, 101
+    ));
+    for (endpoint, inform, time) in [
+        ("old-listener", 100, 101),
+        ("new-listener", 102, 101),
+        ("new-listener", 0, 100000),
+    ] {
+        devices["devices"][&device.cwmp_id] = json!({"endpoint_id":endpoint,"last_inform":inform});
+        assert!(!bootstrap_free_consumers_ready(
+            &config, &devices, &acs, &online, time
+        ));
+    }
+    devices["devices"][&device.cwmp_id] = json!({"endpoint_id":"new-listener","last_inform":100});
+    assert!(!bootstrap_free_consumers_ready(
+        &config,
+        &devices,
+        &acs,
+        &BTreeSet::new(),
+        101
+    ));
+    for adapter in ["none", "hl202-mqtt"] {
+        config.devices[0].provisioning_adapter = adapter.into();
+        assert!(bootstrap_free_consumers_ready(
+            &config,
+            &json!({}),
+            &json!({}),
+            &BTreeSet::new(),
+            101
+        ));
+    }
+}
+
 fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, time: u64) {
     if c.pending_config.is_some() {
         return;
@@ -339,7 +407,7 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
     let config_changed = c.config.triggers.contains("config_change")
         && previous
             .as_ref()
-            .is_none_or(|p| p["revision"] != c.config.revision);
+            .is_none_or(|p| p["revision"] != c.config.business_revision());
     let periodic = c.periodic_due(&d.id, time);
     if !active_op && reachable && c.config.enabled && c.config.automatic {
         if needs_reconcile {
