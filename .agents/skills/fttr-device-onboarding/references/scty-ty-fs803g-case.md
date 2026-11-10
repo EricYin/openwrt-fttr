@@ -3,7 +3,7 @@
 历史窗口：2026-11-06，MGS.V1.0.0.0 固件、HM2004 miniOLT。目标用 `<ONU_A>`，
 主猫和管理端点用 `<OLT_HOST>`、`<ACS_URL>`；身份、凭据、私有路径和原始包不收录。
 当前源码复核基于 `cb1a62d`，终端验收记录为 `1a62b0f`；换固件/FPGA 版本需重新验证。
-源码提交当时目录名为 `h3c-fttr-tools`；下列源码路径按当前 `fttr-tools/` 布局书写。
+源码提交当时目录名为 `h3c-fttr-tools`；下列源码路径现按 `fttr/` 布局引用。
 
 ## 1. 结果与边界先行
 
@@ -80,8 +80,8 @@ VEIP 未形成可通信的原生路径。临时 VEIP 别名与定向路由能成
 低位长度行为由实际 BWmap 验证，未知位的完整定义仍未还原。过大的候选曾挤占
 OMCC；固定窗口消耗共享带宽，不表示吞吐保证或多台规模化已通过。
 
-- 型号策略：`fttr-tools/src/src/devices/scty/ty_fs803g/service.rs`。
-- 公共机制：`fttr-tools/src/src/pon_engine/omci/platform/leases.rs`。配置失败恢复，
+- 型号策略：`fttr/src/src/devices/scty/ty_fs803g/service.rs`。
+- 公共机制：`fttr/src/src/pon_engine/omci/platform/leases.rs`。配置失败恢复，
   成功后保留已归属的 Alloc-ID/窗口，临时 OMCC lease 不覆盖它们，离线清理清空缓存。
   此缓存属于同一 daemon 进程，外部进程不能假定共享所有权。
 - 最终 ONU-G GET 成功才提交 lease；移除所有临时试验线程和旧二进制。其他型号未
@@ -106,8 +106,8 @@ LoB/BIP 是 16 位模差；高增长下多次回绕会漏计。采样带 daemon/
 保证没有硬件清零，离线模式缺少连续性上下文。BWmap、业务实包和端到端响应仍需
 另取证，计数不能替代它们。
 
-当前可复核的寄存器映射与限制见 [`fpga_diag.rs`](../../../../fttr-tools/src/src/fpga_diag.rs)，
-CLI 入口见 [`fpga_diag_cli.rs`](../../../../fttr-tools/src/src/fpga_diag_cli.rs)；实现内记录
+当前可复核的寄存器映射与限制见 [`fpga_diag.rs`](../../../../fttr/src/src/fpga_diag.rs)，
+CLI 入口见 [`fpga_diag_cli.rs`](../../../../fttr/src/src/fpga_diag_cli.rs)；实现内记录
 原厂 `moltdbg` SHA-256、字段/地址映射和非原子读取、回绕/重置及槽位身份限制。历史
 现场汇总位于本机忽略的 `EVIDENCE/TY-FS803G-bridge-validation-2026-11-06.md`，不随仓库分发。
 另一个详细 `moltdbg-readonly-diagnostics.md` 文件在历史提交 `ebbf55d` 中存在，但该提交

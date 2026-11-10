@@ -6,7 +6,7 @@ https://github.com/LazuliKao/openwrt-fttr 。
 ## 目录
 
 - `h3c-fmcs/`：内核驱动、FPGA 初始化、PLOAM/OMCI/GEM 通道及驱动测试。
-- `fttr-tools/`：Rust FTTR 控制器 `fttrd`、命令入口 `fttrctl`、多厂商设备适配和可裁剪 ACS。
+- `fttr/`：Rust FTTR 控制器 `fttrd`、命令入口 `fttrctl`、多厂商设备适配和可裁剪 ACS。
 
 ## 接入 PonWrt
 
@@ -79,7 +79,7 @@ make package/luci-app-fttr/compile V=s -j2
 
 ### Workspace 与诊断工具
 
-`fttr-tools/src/Cargo.toml` 是 workspace 根，所有内部 crate 共用根目录
+`fttr/src/Cargo.toml` 是 workspace 根，所有内部 crate 共用根目录
 `Cargo.lock`。普通 `cargo build` 只构建主包，默认二进制为 `fttrd` 和
 `fttrctl`；OpenWrt 打包也显式限定这两个入口。完整主机测试在该目录执行：
 
@@ -104,7 +104,7 @@ STAR 观察工具要求传入源 MAC；不再内置现场设备地址。独立 r
 
 ## Windows Rust 交叉编译
 
-在 `fttr-tools/src` 中使用已安装的 Rust target、Zig 和 cargo-zigbuild：
+在 `fttr/src` 中使用已安装的 Rust target、Zig 和 cargo-zigbuild：
 
 ```powershell
 $previous = $env:RUSTFLAGS
@@ -125,8 +125,8 @@ try {
 `../luci-app-fttr/src/api/generated/`。在仓库根目录执行：
 
 ```sh
-cargo run --locked --manifest-path fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --generate
-cargo run --locked --manifest-path fttr-tools/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --check
+cargo run --locked --manifest-path fttr/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --generate
+cargo run --locked --manifest-path fttr/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --check
 ```
 
 其他布局追加 `--out-dir FRONTEND/src/api/generated`。`--check` 只检查生成

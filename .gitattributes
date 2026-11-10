@@ -2,5 +2,5 @@
 * text=auto
 
 # Keep backend and driver text files as LF in the repository and worktree.
-fttr-tools/** text=auto eol=lf
+fttr/** text=auto eol=lf
 h3c-fmcs/** text=auto eol=lf
