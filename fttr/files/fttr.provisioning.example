@@ -36,12 +36,16 @@ config group 'home_group'
 
 config device 'hl202'
 	option optical_sn 'H3CT00088888'
-	option adapter 'hl202'
+	option omci_adapter 'hl202'
+	option bootstrap_adapter 'hl202-mqtt-acs'
+	option provisioning_adapter 'hl202-cu'
 	option group 'home_group'
 
 config device 'k155'
 	option optical_sn 'HWTC00088888'
-	option adapter 'hwtc'
+	option omci_adapter 'hwtc'
+	option bootstrap_adapter 'manual-acs'
+	option provisioning_adapter 'hwtc-hw'
 	option group 'home_group'
 
 config wifi 'wifi_2g'

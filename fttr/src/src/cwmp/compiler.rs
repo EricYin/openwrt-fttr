@@ -230,23 +230,23 @@ pub fn compile_binding(
         return Err("binding capability/reference encoding is unverified".into());
     }
     let (parent, connection) = objects.paths()?;
-    if matches!(
-        contract.references,
-        Some(super::contract::ReferenceEncoding::HwLanBindFlags)
-    ) {
+    if let Some(super::contract::ReferenceEncoding::EndpointFlags { lan, wlan }) =
+        contract.references
+    {
         let mut selected = std::collections::BTreeSet::new();
         for endpoint in &intent.endpoints {
             let path = endpoints.resolve(endpoint)?;
             let (kind, index) = path.rsplit_once('.').ok_or("invalid binding endpoint")?;
             let index: usize = index.parse().map_err(|_| "invalid binding instance")?;
-            let offset =
-                if kind.ends_with(".LANEthernetInterfaceConfig") && (1..=4).contains(&index) {
-                    index - 1
-                } else if kind.ends_with(".WLANConfiguration") && (1..=8).contains(&index) {
-                    index + 3
-                } else {
-                    return Err("endpoint outside V152 binding switch range".into());
-                };
+            let offset = if kind.ends_with(".LANEthernetInterfaceConfig")
+                && (1..=lan.len()).contains(&index)
+            {
+                index - 1
+            } else if kind.ends_with(".WLANConfiguration") && (1..=wlan.len()).contains(&index) {
+                lan.len() + index - 1
+            } else {
+                return Err("endpoint outside contract binding switch range".into());
+            };
             selected.insert(offset);
         }
         return Ok(Plan {

@@ -113,6 +113,7 @@ pub struct Lifecycle {
 #[serde(rename_all = "snake_case")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagementState {
+    Disabled,
     Online,
     WaitingInform,
     OfflineOrStale,
@@ -218,6 +219,7 @@ pub struct BootstrapSnapshot {
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum BootstrapUnavailablePhase {
+    NotRequired,
     Pending,
     Unavailable,
 }
@@ -307,6 +309,15 @@ pub enum WifiCleanup {
 pub struct ProvisioningStatus {
     pub state: OperationPhase,
     pub items: Vec<SyncItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub omci_adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub bootstrap_adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub provisioning_adapter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "codegen", ts(optional))]
     pub backend: Option<BackendStatus>,
@@ -488,7 +499,9 @@ pub struct DeviceSync {
     pub template: Option<String>,
     pub template_name: Option<String>,
     pub optical_sn: String,
-    pub adapter: String,
+    pub omci_adapter: String,
+    pub bootstrap_adapter: String,
+    pub provisioning_adapter: String,
     pub omci_management: DeviceOmciManagement,
     pub management: Option<ManagementStatus>,
     pub acs_bootstrap: AcsBootstrap,

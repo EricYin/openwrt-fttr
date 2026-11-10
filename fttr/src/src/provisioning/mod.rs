@@ -4,13 +4,14 @@
 //! `wan` and `wifi` own their respective lifecycle state machines. `model`
 //! defines internal types, `policy` centralizes WAN protection, and `storage`
 //! provides persistence mechanics without choosing formats or retry behavior.
-mod bootstrap;
+pub(crate) use crate::bootstrap;
 mod config;
 pub(crate) use config::words as uci_words;
+pub(crate) mod command;
 pub(crate) mod controller;
 pub(crate) mod health_watch;
 pub(crate) mod link_identity;
-mod management_network;
+pub(crate) mod management_network;
 pub mod model;
 mod policy;
 pub(crate) mod storage;
@@ -26,7 +27,7 @@ pub(crate) use controller::connection_request_devices;
 #[cfg(test)]
 use controller::RPC;
 pub(crate) use controller::{
-    allows_generic_bridge, is_device_adapter, management_desired, management_result,
+    allows_generic_bridge, configured_omci_adapter, management_desired, management_result,
 };
 pub use controller::{control, snapshot, start};
 pub(crate) use policy::contains_service_token;

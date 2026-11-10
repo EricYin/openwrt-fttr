@@ -1,5 +1,5 @@
 //! Reservations follow response ownership, including consumers outside State.
-use crate::devices::cwmp::response::Data;
+use crate::cwmp::response::Data;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::sync::{
@@ -125,12 +125,8 @@ impl Response {
     pub fn bytes(&self) -> usize {
         self.0.bytes
     }
-    pub fn reply(&self, metadata: Value) -> crate::devices::cwmp::transport::Reply {
-        crate::devices::cwmp::transport::Reply::shared(
-            metadata,
-            self.0.value.clone(),
-            self.0.clone(),
-        )
+    pub fn reply(&self, metadata: Value) -> crate::cwmp::transport::Reply {
+        crate::cwmp::transport::Reply::shared(metadata, self.0.value.clone(), self.0.clone())
     }
 }
 impl std::ops::Deref for Response {
@@ -157,7 +153,7 @@ impl<'de> Deserialize<'de> for Response {
     }
 }
 
-pub(super) use crate::devices::cwmp::response::memory;
+pub(super) use crate::cwmp::response::memory;
 pub(super) fn reservation(method: &str) -> usize {
     match method {
         "GetParameterNames" => 2 * 1024 * 1024,

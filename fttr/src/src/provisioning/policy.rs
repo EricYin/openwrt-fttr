@@ -29,8 +29,7 @@ pub(super) fn protected(service: &str, vlan_enabled: bool) -> bool {
 }
 
 pub(crate) fn contains_service_token(service: &str, token: &str) -> bool {
-    crate::devices::cwmp::codec::service_tokens(service)
-        .any(|value| value.eq_ignore_ascii_case(token))
+    crate::cwmp::codec::service_tokens(service).any(|value| value.eq_ignore_ascii_case(token))
 }
 
 #[cfg(test)]

@@ -1,6 +1,5 @@
 //! Whole-device compile-time registry. Core activation/inventory never depend on adapters.
-pub mod command_provisioning;
-pub mod cwmp;
+use crate::cwmp;
 use crate::model::BusinessPhase;
 
 pub fn observe_mqtt_report(source: &str, payload: Vec<u8>, received: u64) -> bool {
@@ -345,40 +344,8 @@ pub fn select_with_serial(
     serial: Option<&str>,
 ) -> Adapter {
     let equipment = identity.equipment_id.as_deref();
-    if let Some(sn) = serial {
-        if crate::provisioning::is_device_adapter(sn, "generic") {
-            return Adapter::GenericBridge;
-        }
-        #[cfg(feature = "device-star")]
-        if crate::provisioning::is_device_adapter(sn, "star") {
-            return Adapter::Star;
-        }
-        #[cfg(feature = "device-zte")]
-        if crate::provisioning::is_device_adapter(sn, "zte") {
-            return Adapter::Zte(
-                zte::profile(vendor, equipment, serial).unwrap_or(zte::Profile::G1612),
-            );
-        }
-        #[cfg(feature = "device-scty")]
-        if crate::provisioning::is_device_adapter(sn, "scty") {
-            return Adapter::Scty;
-        }
-        #[cfg(feature = "device-fiberhome")]
-        if crate::provisioning::is_device_adapter(sn, "fiberhome") {
-            return if fiberhome::matches(vendor, equipment) {
-                Adapter::Fiberhome
-            } else {
-                Adapter::Unavailable
-            };
-        }
-        #[cfg(feature = "device-realtek")]
-        if crate::provisioning::is_device_adapter(sn, "realtek") {
-            return if realtek::matches(vendor, equipment) {
-                Adapter::Realtek
-            } else {
-                Adapter::Unavailable
-            };
-        }
+    if let Some(id) = serial.and_then(crate::provisioning::configured_omci_adapter) {
+        return select_explicit(&id, vendor, identity, serial);
     }
     #[cfg(feature = "device-hl202")]
     if hl202::matches(vendor, equipment) {
@@ -421,6 +388,42 @@ pub fn select_with_serial(
         return Adapter::GenericBridge;
     }
     Adapter::Unavailable
+}
+
+/// Explicit A selection never falls through to another device adapter.
+pub(crate) fn select_explicit(
+    id: &str,
+    vendor: &str,
+    identity: &crate::model::OnuIdentity,
+    serial: Option<&str>,
+) -> Adapter {
+    let equipment = identity.equipment_id.as_deref();
+    match id {
+        "generic" => Adapter::GenericBridge,
+        #[cfg(feature = "device-hl202")]
+        "hl202" if hl202::matches(vendor, equipment) => Adapter::Hl202,
+        #[cfg(feature = "device-hwtc")]
+        "hwtc" if vendor == "HWTC" => match hwtc::profile(equipment) {
+            profile @ (hwtc::Profile::K155 | hwtc::Profile::V152) => Adapter::Hwtc(profile),
+            hwtc::Profile::Standard => Adapter::Unavailable,
+        },
+        #[cfg(feature = "device-star")]
+        "star" if vendor == "STAR" || equipment == Some("SG631Z-C") => Adapter::Star,
+        #[cfg(feature = "device-zte")]
+        "zte" => zte::profile(vendor, equipment, serial)
+            .map(Adapter::Zte)
+            .unwrap_or(Adapter::Unavailable),
+        #[cfg(feature = "device-scty")]
+        "scty" if scty::matches(vendor, equipment) => Adapter::Scty,
+        #[cfg(feature = "device-fiberhome")]
+        "fiberhome" if fiberhome::matches(vendor, equipment) => Adapter::Fiberhome,
+        #[cfg(feature = "device-realtek")]
+        "realtek" if realtek::matches(vendor, equipment) => Adapter::Realtek,
+        _ => {
+            let _ = (vendor, equipment, serial);
+            Adapter::Unavailable
+        }
+    }
 }
 
 #[cfg(test)]
@@ -659,6 +662,27 @@ mod tests {
             &CwmpCredentials::default()
         )
         .is_err());
+    }
+
+    #[test]
+    fn explicit_omci_selection_never_falls_back_to_another_adapter() {
+        let identity = crate::model::OnuIdentity::default();
+        assert_eq!(
+            select_explicit("unknown", "H3CT", &identity, None),
+            Adapter::Unavailable
+        );
+        assert_eq!(
+            select_explicit("hwtc", "H3CT", &identity, None),
+            Adapter::Unavailable
+        );
+        assert_eq!(
+            select_explicit("hl202", "HWTC", &identity, None),
+            Adapter::Unavailable
+        );
+        assert_eq!(
+            select_explicit("generic", "HWTC", &identity, None),
+            Adapter::GenericBridge
+        );
     }
 
     #[test]

@@ -43,7 +43,37 @@ fn capabilities_offline_queries_agree_without_controller_initialization() {
     for page in ["status", "hardware", "calibration", "about"] {
         assert_eq!(cli["pages"][page], true);
     }
-    let adapters = cli["adapters"].as_array().expect("adapters array");
+    let adapters = cli["adapters"]["omci"]
+        .as_array()
+        .expect("OMCI adapters array");
+    let bootstrap = cli["adapters"]["bootstrap"]
+        .as_array()
+        .expect("bootstrap adapters array");
+    let provisioning = cli["adapters"]["provisioning"]
+        .as_array()
+        .expect("provisioning adapters array");
+    assert!(bootstrap.iter().any(|a| a["id"] == "none"));
+    assert!(provisioning.iter().any(|a| a["id"] == "none"));
+    assert_eq!(
+        bootstrap.iter().any(|a| a["id"] == "manual-acs"),
+        cfg!(feature = "acs")
+    );
+    assert_eq!(
+        bootstrap.iter().any(|a| a["id"] == "hl202-mqtt-acs"),
+        cfg!(all(
+            feature = "acs",
+            feature = "device-hl202",
+            feature = "mqtt"
+        ))
+    );
+    assert_eq!(
+        provisioning.iter().any(|a| a["id"] == "hl202-mqtt"),
+        cfg!(all(feature = "device-hl202", feature = "mqtt"))
+    );
+    assert_eq!(
+        provisioning.iter().any(|a| a["id"] == "cu"),
+        cfg!(feature = "acs")
+    );
     assert_eq!(
         cli["features"]["device-scty"],
         cfg!(feature = "device-scty")

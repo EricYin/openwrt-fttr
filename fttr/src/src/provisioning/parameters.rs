@@ -2,12 +2,12 @@
 //! controller so execution can mutate its operation without exposing internals.
 use super::super::model::{ItemOutcome, TaskOutcome};
 use super::{acs, now, Item, ItemKind, Operation, OperationPhase, Parameter, ParameterKind};
-use crate::devices::cwmp::transport::Command;
+use crate::cwmp::transport::Command;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
 fn queue(op: &mut Operation, method: &str, args: Value, stage: OperationPhase) {
-    op.submission = Some(crate::devices::cwmp::transport::Pending {
+    op.submission = Some(crate::cwmp::transport::Pending {
         method: method.into(),
         args,
         stage,
@@ -24,7 +24,7 @@ fn submit(op: &mut Operation) {
     if let Some(id) = reply["id"].as_u64() {
         op.task = Some(id);
         op.stage = op.submission.take().unwrap().stage;
-    } else if crate::devices::cwmp::transport::backpressure(&reply) {
+    } else if crate::cwmp::transport::backpressure(&reply) {
         op.task = None;
     } else {
         op.submission = None;
@@ -295,7 +295,7 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
     }
     if let Some(guard) = &item.guard {
         if let Some((root, _)) = guard.rsplit_once('.') {
-            if crate::devices::cwmp::observed::protected(&values, &format!("{root}.")) {
+            if crate::cwmp::observed::protected(&values, &format!("{root}.")) {
                 op.finish_item(
                     ItemOutcome::Blocked,
                     "cross-contract readback identifies a management/fallback WAN",
@@ -494,7 +494,7 @@ fn queue_read(op: &mut Operation, stage: OperationPhase) {
             }
         }
         let field = contract.enabled.unwrap_or(contract.vlan);
-        if field.location == crate::devices::cwmp::contract::Location::Parent {
+        if field.location == crate::cwmp::contract::Location::Parent {
             if let Some((parent, _)) = guard.split_once(".WANIPConnection.") {
                 names.push(format!("{parent}.{}", field.name));
             }
@@ -519,7 +519,7 @@ pub(super) fn equivalent(p: &Parameter, observed: &str) -> bool {
             ("1", "true" | "1") | ("0", "false" | "0")
         );
     }
-    for contract in crate::devices::cwmp::registry::available() {
+    for contract in crate::cwmp::registry::available() {
         for field in [
             Some(contract.wan.service),
             Some(contract.wan.vlan),
@@ -532,7 +532,7 @@ pub(super) fn equivalent(p: &Parameter, observed: &str) -> bool {
         .flatten()
         {
             if p.name.ends_with(&format!(".{}", field.name)) {
-                return crate::devices::cwmp::contract::equivalent_field(field, &p.value, observed);
+                return crate::cwmp::contract::equivalent_field(field, &p.value, observed);
             }
         }
     }

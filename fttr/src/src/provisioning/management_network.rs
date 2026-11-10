@@ -292,7 +292,7 @@ pub(super) fn grant(id: &str, sn: &str) -> Option<(u64, bool)> {
     }
     Some((c.journal.applied_epoch, d.automatic))
 }
-pub(super) fn credentials(epoch: u64) -> Option<crate::devices::CwmpCredentials> {
+pub(crate) fn credentials(epoch: u64) -> Option<crate::devices::CwmpCredentials> {
     let c = coordinator().lock().unwrap();
     if !c.ready || c.journal.applied_epoch != epoch {
         return None;

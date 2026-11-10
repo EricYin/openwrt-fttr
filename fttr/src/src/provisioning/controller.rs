@@ -20,7 +20,7 @@ mod scheduler;
 #[cfg(test)]
 #[path = "controller/scheduling_tests.rs"]
 mod scheduling_tests;
-use crate::devices::cwmp::transport::Command;
+use crate::cwmp::transport::Command;
 use config::{Config, Device, Item, Parameter};
 use parameters::advance;
 #[cfg(test)]
@@ -40,17 +40,17 @@ fn error(s: &str) -> Value {
     json!({"error":s})
 }
 #[cfg(all(feature = "acs", not(test)))]
-pub(super) fn acs(v: Command) -> crate::devices::cwmp::transport::Reply {
+pub(super) fn acs(v: Command) -> crate::cwmp::transport::Reply {
     crate::acs::transact(v)
 }
 #[cfg(all(not(feature = "acs"), not(test)))]
-pub(super) fn acs(_: Command) -> crate::devices::cwmp::transport::Reply {
+pub(super) fn acs(_: Command) -> crate::cwmp::transport::Reply {
     error("ACS adapter not compiled").into()
 }
 #[cfg(test)]
 thread_local! { pub(super) static RPC: std::cell::RefCell<(std::collections::VecDeque<Value>,Vec<Value>)> = std::cell::RefCell::new((std::collections::VecDeque::new(),Vec::new())); }
 #[cfg(test)]
-pub(super) fn acs(v: Command) -> crate::devices::cwmp::transport::Reply {
+pub(super) fn acs(v: Command) -> crate::cwmp::transport::Reply {
     RPC.with(|r| {
         let mut r = r.borrow_mut();
         r.1.push(v.wire());
@@ -85,13 +85,13 @@ pub(crate) fn wake_device(device: &str) {
 #[derive(Clone)]
 struct Operation {
     work_started: bool,
-    command_job: Option<crate::devices::command_provisioning::Job>,
+    command_job: Option<crate::provisioning::command::Job>,
     command_result: Option<Value>,
     full_sync: bool,
-    submission: Option<crate::devices::cwmp::transport::Pending<OperationPhase>>,
+    submission: Option<crate::cwmp::transport::Pending<OperationPhase>>,
     verify_after: u64,
     compiled: bool,
-    capabilities: crate::devices::cwmp::runtime::Discovery,
+    capabilities: crate::cwmp::runtime::Discovery,
     id: u64,
     device: Device,
     revision: String,
@@ -150,15 +150,16 @@ pub(crate) fn allows_generic_bridge(serial: &str) -> bool {
     c.config
         .devices
         .iter()
-        .any(|d| d.optical_sn.eq_ignore_ascii_case(serial) && d.adapter == "generic")
+        .any(|d| d.optical_sn.eq_ignore_ascii_case(serial) && d.omci_adapter == "generic")
 }
 
-pub(crate) fn is_device_adapter(serial: &str, adapter: &str) -> bool {
+pub(crate) fn configured_omci_adapter(serial: &str) -> Option<String> {
     let c = controller().lock().unwrap();
     c.config
         .devices
         .iter()
-        .any(|d| d.optical_sn.eq_ignore_ascii_case(serial) && d.adapter == adapter)
+        .find(|d| d.optical_sn.eq_ignore_ascii_case(serial))
+        .map(|d| d.omci_adapter.clone())
 }
 
 pub(crate) fn management_desired(serial: &str) -> Option<(config::Management, String)> {
@@ -168,7 +169,7 @@ pub(crate) fn management_desired(serial: &str) -> Option<(config::Management, St
         .config
         .devices
         .iter()
-        .any(|d| d.optical_sn == serial && d.omci_management)
+        .any(|d| d.optical_sn == serial && d.omci_management())
     {
         return None;
     }
@@ -184,7 +185,7 @@ pub(crate) fn management_result(serial: &str, result: Value) {
 }
 impl Controller {
     fn omci_management_view(&self, device: &Device) -> Value {
-        if !device.omci_management {
+        if !device.omci_management() {
             json!({"state":"disabled","enabled":false,"reason":"OMCI management provisioning is disabled for this device"})
         } else {
             let mut value = self
@@ -266,6 +267,13 @@ impl Controller {
             })
             .cloned()
             .collect();
+        if target != "all"
+            && !target.starts_with("group:")
+            && devices.iter().any(|d| d.backend() == "disabled")
+        {
+            return Err("business provisioning is disabled for this device".into());
+        }
+        devices.retain(|d| d.backend() != "disabled");
         if let Some(item) = item {
             if devices
                 .iter()
@@ -404,7 +412,7 @@ impl Controller {
                 aggregate(&ssids)
             };
             let assignment=self.config.assignments.get(&d.id);
-            json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"adapter":d.adapter,"omci_management":self.omci_management_view(d),"management":self.management.get(&d.id),"acs_bootstrap":super::bootstrap::view(&d.id,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
+            json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"omci_adapter":d.omci_adapter,"bootstrap_adapter":d.bootstrap_adapter,"provisioning_adapter":d.provisioning_adapter,"omci_management":self.omci_management_view(d),"management":self.management.get(&d.id),"acs_bootstrap":super::bootstrap::view(d,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
         }).collect();
         json!({"enabled":self.config.enabled,"mode":if self.config.automatic {"auto"} else {"manual"},"method":"diff","revision":self.config.revision,"triggers":self.config.triggers,"interval_minutes":self.config.interval_seconds / 60,"omci_management":{"desired":self.config.management,"state":"not_verified"},"management_network":super::management_network::view(self.config.management_network.as_ref()),"groups":self.config.groups.iter().map(|(id,t)|json!({"id":id,"name":self.config.labels.get(id),"template":t})).collect::<Vec<_>>(),"error":self.failure,"devices":devices,"pending_devices":devices.iter().filter(|d| d["provisioning"]["state"] != "completed").map(|d| d["device"].clone()).collect::<Vec<_>>()})
     }
@@ -416,7 +424,12 @@ fn discovered_identity(devices: &Value, optical_sn: &str, adapter: &str) -> Opti
         .filter(|(_, d)| {
             let product_class = d["product_class"].as_str().unwrap_or("");
             let serial = d["serial"].as_str().unwrap_or("");
-            crate::devices::matches_cwmp_adapter(adapter, optical_sn, product_class, serial)
+            crate::adapters::provisioning::matches_identity(
+                adapter,
+                optical_sn,
+                product_class,
+                serial,
+            )
         })
         .map(|(id, _)| id.clone())
         .collect();
@@ -689,7 +702,7 @@ mod tests {
             "child":{"product_class":"SG631Z-C","serial":"MODEL-STAR1234ABCD-SUFFIX"}
         }});
         assert_eq!(
-            discovered_identity(&devices, "STAR1234ABCD", "star"),
+            discovered_identity(&devices, "STAR1234ABCD", "cu"),
             cfg!(feature = "device-star").then(|| "child".into())
         );
         assert_eq!(
@@ -697,24 +710,21 @@ mod tests {
             None
         );
         for serial in ["STAR1234ABCE", "STAR1234ABC0", "HWTC1234ABCD"] {
-            assert_eq!(discovered_identity(&devices, serial, "star"), None);
+            assert_eq!(discovered_identity(&devices, serial, "cu"), None);
         }
         assert_eq!(discovered_identity(&devices, "STAR1234ABCD", "hl202"), None);
         let wrong_model = json!({"devices":{
             "child":{"product_class":"OTHER","serial":"MODEL-STAR1234ABCD-SUFFIX"}
         }});
         assert_eq!(
-            discovered_identity(&wrong_model, "STAR1234ABCD", "star"),
+            discovered_identity(&wrong_model, "STAR1234ABCD", "cu"),
             None
         );
         let ambiguous = json!({"devices":{
             "one":{"product_class":"SG631Z-C","serial":"MODEL-STAR1234ABCD-SUFFIX"},
             "two":{"product_class":"SG631Z-C","serial":"OTHER-STAR1234ABCD-SUFFIX"}
         }});
-        assert_eq!(
-            discovered_identity(&ambiguous, "STAR1234ABCD", "star"),
-            None
-        );
+        assert_eq!(discovered_identity(&ambiguous, "STAR1234ABCD", "cu"), None);
     }
     #[test]
     fn hwtc_identity_matches_serial_across_models() {
@@ -722,22 +732,31 @@ mod tests {
             let devices =
                 json!({"devices":{"child":{"product_class":model,"serial":"485754431234ABCD"}}});
             assert_eq!(
-                discovered_identity(&devices, "HWTC1234ABCD", "hwtc"),
+                discovered_identity(&devices, "HWTC1234ABCD", "hwtc-hw"),
                 cfg!(feature = "device-hwtc").then(|| "child".into())
             );
-            assert_eq!(discovered_identity(&devices, "HWTC9999ABCD", "hwtc"), None);
+            assert_eq!(
+                discovered_identity(&devices, "HWTC9999ABCD", "hwtc-hw"),
+                None
+            );
         }
     }
     #[test]
     fn hwtc_identity_rejects_other_vendors_and_ambiguous_serials() {
         let devices =
             json!({"devices":{"child":{"product_class":"V152","serial":"483343543C6DE5B3"}}});
-        assert_eq!(discovered_identity(&devices, "H3CT3C6DE5B3", "hwtc"), None);
+        assert_eq!(
+            discovered_identity(&devices, "H3CT1234ABCD", "hwtc-hw"),
+            None
+        );
         let devices = json!({"devices":{
             "one":{"product_class":"V152","serial":"485754431234ABCD"},
             "two":{"product_class":"K155-11","serial":"485754431234ABCD"}
         }});
-        assert_eq!(discovered_identity(&devices, "HWTC1234ABCD", "hwtc"), None);
+        assert_eq!(
+            discovered_identity(&devices, "HWTC1234ABCD", "hwtc-hw"),
+            None
+        );
     }
     #[test]
     #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 contract")]
@@ -787,10 +806,10 @@ mod tests {
                 id: "child".into(),
                 optical_sn: "H3CT12345678".into(),
                 cwmp_id: "id".into(),
-                adapter: "hl202".into(),
-                provisioning_method: "acs".into(),
-                cwmp_contract: "hl202-cu".into(),
-                omci_management: false,
+                omci_adapter: "hl202".into(),
+                bootstrap_adapter: "manual-acs".into(),
+                provisioning_adapter: "hl202-cu".into(),
+                resolved_contract: None,
                 connection_request: Default::default(),
                 items: vec![item],
                 wifi_cleanup: "preserve".into(),
@@ -905,8 +924,8 @@ mod tests {
     #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC contract")]
     fn hwtc_passphrase_fault_does_not_retry() {
         let mut o = operation(OperationPhase::Writing, true);
-        o.device.adapter = "hwtc".into();
-        o.device.cwmp_contract = "hwtc-hw".into();
+        o.device.omci_adapter = "hwtc".into();
+        o.device.provisioning_adapter = "hwtc-hw".into();
         o.changes = vec![Parameter {
             name:
                 "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.KeyPassphrase"
@@ -925,8 +944,8 @@ mod tests {
         for service in ["TR069,INTERNET", "TR069_INTERNET", "internet_tr069"] {
             for apply in [false, true] {
                 let mut o = operation(OperationPhase::Reading, apply);
-                o.device.adapter = "hwtc".into();
-                o.device.cwmp_contract = "hwtc-hw".into();
+                o.device.omci_adapter = "hwtc".into();
+                o.device.provisioning_adapter = "hwtc-hw".into();
                 o.device.items[0].guard = Some("guard".into());
                 o.device.items[0].service_type = "internet".into();
                 let mut reply = readback("old");

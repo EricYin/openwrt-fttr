@@ -706,10 +706,10 @@ mod tests {
                 id: "child".into(),
                 optical_sn: "H3CT12345678".into(),
                 cwmp_id: "pending:H3CT12345678".into(),
-                adapter: "hl202".into(),
-                provisioning_method: String::new(),
-                cwmp_contract: "auto".into(),
-                omci_management: false,
+                omci_adapter: "hl202".into(),
+                bootstrap_adapter: "none".into(),
+                provisioning_adapter: "hl202-mqtt".into(),
+                resolved_contract: None,
                 connection_request: ConnectionRequest::default(),
                 items: vec![item],
                 wifi_cleanup: "preserve".into(),
@@ -862,10 +862,10 @@ mod tests {
     fn backend_defaults_and_explicit_override_follow_compiled_capability() {
         let (mut device, _) = fixture();
         assert_eq!(device.backend(), "command");
-        device.provisioning_method = "acs".into();
+        device.provisioning_adapter = "hl202-cu".into();
         assert_eq!(device.backend(), "acs");
-        device.provisioning_method.clear();
-        device.adapter = "hwtc".into();
+        device.provisioning_adapter = "hwtc-hw".into();
+        device.omci_adapter = "hwtc".into();
         assert_eq!(device.backend(), "acs");
     }
     #[test]

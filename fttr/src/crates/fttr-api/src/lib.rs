@@ -30,6 +30,14 @@ pub struct AdapterCapability {
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct AdapterCapabilities {
+    pub omci: Vec<AdapterCapability>,
+    pub bootstrap: Vec<AdapterCapability>,
+    pub provisioning: Vec<AdapterCapability>,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct Capabilities {
     #[cfg_attr(feature = "codegen", ts(type = "1"))]
     pub schema_version: u32,
@@ -37,7 +45,7 @@ pub struct Capabilities {
     pub features: CapabilityFeatures,
     pub functions: CapabilityFunctions,
     pub pages: CapabilityPages,
-    pub adapters: Vec<AdapterCapability>,
+    pub adapters: AdapterCapabilities,
 }
 
 #[derive(Debug, Serialize)]

@@ -1,13 +1,17 @@
 #[cfg(feature = "acs")]
 pub mod acs;
 pub mod acs_cli;
+pub mod adapters;
+pub(crate) mod bootstrap;
 pub mod bosa;
 #[cfg(feature = "mqtt")]
 pub mod broker;
 pub mod calibration;
 pub mod capabilities;
 pub mod controller;
+pub mod cwmp;
 pub mod devices;
+pub mod domain;
 pub mod fpga;
 pub mod fpga_diag;
 pub mod fpga_diag_cli;

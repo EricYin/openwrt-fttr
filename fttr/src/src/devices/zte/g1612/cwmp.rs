@@ -1,4 +1,4 @@
-use crate::devices::cwmp::{
+use crate::cwmp::{
     contract::{Capabilities, Contract, OperationRequirements, Support, WlanContract},
     vendor::ct,
 };

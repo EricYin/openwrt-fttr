@@ -11,53 +11,11 @@ pub fn compiled() -> Capabilities {
     let star = cfg!(feature = "device-star");
     let zte = cfg!(feature = "device-zte");
     let scty = cfg!(feature = "device-scty");
-    let mut adapters = Vec::new();
-    if hl202 {
-        adapters.push(AdapterCapability {
-            id: "hl202",
-            name: "H3C HL202",
-        });
-    }
-    if hwtc {
-        adapters.push(AdapterCapability {
-            id: "hwtc",
-            name: "Huawei HWTC",
-        });
-    }
-    if star {
-        adapters.push(AdapterCapability {
-            id: "star",
-            name: "STAR SG631",
-        });
-    }
-    if zte {
-        adapters.push(AdapterCapability {
-            id: "zte",
-            name: "ZTE G1612 / F650A",
-        });
-    }
-    if scty {
-        adapters.push(AdapterCapability {
-            id: "scty",
-            name: "SCTY TY-FS803G (OMCI bridge only)",
-        });
-    }
-    adapters.push(AdapterCapability {
-        id: "generic",
-        name: "Generic G.988 Bridge",
-    });
-    if cfg!(feature = "device-fiberhome") {
-        adapters.push(AdapterCapability {
-            id: "fiberhome",
-            name: "FiberHome HG6371F-C / HG6371F (experimental discovered bridge; explicit opt-in)",
-        });
-    }
-    if cfg!(feature = "device-realtek") {
-        adapters.push(AdapterCapability {
-            id: "realtek",
-            name: "Realtek TYFCA1 (diagnostic probe & bridge)",
-        });
-    }
+    let adapters = fttr_api::AdapterCapabilities {
+        omci: crate::adapters::omci::available(),
+        bootstrap: crate::adapters::bootstrap::available(),
+        provisioning: crate::adapters::provisioning::capabilities(),
+    };
     Capabilities {
         schema_version: 1,
         version: env!("CARGO_PKG_VERSION"),

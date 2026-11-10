@@ -54,7 +54,12 @@ impl Operation {
             full_sync: true,
             verify_after: 0,
             compiled: false,
-            capabilities: crate::devices::cwmp::runtime::Discovery::new(&device.cwmp_contract),
+            capabilities: crate::cwmp::runtime::Discovery::new(
+                crate::adapters::provisioning::lookup(&device.provisioning_adapter)
+                    .ok()
+                    .and_then(|a| a.contract)
+                    .map_or("none", |c| c.id),
+            ),
             id,
             device,
             revision,
@@ -147,6 +152,9 @@ impl Operation {
             result["cwmp_id"] = json!(self.device.cwmp_id);
             result["revision"] = json!(self.revision);
             result["backend"] = self.device.backend_view();
+            result["omci_adapter"] = json!(self.device.omci_adapter);
+            result["bootstrap_adapter"] = json!(self.device.bootstrap_adapter);
+            result["provisioning_adapter"] = json!(self.device.provisioning_adapter);
             result["state"] = json!(self.stage);
             result["mode"] = json!(if self.apply { "apply" } else { "plan" });
             result["started_at"] = json!(self.started);
@@ -169,6 +177,6 @@ impl Operation {
         for i in self.device.items.iter().skip(self.index) {
             items.push(json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":if i.id == self.item().id { self.stage.as_str() } else {"pending"},"task_id":if i.id == self.item().id {self.task} else {None},"revision":self.revision}));
         }
-        json!({"backend":self.device.backend_view(),"operation_id":self.id,"device":self.device.id,"optical_sn":self.device.optical_sn,"cwmp_id":self.device.cwmp_id,"revision":self.revision,"mode":if self.apply {"apply"} else {"plan"},"state":self.stage,"started_at":self.started,"completed_at":self.completed_at,"items":items,"cwmp_contract":self.capabilities.view(),"wan_objects":self.wan.owned,"wan_lifecycle":self.wan.results,"wan_stage":self.wan.stage,"wifi_objects":self.wifi.registry,"wifi_lifecycle":self.wifi.results,"wifi_stage":self.wifi.stage,"wifi_cleanup":self.device.wifi_cleanup})
+        json!({"omci_adapter":self.device.omci_adapter,"bootstrap_adapter":self.device.bootstrap_adapter,"provisioning_adapter":self.device.provisioning_adapter,"backend":self.device.backend_view(),"operation_id":self.id,"device":self.device.id,"optical_sn":self.device.optical_sn,"cwmp_id":self.device.cwmp_id,"revision":self.revision,"mode":if self.apply {"apply"} else {"plan"},"state":self.stage,"started_at":self.started,"completed_at":self.completed_at,"items":items,"cwmp_contract":self.capabilities.view(),"wan_objects":self.wan.owned,"wan_lifecycle":self.wan.results,"wan_stage":self.wan.stage,"wifi_objects":self.wifi.registry,"wifi_lifecycle":self.wifi.results,"wifi_stage":self.wifi.stage,"wifi_cleanup":self.device.wifi_cleanup})
     }
 }

@@ -77,12 +77,11 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 "name",
                 "optical_sn",
                 "onu_id",
-                "adapter",
-                "provisioning_method",
-                "cwmp_contract",
+                "omci_adapter",
+                "bootstrap_adapter",
+                "provisioning_adapter",
                 "group",
                 "wifi_cleanup",
-                "omci_management",
                 "connection_request",
                 "connection_request_defaults",
                 "connection_request_port",
@@ -453,7 +452,7 @@ mod tests {
 
     #[test]
     fn onu_pins_are_strict_unique_and_independent_of_business_revision() {
-        let base = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'TESTabcdef01'\n option adapter 'generic'\n option group 'g'\n";
+        let base = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'TESTabcdef01'\n option omci_adapter 'generic'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'none'\n option group 'g'\n";
         let automatic = super::compile(base).unwrap();
         for id in [0, 15] {
             let pinned = super::compile(&format!("{base} option onu_id '{id}'\n")).unwrap();
@@ -475,7 +474,7 @@ mod tests {
                 "{option}"
             );
         }
-        let duplicate = format!("{base} option onu_id '0'\nconfig device 'other'\n option optical_sn 'TEST12345678'\n option adapter 'generic'\n option group 'g'\n option onu_id '0'\n");
+        let duplicate = format!("{base} option onu_id '0'\nconfig device 'other'\n option optical_sn 'TEST12345678'\n option omci_adapter 'generic'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'none'\n option group 'g'\n option onu_id '0'\n");
         assert!(super::compile(&duplicate)
             .err()
             .unwrap()
@@ -486,7 +485,7 @@ mod tests {
     fn plan(mut cfg: Config) -> Result<Config, String> {
         for device in &mut cfg.devices {
             assert!(device.items.iter().all(|i| i.parameters.is_empty()));
-            let mut endpoints = crate::devices::cwmp::path::EndpointMap::default();
+            let mut endpoints = crate::cwmp::path::EndpointMap::default();
             for n in 1..=4 {
                 endpoints.0.insert(
                     super::super::model::EndpointRef::Lan(n),
@@ -504,7 +503,7 @@ mod tests {
                     );
                 }
             }
-            crate::devices::cwmp::compiler::compile_device(device, &endpoints);
+            crate::cwmp::compiler::compile_device(device, &endpoints);
         }
         Ok(cfg)
     }
@@ -585,9 +584,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC adapter")]
+    #[cfg_attr(
+        not(all(feature = "device-hwtc", feature = "acs")),
+        ignore = "requires HWTC ACS adapter"
+    )]
     fn configuration_outputs_only_business_intent_before_discovery() {
-        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'HWTC1234ABCD'\n option adapter 'hwtc'\n option group 'g'\nconfig network 'n'\n option template 't'\n option vlan '66'\n list service_list 'OTHER'\n list port 'lan2'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '5g'";
+        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'HWTC1234ABCD'\n option omci_adapter 'hwtc'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hwtc-hw'\n option group 'g'\nconfig network 'n'\n option template 't'\n option vlan '66'\n list service_list 'OTHER'\n list port 'lan2'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '5g'";
         let cfg = super::compile(text).unwrap();
         assert!(cfg.devices[0]
             .items
@@ -640,53 +642,50 @@ mod tests {
     }
 
     #[test]
-    fn omci_management_is_opt_in_per_device_and_changes_revision() {
-        if !cfg!(feature = "all-devices") {
+    fn bootstrap_selection_is_independent_per_device_and_changes_revision() {
+        if !cfg!(all(feature = "all-devices", feature = "acs")) {
             return;
         }
         let config = |option: &str| {
             format!(
-            "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h3c'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\n option omci_management '1'\nconfig device 'k155'\n option optical_sn 'HWTC12345678'\n option adapter 'k155'\n option group 'g'\n{option}"
+            "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h3c'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'generic'\n option provisioning_adapter 'hl202-cu'\n option bootstrap_adapter 'omci-acs'\n option group 'g'\nconfig device 'k155'\n option optical_sn 'HWTC12345678'\n option omci_adapter 'hwtc'\n option provisioning_adapter 'hwtc-hw'\n option bootstrap_adapter 'manual-acs'\n option group 'g'\n{option}"
         )
         };
         let default = compile(&config("")).unwrap();
-        assert!(
-            default
-                .devices
-                .iter()
-                .find(|d| d.id == "h3c")
-                .unwrap()
-                .omci_management
-        );
-        assert!(
-            !default
-                .devices
-                .iter()
-                .find(|d| d.id == "k155")
-                .unwrap()
-                .omci_management
-        );
-        let explicit_off = compile(&config(" option omci_management '0'\n")).unwrap();
-        assert!(
-            !explicit_off
-                .devices
-                .iter()
-                .find(|d| d.id == "k155")
-                .unwrap()
-                .omci_management
-        );
-        let enabled = compile(&config(" option omci_management '1'\n")).unwrap();
-        assert!(enabled.devices.iter().all(|d| d.omci_management));
+        assert!(default
+            .devices
+            .iter()
+            .find(|d| d.id == "h3c")
+            .unwrap()
+            .omci_management());
+        assert!(!default
+            .devices
+            .iter()
+            .find(|d| d.id == "k155")
+            .unwrap()
+            .omci_management());
+        let explicit_off = compile(&config(" option bootstrap_adapter 'manual-acs'\n")).unwrap();
+        assert!(!explicit_off
+            .devices
+            .iter()
+            .find(|d| d.id == "k155")
+            .unwrap()
+            .omci_management());
+        let enabled = compile(&config(" option bootstrap_adapter 'omci-acs'\n")).unwrap();
+        assert!(enabled.devices.iter().all(|d| d.omci_management()));
         assert_ne!(explicit_off.revision, enabled.revision);
-        assert!(compile(&config(" option omci_management 'invalid'\n"))
+        assert!(compile(&config(" option bootstrap_adapter 'invalid'\n"))
             .err()
             .unwrap()
-            .contains("omci_management"));
+            .contains("bootstrap adapter"));
     }
     #[test]
-    #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
+    #[cfg_attr(
+        not(all(feature = "device-hl202", feature = "acs")),
+        ignore = "requires HL202 ACS adapter"
+    )]
     fn hl202_internet_bridge_dhcp_and_second_radio_slots_compile_for_binding() {
-        let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'a2'\n option template 't'\n option ssid 'base2'\n option radio '2g'\nconfig wifi 'a5'\n option template 't'\n option ssid 'base5'\n option radio '5g'\nconfig wifi 'b2'\n option template 't'\n option ssid 'TTTT'\n option radio '2g'\nconfig wifi 'b5'\n option template 't'\n option ssid 'YYYY'\n option radio '5g'\nconfig network 'iot'\n option template 't'\n option vlan '66'\n list service_list 'INTERNET'\n option priority '6'\n list ssid 'b2'\n list ssid 'b5'";
+        let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\nconfig wifi 'a2'\n option template 't'\n option ssid 'base2'\n option radio '2g'\nconfig wifi 'a5'\n option template 't'\n option ssid 'base5'\n option radio '5g'\nconfig wifi 'b2'\n option template 't'\n option ssid 'TTTT'\n option radio '2g'\nconfig wifi 'b5'\n option template 't'\n option ssid 'YYYY'\n option radio '5g'\nconfig network 'iot'\n option template 't'\n option vlan '66'\n list service_list 'INTERNET'\n option priority '6'\n list ssid 'b2'\n list ssid 'b5'";
         let cfg = compile(text).unwrap();
         let items = &cfg.devices[0].items;
         let service = items
@@ -712,10 +711,10 @@ mod tests {
     }
     #[test]
     fn custom_vlan_service_list_supports_multiple_tokens() {
-        if !cfg!(feature = "device-hl202") {
+        if !cfg!(all(feature = "device-hl202", feature = "acs")) {
             return;
         }
-        let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig network 'n'\n option template 't'\n option vlan '123'\n list service_list 'iptv,VOIP'\n list service_list 'OTHER'";
+        let text = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\nconfig network 'n'\n option template 't'\n option vlan '123'\n list service_list 'iptv,VOIP'\n list service_list 'OTHER'";
         let cfg = compile(text).unwrap();
         let item = cfg.devices[0]
             .items
@@ -729,10 +728,10 @@ mod tests {
     }
     #[test]
     fn service_list_infers_internet_behavior() {
-        if !cfg!(feature = "device-hl202") {
+        if !cfg!(all(feature = "device-hl202", feature = "acs")) {
             return;
         }
-        let head = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\n";
+        let head = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\n";
         let internet = format!(
             "{head}config network 'n'\n option template 't'\n option vlan '123'\n list service_list 'INTERNET,IPTV'"
         );
@@ -764,7 +763,7 @@ mod tests {
     }
     #[test]
     fn custom_vlan_service_list_rejects_tr069_and_untagged_internet_is_not_managed() {
-        let head = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT1234ABCD'\n option adapter 'hl202'\n option group 'g'\n";
+        let head = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT1234ABCD'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\n";
         let tr069 = format!("{head}config network 'n'\n option template 't'\n option vlan '123'\n list service_list 'IPTV,TR069'");
         assert!(compile(&tr069).err().unwrap().contains("TR069"));
         let untagged = format!("{head}config network 'n'\n option template 't'\n option vlan '0'\n list service_list 'INTERNET'");
@@ -780,11 +779,11 @@ mod tests {
     }
     #[test]
     #[cfg_attr(
-        not(all(feature = "device-hl202", feature = "device-hwtc")),
+        not(all(feature = "device-hl202", feature = "device-hwtc", feature = "acs")),
         ignore = "requires both device contracts"
     )]
     fn wpa2_uses_device_beacon_contract() {
-        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC12345678'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '2g'\n option security 'wpa2-psk'\n option key 'testpassword'";
+        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC12345678'\n option omci_adapter 'hwtc'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hwtc-hw'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'test'\n option radio '2g'\n option security 'wpa2-psk'\n option key 'testpassword'";
         let cfg = compile(text).unwrap();
         for d in &cfg.devices {
             let beacon = d.items[0]
@@ -794,18 +793,22 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 beacon.value,
-                if d.adapter == "hl202" { "WPA2" } else { "11i" }
+                if d.provisioning_adapter == "hl202-cu" {
+                    "WPA2"
+                } else {
+                    "11i"
+                }
             );
         }
     }
     #[test]
     #[cfg_attr(
-        not(all(feature = "device-hl202", feature = "device-hwtc")),
+        not(all(feature = "device-hl202", feature = "device-hwtc", feature = "acs")),
         ignore = "requires both device contracts"
     )]
     fn wifi_security_modes_compile_expected_parameters() {
         // 1. None (Open)
-        let text_none = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'open_net'\n option radio '2g'\n option security 'none'";
+        let text_none = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'open_net'\n option radio '2g'\n option security 'none'";
         let cfg_none = compile(text_none).unwrap();
         let p_none = &cfg_none.devices[0].items[0].parameters;
         assert_eq!(
@@ -835,7 +838,7 @@ mod tests {
         assert!(p_none.iter().all(|p| !p.name.contains("PreSharedKey")));
 
         // 2. WPA3-SAE
-        let text_wpa3 = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC12345678'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'wpa3_net'\n option radio '5g'\n option security 'wpa3-sae'\n option key 'pass123456'";
+        let text_wpa3 = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC12345678'\n option omci_adapter 'hwtc'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hwtc-hw'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'wpa3_net'\n option radio '5g'\n option security 'wpa3-sae'\n option key 'pass123456'";
         let cfg_wpa3 = compile(text_wpa3).unwrap();
         for d in &cfg_wpa3.devices {
             let p = &d.items[0].parameters;
@@ -870,7 +873,7 @@ mod tests {
         }
 
         // 3. WPA2-PSK / WPA3-SAE mixed
-        let text_wpa2_wpa3 = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC12345678'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'mixed_net'\n option radio '2g'\n option security 'wpa2-psk/wpa3-sae'\n option key 'pass123456'";
+        let text_wpa2_wpa3 = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC12345678'\n option omci_adapter 'hwtc'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hwtc-hw'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'mixed_net'\n option radio '2g'\n option security 'wpa2-psk/wpa3-sae'\n option key 'pass123456'";
         let cfg_wpa2_wpa3 = compile(text_wpa2_wpa3).unwrap();
         for d in &cfg_wpa2_wpa3.devices {
             let p = &d.items[0].parameters;
@@ -898,11 +901,11 @@ mod tests {
         }
 
         // 4. WPA-PSK / WPA2-PSK mixed
-        let text_wpa_wpa2 = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC12345678'\n option adapter 'hwtc'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'legacy_net'\n option radio '2g'\n option security 'wpa-psk/wpa2-psk'\n option key 'pass123456'";
+        let text_wpa_wpa2 = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\nconfig device 'k'\n option optical_sn 'HWTC12345678'\n option omci_adapter 'hwtc'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hwtc-hw'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'legacy_net'\n option radio '2g'\n option security 'wpa-psk/wpa2-psk'\n option key 'pass123456'";
         let cfg_wpa_wpa2 = compile(text_wpa_wpa2).unwrap();
         for d in &cfg_wpa_wpa2.devices {
             let p = &d.items[0].parameters;
-            let expected_beacon = if d.adapter == "hl202" {
+            let expected_beacon = if d.provisioning_adapter == "hl202-cu" {
                 "WPA/WPA2"
             } else {
                 "WPAand11i"
@@ -952,7 +955,7 @@ mod tests {
         }
 
         // 5. Keep current key (empty security)
-        let text_keep = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'keep_net'\n option radio '2g'\n option security ''";
+        let text_keep = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'h'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\nconfig wifi 'w'\n option template 't'\n option ssid 'keep_net'\n option radio '2g'\n option security ''";
         let cfg_keep = compile(text_keep).unwrap();
         let p_keep = &cfg_keep.devices[0].items[0].parameters;
         assert!(p_keep
@@ -965,9 +968,12 @@ mod tests {
         assert!(compile("config template 't'\nconfig network 'n'\n option template 't'\n option type 'tr069'\n option vlan '46'").err().unwrap().contains("unsupported option type"));
     }
     #[test]
-    #[cfg_attr(not(feature = "device-hwtc"), ignore = "requires HWTC adapter")]
+    #[cfg_attr(
+        not(all(feature = "device-hwtc", feature = "acs")),
+        ignore = "requires HWTC ACS adapter"
+    )]
     fn enabled_ssid_requires_radio_but_disabled_ssid_does_not_disable_shared_radio() {
-        let text="config device 'd'\n option optical_sn 'HWTC1234ABCD'\n option cwmp_id 'test:hwtc'\n option adapter 'hwtc'\nconfig wifi_profile 'a'\n option ssid 'enabled'\n option enabled '1'\nconfig wifi_profile 'b'\n option ssid 'disabled'\n option enabled '0'\nconfig ssid 'a'\n option device 'd'\n option profile 'a'\n option radio '2g'\n option slot '1'\nconfig ssid 'b'\n option device 'd'\n option profile 'b'\n option radio '2g'\n option slot '2'";
+        let text="config device 'd'\n option optical_sn 'HWTC1234ABCD'\n option cwmp_id 'test:hwtc'\n option omci_adapter 'hwtc'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hwtc-hw'\nconfig wifi_profile 'a'\n option ssid 'enabled'\n option enabled '1'\nconfig wifi_profile 'b'\n option ssid 'disabled'\n option enabled '0'\nconfig ssid 'a'\n option device 'd'\n option profile 'a'\n option radio '2g'\n option slot '1'\nconfig ssid 'b'\n option device 'd'\n option profile 'b'\n option radio '2g'\n option slot '2'";
         let text = text
             .replace("config ssid 'a'", "config ssid 'ssid_a'")
             .replace("config ssid 'b'", "config ssid 'ssid_b'");
@@ -1002,9 +1008,12 @@ mod tests {
         );
     }
     #[test]
-    #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
+    #[cfg_attr(
+        not(all(feature = "device-hl202", feature = "acs")),
+        ignore = "requires HL202 ACS adapter"
+    )]
     fn wlan_cleanup_defaults_to_disable_and_explicit_policy_is_preserved() {
-        let base="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'";
+        let base="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hl202-cu'\n option group 'g'";
         assert_eq!(compile(base).unwrap().devices[0].wifi_cleanup, "disable");
         for policy in ["preserve", "disable", "delete"] {
             let text = format!("{base}\n option wifi_cleanup '{policy}'");
@@ -1013,9 +1022,12 @@ mod tests {
         assert!(compile(&format!("{base}\n option wifi_cleanup 'remove-everything'")).is_err());
     }
     #[test]
-    #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
+    #[cfg_attr(
+        not(all(feature = "device-hl202", feature = "acs")),
+        ignore = "requires HL202 ACS adapter"
+    )]
     fn group_expansion_keeps_creation_order_and_no_public_indices() {
-        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option group 'g'\nconfig network 'z'\n option template 't'\n option vlan '100'\n list service_list 'INTERNET'\nconfig network 'a'\n option template 't'\n option vlan '43'\n list service_list 'OTHER'\nconfig wifi 'w5'\n option template 't'\n option ssid 'five'\n option radio '5g'\nconfig wifi 'w2'\n option template 't'\n option ssid 'two'\n option radio '2g'";
+        let text="config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'manual-acs'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\nconfig network 'z'\n option template 't'\n option vlan '100'\n list service_list 'INTERNET'\nconfig network 'a'\n option template 't'\n option vlan '43'\n list service_list 'OTHER'\nconfig wifi 'w5'\n option template 't'\n option ssid 'five'\n option radio '5g'\nconfig wifi 'w2'\n option template 't'\n option ssid 'two'\n option radio '2g'";
         let cfg = compile(text).unwrap();
         let d = &cfg.devices[0];
         assert_eq!(

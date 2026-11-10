@@ -1,6 +1,6 @@
 use super::parse;
 
-const DEVICE: &str = "config template 'home'\nconfig group 'home_group'\n option template 'home'\nconfig device 'child'\n option optical_sn 'ZTEG12345678'\n option adapter 'generic'\n option group 'home_group'\n";
+const DEVICE: &str = "config template 'home'\nconfig group 'home_group'\n option template 'home'\nconfig device 'child'\n option optical_sn 'ZTEG12345678'\n option omci_adapter 'generic'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'none'\n option group 'home_group'\n";
 
 #[test]
 fn connection_request_is_enabled_when_options_are_absent() {
@@ -69,9 +69,27 @@ fn connection_request_rejects_an_invalid_opt_in_boolean() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
+#[cfg_attr(
+    not(all(feature = "device-hl202", any(feature = "acs", feature = "mqtt"))),
+    ignore = "requires HL202 and a provisioning transport"
+)]
 fn hl202_uses_reserved_default_credentials_when_defaults_are_enabled() {
-    let text = DEVICE.replace("option adapter 'generic'", "option adapter 'hl202'");
+    let text = DEVICE.replace(
+        "option provisioning_adapter 'none'",
+        if cfg!(feature = "acs") {
+            "option provisioning_adapter 'hl202-cu'"
+        } else {
+            "option provisioning_adapter 'hl202-mqtt'"
+        },
+    );
+    let text = if cfg!(feature = "acs") {
+        text.replace(
+            "option bootstrap_adapter 'none'",
+            "option bootstrap_adapter 'manual-acs'",
+        )
+    } else {
+        text
+    };
     let config = parse(&text).unwrap();
 
     let request = &config.devices[0].connection_request;

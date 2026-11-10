@@ -20,7 +20,7 @@ pub struct Message {
     pub serial: String,
     pub oui: String,
     pub product: String,
-    pub data: crate::devices::cwmp::response::Data,
+    pub data: crate::cwmp::response::Data,
 }
 fn bad(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -52,7 +52,7 @@ pub(super) async fn parse_stream<R: tokio::io::AsyncBufRead + Unpin>(
         serial: String::new(),
         oui: String::new(),
         product: String::new(),
-        data: crate::devices::cwmp::response::Data {
+        data: crate::cwmp::response::Data {
             parameters: Some(Vec::new()),
             fields: [("methods".into(), json!([])), ("events".into(), json!([]))].into(),
         },
@@ -229,10 +229,10 @@ pub(super) async fn parse_stream<R: tokio::io::AsyncBufRead + Unpin>(
                     {
                         return Err(bad("incomplete parameter row"));
                     }
-                    let value: crate::devices::cwmp::response::Row =
+                    let value: crate::cwmp::response::Row =
                         serde_json::from_value(value).map_err(|_| bad("invalid parameter row"))?;
-                    result_bytes += value.heap_bytes()
-                        + std::mem::size_of::<crate::devices::cwmp::response::Row>();
+                    result_bytes +=
+                        value.heap_bytes() + std::mem::size_of::<crate::cwmp::response::Row>();
                     let rows = message.data.parameters.as_mut().unwrap();
                     if rows.len() >= 32768 || result_bytes > ceiling {
                         return Err(bad("response_too_large: parameter result exceeds contract"));

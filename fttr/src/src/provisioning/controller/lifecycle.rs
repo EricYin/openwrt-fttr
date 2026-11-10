@@ -61,7 +61,9 @@ impl Controller {
         let mut resolved = false;
         for d in &mut self.config.devices {
             if d.cwmp_id.starts_with("pending:") && !self.resets.blocks(&d.optical_sn) {
-                if let Some(id) = discovered_identity(devices, &d.optical_sn, &d.adapter) {
+                if let Some(id) =
+                    discovered_identity(devices, &d.optical_sn, &d.provisioning_adapter)
+                {
                     d.cwmp_id = id;
                     resolved = true;
                 }
@@ -238,7 +240,7 @@ impl Controller {
                 if let Some(previous) = self.config.devices.iter().find(|previous| {
                     previous.id == device.id
                         && previous.optical_sn == device.optical_sn
-                        && previous.adapter == device.adapter
+                        && previous.provisioning_adapter == device.provisioning_adapter
                 }) {
                     device.cwmp_id.clone_from(&previous.cwmp_id);
                 }
@@ -266,7 +268,7 @@ impl Controller {
             self.config
                 .devices
                 .iter()
-                .filter(|d| d.omci_management)
+                .filter(|d| d.omci_management())
                 .map(|d| d.optical_sn.clone())
                 .collect(),
         );
@@ -291,11 +293,13 @@ impl Controller {
             if devices.iter().any(|d| {
                 &d.id == id
                     && view["optical_sn"] == d.optical_sn
-                    && view["backend"]["effective"].as_str().unwrap_or("acs") != d.backend()
+                    && (view["omci_adapter"] != d.omci_adapter
+                        || view["bootstrap_adapter"] != d.bootstrap_adapter
+                        || view["provisioning_adapter"] != d.provisioning_adapter)
             }) {
                 let mut retired = view;
                 retired["retired_reason"] =
-                    json!("provisioning backend changed; rediscovery required");
+                    json!("adapter selection changed; rediscovery required");
                 self.retired.push(retired);
             }
         }
@@ -306,7 +310,9 @@ impl Controller {
             devices.iter().any(|d| {
                 &d.id == id
                     && d.backend() == op.device.backend()
-                    && d.provisioning_method == op.device.provisioning_method
+                    && d.provisioning_adapter == op.device.provisioning_adapter
+                    && d.bootstrap_adapter == op.device.bootstrap_adapter
+                    && d.omci_adapter == op.device.omci_adapter
                     && d.optical_sn == op.device.optical_sn
                     && (d.cwmp_id.starts_with("pending:")
                         || op.device.cwmp_id.starts_with("pending:")
@@ -319,6 +325,9 @@ impl Controller {
                     &d.id == id
                         && op["optical_sn"] == d.optical_sn
                         && op["backend"]["effective"].as_str().unwrap_or("acs") == d.backend()
+                        && op["omci_adapter"] == d.omci_adapter
+                        && op["bootstrap_adapter"] == d.bootstrap_adapter
+                        && op["provisioning_adapter"] == d.provisioning_adapter
                         && (d.cwmp_id.starts_with("pending:") || op["cwmp_id"] == d.cwmp_id)
                 })
         });

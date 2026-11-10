@@ -49,7 +49,10 @@ pub const UNVERIFIED: Capabilities = Capabilities {
 #[derive(Clone, Copy, Debug)]
 pub enum ReferenceEncoding {
     FullPathsComma,
-    HwLanBindFlags,
+    EndpointFlags {
+        lan: &'static [Field],
+        wlan: &'static [Field],
+    },
 }
 #[derive(Clone, Copy, Debug)]
 pub struct OperationRequirements {
@@ -131,24 +134,8 @@ pub struct Contract {
 
 impl Contract {
     pub fn binding_fields(&self) -> Vec<Field> {
-        if matches!(self.references, Some(ReferenceEncoding::HwLanBindFlags)) {
-            [
-                "X_HW_LANBIND.Lan1Enable",
-                "X_HW_LANBIND.Lan2Enable",
-                "X_HW_LANBIND.Lan3Enable",
-                "X_HW_LANBIND.Lan4Enable",
-                "X_HW_LANBIND.SSID1Enable",
-                "X_HW_LANBIND.SSID2Enable",
-                "X_HW_LANBIND.SSID3Enable",
-                "X_HW_LANBIND.SSID4Enable",
-                "X_HW_LANBIND.SSID5Enable",
-                "X_HW_LANBIND.SSID6Enable",
-                "X_HW_LANBIND.SSID7Enable",
-                "X_HW_LANBIND.SSID8Enable",
-            ]
-            .into_iter()
-            .map(|name| unsigned(connection(name)))
-            .collect()
+        if let Some(ReferenceEncoding::EndpointFlags { lan, wlan }) = self.references {
+            lan.iter().chain(wlan).copied().collect()
         } else {
             self.wan.binding.into_iter().collect()
         }

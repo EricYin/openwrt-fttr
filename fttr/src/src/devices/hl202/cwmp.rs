@@ -1,4 +1,4 @@
-use crate::devices::cwmp::{contract::*, vendor::cu};
+use crate::cwmp::{contract::*, vendor::cu};
 
 pub const CONTRACT: Contract = Contract {
     id: "hl202-cu",
@@ -9,7 +9,7 @@ pub const CONTRACT: Contract = Contract {
         binding: Support::Supported,
     },
     references: Some(ReferenceEncoding::FullPathsComma),
-    service_encoding: Some(crate::devices::cwmp::codec::ServiceEncoding::Comma),
+    service_encoding: Some(crate::cwmp::codec::ServiceEncoding::Comma),
     wan: WanContract {
         binding: Some(ignore_wlan(
             reference(connection("X_CU_LanInterface")),

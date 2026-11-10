@@ -34,6 +34,36 @@ fn configured() -> Controller {
 }
 
 #[test]
+fn disabled_provisioning_cannot_start_an_operation() {
+    let mut c = configured();
+    c.config.devices[0].provisioning_adapter = "none".into();
+    c.config.devices[0].bootstrap_adapter = "none".into();
+    assert!(c
+        .start("child", false, false)
+        .unwrap_err()
+        .contains("disabled"));
+    assert!(c.start("all", false, false).is_err());
+    assert!(c.operations.is_empty());
+}
+
+#[test]
+fn changing_adapter_with_same_transport_retires_recovered_operation() {
+    for layer in ["omci", "bootstrap", "provisioning"] {
+        let mut c = configured();
+        let mut config = c.config.clone();
+        match layer {
+            "omci" => config.devices[0].omci_adapter = "generic".into(),
+            "bootstrap" => config.devices[0].bootstrap_adapter = "omci-acs".into(),
+            _ => config.devices[0].provisioning_adapter = "cu".into(),
+        }
+        c.replace_config(config).unwrap();
+        assert!(c.recovered.is_empty(), "{layer}");
+        assert_eq!(c.retired.len(), 1, "{layer}");
+        assert!(c.owned.contains_key("id"), "{layer}");
+    }
+}
+
+#[test]
 fn removed_devices_release_all_volatile_state() {
     let mut c = configured();
     c.operations
@@ -198,7 +228,8 @@ fn unstarted_command_job_is_superseded_without_duplicate_item_results() {
     let mut c = configured();
     let mut op = operation(OperationPhase::Waiting, false);
     op.task = None;
-    op.device.provisioning_method = "command".into();
+    op.device.provisioning_adapter = "hl202-mqtt".into();
+    op.device.bootstrap_adapter = "none".into();
     c.config.devices[0] = op.device.clone();
     c.operations.insert("child".into(), op);
     let mut next = c.config.clone();
@@ -316,7 +347,7 @@ fn program_start_trigger_is_pending_only_for_configured_devices() {
 
 fn template_config() -> Config {
     crate::provisioning::templates::compile(
-        "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'child'\n option optical_sn 'H3CT12345678'\n option adapter 'hl202'\n option provisioning_method 'acs'\n option group 'g'\n",
+        "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'child'\n option optical_sn 'H3CT12345678'\n option omci_adapter 'hl202'\n option provisioning_adapter 'hl202-cu'\n option bootstrap_adapter 'manual-acs'\n option group 'g'\n",
     ).unwrap()
 }
 
@@ -325,7 +356,10 @@ fn discovered(id: &str) -> Value {
 }
 
 #[test]
-#[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
+#[cfg_attr(
+    not(all(feature = "device-hl202", feature = "acs")),
+    ignore = "requires HL202 ACS adapter"
+)]
 fn startup_preserves_template_safety_and_ownership_until_binding_is_discovered() {
     for state in ["writing", "completed"] {
         let previous = configured();
@@ -357,7 +391,10 @@ fn startup_preserves_template_safety_and_ownership_until_binding_is_discovered()
 }
 
 #[test]
-#[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
+#[cfg_attr(
+    not(all(feature = "device-hl202", feature = "acs")),
+    ignore = "requires HL202 ACS adapter"
+)]
 fn unchanged_template_reload_preserves_resolved_binding_and_unknown_outcomes() {
     let mut c = configured();
     c.config = template_config();
@@ -379,7 +416,10 @@ fn unchanged_template_reload_preserves_resolved_binding_and_unknown_outcomes() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 adapter")]
+#[cfg_attr(
+    not(all(feature = "device-hl202", feature = "acs")),
+    ignore = "requires HL202 ACS adapter"
+)]
 fn discovered_template_replacement_prunes_previous_resolved_history_and_ownership() {
     let previous = configured();
     let mut c = Controller::default();

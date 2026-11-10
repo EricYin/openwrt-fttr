@@ -56,6 +56,10 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     c.begin_history_tick();
     let mut history_changed = false;
     for d in &config.devices {
+        if d.backend() == "disabled" {
+            c.management.insert(d.id.clone(), json!({"state":"disabled","optical_online":online.contains(&d.optical_sn),"cwmp_id":d.cwmp_id,"last_inform":null,"age_seconds":null,"backend":d.backend_view()}));
+            continue;
+        }
         if c.resets.blocks(&d.optical_sn) {
             continue;
         }
@@ -81,7 +85,7 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
                     }
                 } else if op.stage != OperationPhase::Completed && reachable {
                     op.work_started = true;
-                    op.command_job = Some(crate::devices::command_provisioning::Job::start(
+                    op.command_job = Some(crate::provisioning::command::Job::start(
                         op.device.clone(),
                         op.apply,
                         op.full_sync,
@@ -470,7 +474,7 @@ mod config_change_tests {
     }
 }
 
-fn identity(d: &Device, observed: &Value) -> crate::devices::cwmp::identity::Identity {
+fn identity(d: &Device, observed: &Value) -> crate::cwmp::identity::Identity {
     let version = |suffix: &str| {
         observed["inform"]["parameters"]
             .as_array()
@@ -482,7 +486,7 @@ fn identity(d: &Device, observed: &Value) -> crate::devices::cwmp::identity::Ide
             .unwrap_or("")
             .to_owned()
     };
-    crate::devices::cwmp::identity::Identity {
+    crate::cwmp::identity::Identity {
         optical_vendor: d.optical_sn[..4].into(),
         optical_serial: d.optical_sn.clone(),
         cwmp_serial: observed["serial"].as_str().unwrap_or("").into(),
@@ -495,7 +499,7 @@ fn identity(d: &Device, observed: &Value) -> crate::devices::cwmp::identity::Ide
 /// False retains the original tick's early-continue boundary (no ownership publication).
 fn reconcile(
     op: &mut Operation,
-    identity: crate::devices::cwmp::identity::Identity,
+    identity: crate::cwmp::identity::Identity,
     epoch: u64,
     reachable: bool,
     reload_pending: bool,
@@ -516,11 +520,11 @@ fn reconcile(
     if !op.capabilities.ready() {
         return false;
     }
-    op.device.cwmp_contract = op.capabilities.selected().unwrap().to_owned();
+    op.device.resolved_contract = Some(op.capabilities.selected().unwrap().to_owned());
     if !op.compiled {
         match op.capabilities.endpoints(&op.device) {
             Ok(endpoints) => {
-                crate::devices::cwmp::compiler::compile_device(&mut op.device, &endpoints);
+                crate::cwmp::compiler::compile_device(&mut op.device, &endpoints);
                 let mut prepared = Operation::new(
                     op.id,
                     op.device.clone(),

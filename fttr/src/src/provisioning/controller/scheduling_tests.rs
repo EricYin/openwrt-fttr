@@ -13,10 +13,10 @@ fn discovery_retry_wait_is_part_of_same_operation_before_periodic_anchor() {
     let mut c = periodic_controller();
     let mut op = operation(OperationPhase::Waiting, false);
     op.started = 100;
-    op.capabilities = crate::devices::cwmp::runtime::Discovery::new("auto");
+    op.capabilities = crate::cwmp::runtime::Discovery::new("auto");
     op.capabilities.tick(
         "test",
-        crate::devices::cwmp::identity::Identity {
+        crate::cwmp::identity::Identity {
             optical_vendor: "HWTC".into(),
             optical_serial: "HWTC00000042".into(),
             cwmp_serial: "4857544300000042".into(),

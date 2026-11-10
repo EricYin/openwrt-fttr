@@ -272,17 +272,14 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
             cfg.onu_pins
                 .insert(s.get("optical_sn").to_ascii_uppercase(), slot);
         }
-        let adapter = match s.get("adapter") {
-            "hl202" if cfg!(feature = "device-hl202") => "hl202",
-            "hwtc" | "k155" if cfg!(feature = "device-hwtc") => "hwtc",
-            "star" if cfg!(feature = "device-star") => "star",
-            "zte" if cfg!(feature = "device-zte") => "zte",
-            "scty" if cfg!(feature = "device-scty") => "scty",
-            "fiberhome" if cfg!(feature = "device-fiberhome") => "fiberhome",
-            "realtek" if cfg!(feature = "device-realtek") => "realtek",
-            "generic" => "generic",
-            _ => return Err(format!("{id}: adapter unknown or not compiled")),
-        };
+        let omci_adapter = s.get("omci_adapter");
+        crate::adapters::omci::validate(omci_adapter).map_err(|e| format!("{id}: {e}"))?;
+        let provisioning_adapter = s.get("provisioning_adapter");
+        let selected = crate::adapters::provisioning::lookup(provisioning_adapter)
+            .map_err(|e| format!("{id}: {e}"))?;
+        let bootstrap_adapter = s.get("bootstrap_adapter");
+        crate::adapters::bootstrap::validate(bootstrap_adapter, selected.transport)
+            .map_err(|e| format!("{id}: {e}"))?;
         let wifi_cleanup = match s.get("wifi_cleanup") {
             "" | "preserve" => "preserve",
             "delete" => "delete",
@@ -305,14 +302,6 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
                     .ok_or("invalid wifi_preserve instance")
             })
             .collect::<Result<BTreeSet<_>, _>>()?;
-        let cwmp_contract = if s.get("cwmp_contract").is_empty() {
-            "auto"
-        } else {
-            s.get("cwmp_contract")
-        };
-        if cwmp_contract != "auto" {
-            crate::devices::cwmp::registry::lookup(cwmp_contract)?;
-        }
         let use_defaults = boolean(
             s.get("connection_request_defaults"),
             s.get("connection_request_username").is_empty()
@@ -320,7 +309,7 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
         )
         .map_err(|error| format!("{id}: connection_request_defaults: {error}"))?;
         let (cr_username, cr_password, cr_defaults) = if use_defaults {
-            if adapter == "hl202" || cwmp_contract == "hl202" {
+            if matches!(provisioning_adapter, "hl202-cu" | "hl202-mqtt") {
                 ("rms".to_string(), "rms".to_string(), false)
             } else {
                 (
@@ -352,23 +341,14 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
             port,
             ..Default::default()
         };
-        if !matches!(s.get("provisioning_method"), "" | "command" | "acs") {
-            return Err(format!("{id}: provisioning_method must be command or acs"));
-        }
-        if s.get("provisioning_method") == "command" && adapter != "hl202" {
-            return Err(format!(
-                "{id}: command provisioning is only supported by HL202"
-            ));
-        }
         cfg.devices.push(Device {
             id: id.clone(),
             optical_sn: s.get("optical_sn").to_ascii_uppercase(),
             cwmp_id: s.get("cwmp_id").into(),
-            adapter: adapter.into(),
-            provisioning_method: s.get("provisioning_method").into(),
-            cwmp_contract: cwmp_contract.into(),
-            omci_management: boolean(s.get("omci_management"), false)
-                .map_err(|error| format!("{id}: omci_management: {error}"))?,
+            omci_adapter: omci_adapter.into(),
+            bootstrap_adapter: bootstrap_adapter.into(),
+            provisioning_adapter: provisioning_adapter.into(),
+            resolved_contract: None,
             connection_request,
             items: Vec::new(),
             wifi_cleanup: wifi_cleanup.into(),
@@ -535,7 +515,7 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
                     .ok_or("port_binding requires logical endpoints")?;
                 let endpoints = interfaces
                     .iter()
-                    .map(|v| crate::devices::cwmp::path::parse_endpoint(v))
+                    .map(|v| crate::cwmp::path::parse_endpoint(v))
                     .collect::<Result<Vec<_>, _>>()?;
                 item.binding_intent = Some(super::model::BindingIntent { endpoints });
             } else {
@@ -605,7 +585,7 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
     }
     // Stable revision over provisioning sections only; ACS credentials never enter it.
     let mut hash = 0xcbf29ce484222325u64;
-    for byte in crate::devices::cwmp::registry::VERSION.to_le_bytes() {
+    for byte in crate::cwmp::registry::VERSION.to_le_bytes() {
         hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
     }
     for (id, s) in sections.iter().filter(|(_, s)| {
@@ -701,24 +681,15 @@ mod tests {
         );
     }
     #[test]
-    fn hwtc_and_legacy_k155_names_select_the_hwtc_adapter() {
+    fn hwtc_selection_is_explicit_and_legacy_alias_is_rejected() {
         let config = |adapter: &str| {
-            format!("config device 'child'\n option optical_sn 'HWTC1234ABCD'\n option cwmp_id 'child-id'\n option adapter '{adapter}'")
+            format!("config device 'child'\n option optical_sn 'HWTC1234ABCD'\n option cwmp_id 'child-id'\n option omci_adapter '{adapter}'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'none'")
         };
         assert_eq!(
             parse_expanded(&config("hwtc")).is_ok(),
             cfg!(feature = "device-hwtc")
         );
-        assert_eq!(
-            parse_expanded(&config("k155")).is_ok(),
-            cfg!(feature = "device-hwtc")
-        );
-        if cfg!(feature = "device-hwtc") {
-            assert_eq!(
-                parse_expanded(&config("k155")).unwrap().devices[0].adapter,
-                "hwtc"
-            );
-        }
+        assert_eq!(parse_expanded(&config("k155")).is_ok(), false);
     }
     #[test]
     fn provisioning_has_no_optical_policy() {
@@ -734,10 +705,10 @@ mod tests {
         );
         assert!(parse_expanded("").unwrap().allow_unsupported_as_bridge);
 
-        let text = "config provisioning 'global'\n option allow_unsupported_as_bridge '1'\nconfig device 'child'\n option optical_sn 'ZTEG12345678'\n option cwmp_id 'child-id'\n option adapter 'generic'\n";
+        let text = "config provisioning 'global'\n option allow_unsupported_as_bridge '1'\nconfig device 'child'\n option optical_sn 'ZTEG12345678'\n option cwmp_id 'child-id'\n option omci_adapter 'generic'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'none'\n";
         let config = parse_expanded(text).unwrap();
         assert!(config.allow_unsupported_as_bridge);
-        assert_eq!(config.devices[0].adapter, "generic");
+        assert_eq!(config.devices[0].omci_adapter, "generic");
 
         let text_disabled =
             "config provisioning 'global'\n option allow_unsupported_as_bridge '0'\n";

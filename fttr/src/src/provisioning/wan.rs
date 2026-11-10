@@ -56,7 +56,7 @@ fn ip_kind() -> String {
 }
 #[derive(Clone)]
 pub struct Reconciler {
-    submission: Option<crate::devices::cwmp::transport::Pending<WanPhase>>,
+    submission: Option<crate::cwmp::transport::Pending<WanPhase>>,
     pub evidence_paths: BTreeMap<String, Vec<String>>,
     pub protected_roots: BTreeSet<String>,
     pub owned: BTreeMap<String, Owned>,
@@ -128,7 +128,7 @@ impl Reconciler {
         self.prune
     }
     fn queue(&mut self, device: &Device, method: &str, args: Value, stage: WanPhase) {
-        self.submission = Some(crate::devices::cwmp::transport::Pending {
+        self.submission = Some(crate::cwmp::transport::Pending {
             method: method.into(),
             args,
             stage,
@@ -153,7 +153,7 @@ impl Reconciler {
         if let Some(id) = v["id"].as_u64() {
             self.task = Some(id);
             self.stage = self.submission.take().unwrap().stage;
-        } else if crate::devices::cwmp::transport::backpressure(&v) {
+        } else if crate::cwmp::transport::backpressure(&v) {
             self.task = None;
         } else {
             self.submission = None;
@@ -356,9 +356,7 @@ impl Reconciler {
                         return true;
                     };
                     self.vlans.insert(parent, (vlan, enabled));
-                    if contract.priority.location
-                        == crate::devices::cwmp::contract::Location::Parent
-                    {
+                    if contract.priority.location == crate::cwmp::contract::Location::Parent {
                         let Some(priority) =
                             value(contract.priority.name).and_then(|v| v.parse::<u32>().ok())
                         else {
@@ -377,7 +375,7 @@ impl Reconciler {
                         connection,
                         kind: kind.clone(),
                         state: if protected(service, enabled)
-                            || crate::devices::cwmp::observed::protected(
+                            || crate::cwmp::observed::protected(
                                 parameters.unwrap_or_default(),
                                 &format!("{ROOT}{parent}.{kind}.{connection}."),
                             ) {
@@ -517,7 +515,7 @@ impl Reconciler {
                         );
                         return false;
                     };
-                    if crate::devices::cwmp::observed::protected(
+                    if crate::cwmp::observed::protected(
                         parameters.unwrap_or_default(),
                         &format!("{ROOT}{}.{}.{}.", o.parent, o.kind, o.connection),
                     ) || super::contains_service_token(observed, "TR069")
@@ -877,7 +875,7 @@ impl Reconciler {
                 }
             }
             if let Some(o) = editable.get(index) {
-                if contract.vlan.location == crate::devices::cwmp::contract::Location::Parent
+                if contract.vlan.location == crate::cwmp::contract::Location::Parent
                     && self
                         .discovered
                         .iter()
@@ -948,20 +946,20 @@ impl Reconciler {
                             .find(|p| p.name.ends_with(".Enable"))
                             .map(|p| p.value.clone());
                         let activation_separate = enable.is_none();
-                        let objects = crate::devices::cwmp::path::WanObjects {
+                        let objects = crate::cwmp::path::WanObjects {
                             parent: o.parent,
                             connection: o.connection,
                             kind: if o.kind == "WANIPConnection" {
-                                crate::devices::cwmp::path::ConnectionKind::Ip
+                                crate::cwmp::path::ConnectionKind::Ip
                             } else {
-                                crate::devices::cwmp::path::ConnectionKind::Ppp
+                                crate::cwmp::path::ConnectionKind::Ppp
                             },
                         };
-                        match crate::devices::cwmp::compiler::compile_wan(
+                        match crate::cwmp::compiler::compile_wan(
                             intent,
                             contract,
                             &objects,
-                            &crate::devices::cwmp::path::EndpointMap::default(),
+                            &crate::cwmp::path::EndpointMap::default(),
                         ) {
                             Ok(mut plan) => {
                                 if activation_separate {
@@ -1121,10 +1119,10 @@ mod tests {
             id: "child".into(),
             optical_sn: "HWTC12345678".into(),
             cwmp_id: "id".into(),
-            adapter: "hwtc".into(),
-            provisioning_method: "acs".into(),
-            cwmp_contract: "hwtc-hw".into(),
-            omci_management: false,
+            omci_adapter: "hwtc".into(),
+            bootstrap_adapter: "manual-acs".into(),
+            provisioning_adapter: "hwtc-hw".into(),
+            resolved_contract: None,
             connection_request: Default::default(),
             items: vec![Item {
                 wlan_intent: None,
@@ -1263,7 +1261,7 @@ mod tests {
     fn cross_contract_management_roots_are_not_reclassified_or_pruned() {
         let mut d = device();
         d.items.clear();
-        d.cwmp_contract = "hl202-cu".into();
+        d.provisioning_adapter = "hl202-cu".into();
         let mut r = Reconciler::new(&d, BTreeMap::new(), true);
         r.protected_roots
             .insert(format!("{ROOT}1.WANIPConnection.1."));
@@ -1338,8 +1336,8 @@ mod tests {
     #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 contract")]
     fn shared_protected_parent_blocks_mutation() {
         let mut d = device();
-        d.adapter = "hl202".into();
-        d.cwmp_contract = "hl202-cu".into();
+        d.omci_adapter = "hl202".into();
+        d.provisioning_adapter = "hl202-cu".into();
         let mut r = Reconciler::new(&d, BTreeMap::new(), true);
         r.discovered = vec![
             Owned {
@@ -1539,4 +1537,4 @@ mod tests {
         });
     }
 }
-use crate::devices::cwmp::transport::Command;
+use crate::cwmp::transport::Command;

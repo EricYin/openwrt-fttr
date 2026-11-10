@@ -196,12 +196,8 @@ impl Server {
             Err(_) => error("invalid ACS operation"),
         }
     }
-    fn execute_command(
-        &self,
-        command: crate::devices::cwmp::transport::Command,
-        internal: bool,
-    ) -> Value {
-        use crate::devices::cwmp::transport::Command;
+    fn execute_command(&self, command: crate::cwmp::transport::Command, internal: bool) -> Value {
+        use crate::cwmp::transport::Command;
         let mut state = self.state.lock().unwrap();
         if !matches!(command, Command::Status | Command::Clean) {
             if let Some(reason) = &state.load_failure {
@@ -286,13 +282,11 @@ impl Server {
         }
     }
 }
-pub fn transact(
-    command: crate::devices::cwmp::transport::Command,
-) -> crate::devices::cwmp::transport::Reply {
+pub fn transact(command: crate::cwmp::transport::Command) -> crate::cwmp::transport::Reply {
     crate::runtime::block_on(async move {
         actor::call(move || {
             let server = init();
-            if let crate::devices::cwmp::transport::Command::Task { id } = command {
+            if let crate::cwmp::transport::Command::Task { id } = command {
                 let mut state = server.state.lock().unwrap();
                 if let Some(reason) = &state.load_failure {
                     return error(reason).into();

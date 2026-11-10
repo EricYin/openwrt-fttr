@@ -1,6 +1,10 @@
 //! Per-device ACS bootstrap; MQTT, settings verification and Inform are independent evidence.
-use super::model::{Device, Management};
 use crate::mqtt_identity::Registry;
+use crate::provisioning::{
+    management_network,
+    model::{Device, Management},
+    storage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -94,7 +98,8 @@ fn version(device: &Device, management: Option<&Management>, target: Option<&str
     let bytes = serde_json::to_vec(&(
         device.optical_sn.as_str(),
         device.cwmp_id.as_str(),
-        device.adapter.as_str(),
+        device.bootstrap_adapter.as_str(),
+        device.provisioning_adapter.as_str(),
         device.connection_request.enabled,
         management,
         target,
@@ -250,7 +255,11 @@ impl Coordinator {
             acs_available,
             authorization,
         } = observation;
-        let automatic = sources.automatic_source(&device.optical_sn, time);
+        let automatic = if device.bootstrap_adapter == "hl202-mqtt-acs" {
+            sources.automatic_source(&device.optical_sn, time)
+        } else {
+            Ok(None)
+        };
         let automatic_target = automatic
             .as_ref()
             .ok()
@@ -298,12 +307,7 @@ impl Coordinator {
         r.cwmp_id = device.cwmp_id.clone();
         r.mqtt_target = target.map(str::to_owned);
         r.binding_source = binding_source.into();
-        r.method = if device.adapter == "hl202" && cfg!(feature = "device-hl202") {
-            "mqtt"
-        } else {
-            "manual"
-        }
-        .into();
+        r.method.clone_from(&device.bootstrap_adapter);
         if r.optical_online && !online {
             r.invalidate(
                 time,
@@ -330,8 +334,7 @@ impl Coordinator {
         // A recent Inform proves reachability, but does not prove that the
         // currently authorized ACS credentials have been written to the CPE.
         // Require a post-readback Inform before declaring the bootstrap ready.
-        let settings_verified = device.adapter != "hl202"
-            || !cfg!(all(feature = "device-hl202", feature = "mqtt"))
+        let settings_verified = device.bootstrap_adapter != "hl202-mqtt-acs"
             || r.settings_verified_at
                 .is_some_and(|verified| at.is_some_and(|at| at >= verified));
         let fresh = acs_available
@@ -377,8 +380,14 @@ impl Coordinator {
             !automatic && (epoch == 0 || epoch == r.completed_authorization)
         }) {
             r.set_phase(Phase::AwaitingApply,time,"management drift or reset detected; apply management configuration to authorize recovery");
-        } else if device.adapter != "hl202" || !cfg!(feature = "device-hl202") {
-            r.set_phase(Phase::ManualRequired, time, "automatic ACS bootstrap is unavailable for this adapter; follow the current management settings");
+        } else if device.bootstrap_adapter == "omci-acs" {
+            r.set_phase(Phase::WaitingInform, time, "waiting for OMCI ACS association and a fresh Inform; association readback alone does not prove reachability");
+        } else if device.bootstrap_adapter != "hl202-mqtt-acs" {
+            r.set_phase(
+                Phase::ManualRequired,
+                time,
+                "configure the selected manual ACS path and wait for a fresh Inform",
+            );
         } else if target.is_none() {
             r.set_phase(Phase::WaitingIdentity, time, automatic.err().unwrap_or("waiting for a unique fresh MQTT source MAC learned on this device's online ONU interface"));
         } else if !online {
@@ -423,7 +432,7 @@ impl Coordinator {
     fn persist(&mut self) {
         let bytes = serde_json::to_vec(&self.records).unwrap_or_default();
         if bytes != self.saved {
-            match super::storage::write_atomic(STATE_FILE, &bytes, true) {
+            match storage::write_atomic(STATE_FILE, &bytes, true) {
                 Ok(()) => {
                     self.saved = bytes;
                     self.persistence_error = None;
@@ -470,7 +479,7 @@ async fn run(
     authorization_epoch: u64,
 ) {
     let result = async {
-        let credentials = super::management_network::credentials(authorization_epoch)
+        let credentials = management_network::credentials(authorization_epoch)
             .ok_or("management authorization changed before execution")?;
         if !progress_async(
             &id,
@@ -490,7 +499,7 @@ async fn run(
             |stage| {
                 let id = id.clone();
                 async move {
-                    if super::management_network::credentials(authorization_epoch).is_none() {
+                    if management_network::credentials(authorization_epoch).is_none() {
                         return false;
                     }
                     match stage {
@@ -557,7 +566,7 @@ async fn run(
             {
                 return Ok(false);
             }
-            if super::management_network::credentials(authorization_epoch).is_none() {
+            if management_network::credentials(authorization_epoch).is_none() {
                 return Ok(false);
             }
             crate::devices::configure_authenticated_cwmp_settings_async(
@@ -592,7 +601,7 @@ async fn run(
         }
         c.persist();
         drop(c);
-        super::controller::wake();
+        crate::provisioning::controller::wake();
     })
     .await;
 }
@@ -638,18 +647,28 @@ pub(super) fn omci_write_allowed(id: &str, epoch: u64, automatic: bool) -> bool 
     })
 }
 
-pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Value {
-    let Ok(sources) = crate::mqtt_identity::shared().lock() else {
-        return json!({"state":"unavailable","reason":"MQTT identity state unavailable"});
+pub(super) fn view(device: &Device, management: Option<&Management>, acs: &Value) -> Value {
+    if device.bootstrap_adapter == "none" {
+        return json!({"state":"not_required","reason":"selected provisioning adapter requires no ACS bootstrap"});
+    }
+    let sources = if device.bootstrap_adapter == "hl202-mqtt-acs" {
+        match crate::mqtt_identity::shared().lock() {
+            Ok(sources) => Some(sources),
+            Err(_) => {
+                return json!({"state":"unavailable","reason":"MQTT identity state unavailable"})
+            }
+        }
+    } else {
+        None
     };
     let c = coordinator().lock().unwrap();
-    let Some(r) = c.records.get(id) else {
+    let Some(r) = c.records.get(&device.id) else {
         return json!({"state":"pending","reason":"bootstrap observation not started"});
     };
     let mut view = serde_json::to_value(r).unwrap_or_default();
     view["inflight"] = json!(r.worker.is_some());
     view["persistence_error"] = json!(c.persistence_error);
-    view["link_identity_error"] = json!(sources.topology_error());
+    view["link_identity_error"] = json!(sources.as_ref().and_then(|s| s.topology_error()));
     view["listener"] = serde_json::to_value(fttr_api::AcsListener {
         enabled: acs["enabled"].as_bool().unwrap_or(false),
         listen: acs["listen"].as_str().map(str::to_owned),
@@ -657,7 +676,10 @@ pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Va
         error: acs["error"].as_str().map(str::to_owned),
     })
     .expect("ACS listener serialization");
-    view["mqtt_last_seen"] = json!(r.mqtt_target.as_ref().and_then(|t| sources.last_seen(t)));
+    view["mqtt_last_seen"] = json!(r
+        .mqtt_target
+        .as_ref()
+        .and_then(|t| sources.as_ref().and_then(|s| s.last_seen(t))));
     if let Some(m) = management {
         let url = public_url(&m.acs_url);
         view["desired"] = json!({"vlan":r.selected_vlan.filter(|v|m.vlans.contains(v)).unwrap_or(m.vlan),"vlans":m.vlans,"priority":m.priority,"acs_url":url});
@@ -681,7 +703,6 @@ pub(super) fn view(id: &str, management: Option<&Management>, acs: &Value) -> Va
 }
 
 #[cfg(test)]
-#[path = "bootstrap_interval_tests.rs"]
 mod interval_tests;
 
 #[cfg(test)]
@@ -734,10 +755,15 @@ mod tests {
             id: id.into(),
             optical_sn: "H3CT12345678".into(),
             cwmp_id: id.into(),
-            adapter: adapter.into(),
-            provisioning_method: "acs".into(),
-            cwmp_contract: "auto".into(),
-            omci_management: false,
+            omci_adapter: adapter.into(),
+            bootstrap_adapter: if adapter == "hl202" {
+                "hl202-mqtt-acs"
+            } else {
+                "manual-acs"
+            }
+            .into(),
+            provisioning_adapter: "hl202-cu".into(),
+            resolved_contract: None,
             connection_request: Default::default(),
             items: Vec::new(),
             wifi_cleanup: "preserve".into(),

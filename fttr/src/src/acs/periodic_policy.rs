@@ -72,7 +72,7 @@ impl Policy {
         self.verified_at = Some(now());
     }
 
-    fn read(&mut self, data: &crate::devices::cwmp::response::Data) -> bool {
+    fn read(&mut self, data: &crate::cwmp::response::Data) -> bool {
         let parameters = data.rows();
         let value = |leaf| {
             parameters
@@ -92,7 +92,7 @@ impl Policy {
         enabled.is_some() && interval.is_some_and(|value| value > 0)
     }
 
-    fn advance(&mut self, result: &crate::devices::cwmp::response::Data) {
+    fn advance(&mut self, result: &crate::cwmp::response::Data) {
         match self.state {
             Phase::Reading | Phase::Readback => {
                 let readback = self.state == Phase::Readback;

@@ -33,7 +33,7 @@ pub(super) fn observed(state: &super::State, device: &str, prefix: &str) -> Opti
 }
 
 pub(super) fn service_evidence(
-    value: &crate::devices::cwmp::response::Data,
+    value: &crate::cwmp::response::Data,
 ) -> std::collections::BTreeMap<String, bool> {
     let mut evidence = std::collections::BTreeMap::new();
     for row in value.rows().into_iter().flatten() {
@@ -60,10 +60,7 @@ pub(super) fn service_evidence(
     evidence
 }
 
-pub(super) fn is_management(
-    result: &crate::devices::cwmp::response::Data,
-    prefix: &str,
-) -> Option<bool> {
+pub(super) fn is_management(result: &crate::cwmp::response::Data, prefix: &str) -> Option<bool> {
     let Some(rows) = result.rows() else {
         return Some(true);
     };

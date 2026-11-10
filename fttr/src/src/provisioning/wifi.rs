@@ -29,10 +29,10 @@ mod tests {
             id: "child".into(),
             optical_sn: "H3CT12345678".into(),
             cwmp_id: "id".into(),
-            adapter: "hl202".into(),
-            provisioning_method: "acs".into(),
-            cwmp_contract: "hl202-cu".into(),
-            omci_management: false,
+            omci_adapter: "hl202".into(),
+            bootstrap_adapter: "manual-acs".into(),
+            provisioning_adapter: "hl202-cu".into(),
+            resolved_contract: None,
             connection_request: Default::default(),
             wifi_cleanup: "delete".into(),
             wifi_preserve: BTreeSet::new(),
@@ -235,7 +235,7 @@ pub fn reset(id: &str) -> Result<(), String> {
 pub fn instance(name: &str) -> Option<u32> {
     name.strip_prefix(ROOT)?.split('.').next()?.parse().ok()
 }
-fn inventory(v: &crate::devices::cwmp::response::Data) -> BTreeSet<u32> {
+fn inventory(v: &crate::cwmp::response::Data) -> BTreeSet<u32> {
     v.rows()
         .into_iter()
         .flatten()
@@ -251,7 +251,7 @@ fn inventory(v: &crate::devices::cwmp::response::Data) -> BTreeSet<u32> {
 }
 #[derive(Clone)]
 pub struct Reconciler {
-    submission: Option<crate::devices::cwmp::transport::Pending<WifiPhase>>,
+    submission: Option<crate::cwmp::transport::Pending<WifiPhase>>,
     pub registry: Registry,
     pub results: BTreeMap<String, Value>,
     pub stage: WifiPhase,
@@ -350,7 +350,7 @@ impl Reconciler {
         }
     }
     fn queue(&mut self, d: &Device, method: &str, args: Value, stage: WifiPhase) {
-        self.submission = Some(crate::devices::cwmp::transport::Pending {
+        self.submission = Some(crate::cwmp::transport::Pending {
             method: method.into(),
             args,
             stage,
@@ -374,7 +374,7 @@ impl Reconciler {
         if let Some(id) = v["id"].as_u64() {
             self.task = Some(id);
             self.stage = self.submission.take().unwrap().stage;
-        } else if crate::devices::cwmp::transport::backpressure(&v) {
+        } else if crate::cwmp::transport::backpressure(&v) {
             self.task = None;
         } else {
             self.submission = None;
@@ -668,4 +668,4 @@ impl Reconciler {
         true
     }
 }
-use crate::devices::cwmp::transport::Command;
+use crate::cwmp::transport::Command;

@@ -506,7 +506,7 @@ impl Discovery {
         }
         if matches!(
             contract.references,
-            Some(super::contract::ReferenceEncoding::HwLanBindFlags)
+            Some(super::contract::ReferenceEncoding::EndpointFlags { .. })
         ) {
             let mut connections = BTreeSet::new();
             for path in self.names.keys() {
@@ -532,7 +532,7 @@ impl Discovery {
                 })
             {
                 self.invalidate(
-                    "V152 binding switches require complete writable unsignedInt 0/1 evidence",
+                    "binding switches require complete writable unsignedInt 0/1 evidence",
                 );
                 return;
             }
