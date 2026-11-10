@@ -194,6 +194,89 @@ pub fn save(settings: fttr_api::OpticalSettings) -> io::Result<()> {
     save_settings_at(std::path::Path::new(CONFIG), Some(settings), None)
 }
 
+pub fn load_calibration_mode() -> io::Result<fttr_api::CalibrationMode> {
+    let config = std::path::Path::new(CONFIG);
+    if !config.exists() {
+        return Ok(fttr_api::CalibrationMode::Auto);
+    }
+    let mut session = UciSession::new(config)?;
+    let text = session
+        .uci
+        .export_package(&session.package)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    parse_calibration_mode(&text)
+}
+
+pub(crate) fn parse_calibration_mode(text: &str) -> io::Result<fttr_api::CalibrationMode> {
+    let mut section = false;
+    let mut seen = false;
+    let mut mode = fttr_api::CalibrationMode::Auto;
+    let mut source_seen = false;
+    for line in text.lines() {
+        let words = crate::provisioning::uci_words(line).map_err(io::Error::other)?;
+        match words.first().map(String::as_str) {
+            Some("config") => {
+                section = words.get(1).is_some_and(|w| w == "calibration");
+                if section {
+                    if seen || words.get(2).is_none_or(|w| w != "calibration") {
+                        return Err(io::Error::other("expected one named calibration section"));
+                    }
+                    seen = true;
+                } else if words.get(2).is_some_and(|w| w == "calibration") {
+                    return Err(io::Error::other(
+                        "fttr.calibration has the wrong section type",
+                    ));
+                }
+            }
+            Some("option" | "list") if section => {
+                if source_seen || words.len() != 3 || words[0] != "option" || words[1] != "source" {
+                    return Err(io::Error::other("invalid calibration source option"));
+                }
+                source_seen = true;
+                mode = serde_json::from_value(serde_json::Value::String(words[2].clone()))
+                    .map_err(io::Error::other)?;
+            }
+            _ => (),
+        }
+    }
+    Ok(mode)
+}
+
+pub fn save_calibration_mode(mode: fttr_api::CalibrationMode) -> io::Result<()> {
+    let config = std::path::Path::new(CONFIG);
+    let source = OpenOptions::new().read(true).write(true).open(config)?;
+    if unsafe { libc::flock(source.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "FTTR configuration is being edited; retry",
+        ));
+    }
+    let mut session = UciSession::new(config)?;
+    session
+        .uci
+        .ensure_section(&session.package, "calibration", "calibration")
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let value = serde_json::to_value(mode).map_err(io::Error::other)?;
+    session
+        .uci
+        .set(
+            &session.package,
+            "calibration",
+            "source",
+            value.as_str().unwrap(),
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    session
+        .uci
+        .commit(&session.package)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let bytes = fs::read(session.conf_dir.join(&session.package))?;
+    if parse_calibration_mode(std::str::from_utf8(&bytes).map_err(io::Error::other)?)? != mode {
+        return Err(io::Error::other("calibration source readback mismatch"));
+    }
+    replace_config(config, &source, &session.original, &bytes, &session.package)
+}
+
 fn save_at(config: &std::path::Path, enabled: bool) -> io::Result<()> {
     save_settings_at(config, None, Some(enabled))
 }
@@ -342,6 +425,27 @@ pub(crate) fn parse_settings(text: &str) -> io::Result<fttr_api::OpticalSettings
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn calibration_source_is_separate_from_optical_flags_and_invalid_sources_fail() {
+        use fttr_api::CalibrationMode;
+        assert_eq!(
+            super::parse_calibration_mode("").unwrap(),
+            CalibrationMode::Auto
+        );
+        for source in ["auto", "factory", "firmware", "builtin"] {
+            let text = format!("config calibration 'calibration'\n option source '{source}'\nconfig optical 'optical'\n option enabled '0'\n");
+            assert!(super::parse_calibration_mode(&text).is_ok());
+            assert!(!super::parse_settings(&text).unwrap().enabled);
+        }
+        assert!(super::parse_calibration_mode(
+            "config calibration 'calibration'\n option source 'other'"
+        )
+        .is_err());
+        assert!(super::parse_calibration_mode(
+            "config calibration 'calibration'\n option source 'auto'\n option source 'factory'"
+        )
+        .is_err());
+    }
     use super::*;
     #[test]
     fn optical_defaults_and_strict_settings() {

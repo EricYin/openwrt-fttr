@@ -429,22 +429,37 @@ mod tests {
     #[test]
     fn generic_bridge_associates_exact_ct_native_identity_without_enrolling_business() {
         assert!(matches_cwmp_adapter(
-            "generic", "SCTY72ABCDEF", "TEWA-768G", "308618C8172ABCDEF",
+            "generic",
+            "SCTY72ABCDEF",
+            "TEWA-768G",
+            "308618C8172ABCDEF",
         ));
         assert!(!matches_cwmp_adapter(
-            "generic", "SCTY72ABCDE0", "TEWA-768G", "308618C8172ABCDEF",
+            "generic",
+            "SCTY72ABCDE0",
+            "TEWA-768G",
+            "308618C8172ABCDEF",
         ));
         assert!(!matches_cwmp_adapter(
-            "generic", "SCTY72ABCDEF", "TEWA-unknown", "308618C8172ABCDEF",
+            "generic",
+            "SCTY72ABCDEF",
+            "TEWA-unknown",
+            "308618C8172ABCDEF",
         ));
         assert!(!matches_cwmp_adapter(
-            "unavailable", "SCTY72ABCDEF", "TEWA-768G", "308618C8172ABCDEF",
+            "unavailable",
+            "SCTY72ABCDEF",
+            "TEWA-768G",
+            "308618C8172ABCDEF",
         ));
         assert_eq!(
-            select("SCTY", &crate::model::OnuIdentity {
-                equipment_id: Some("TEWA-768G".into()),
-                ..Default::default()
-            }),
+            select(
+                "SCTY",
+                &crate::model::OnuIdentity {
+                    equipment_id: Some("TEWA-768G".into()),
+                    ..Default::default()
+                }
+            ),
             Adapter::Unavailable,
         );
     }
@@ -611,10 +626,7 @@ mod tests {
             ..Default::default()
         };
         #[cfg(feature = "device-zte")]
-        assert_eq!(
-            select("ZTEG", &identity),
-            Adapter::Zte(zte::Profile::F650a)
-        );
+        assert_eq!(select("ZTEG", &identity), Adapter::Zte(zte::Profile::F650a));
         #[cfg(not(feature = "device-zte"))]
         assert_eq!(select("ZTEG", &identity), Adapter::Unavailable);
         assert_eq!(select("OTHER", &identity), Adapter::Unavailable);
@@ -622,10 +634,7 @@ mod tests {
         assert_eq!(select("ZTEG", &identity), Adapter::Unavailable);
         identity.equipment_id = Some("ZXHN G1612".into());
         #[cfg(feature = "device-zte")]
-        assert_eq!(
-            select("ZTEG", &identity),
-            Adapter::Zte(zte::Profile::G1612)
-        );
+        assert_eq!(select("ZTEG", &identity), Adapter::Zte(zte::Profile::G1612));
         #[cfg(not(feature = "device-zte"))]
         assert_eq!(select("ZTEG", &identity), Adapter::Unavailable);
         assert!(!matches_cwmp_adapter(

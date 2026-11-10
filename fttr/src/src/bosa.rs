@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io;
-use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
@@ -279,7 +278,7 @@ pub struct BosaCalibration {
     pub bias: (u16, u16, i16),         // N (0x4c), D (0x4e), O (0x50)
     pub tx_power: (u16, u16, i16),     // N (0x52), D (0x54), O (0x56)
     pub temp_alt: (u16, u16, i16),     // N (0x58), D (0x5a), O (0x5c)
-    pub temp_threshold: i16,           // threshold (0x5e)
+    pub temp_threshold: u16,           // unsigned BE16 threshold (0x5e), per stock
 }
 
 impl BosaCalibration {
@@ -296,30 +295,13 @@ impl BosaCalibration {
             bias: (read_u16(0x4c), read_u16(0x4e), read_i16(0x50)),
             tx_power: (read_u16(0x52), read_u16(0x54), read_i16(0x56)),
             temp_alt: (read_u16(0x58), read_u16(0x5a), read_i16(0x5c)),
-            temp_threshold: read_i16(0x5e),
+            temp_threshold: read_u16(0x5e),
         })
     }
 }
 
 pub const FACTORY_UX3326_OFFSET: u64 = 0x2200;
 pub const FACTORY_UX3326_LEN: usize = 288;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CalibrationSource {
-    Factory,
-    FirmwareFile,
-    BuiltinDefault,
-}
-
-impl std::fmt::Display for CalibrationSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Factory => write!(f, "1MB Factory partition (offset 0x2200)"),
-            Self::FirmwareFile => write!(f, "/lib/firmware/modified_UX3326.bin"),
-            Self::BuiltinDefault => write!(f, "Built-in static default fallback"),
-        }
-    }
-}
 
 /// Tries to locate and read 288 bytes from the 1MB factory partition (UBI volume or MTD) at offset 0x2200.
 pub fn read_factory_calibration() -> Option<[u8; 288]> {
@@ -385,79 +367,6 @@ pub fn factory_calibration() -> (Option<String>, Option<[u8; 288]>) {
     (detected, None)
 }
 
-/// Loads the calibration 288-byte data with strict priority:
-/// 1. 1MB Factory partition (offset 0x2200)
-/// 2. /lib/firmware/modified_UX3326.bin
-/// 3. Built-in default table (fallback with warning)
-pub fn load_calibration_data() -> ([u8; 288], CalibrationSource) {
-    // Priority 1: 1MB Factory partition
-    if let Some(bytes) = read_factory_calibration() {
-        return (bytes, CalibrationSource::Factory);
-    }
-
-    // Priority 2: /lib/firmware/modified_UX3326.bin
-    let fw_path = "/lib/firmware/modified_UX3326.bin";
-    if Path::new(fw_path).exists() {
-        if let Ok(bytes) = fs::read(fw_path) {
-            if bytes.len() >= 56 {
-                let mut data = [0u8; 288];
-                let copy_len = bytes.len().min(288);
-                data[..copy_len].copy_from_slice(&bytes[..copy_len]);
-                if bytes.len() < 288 {
-                    data[copy_len..].copy_from_slice(&DEFAULT_UX3326_CALIBRATION_DATA[copy_len..]);
-                }
-                return (data, CalibrationSource::FirmwareFile);
-            }
-        }
-    }
-
-    // Priority 3: Fallback to built-in default
-    (
-        DEFAULT_UX3326_CALIBRATION_DATA,
-        CalibrationSource::BuiltinDefault,
-    )
-}
-
-pub fn load_calibration() -> BosaCalibration {
-    static CACHED: std::sync::OnceLock<BosaCalibration> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let (data, source) = load_calibration_data();
-        match source {
-            CalibrationSource::Factory => {
-                println!("[+] Using UX3326 calibration from 1MB Factory partition");
-            }
-            CalibrationSource::FirmwareFile => {
-                println!("[+] Using UX3326 calibration from /lib/firmware/modified_UX3326.bin");
-            }
-            CalibrationSource::BuiltinDefault => {
-                eprintln!("[-] WARNING: No factory partition or /lib/firmware/modified_UX3326.bin found; falling back to built-in default!");
-            }
-        }
-
-        BosaCalibration::from_bytes(&data)
-            .expect("static UX3326 calibration data must be valid")
-    })
-}
-
-fn load_calibration_table() -> [u8; 56] {
-    let (data, source) = load_calibration_data();
-    match source {
-        CalibrationSource::Factory => {
-            println!("[+] Loaded BOSA calibration table from 1MB Factory partition");
-        }
-        CalibrationSource::FirmwareFile => {
-            println!("[+] Loaded BOSA calibration table from /lib/firmware/modified_UX3326.bin");
-        }
-        CalibrationSource::BuiltinDefault => {
-            println!("[*] WARNING: Using built-in default UX3326 calibration table (56 bytes)");
-        }
-    }
-
-    let mut table = [0u8; 56];
-    table.copy_from_slice(&data[..56]);
-    table
-}
-
 /// Read 16-bit ADC register pair (high byte at base_reg, low byte at base_reg + 1).
 /// UX3326 requires 1ms wait after each byte read.
 pub fn read_adc_u16(base_reg: u32) -> io::Result<u16> {
@@ -479,48 +388,45 @@ pub fn read_adc_u16(base_reg: u32) -> io::Result<u16> {
     }
 }
 
+fn scaled_adc(raw: u16, (n, d, o): (u16, u16, i16)) -> Option<f32> {
+    let product = i32::try_from(u32::from(raw) * u32::from(n)).ok()?;
+    if d == 0 {
+        return None;
+    }
+    Some(product as f32 / d as f32 + o as f32)
+}
+
 pub fn calc_temperature(raw: u16, cal: &BosaCalibration) -> f32 {
-    let (n, d, o) = cal.temp_primary;
-    let d = if d == 0 { 4096 } else { d };
-    let scaled = (raw as i64 * n as i64) / d as i64 + o as i64;
-    let temp = scaled as f32 / 256.0;
+    let temp = scaled_adc(raw, cal.temp_primary).unwrap_or(f32::NAN) / 256.0;
     if temp <= cal.temp_threshold as f32 {
-        let (n_alt, d_alt, o_alt) = cal.temp_alt;
-        let d_alt = if d_alt == 0 { 4096 } else { d_alt };
-        let scaled_alt = (raw as i64 * n_alt as i64) / d_alt as i64 + o_alt as i64;
-        scaled_alt as f32 / 256.0
+        scaled_adc(raw, cal.temp_alt).unwrap_or(f32::NAN) / 256.0
     } else {
         temp
     }
 }
 
 pub fn calc_voltage(raw: u16, cal: &BosaCalibration) -> f32 {
-    let (n, d, o) = cal.voltage;
-    let d = if d == 0 { 1024 } else { d };
-    let scaled = (raw as i64 * n as i64) / d as i64 + o as i64;
-    scaled as f32 / 10000.0
+    scaled_adc(raw, cal.voltage).unwrap_or(f32::NAN) / 10000.0
 }
 
 pub fn calc_bias(raw: u16, cal: &BosaCalibration) -> f32 {
-    let (n, d, o) = cal.bias;
-    let d = if d == 0 { 1024 } else { d };
-    let scaled = (raw as i64 * n as i64) / d as i64 + o as i64;
-    scaled as f32 / 500.0
+    scaled_adc(raw, cal.bias).unwrap_or(f32::NAN) / 500.0
 }
 
 pub fn calc_tx_power(raw: u16, cal: &BosaCalibration) -> Option<f32> {
-    let (n, d, o) = cal.tx_power;
-    let d = if d == 0 { 256 } else { d };
-    let p_uw = (raw as i64 * n as i64) / d as i64 + o as i64;
-    let p_mw = p_uw as f32 / 10000.0;
+    let p_mw = (scaled_adc(raw, cal.tx_power)? / 10.0) / 1000.0;
     if p_mw > 0.0 {
-        Some(10.0 * p_mw.log10())
+        Some((10.0 * f64::from(p_mw).log10()) as f32)
     } else {
         None
     }
 }
 
 pub fn init_optical_transceiver() -> io::Result<()> {
+    set_optical_tx_enable(true)
+}
+
+fn init_optical_transceiver_with(snapshot: &crate::calibration::Snapshot) -> io::Result<()> {
     println!("[*] === Initializing Micro-OLT BOSA Transceiver (UX3326) ===");
 
     // Step 1: Set FPGA optical transceiver clock sync mode.
@@ -564,7 +470,7 @@ pub fn init_optical_transceiver() -> io::Result<()> {
     }
 
     // Step 3: Load calibration table
-    let cal_table = load_calibration_table();
+    let cal_table = &snapshot.bytes[..56];
 
     // Step 4: Program calibration table into BOSA registers.
     println!("[*] Step 3: Enabling BOSA bus gate on FPGA (0x50 = 1)...");
@@ -595,6 +501,10 @@ pub fn init_optical_transceiver() -> io::Result<()> {
     program_result?;
     gate_result?;
     thread::sleep(Duration::from_millis(1));
+
+    if read_bosa_reg(6)? as u8 != cal_table[6] || read_bosa_reg(7)? as u8 != cal_table[7] {
+        return Err(io::Error::other("initial BOSA code pair readback mismatch"));
+    }
 
     println!("[+] Micro-OLT BOSA optical transceiver successfully initialized!");
     Ok(())
@@ -630,48 +540,57 @@ pub(crate) fn parse_optical_reset_state(val: u32) -> io::Result<bool> {
 ///
 /// When `enable` is false (OFF):
 /// - Writes 0 to FPGA register 0x84, asserting RESET_N (hardware reset/power-down).
-/// - UX3326 laser diode driver (LDD) is cut off, completely extinguishing 1490nm optical emission.
+/// - Asserts the UX3326 reset line; this readback is not an optical power measurement.
 /// - Verifies readback of register 0x84 is 0.
 ///
 /// When `enable` is true (ON):
 /// - UX3326 registers are volatile and lose calibration across reset.
 /// - Performs the full optical initialization sequence via `init_optical_transceiver()`,
 ///   releasing reset (0x84 = 1), waiting for stabilization, and reprogramming the 56-byte
-///   factory calibration table followed by latching.
+///   selected calibration table followed by latching.
 /// - Verifies readback of register 0x84 is 1.
 pub fn set_optical_tx_enable(enable: bool) -> io::Result<()> {
-    if enable {
-        init_optical_transceiver()?;
-        let verify = read_fpga_reg(FPGA_REG_OPTICAL_RESET)?;
-        if verify != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Optical TX enable verification failed: expected 0x00000001, got 0x{verify:08X}"
-                ),
-            ));
-        }
+    // Resolve before any hardware side effect. The owner uses exactly this immutable
+    // version for initialization, telemetry and the temperature table.
+    let candidate = if enable {
+        Some(crate::calibration::resolve()?)
     } else {
-        write_fpga_reg(FPGA_REG_OPTICAL_RESET, 0)?;
-        thread::sleep(Duration::from_millis(10));
-        let verify = read_fpga_reg(FPGA_REG_OPTICAL_RESET)?;
-        if verify != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Optical TX disable verification failed: expected 0x00000000, got 0x{verify:08X}"
-                ),
-            ));
+        None
+    };
+    let mut runtime = crate::calibration::RUNTIME.write().unwrap();
+    runtime.transition(candidate, |candidate| {
+        if enable {
+            init_optical_transceiver_with(candidate.unwrap())?;
+            let verify = read_fpga_reg(FPGA_REG_OPTICAL_RESET)?;
+            if verify != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "Optical TX enable verification failed: expected 0x00000001, got 0x{verify:08X}"
+                    ),
+                ));
+            }
+        } else {
+            write_fpga_reg(FPGA_REG_OPTICAL_RESET, 0)?;
+            thread::sleep(Duration::from_millis(10));
+            let verify = read_fpga_reg(FPGA_REG_OPTICAL_RESET)?;
+            if verify != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "Optical TX disable verification failed: expected 0x00000000, got 0x{verify:08X}"
+                    ),
+                ));
+            }
         }
-    }
-    invalidate_optical_cache();
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Reads the downstream PON optical transceiver reset line state via FPGA register 0x84.
 ///
 /// Returns:
-/// - `Ok(true)`: 0x84 is 1 (normal active/calibrated state)
+/// - `Ok(true)`: 0x84 is 1 (RESET_N released; not proof of calibration or emitted light)
 /// - `Ok(false)`: 0x84 is 0 (hardware reset/power-down state)
 pub fn get_optical_tx_enable() -> io::Result<bool> {
     let val = read_fpga_reg(FPGA_REG_OPTICAL_RESET)?;
@@ -679,6 +598,7 @@ pub fn get_optical_tx_enable() -> io::Result<bool> {
 }
 
 pub fn get_optical_status() -> OpticalTransceiverStatus {
+    let runtime = crate::calibration::RUNTIME.read().unwrap();
     if let Ok(guard) = OPTICAL_CACHE.lock() {
         if let Some((ts, ref status)) = *guard {
             if ts.elapsed() < Duration::from_secs(2) {
@@ -687,7 +607,7 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         }
     }
 
-    let cal = load_calibration();
+    let cal = runtime.active.as_ref().map(|s| s.telemetry);
     let tx_enabled = get_optical_tx_enable().ok();
 
     let mut measurements = BTreeMap::new();
@@ -697,45 +617,38 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
     // 0x30/0x31: Supply Voltage (Vcc)
     // 0x32/0x33: Laser Bias Current
     // 0x34/0x35: Transmit Power
+    let unavailable = if tx_enabled == Some(false) {
+        "optical_tx_disabled_hardware_reset"
+    } else if tx_enabled.is_none() {
+        "optical_reset_state_unknown"
+    } else {
+        "calibration_not_applied_by_owner"
+    };
     let (temperature_celsius, vcc_voltage, laser_bias_current_ma, tx_power_dbm) = if tx_enabled
-        == Some(false)
+        != Some(true)
+        || !runtime.hardware_applied
     {
         // When hardware reset is asserted (FPGA 0x84 = 0), UX3326 is powered down
         // and SPI reads return floating idle (0x4040). Do not interpret as valid telemetry.
         measurements.insert(
             "temperature_celsius".into(),
-            MeasurementEvidence::unavailable(
-                "UX3326/FMCS",
-                "C",
-                "optical_tx_disabled_hardware_reset",
-            ),
+            MeasurementEvidence::unavailable("UX3326/FMCS", "C", unavailable),
         );
         measurements.insert(
             "vcc_voltage".into(),
-            MeasurementEvidence::unavailable(
-                "UX3326/FMCS",
-                "V",
-                "optical_tx_disabled_hardware_reset",
-            ),
+            MeasurementEvidence::unavailable("UX3326/FMCS", "V", unavailable),
         );
         measurements.insert(
             "laser_bias_current_ma".into(),
-            MeasurementEvidence::unavailable(
-                "UX3326/FMCS",
-                "mA",
-                "optical_tx_disabled_hardware_reset",
-            ),
+            MeasurementEvidence::unavailable("UX3326/FMCS", "mA", unavailable),
         );
         measurements.insert(
             "tx_power_dbm".into(),
-            MeasurementEvidence::unavailable(
-                "UX3326/FMCS",
-                "dBm",
-                "optical_tx_disabled_hardware_reset",
-            ),
+            MeasurementEvidence::unavailable("UX3326/FMCS", "dBm", unavailable),
         );
         (None, None, None, None)
     } else {
+        let cal = cal.expect("applied runtime has a calibration snapshot");
         let temp_res = read_adc_u16(0x2e);
         let volt_res = read_adc_u16(0x30);
         let bias_res = read_adc_u16(0x32);
@@ -752,7 +665,19 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
                         format!("{raw:04x}"),
                     ),
                 );
-                Some(val)
+                if val.is_finite() {
+                    Some(val)
+                } else {
+                    measurements.insert(
+                        "temperature_celsius".into(),
+                        MeasurementEvidence::unavailable(
+                            "UX3326/FMCS",
+                            "C",
+                            "invalid_calibration_or_adc_overflow",
+                        ),
+                    );
+                    None
+                }
             }
             Err(_) => {
                 measurements.insert(
@@ -774,7 +699,19 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
                         format!("{raw:04x}"),
                     ),
                 );
-                Some(val)
+                if val.is_finite() {
+                    Some(val)
+                } else {
+                    measurements.insert(
+                        "vcc_voltage".into(),
+                        MeasurementEvidence::unavailable(
+                            "UX3326/FMCS",
+                            "V",
+                            "invalid_calibration_or_adc_overflow",
+                        ),
+                    );
+                    None
+                }
             }
             Err(_) => {
                 measurements.insert(
@@ -796,7 +733,19 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
                         format!("{raw:04x}"),
                     ),
                 );
-                Some(val)
+                if val.is_finite() {
+                    Some(val)
+                } else {
+                    measurements.insert(
+                        "laser_bias_current_ma".into(),
+                        MeasurementEvidence::unavailable(
+                            "UX3326/FMCS",
+                            "mA",
+                            "invalid_calibration_or_adc_overflow",
+                        ),
+                    );
+                    None
+                }
             }
             Err(_) => {
                 measurements.insert(
@@ -826,7 +775,7 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
                         MeasurementEvidence::unavailable(
                             "UX3326/FMCS",
                             "dBm",
-                            "tx_power_non_positive",
+                            "tx_power_non_positive_or_invalid_calibration",
                         ),
                     );
                     None
@@ -865,7 +814,7 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
                 "FPGA Reg 0x84 (UX3326 RESET_N)",
                 "boolean",
                 if enabled {
-                    "true (active/calibrated)"
+                    "true (reset released; not a measured light state)"
                 } else {
                     "false (reset/powered_down)"
                 },
@@ -886,6 +835,11 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         cdr_locked: None,
         tx_enabled,
         measurements,
+        calibration_sha256: runtime
+            .active
+            .as_ref()
+            .map(|s| s.version.effective_sha256.clone()),
+        calibration_applied: runtime.hardware_applied,
     };
 
     if let Ok(mut guard) = OPTICAL_CACHE.lock() {
@@ -1214,6 +1168,29 @@ mod tests {
         // Zero raw -> non-positive or very low
         let zero = calc_tx_power(0, &cal);
         assert!(zero.is_some());
+    }
+
+    #[test]
+    fn telemetry_preserves_fractional_quotients_and_rejects_invalid_coefficients() {
+        let mut cal = BosaCalibration::from_bytes(&DEFAULT_UX3326_CALIBRATION_DATA).unwrap();
+        assert_eq!(calc_temperature(0x5980, &cal), 59.26001);
+        assert_eq!(calc_voltage(0x8881, &cal), 3.2419677);
+        assert_eq!(calc_bias(0x1f01, &cal), 22.42324);
+        assert!((calc_tx_power(0x2441, &cal).unwrap() - -0.8456657).abs() < 0.000001);
+        cal.voltage.1 = 0;
+        assert!(!calc_voltage(1, &cal).is_finite());
+        cal.tx_power.1 = 0;
+        assert!(calc_tx_power(0x2441, &cal).is_none());
+        cal.temp_primary = (u16::MAX, 1, 0);
+        assert!(!calc_temperature(u16::MAX, &cal).is_finite());
+        let mut bytes = DEFAULT_UX3326_CALIBRATION_DATA;
+        bytes[0x5e..0x60].copy_from_slice(&u16::MAX.to_be_bytes());
+        let cal = BosaCalibration::from_bytes(&bytes).unwrap();
+        assert_eq!(cal.temp_threshold, u16::MAX);
+        assert_eq!(
+            calc_temperature(0x5980, &cal),
+            scaled_adc(0x5980, cal.temp_alt).unwrap() / 256.0
+        );
     }
 
     #[test]

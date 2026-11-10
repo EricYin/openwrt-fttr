@@ -46,6 +46,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
     // Optical state belongs to the controller, not the expanded provisioning plan.
     // Share its validation so config check and optical startup accept the same input.
     crate::optical::parse_export(text).map_err(|error| error.to_string())?;
+    crate::optical::parse_calibration_mode(text).map_err(|error| error.to_string())?;
     let all = config::parse_sections(text)?;
     if all.iter().filter(|(_, s)| s.kind == "management").count() > 1 {
         return Err("only one management network allowed".into());
@@ -55,6 +56,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
         if !matches!(
             s.kind.as_str(),
             "optical"
+                | "calibration"
                 | "acs"
                 | "provisioning"
                 | "management"
@@ -70,6 +72,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
         }
         let allowed: &[&str] = match s.kind.as_str() {
             "optical" => &["enabled", "downstream_tx_enabled", "fec_enabled"],
+            "calibration" => &["source"],
             "device" => &[
                 "name",
                 "optical_sn",
@@ -426,7 +429,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
     // Listener credentials and owner-managed optical policy do not schedule business sync.
     let mut canonical = String::new();
     for (id, s) in &all {
-        if s.kind != "acs" && s.kind != "optical" {
+        if !matches!(s.kind.as_str(), "acs" | "optical" | "calibration") {
             let mut business = s.clone();
             if business.kind == "device" {
                 business.options.remove("onu_id");
@@ -614,6 +617,16 @@ mod tests {
             super::compile("config optical 'optical'\n option fec_enabled '0'\n").unwrap();
         let enabled = super::compile("config optical 'optical'\n option fec_enabled '1'\n option downstream_tx_enabled '0'\n").unwrap();
         assert_eq!(disabled.revision, enabled.revision);
+        for source in ["auto", "factory", "firmware", "builtin"] {
+            let selected = super::compile(&format!(
+                "config calibration 'calibration'\n option source '{source}'\n"
+            ))
+            .unwrap();
+            assert_eq!(disabled.revision, selected.revision);
+        }
+        assert!(
+            super::compile("config calibration 'calibration'\n option source 'unknown'\n").is_err()
+        );
         for key in [
             "fec_enabled",
             "downstream_tx_enabled",

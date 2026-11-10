@@ -241,6 +241,7 @@ macro_rules! fttr_methods {
             HL202_EXEC_START, hl202_exec_start, hl202ExecStart, HlExecRequest, JobStartReply, Write, Hl202, [target, script, timeout_seconds];
             JOB_RESULT, job_result, jobResult, JobRequest, JobChunkReply, Read, Always, [job, chunk];
             GET_CALIBRATION, get_calibration, getCalibration, EmptyRequest, CalibrationInfoReply, Read, Always, [];
+            SELECT_CALIBRATION, select_calibration, selectCalibration, CalibrationSelectRequest, CalibrationInfoReply, Write, Always, [source];
             SAVE_CALIBRATION, save_calibration, saveCalibration, CalibrationSaveRequest, CalibrationSaveReply, Write, Always, [data];
             APPLY_CALIBRATION, apply_calibration, applyCalibration, EmptyRequest, JobStartReply, Write, Always, [];
         }

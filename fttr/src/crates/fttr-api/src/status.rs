@@ -74,6 +74,11 @@ impl MeasurementEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct OpticalTransceiverStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub calibration_sha256: Option<String>,
+    #[serde(default)]
+    pub calibration_applied: bool,
     pub model: String,
     pub wavelength_tx_nm: u32,
     pub wavelength_rx_nm: u32,

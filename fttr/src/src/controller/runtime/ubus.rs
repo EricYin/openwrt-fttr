@@ -245,6 +245,32 @@ impl Handlers {
             }),
         })
     }
+    fn select_calibration(
+        &self,
+        request: CalibrationSelectRequest,
+    ) -> Result<CalibrationInfoReply, i32> {
+        let result = (|| {
+            let factory = crate::bosa::read_factory_calibration();
+            let firmware = match crate::calibration::firmware() {
+                Ok(b) => b,
+                Err(e) if request.source == CalibrationMode::Firmware => return Err(e),
+                Err(_) => Vec::new(),
+            };
+            crate::calibration::select(
+                request.source,
+                factory.as_ref().map(|v| v.as_slice()),
+                &firmware,
+            )?;
+            crate::optical::save_calibration_mode(request.source)?;
+            super::calibration::get()
+        })();
+        Ok(match result {
+            Ok(info) => CalibrationInfoReply::Info(info),
+            Err(error) => CalibrationInfoReply::Error(CommandError {
+                error: error.to_string(),
+            }),
+        })
+    }
     fn save_calibration(
         &self,
         request: CalibrationSaveRequest,
@@ -261,6 +287,7 @@ impl Handlers {
         response(self.jobs.start("calibration", move || {
             let result = match optical(&optics, OpticalCommand::Reinitialize) {
                 Ok(reply) if reply.status == ReplyStatus::Success => CalibrationApplied {
+                    state: super::calibration::get().ok().and_then(|i| i.state),
                     success: true,
                     output: Some(
                         if reply.desired_enabled == Some(true) {
@@ -273,6 +300,7 @@ impl Handlers {
                     error: None,
                 },
                 Ok(reply) => CalibrationApplied {
+                    state: super::calibration::get().ok().and_then(|i| i.state),
                     success: false,
                     output: None,
                     error: Some(
@@ -283,6 +311,7 @@ impl Handlers {
                     ),
                 },
                 Err(_) => CalibrationApplied {
+                    state: super::calibration::get().ok().and_then(|i| i.state),
                     success: false,
                     output: None,
                     error: Some(

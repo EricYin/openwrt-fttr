@@ -114,13 +114,67 @@ pub enum NpuSetReply {
     Error { error: String },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub enum CalibrationSource {
     Factory,
     Firmware,
     Builtin,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub enum CalibrationMode {
+    #[default]
+    Auto,
+    Factory,
+    Firmware,
+    Builtin,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct CalibrationSelectRequest {
+    pub source: CalibrationMode,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct CalibrationVersion {
+    pub source: CalibrationSource,
+    pub raw_sha256: String,
+    pub effective_sha256: String,
+    pub size: u32,
+    pub supplemented: bool,
+    pub temperature_compensation_enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct TemperatureCompensationStatus {
+    pub enabled: bool,
+    pub reason: String,
+    pub calibration_sha256: Option<String>,
+    pub raw_temperature: Option<u16>,
+    pub table_index: Option<u8>,
+    pub target_code: Option<u16>,
+    pub last_check_unix: Option<u32>,
+    pub last_write_unix: Option<u32>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct CalibrationState {
+    pub selected: CalibrationMode,
+    pub candidate: Option<CalibrationVersion>,
+    pub candidate_error: Option<String>,
+    pub active: Option<CalibrationVersion>,
+    pub hardware_applied: bool,
+    pub pending: bool,
+    pub temperature_compensation: TemperatureCompensationStatus,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
@@ -150,6 +204,9 @@ pub struct CalibrationInfo {
     pub data: String,
     pub factory: FactoryCalibration,
     pub firmware: FirmwareCalibration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub state: Option<CalibrationState>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -180,6 +237,9 @@ pub struct CalibrationSaved {
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct CalibrationApplied {
     pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub state: Option<CalibrationState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "codegen", ts(optional))]
     pub output: Option<String>,

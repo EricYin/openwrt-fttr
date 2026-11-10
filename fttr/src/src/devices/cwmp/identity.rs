@@ -15,11 +15,7 @@ pub fn associated(identity: &Identity) -> bool {
         return false;
     }
     if identity.optical_vendor == "SCTY"
-        && super::vendor::ct::matches_identity(
-            sn,
-            &identity.product_class,
-            &identity.cwmp_serial,
-        )
+        && super::vendor::ct::matches_identity(sn, &identity.product_class, &identity.cwmp_serial)
     {
         return true;
     }

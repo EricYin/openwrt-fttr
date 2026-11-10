@@ -561,7 +561,10 @@ fn main() {
         exit(1);
     }
 
-    let _hardware_owner = if matches!(args[1].as_str(), "load-fpga" | "fpga-write" | "bosa-write") {
+    let _hardware_owner = if matches!(
+        args[1].as_str(),
+        "load-fpga" | "fpga-write" | "bosa-write" | "write-reg" | "write-bosa"
+    ) {
         Some(
             openwrt_fttr::optical::claim_owner().unwrap_or_else(|error| {
                 eprintln!("[-] Direct hardware write refused: {error}");
@@ -685,7 +688,22 @@ fn main() {
         }
         "bosa-diag" => {
             let is_json = args.iter().any(|a| a == "--json" || a == "-j");
-            let opt = bosa::get_optical_status();
+            // Only the daemon knows which coefficients were actually initialized.
+            let opt: fttr_api::OpticalTransceiverStatus = match ipc::send_ipc_command("STATUS")
+                .and_then(|reply| {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&reply).map_err(std::io::Error::other)?;
+                    serde_json::from_value(value.get("optical_transceiver").cloned().ok_or_else(
+                        || std::io::Error::other("daemon did not return optical telemetry"),
+                    )?)
+                    .map_err(std::io::Error::other)
+                }) {
+                Ok(status) => status,
+                Err(error) => {
+                    eprintln!("[-] Owner optical diagnostics unavailable: {error}");
+                    exit(1);
+                }
+            };
             if is_json {
                 println!("{}", serde_json::to_string_pretty(&opt).unwrap_or_default());
             } else {

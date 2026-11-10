@@ -102,6 +102,47 @@ STAR 观察工具要求传入源 MAC；不再内置现场设备地址。独立 r
 `fttrd`，OMCI MIB 入口复用控制器 inventory 核心。CLI 的受支持命令以
 `fttrctl help` 为准，手动 `discover/register/auth/sync-wifi/provision` 入口已移除。
 
+## HM2004-DU 光模块校准与温补
+
+`fttrd` 的光硬件 owner 统一应用 UX3326 的寄存器镜像、遥测系数和温度表。
+在 LuCI 校准页分别执行 **上传保存 → 保存来源选择 → 应用所选校准**；上传文件本身不切换来源。
+配置保存在 `/etc/config/fttr`：
+
+```uci
+config calibration 'calibration'
+    option source 'auto'
+```
+
+`auto`（缺省）按有效 Factory → firmware 文件 → builtin 选择；也可显式选择
+`factory`、`firmware`、`builtin`。显式来源不可用或无效时返回错误，不自动回退。
+firmware 文件路径为 `/lib/firmware/modified_UX3326.bin`，由现有 sysupgrade keep 文件保留。
+来源配置与业务同步 revision 分离，改来源不会触发 ONU 业务重配。
+
+```sh
+ubus call fttr get_calibration '{}'
+ubus call fttr select_calibration '{"source":"firmware"}'
+ubus call fttr apply_calibration '{}'
+```
+
+`apply_calibration` 返回异步 job，需按任务 API 查询最终结果。应用会通过 owner 暂停发现和业务、
+重新初始化并核对硬件读回；成功后同时发布该版本的遥测系数和温补表。关光期间应用保持关光，
+显示 pending，下一次启用才加载。`get_calibration.state` 区分 selected、candidate、active、
+hardware_applied 和 pending，并报告原始/有效 SHA-256；active 保留上次成功版本历史，
+仅当 hardware_applied 为真时才表示当前已应用。手动关闭再开启也会重新选择候选版本。
+
+完整文件为 288 字节；兼容 56 字节寄存器镜像，但其遥测系数由内置历史样本补全，
+**不启用温补**，原始与有效哈希分别报告。完整表中 `Mod_Lut_EN=1` 时，owner 在启用/
+应用后首次检查，随后约每 60 秒用主温度系数计算 84 项表索引，必要时依次写 BOSA
+`0x06/0x07` 并验证。温补独立于 GPON MAC TX 开关；owner 停止、复位或关光时停止写入。
+ADC 失败或温度索引越界跳过该次，部分写入或验证失败则暂停发现并尝试复位，需显式恢复。
+状态提供最近检查/写入、原始温度、索引、目标码及错误。
+
+遥测使用浮点商而非先整除；无效分母、溢出、非正 TX 功率返回不可用，不替换默认分母。
+`fttrctl bosa-diag` 从运行中的 daemon 获取同版本遥测；低层写寄存器命令及其别名遵守 owner 锁。
+RESET_N 读回、MAC TX 和实际光输出是不同证据；温补码没有已确认的 dBm 目标换算。
+本轮实现不包含原厂 ALS/LOS 自动关光状态机。离线调查和验收边界见本地
+`EVIDENCE/HM2004-DU-STOCK-TX-CONTROL.md`、`EVIDENCE/HM2004-DU-OPTICAL-IMPLEMENTATION.md`。
+
 ## Windows Rust 交叉编译
 
 在 `fttr/src` 中使用已安装的 Rust target、Zig 和 cargo-zigbuild：

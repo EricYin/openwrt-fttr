@@ -143,6 +143,9 @@ impl OpticalClient {
 }
 
 trait OpticalBackend {
+    fn validate_calibration(&self) -> io::Result<()> {
+        Ok(())
+    }
     fn save_settings(&mut self, _settings: fttr_api::OpticalSettings) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -236,6 +239,7 @@ impl OpticalActor {
                             })
                         }
                         OpticalCommand::Shutdown => Ok(false),
+                        OpticalCommand::Reinitialize => backend.validate_calibration().and(desired),
                         _ => desired,
                     };
                     // Persist first; failures must not falsely report a saved setting.
@@ -415,6 +419,9 @@ impl RuntimeOptics<'_> {
 }
 
 impl OpticalBackend for RuntimeOptics<'_> {
+    fn validate_calibration(&self) -> io::Result<()> {
+        crate::calibration::resolve().map(|_| ())
+    }
     fn save_settings(&mut self, settings: fttr_api::OpticalSettings) -> io::Result<()> {
         crate::optical::save(settings)
     }
@@ -927,6 +934,7 @@ async fn run_async() {
             let mut mac_allowed = false;
             let mut last_mac_poll = Instant::now() - Duration::from_secs(2);
             let mut last_mac_desired = None;
+            let mut temperature_compensation = crate::calibration::Compensator::default();
             loop {
                 let ready = hardware_ready.load(Ordering::Acquire);
                 {
@@ -957,6 +965,26 @@ async fn run_async() {
                         last_mac_poll = Instant::now();
                         last_mac_desired = Some(desired);
                     }
+                }
+                // Independent of the MAC TX flag: compensate the released BOSA even
+                // when downstream GPON frames are administratively disabled.
+                if let Err(error) = temperature_compensation.poll(
+                    Instant::now(),
+                    ready && !stopping.load(Ordering::Acquire) && optics.state == OpticalState::Enabled,
+                    &mut crate::calibration::Hardware,
+                ) {
+                    eprintln!("[-] Temperature compensation failed; resetting optical owner: {error}");
+                    let mut backend = RuntimeOptics {
+                        ready, ranging: &mut ranging, online: &mut online,
+                        pending_cleanup: &mut pending_cleanup, services: &mut services,
+                        engine: &pon_engine_ploam,
+                    };
+                    let _ = backend.quiesce();
+                    let reset = backend.set_tx(false);
+                    optics.state = OpticalState::Unknown;
+                    let mut runtime = crate::calibration::RUNTIME.write().unwrap();
+                    runtime.compensation.reason = "write_failed_owner_reset".into();
+                    runtime.compensation.error = Some(match reset { Ok(()) => error.to_string(), Err(reset) => format!("{error}; recovery reset failed: {reset}") });
                 }
                 if stopping.load(Ordering::Acquire) || !ready || !mac_allowed || optics.state != OpticalState::Enabled {
                     thread::sleep(Duration::from_millis(10));

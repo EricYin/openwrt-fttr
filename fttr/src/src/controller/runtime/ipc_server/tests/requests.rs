@@ -72,9 +72,17 @@ struct TestOptics {
     save_failure: bool,
     enable_failure_after_write: bool,
     saved_settings: Option<fttr_api::OpticalSettings>,
+    invalid_calibration: bool,
 }
 
 impl OpticalBackend for TestOptics {
+    fn validate_calibration(&self) -> io::Result<()> {
+        if self.invalid_calibration {
+            Err(io::Error::other("selected calibration is invalid"))
+        } else {
+            Ok(())
+        }
+    }
     fn save_settings(&mut self, settings: fttr_api::OpticalSettings) -> io::Result<()> {
         self.save(settings.enabled)?;
         self.saved_settings = Some(settings);
@@ -126,6 +134,32 @@ impl OpticalBackend for TestOptics {
             Ok(self.tx)
         }
     }
+}
+
+#[test]
+fn calibration_apply_while_off_does_not_enable_and_invalid_selection_is_reported() {
+    let mut actor = OpticalActor {
+        state: OpticalState::Disabled,
+    };
+    let mut backend = TestOptics {
+        ready: true,
+        ..Default::default()
+    };
+    let applied = actor.handle(OpticalCommand::Reinitialize, &mut backend);
+    assert_eq!(applied["status"], "success");
+    assert_eq!(applied["desired_enabled"], false);
+    assert_eq!(applied["actor_state"], "disabled");
+    assert!(!backend.events.contains(&"enable"));
+    assert_eq!(backend.events, ["quiesce", "disable", "read"]);
+
+    backend.events.clear();
+    backend.invalid_calibration = true;
+    let rejected = actor.handle(OpticalCommand::Reinitialize, &mut backend);
+    assert_eq!(rejected["status"], "error");
+    assert_eq!(rejected["error"]["code"], "Configuration");
+    assert!(!backend.tx);
+    assert!(!backend.desired);
+    assert!(!backend.events.contains(&"enable"));
 }
 
 #[test]

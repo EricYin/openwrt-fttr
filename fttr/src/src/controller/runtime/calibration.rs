@@ -5,7 +5,7 @@ use fttr_api::{
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, Write},
     os::unix::fs::OpenOptionsExt,
 };
 
@@ -16,37 +16,43 @@ fn hash(bytes: &[u8]) -> String {
 
 pub(super) fn get() -> io::Result<CalibrationInfo> {
     let (device, factory) = crate::bosa::factory_calibration();
-    let firmware = match fs::File::open(PATH) {
-        Ok(file) => {
-            let mut bytes = Vec::new();
-            file.take(289).read_to_end(&mut bytes)?;
-            bytes
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(e),
-    };
-    // Firmware accepted by the hardware loader is 56 or 288 bytes. Do not export
-    // arbitrarily sized files into a ubus reply.
-    if firmware.len() > 288 {
-        return Err(io::Error::other("Calibration file exceeds 288 bytes"));
-    }
-    let exists = std::path::Path::new(PATH).is_file();
-    let (source, path, bytes): (CalibrationSource, &str, &[u8]) = if let Some(bytes) = &factory {
-        (
-            CalibrationSource::Factory,
-            "Factory partition (offset 0x2200)",
-            bytes,
-        )
-    } else if firmware.len() >= 56 {
-        (CalibrationSource::Firmware, PATH, &firmware)
+    let firmware_result = crate::calibration::firmware();
+    let firmware = firmware_result
+        .as_ref()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mode = crate::optical::load_calibration_mode()?;
+    let candidate = if mode == fttr_api::CalibrationMode::Firmware && firmware_result.is_err() {
+        Err(io::Error::other(
+            firmware_result.as_ref().unwrap_err().to_string(),
+        ))
     } else {
-        (
-            CalibrationSource::Builtin,
-            "Builtin static default",
-            &crate::bosa::DEFAULT_UX3326_CALIBRATION_DATA,
-        )
+        crate::calibration::select(mode, factory.as_ref().map(|v| v.as_slice()), firmware)
+    };
+    let state = crate::calibration::state(
+        mode,
+        candidate
+            .as_ref()
+            .map_err(|e| io::Error::other(e.to_string())),
+    );
+    let exists = std::path::Path::new(PATH).is_file();
+    // Legacy fields describe the candidate, never masquerade as the applied version.
+    // An invalid candidate is represented by empty legacy data plus candidate_error.
+    let source = candidate
+        .as_ref()
+        .map(|s| s.version.source)
+        .unwrap_or(CalibrationSource::Builtin);
+    let bytes = candidate
+        .as_ref()
+        .map(|s| s.bytes.as_slice())
+        .unwrap_or_default();
+    let path = match source {
+        CalibrationSource::Factory => "Factory partition (offset 0x2200)",
+        CalibrationSource::Firmware => PATH,
+        CalibrationSource::Builtin => "Builtin historical fallback",
     };
     Ok(CalibrationInfo {
+        state: Some(state),
         source,
         active_path: path.into(),
         size: bytes.len() as u32,
@@ -71,7 +77,7 @@ pub(super) fn get() -> io::Result<CalibrationInfo> {
             } else {
                 String::new()
             },
-            data: STANDARD.encode(&firmware),
+            data: STANDARD.encode(firmware),
         },
     })
 }
@@ -90,6 +96,7 @@ fn save_at(data: &str, path: &std::path::Path) -> io::Result<CalibrationSaved> {
             "Calibration payload must be 56 or 288 bytes",
         ));
     }
+    crate::calibration::Snapshot::parse(&bytes, CalibrationSource::Firmware)?;
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("Invalid calibration path"))?;
@@ -129,7 +136,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("calibration.bin");
         for length in [56, 288] {
-            let bytes = vec![0x5a; length];
+            let bytes = crate::bosa::DEFAULT_UX3326_CALIBRATION_DATA[..length].to_vec();
             let reply = save_at(&STANDARD.encode(&bytes), &path).unwrap();
             assert_eq!(reply.sha256, hash(&bytes));
             assert_eq!(fs::read(&path).unwrap(), bytes);
@@ -145,13 +152,21 @@ mod tests {
         }
         let temporary = directory.join(format!("calibration.bin.{}.tmp", std::process::id()));
         fs::write(&temporary, b"existing temporary data").unwrap();
-        assert!(save_at(&STANDARD.encode([0; 56]), &path).is_err());
+        assert!(save_at(
+            &STANDARD.encode(crate::bosa::DEFAULT_UX3326_CALIBRATION_DATA),
+            &path
+        )
+        .is_err());
         assert_eq!(fs::read(&temporary).unwrap(), b"existing temporary data");
         assert_eq!(fs::read(&path).unwrap(), expected);
         fs::remove_file(&temporary).unwrap();
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
-        assert!(save_at(&STANDARD.encode([0; 56]), &path).is_err());
+        assert!(save_at(
+            &STANDARD.encode(crate::bosa::DEFAULT_UX3326_CALIBRATION_DATA),
+            &path
+        )
+        .is_err());
         assert!(!temporary.exists());
         assert!(path.is_dir());
         fs::remove_dir_all(directory).unwrap();

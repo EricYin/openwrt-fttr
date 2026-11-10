@@ -4,6 +4,7 @@ pub mod acs_cli;
 pub mod bosa;
 #[cfg(feature = "mqtt")]
 pub mod broker;
+pub mod calibration;
 pub mod capabilities;
 pub mod controller;
 pub mod devices;

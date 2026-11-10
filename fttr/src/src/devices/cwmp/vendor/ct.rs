@@ -48,8 +48,16 @@ mod tests {
 
     #[test]
     fn tewa_identity_requires_the_complete_native_serial_and_exact_model() {
-        assert!(matches_identity("SCTY72ABCDEF", "TEWA-768G", "308618C8172ABCDEF"));
-        assert!(matches_identity("SCTY72abcdef", "TEWA-768G", "308618c8172abcdef"));
+        assert!(matches_identity(
+            "SCTY72ABCDEF",
+            "TEWA-768G",
+            "308618C8172ABCDEF"
+        ));
+        assert!(matches_identity(
+            "SCTY72abcdef",
+            "TEWA-768G",
+            "308618c8172abcdef"
+        ));
         for (optical, model, serial) in [
             ("SCTY72ABCDEF", "TEWA-768", "308618C8172ABCDEF"),
             ("HWTC72ABCDEF", "TEWA-768G", "308618C8172ABCDEF"),

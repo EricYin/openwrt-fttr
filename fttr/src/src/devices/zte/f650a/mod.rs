@@ -58,7 +58,9 @@ fn configure_evto(session: &mut OmciSession, instance: u16) -> io::Result<()> {
             "F650A EVTO transparent table readback differs",
         ));
     }
-    println!("F650A_EVTO_FACTORY_DISCARD_REPLACED instance={instance:04x}; data evidence still required");
+    println!(
+        "F650A_EVTO_FACTORY_DISCARD_REPLACED instance={instance:04x}; data evidence still required"
+    );
     Ok(())
 }
 

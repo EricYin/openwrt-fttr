@@ -80,6 +80,8 @@ fn status(onus: Vec<SubGatewayStatus>) -> StatusReply {
         sub_gateways: onus,
         telemetry_gateways: Vec::new(),
         optical_transceiver: OpticalTransceiverStatus {
+            calibration_sha256: None,
+            calibration_applied: false,
             model: "test-module".into(),
             wavelength_tx_nm: 1490,
             wavelength_rx_nm: 1310,
