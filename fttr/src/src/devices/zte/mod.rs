@@ -42,12 +42,13 @@ pub fn matches_cwmp(optical_sn: &str, product_class: &str, serial: &str) -> bool
 }
 
 pub fn configure(
+    platform: crate::platform::context::PlatformContext,
     profile: Profile,
     id: u8,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::io::Result<()> {
     match profile {
-        Profile::G1612 => g1612::configure(id, cancellation),
-        Profile::F650a => f650a::configure(id, cancellation),
+        Profile::G1612 => g1612::configure(platform, id, cancellation),
+        Profile::F650a => f650a::configure(platform, id, cancellation),
     }
 }

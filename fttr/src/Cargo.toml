@@ -96,7 +96,7 @@ required-features = ["diagnostics", "device-hwtc"]
 [[bin]]
 name = "fttr-ranging"
 path = "src/bin/fttr-ranging.rs"
-required-features = ["diagnostics"]
+required-features = ["diagnostics", "platform-h3c-hm2004-du"]
 
 [[bin]]
 name = "fttr-star-observe"

@@ -1,11 +1,10 @@
 use std::env;
 use std::path::Path;
-use std::process::{exit, Command};
+use std::process::exit;
 
-use openwrt_fttr::bosa;
-use openwrt_fttr::fpga;
 use openwrt_fttr::ipc;
 use openwrt_fttr::model::FttrSystemStatus;
+use openwrt_fttr::platform::{context::PlatformContext, diagnostics::HardwareDiagnostics};
 #[cfg(feature = "device-hl202")]
 #[path = "fttrctl/hl202.rs"]
 mod hl202;
@@ -16,7 +15,7 @@ mod mqtt_command;
 use mqtt_command::handle as handle_mqtt_command;
 
 fn print_usage() {
-    eprintln!(
+    let usage =
         "Usage: fttrctl <command> [arguments]\n\n\
 Commands:\n  \
   capabilities [--json] [--daemon]  Report compiled support (optionally from running fttrd)\n  \
@@ -24,7 +23,7 @@ Commands:\n  \
   sync plan|apply [DEVICE|all] [--item SECTION] [--management] [--wait SECONDS]\n  \
   load-fpga [path]     Program FPGA bitstream (default: /lib/firmware/FTTR_TOP.sbit)\n  \
   bosa-init            Initialize BOSA optical transceiver registers\n  \
-  bridge-setup         Ensure downstream FTTR switch ports (fttr1~16) are bridged to br-lan\n  \
+  bridge-setup         Reapply selected platform network topology through fttrd\n  \
   offload on|off|status [--json]  Control or query NPU / PPE hardware offload\n  \
   optical on|off|status|reload|shutdown|shutdown-offline [--json]\n  \
   status [--json|-j]   Display active FTTR optical link and DSA switch ports (table or JSON)\n  \
@@ -41,7 +40,31 @@ Commands:\n  \
   cmd [options] <mac> <command>   Dispatch without waiting for device execution\n  \
   broadcast [options] <command>  Broadcast dispatch, or --wait for per-device replies\n  \
   help                 Show this help message"
-    );
+    ;
+    for line in usage.lines() {
+        let command = line.split_whitespace().next().unwrap_or("");
+        if !cfg!(feature = "platform-h3c-hm2004-du")
+            && matches!(
+                command,
+                "load-fpga"
+                    | "bosa-init"
+                    | "fpga-read"
+                    | "fpga-write"
+                    | "fpga-diag"
+                    | "bosa-diag"
+                    | "bosa-read"
+                    | "bosa-write"
+            )
+        {
+            continue;
+        }
+        if !cfg!(feature = "device-hl202")
+            && matches!(command, "hl202" | "exec" | "cmd" | "broadcast")
+        {
+            continue;
+        }
+        eprintln!("{line}");
+    }
 }
 
 fn status_ipc_error(error: &str) -> serde_json::Value {
@@ -57,18 +80,11 @@ fn handle_mqtt_command(_: &[String]) -> Result<i32, String> {
     Err("HL202 adapter not compiled; enable device-hl202".into())
 }
 
-fn setup_bridge() {
-    println!("[*] Configuring downstream FTTR DSA switch ports (fttr1 ~ fttr16) to br-lan...");
-    for id in 1..=16 {
-        let ifname = format!("fttr{id}");
-        let _ = Command::new("ip")
-            .args(["link", "set", &ifname, "up"])
-            .status();
-        let _ = Command::new("ip")
-            .args(["link", "set", &ifname, "master", "br-lan"])
-            .status();
-    }
-    println!("[+] Downstream switch ports fttr1 ~ fttr16 configured and bridged to br-lan.");
+fn hardware() -> HardwareDiagnostics {
+    HardwareDiagnostics::new(PlatformContext::detect().unwrap_or_else(|error| {
+        eprintln!("Platform selection: {error}");
+        exit(1)
+    }))
 }
 
 fn handle_offload(args: &[String]) {
@@ -146,14 +162,14 @@ fn handle_offload(args: &[String]) {
         }
         "on" | "off" => {
             let enabled = sub == "on";
-            #[cfg(feature = "npu")]
+            #[cfg(all(feature = "npu", feature = "platform-h3c-hm2004-du"))]
             let bridge = args
                 .iter()
                 .position(|a| a == "--bridge")
                 .map(|i| args.get(i + 1).map(String::as_str).unwrap_or(""));
-            #[cfg(feature = "npu")]
+            #[cfg(all(feature = "npu", feature = "platform-h3c-hm2004-du"))]
             let result = openwrt_fttr::npu::settings::set(enabled, bridge, None, None, None);
-            #[cfg(not(feature = "npu"))]
+            #[cfg(not(all(feature = "npu", feature = "platform-h3c-hm2004-du")))]
             let result: std::io::Result<()> = Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "NPU adapter not compiled (enable Cargo feature npu)",
@@ -339,9 +355,12 @@ fn print_status_table(status: &FttrSystemStatus) {
                 sg.onu_id, sg.serial_number, sg.vendor, sg.model
             );
             println!(
-                "    Switch Port:    {} (GEM: 0x{:03x}, State: {:?})",
-                openwrt_fttr::pon_engine::onu_interface(sg.onu_id),
-                0x100u16 + u16::from(sg.onu_id),
+                "    Switch Port:    {} (GEM: {}, State: {:?})",
+                sg.data_path.interface,
+                sg.data_path
+                    .olt_channel_gem
+                    .map(|gem| format!("0x{gem:03x}"))
+                    .unwrap_or_else(|| "unknown".into()),
                 sg.state
             );
             println!("    Business:       {}", sg.business_status);
@@ -483,12 +502,13 @@ fn handle_optical_command(cmd: &str, is_json: bool) {
         .to_ascii_lowercase();
 
     let result = if cmd == "OFFLINE SHUTDOWN" {
+        let hardware = hardware();
         let start = std::time::Instant::now();
         loop {
             match openwrt_fttr::optical::claim_owner() {
                 Ok(_owner) => {
-                    let reset = bosa::set_optical_tx_enable(false);
-                    let tx = bosa::get_optical_tx_enable().ok();
+                    let reset = hardware.set_optical_tx_enable(false);
+                    let tx = hardware.get_optical_tx_enable().ok();
                     let reply = serde_json::json!({"schema_version":1,"status":if reset.is_ok() {"success"} else {"error"},"action":"optical_shutdown",
                         "desired_enabled":openwrt_fttr::optical::load_enabled().ok(),"tx_enabled":tx,"actor_state":if reset.is_ok() {"disabled"} else {"unknown"},
                         "hardware_ready":false,"discovery_active":false,"cleanup_pending":true,
@@ -616,7 +636,7 @@ fn main() {
                 .map(|s| s.as_str())
                 .unwrap_or("/lib/firmware/FTTR_TOP.sbit");
             let path = Path::new(path_str);
-            if let Err(e) = fpga::load_bitstream(path) {
+            if let Err(e) = hardware().load_bitstream(path) {
                 eprintln!("[-] Error programming FPGA: {e}");
                 exit(1);
             }
@@ -624,9 +644,20 @@ fn main() {
         "bosa-init" => {
             handle_optical_command("OPTICAL REINITIALIZE", false);
         }
-        "bridge-setup" => {
-            setup_bridge();
-        }
+        "bridge-setup" => match ipc::send_ipc_command("BRIDGE SETUP") {
+            Ok(reply) => {
+                println!("{reply}");
+                if !serde_json::from_str::<serde_json::Value>(&reply)
+                    .is_ok_and(|v| v["status"] == "success")
+                {
+                    exit(1);
+                }
+            }
+            Err(error) => {
+                eprintln!("Bridge setup: {error}");
+                exit(1);
+            }
+        },
         "optical" => match parse_optical_args(&args) {
             Ok((cmd, is_json)) => handle_optical_command(cmd, is_json),
             Err(err) => {
@@ -636,7 +667,7 @@ fn main() {
             }
         },
         "fpga-diag" => {
-            if let Err(error) = openwrt_fttr::fpga_diag_cli::run(&args[2..]) {
+            if let Err(error) = hardware().fpga_diag(&args[2..]) {
                 eprintln!("FPGA diagnostics: {error}");
                 exit(1);
             }
@@ -652,7 +683,7 @@ fn main() {
             } else {
                 addr_str.parse::<u32>().unwrap_or(0)
             };
-            match bosa::read_fpga_reg(addr) {
+            match hardware().read_fpga_reg(addr) {
                 Ok(val) => println!("FPGA Reg 0x{:08X} = 0x{:08X} ({})", addr, val, val),
                 Err(e) => {
                     eprintln!("[-] Error reading FPGA reg 0x{:08X}: {e}", addr);
@@ -675,7 +706,7 @@ fn main() {
             } else {
                 args[3].parse::<u32>().unwrap_or(0)
             };
-            match bosa::write_fpga_reg(addr, val) {
+            match hardware().write_fpga_reg(addr, val) {
                 Ok(()) => println!(
                     "[+] Successfully wrote FPGA reg 0x{:08X} = 0x{:08X}",
                     addr, val
@@ -755,7 +786,7 @@ fn main() {
             } else {
                 args[2].parse::<u32>().unwrap_or(0)
             };
-            match bosa::read_bosa_reg(addr) {
+            match hardware().read_bosa_reg(addr) {
                 Ok(val) => println!("BOSA Reg 0x{:02X} = 0x{:02X} ({})", addr, val, val),
                 Err(e) => {
                     eprintln!("[-] Error reading BOSA reg 0x{:02X}: {e}", addr);
@@ -778,7 +809,7 @@ fn main() {
             } else {
                 args[3].parse::<u32>().unwrap_or(0)
             };
-            match bosa::write_bosa_reg(addr, val) {
+            match hardware().write_bosa_reg(addr, val) {
                 Ok(()) => println!(
                     "[+] Successfully wrote BOSA reg 0x{:02X} = 0x{:02X}",
                     addr, val
@@ -805,15 +836,18 @@ fn main() {
                     }
                 }
                 Err(error) => {
-                    let fpga_st = fpga::get_fpga_status();
-                    if fpga_st == fpga::FpgaStatus::Programming {
+                    let fpga_st = PlatformContext::detect()
+                        .ok()
+                        .map(|platform| HardwareDiagnostics::new(platform).firmware_status())
+                        .unwrap_or_default();
+                    if fpga_st.eq_ignore_ascii_case("programming") {
                         if is_json {
                             println!("{{\"fpga_status\": \"programming\", \"message\": \"FPGA bitstream is currently programming in background, please wait...\"}}");
                         } else {
                             println!("[*] FPGA 位流正在内核后台烧录中（Micro-OLT 硬件正在初始化，约需数十秒），请稍候...");
                         }
                         return;
-                    } else if fpga_st == fpga::FpgaStatus::Failed {
+                    } else if fpga_st.eq_ignore_ascii_case("failed") {
                         if is_json {
                             println!("{{\"fpga_status\": \"failed\", \"error\": \"FPGA bitstream programming failed in kernel\"}}");
                         } else {
@@ -834,30 +868,17 @@ fn main() {
             }
         }
         "fec" => {
-            let id = args
-                .get(2)
-                .and_then(|value| value.parse::<u8>().ok())
-                .filter(|id| *id < 16);
-            let Some(id) = id.filter(|_| {
-                args[3..]
-                    .iter()
-                    .all(|arg| matches!(arg.as_str(), "--json" | "--create-pm"))
-            }) else {
+            let Some((id, create_pm)) = parse_fec_args(&args[2..]) else {
                 eprintln!("Usage: fttrctl fec ONU_ID [--json] [--create-pm]");
                 exit(1);
             };
-            if let Err(error) =
-                openwrt_fttr::controller::fec::read(id, args.iter().any(|arg| arg == "--create-pm"))
-            {
+            if let Err(error) = openwrt_fttr::controller::fec::read(id, create_pm) {
                 eprintln!("[-] FEC PM diagnostic failed: {error}");
                 exit(1);
             }
         }
         "mib" => {
-            let id = args
-                .get(2)
-                .and_then(|value| value.parse::<u8>().ok())
-                .filter(|id| (0..=15).contains(id));
+            let id = args.get(2).and_then(|value| parse_onu_id(value));
             let summary = args.iter().any(|arg| arg == "--summary");
             let mut progress_id = None;
             let Some(id) = id else {
@@ -930,7 +951,7 @@ fn main() {
                 16,
             )
             .expect("Invalid hex address");
-            match bosa::read_fpga_reg(addr) {
+            match hardware().read_fpga_reg(addr) {
                 Ok(val) => println!("FPGA [0x{:08X}] = 0x{:08X}", addr, val),
                 Err(e) => eprintln!("[-] Error reading FPGA register: {e}"),
             }
@@ -950,7 +971,7 @@ fn main() {
                 16,
             )
             .expect("Invalid hex value");
-            match bosa::write_fpga_reg(addr, val) {
+            match hardware().write_fpga_reg(addr, val) {
                 Ok(_) => println!("FPGA [0x{:08X}] <= 0x{:08X}", addr, val),
                 Err(e) => eprintln!("[-] Error writing FPGA register: {e}"),
             }
@@ -965,7 +986,7 @@ fn main() {
                 16,
             )
             .expect("Invalid hex register");
-            match bosa::read_bosa_reg(reg) {
+            match hardware().read_bosa_reg(reg) {
                 Ok(val) => println!("BOSA [0x{:02X}] = 0x{:02X}", reg, val),
                 Err(e) => eprintln!("[-] Error reading BOSA register: {e}"),
             }
@@ -985,7 +1006,7 @@ fn main() {
                 16,
             )
             .expect("Invalid hex value");
-            match bosa::write_bosa_reg(reg, val) {
+            match hardware().write_bosa_reg(reg, val) {
                 Ok(_) => println!("BOSA [0x{:02X}] <= 0x{:02X}", reg, val),
                 Err(e) => eprintln!("[-] Error writing BOSA register: {e}"),
             }
@@ -1004,9 +1025,41 @@ fn main() {
     }
 }
 
+fn parse_onu_id(value: &str) -> Option<u8> {
+    value
+        .parse::<u8>()
+        .ok()
+        .filter(|id| openwrt_fttr::pon_engine::onu_id::is_valid(u16::from(*id)))
+}
+
+fn parse_fec_args(args: &[String]) -> Option<(u8, bool)> {
+    let id = parse_onu_id(args.first()?)?;
+    args[1..]
+        .iter()
+        .all(|arg| matches!(arg.as_str(), "--json" | "--create-pm"))
+        .then(|| (id, args.iter().any(|arg| arg == "--create-pm")))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_optical_args, status_ipc_error};
+    use super::{parse_fec_args, parse_optical_args, status_ipc_error};
+
+    #[test]
+    fn fec_accepts_protocol_ids_including_sparse_platform_ids_but_not_reserved_addresses() {
+        use openwrt_fttr::pon_engine::onu_id::{MAX_ONU_ID, MIN_ONU_ID};
+        for id in [MIN_ONU_ID, 15, 16, 72, MAX_ONU_ID] {
+            assert_eq!(
+                parse_fec_args(&[id.to_string(), "--create-pm".into(), "--json".into()]),
+                Some((id, true))
+            );
+            assert_eq!(parse_fec_args(&[id.to_string()]), Some((id, false)));
+        }
+        for value in ["254", "255", "256", "-1", "bad"] {
+            assert!(parse_fec_args(&[value.into()]).is_none());
+        }
+        assert!(parse_fec_args(&[]).is_none());
+        assert!(parse_fec_args(&["72".into(), "--invalid".into()]).is_none());
+    }
 
     #[test]
     fn ipc_failure_is_an_explicit_unavailable_result_not_device_status() {

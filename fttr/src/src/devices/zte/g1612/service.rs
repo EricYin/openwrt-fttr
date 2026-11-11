@@ -10,12 +10,10 @@
 //! - ME 340 (TR-069) instance: 0x0301
 use crate::controller::business as me;
 use crate::controller::business::{assign_tcont, create_verified_lenient, verify};
+use crate::platform::{context::PlatformContext, openwrt::onu_lock::lock_onu};
 use crate::pon_engine::omci::attributes::AttributeValue as V;
-use crate::pon_engine::omci::{
-    platform::leases::{lock_onu, ChannelLease, StockOmccLease},
-    FmcsTransport, OmciSession,
-};
-use crate::{bosa, pon_engine::ploam::PloamFrame};
+use crate::pon_engine::omci::OmciSession;
+use crate::pon_engine::ploam::PloamFrame;
 use std::{
     io,
     sync::{atomic::AtomicBool, Arc},
@@ -28,29 +26,30 @@ pub const G1612_VEIP_EVTO: u16 = 0x0201;
 pub const G1612_BRIDGE_PROFILE: u16 = 1;
 pub const G1612_GAL_PROFILE: u16 = 1;
 
-pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {
-    if id >= crate::pon_engine::ONU_SLOTS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "ONU ID must be 0..15",
-        ));
-    }
+pub fn configure(
+    platform: PlatformContext,
+    id: u8,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> io::Result<()> {
+    platform.resources().onu(id)?;
     let _lock = lock_onu(id)?;
-    let mut session = OmciSession::new(FmcsTransport::open(id)?);
+    let mut session = OmciSession::new(platform.transport(id)?);
     session.guard_registration(move || crate::controller::service::operation_confirmed(id));
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let mut lease = StockOmccLease::open(id)?;
-    let _channel = ChannelLease::open(id, 0)?;
+    let mut lease = platform.management_lease(id)?;
+    let _channel = platform.channel(id, 0)?;
 
-    let port = 0x100u16 + id as u16;
+    let resources = platform.resources().onu(id)?;
+    let port = resources.gem_id;
+    let alloc = resources.alloc_id;
 
     println!("ZTE_G1612_PROVISION_START id={id} port={port:04x}");
 
     // Send Assign_Alloc-ID downstream PLOAM
     for _ in 0..3 {
-        let _ = bosa::send_ploam_msg(&PloamFrame::assign_alloc_id(id).to_bytes());
+        let _ = platform.send_ploam(&PloamFrame::assign_alloc_id(id));
     }
     std::thread::sleep(std::time::Duration::from_millis(50));
 
@@ -66,12 +65,12 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     let _ = session.set_attributes(256, 0, &[(12, V::number(1))]);
 
     // Retire stale ANI/GEM entries from other slots
-    retire_stale_ani(&mut session, port);
+    retire_stale_ani(platform, &mut session, port);
 
     // T-CONT allocation to 0x8002
-    if let Err(error) = assign_tcont(&mut session, G1612_TCONT, port) {
+    if let Err(error) = assign_tcont(&mut session, G1612_TCONT, alloc) {
         println!(
-            "ZTE_G1612_TCONT_ALLOC_SKIPPED instance={G1612_TCONT:04x} alloc={port:04x}: {error}"
+            "ZTE_G1612_TCONT_ALLOC_SKIPPED instance={G1612_TCONT:04x} alloc={alloc:04x}: {error}"
         );
     }
 
@@ -171,8 +170,13 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     Ok(())
 }
 
-fn retire_stale_ani(session: &mut OmciSession, current_port: u16) {
-    for old in 0x100u16..=0x10f {
+fn retire_stale_ani(platform: PlatformContext, session: &mut OmciSession, current_port: u16) {
+    for old in platform
+        .resources()
+        .allocations
+        .iter()
+        .map(|entry| entry.gem_id)
+    {
         if old == current_port {
             continue;
         }

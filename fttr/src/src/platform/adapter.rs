@@ -23,8 +23,8 @@ impl PlatformId {
 /// What is currently implemented for this platform in the Rust userspace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformImplementation {
-    /// Existing H3C userspace runtime; still tied to the H3C FMCS driver.
-    ExistingH3cRuntime,
+    /// Hardware operations and a runtime entry are implemented by the platform.
+    Runtime,
     /// Identity-only adapter. No platform driver or hardware operations exist.
     CompileableStub,
 }
@@ -50,7 +50,7 @@ pub struct PlatformDescriptor {
     pub implementation: PlatformImplementation,
 }
 
-/// Compile-time contract implemented by each gateway/OLT platform adapter.
+/// Compile-time identity metadata. Hardware operations implement PlatformBackend.
 pub trait PlatformAdapter {
     const DESCRIPTOR: PlatformDescriptor;
 }
@@ -69,10 +69,7 @@ mod tests {
         assert_eq!(descriptor.device_tree_compatibles, &["h3c,hm2004-du"]);
         assert_eq!(descriptor.board_names, &["h3c,hm2004-du"]);
         assert_eq!(descriptor.identification, IdentificationStatus::Verified);
-        assert_eq!(
-            descriptor.implementation,
-            PlatformImplementation::ExistingH3cRuntime
-        );
+        assert_eq!(descriptor.implementation, PlatformImplementation::Runtime);
     }
 
     #[test]

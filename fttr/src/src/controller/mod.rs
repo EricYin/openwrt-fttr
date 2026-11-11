@@ -1,21 +1,20 @@
 //! Production controller: one daemon owns activation and per-ONU business workers.
-mod activation;
-mod attribute_probe;
+pub(crate) mod attribute_probe;
 pub mod business;
 pub mod fec;
 pub mod health;
+pub(crate) mod health_policy;
 #[cfg(feature = "device-hl202")]
-mod hl202;
+pub(crate) mod hl202;
 pub mod inventory;
-mod lifetime;
+pub(crate) mod ipc_server;
+pub(crate) mod lifetime;
 pub mod management;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
-mod pon_mac;
+pub(crate) mod optical_owner;
+pub(crate) mod pon_mac;
 pub mod profile;
-mod runtime;
 pub(crate) mod service;
-mod status;
-mod telemetry;
-mod topology;
-pub use runtime::run;
+pub(crate) mod telemetry;
+pub(crate) mod topology;

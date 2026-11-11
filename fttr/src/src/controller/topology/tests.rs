@@ -124,7 +124,7 @@ fn onu(sn: &str, id: u8) -> SubGatewayStatus {
         uptime_seconds: Some(0.0),
         fec: None,
         data_path: DataPathStatus {
-            interface: crate::pon_engine::onu_interface(id),
+            interface: format!("testport{id}"),
             gem_ports: None,
             vlan_id: None,
             onu_inventory: None,
@@ -164,7 +164,7 @@ fn stable_identity_survives_slot_change_and_unknown_is_not_zero() {
     assert_eq!(first.reply.nodes[1].id, second.reply.nodes[1].id);
     assert_eq!(
         second.reply.links[0].data_interface.as_deref(),
-        Some("fttr16")
+        Some("testport15")
     );
     let value = serde_json::to_value(&first.reply).unwrap();
     let detail = &value["nodes"][1]["detail"];

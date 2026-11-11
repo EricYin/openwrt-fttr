@@ -5,18 +5,20 @@
 //! - `omci`: ITU-T G.988 MIB baseline provisioning
 
 pub mod omci;
+pub mod onu_id;
 pub mod ploam;
 
 use self::ploam::{GponOnu, OnuState, PloamFrame};
 
-pub const ONU_SLOTS: u8 = 16;
-
-/// Protocol IDs/FPGA slots are zero-based; Linux downstream ports are one-based.
-pub fn onu_interface(id: u8) -> String {
-    format!("fttr{}", u16::from(id) + 1)
+#[cfg(test)]
+mod test_resources;
+#[cfg(test)]
+pub(crate) fn test_engine() -> PonEngine {
+    PonEngine::new(&test_resources::RESOURCES)
 }
 
 pub struct PonEngine {
+    pub resources: &'static crate::platform::resources::Resources,
     pub active_onus: Vec<GponOnu>,
     pub(crate) onu_pins: std::collections::BTreeMap<String, u8>,
     pub(crate) pin_error: Option<String>,
@@ -25,6 +27,7 @@ pub struct PonEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const ONU_SLOTS: u8 = 16;
 
     #[test]
     fn pins_reserve_offline_slots_and_survive_reordered_discovery_after_restart() {
@@ -33,7 +36,7 @@ mod tests {
             ("TEST00000002".into(), 15),
         ]);
         for order in [[1, 2], [2, 1]] {
-            let mut engine = PonEngine::new();
+            let mut engine = test_engine();
             engine.onu_pins = pins.clone();
             assert!(engine.active_onus.is_empty());
             // An automatic ONU arriving first cannot steal either reservation.
@@ -65,7 +68,7 @@ mod tests {
 
     #[test]
     fn all_reserved_slots_reject_unpinned_identity_and_bad_startup_blocks_allocation() {
-        let mut engine = PonEngine::new();
+        let mut engine = test_engine();
         engine.onu_pins = (0..ONU_SLOTS)
             .map(|id| (format!("TEST000000{id:02X}"), id))
             .collect();
@@ -82,14 +85,12 @@ mod tests {
 
     #[test]
     fn all_sixteen_slots_are_unique_and_full_table_preserves_assignments() {
-        let mut engine = PonEngine::new();
+        let mut engine = test_engine();
         for id in 0..ONU_SLOTS {
             let onu = engine.register_onu(*b"TEST", [0, 0, 0, id]).unwrap();
             assert_eq!(onu.onu_id, id);
-            assert_eq!(onu_interface(id), format!("fttr{}", id + 1));
             let assign = engine.activate_onu(id);
             assert_eq!(assign[0].payload[0], id);
-            assert_eq!(1u32 << (16 + id), 0x10000u32 << id);
         }
         assert!(engine.register_onu(*b"TEST", [0, 0, 0, 16]).is_none());
         for id in 0..ONU_SLOTS {
@@ -109,7 +110,7 @@ mod tests {
 
     #[test]
     fn serial_and_assignment_do_not_claim_operation() {
-        let mut engine = PonEngine::new();
+        let mut engine = test_engine();
         let onu = engine
             .register_onu(*b"TEST", [0x12, 0x34, 0x56, 0x78])
             .unwrap();
@@ -120,6 +121,54 @@ mod tests {
         assert_eq!(engine.active_onus[0].state, OnuState::O4Ranging);
         assert_eq!(engine.active_onus[0].eq_delay, None);
         assert_eq!(engine.active_onus[0].firmware_version, "Unknown");
+    }
+
+    #[test]
+    fn sparse_ids_and_unrelated_alloc_gem_and_netdev_do_not_alias() {
+        use crate::platform::resources::{OnuResources, Resources};
+        static RESOURCES: Resources = Resources {
+            onu_ids: &[3, 72],
+            management_interfaces: &[],
+            capture_interface: None,
+            downstream_interfaces: &["pon-subscriber-a", "uplink-b"],
+            allocations: &[
+                OnuResources {
+                    onu_id: 3,
+                    alloc_id: 900,
+                    gem_id: 1200,
+                    interface: Some("pon-subscriber-a"),
+                },
+                OnuResources {
+                    onu_id: 72,
+                    alloc_id: 901,
+                    gem_id: 1201,
+                    interface: Some("uplink-b"),
+                },
+            ],
+        };
+        let mut engine = PonEngine::new(&RESOURCES);
+        engine.onu_pins.insert("TEST00000001".into(), 72);
+        assert_eq!(
+            engine.register_onu(*b"TEST", [0, 0, 0, 2]).unwrap().onu_id,
+            3
+        );
+        assert_eq!(
+            engine.register_onu(*b"TEST", [0, 0, 0, 1]).unwrap().onu_id,
+            72
+        );
+        assert!(engine.register_onu(*b"TEST", [0, 0, 0, 3]).is_none());
+        assert_eq!(RESOURCES.interface(72), Some("uplink-b"));
+        assert_eq!(RESOURCES.onu(72).unwrap().alloc_id, 901);
+        assert_eq!(RESOURCES.onu(72).unwrap().gem_id, 1201);
+        assert!(RESOURCES.onu(0).is_err());
+        assert!(!RESOURCES.owns_gem(0x100 + 72));
+        engine.mark_offline(72);
+        assert_eq!(
+            engine.register_onu(*b"TEST", [0, 0, 0, 1]).unwrap().onu_id,
+            72
+        );
+        engine.onu_pins.insert("TEST00000003".into(), 0);
+        assert!(engine.try_register_onu(*b"TEST", [0, 0, 0, 3]).is_err());
     }
 
     #[test]
@@ -160,7 +209,7 @@ mod tests {
 
     #[test]
     fn retry_discards_previous_eqd_and_operation_state() {
-        let mut engine = PonEngine::new();
+        let mut engine = test_engine();
         let onu = engine.register_onu(*b"TEST", [1, 2, 3, 4]).unwrap();
         engine.active_onus[0].eq_delay = Some(248248);
         engine.active_onus[0].state = OnuState::O5Operation;
@@ -171,7 +220,7 @@ mod tests {
 
     #[test]
     fn offline_retains_identity_but_requires_new_activation_evidence() {
-        let mut engine = PonEngine::new();
+        let mut engine = test_engine();
         let old = engine.register_onu(*b"TEST", [1, 2, 3, 4]).unwrap();
         engine.active_onus[0].state = OnuState::O5Operation;
         engine.active_onus[0].eq_delay = Some(248248);
@@ -190,20 +239,13 @@ mod tests {
 }
 
 impl PonEngine {
-    pub fn new() -> Self {
+    pub fn new(resources: &'static crate::platform::resources::Resources) -> Self {
         Self {
+            resources,
             active_onus: Vec::new(),
             onu_pins: Default::default(),
             pin_error: None,
         }
-    }
-
-    /// Generates initial PLOAM downstream frames to discover sub-gateways on the ODN
-    pub fn build_discovery_frames(&self) -> Vec<PloamFrame> {
-        vec![
-            PloamFrame::upstream_overhead(),
-            PloamFrame::extended_burst_length(),
-        ]
     }
 
     /// Processes an ONU discovered on the PON link (from upstream PLOAM or auto-ranging)
@@ -232,14 +274,26 @@ impl PonEngine {
             .full_sn_str()
             .to_ascii_uppercase();
         let id = match self.onu_pins.get(&identity) {
-            Some(&id) => id,
-            None => (0..ONU_SLOTS)
+            Some(&id) if self.resources.onu_ids.contains(&id) => id,
+            Some(&id) => {
+                return Err(format!(
+                    "reserved ONU-ID {id} is unavailable on this platform"
+                ))
+            }
+            None => self
+                .resources
+                .onu_ids
+                .iter()
+                .copied()
                 .find(|id| {
                     !self.onu_pins.values().any(|reserved| reserved == id)
                         && !self.active_onus.iter().any(|onu| onu.onu_id == *id)
                 })
                 .ok_or_else(|| {
-                    format!("{identity}: all {ONU_SLOTS} slots are occupied or reserved")
+                    format!(
+                        "{identity}: all {} slots are occupied or reserved",
+                        self.resources.onu_ids.len()
+                    )
                 })?,
         };
         if self.active_onus.iter().any(|onu| onu.onu_id == id) {

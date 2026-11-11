@@ -3,29 +3,26 @@ pub mod acs;
 pub mod acs_cli;
 pub mod adapters;
 pub(crate) mod bootstrap;
-pub mod bosa;
 #[cfg(feature = "mqtt")]
 pub mod broker;
-pub mod calibration;
 pub mod capabilities;
 pub mod controller;
 pub mod cwmp;
 pub mod devices;
 pub mod domain;
-pub mod fpga;
-pub mod fpga_diag;
-pub mod fpga_diag_cli;
 pub mod hl202_ipc;
 pub mod ipc;
 pub mod model;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
 pub mod mqtt_identity;
-#[cfg(feature = "npu")]
-pub mod npu;
-#[cfg(not(feature = "npu"))]
+/// Optional offload API; implementations live with their hardware platform.
 pub mod npu {
+    #[cfg(not(all(feature = "npu", feature = "platform-h3c-hm2004-du")))]
     use crate::model::NpuStatus;
+    #[cfg(all(feature = "npu", feature = "platform-h3c-hm2004-du"))]
+    pub use crate::platform::h3c_hm2004_du::offload::*;
+    #[cfg(not(all(feature = "npu", feature = "platform-h3c-hm2004-du")))]
     pub fn status() -> NpuStatus {
         NpuStatus::default()
     }

@@ -473,13 +473,13 @@ mod tests {
     fn onu_pins_are_strict_unique_and_independent_of_business_revision() {
         let base = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'TESTabcdef01'\n option omci_adapter 'generic'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'none'\n option group 'g'\n";
         let automatic = super::compile(base).unwrap();
-        for id in [0, 15] {
+        for id in [0, 15, 16, 253] {
             let pinned = super::compile(&format!("{base} option onu_id '{id}'\n")).unwrap();
             assert_eq!(pinned.onu_pins["TESTABCDEF01"], id);
             assert_eq!(pinned.revision, automatic.revision);
         }
         for option in [
-            "option onu_id '16'",
+            "option onu_id '254'",
             "option onu_id '-1'",
             "option onu_id '+1'",
             "option onu_id '0x0f'",

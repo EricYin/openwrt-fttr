@@ -8,7 +8,7 @@ use crate::{
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
-pub(in crate::controller) struct InventorySample {
+pub(crate) struct InventorySample {
     inventory: OnuOmciInventory,
     at: Instant,
 }

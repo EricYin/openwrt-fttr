@@ -115,6 +115,7 @@ struct Operation {
 }
 #[derive(Default)]
 struct Controller {
+    resources: Option<&'static crate::platform::resources::Resources>,
     pub(super) dirty: bool,
     resets: reset::Resets,
     config: Config,
@@ -621,9 +622,24 @@ pub fn control(request: &str) -> String {
 pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
     {
         let mut c = controller().lock().unwrap();
+        c.resources = Some(engine.lock().unwrap().resources);
         match config::load() {
             Ok(cfg) => {
-                engine.lock().unwrap().onu_pins = cfg.onu_pins.clone();
+                {
+                    let mut engine = engine.lock().unwrap();
+                    engine.onu_pins = cfg.onu_pins.clone();
+                    if cfg
+                        .onu_pins
+                        .values()
+                        .any(|id| !engine.resources.onu_ids.contains(id))
+                    {
+                        let error =
+                            "configured ONU-ID is unavailable on the selected platform".to_owned();
+                        engine.pin_error = Some(error.clone());
+                        c.config_error = Some(error.clone());
+                        c.failure = Some(error);
+                    }
+                }
                 if let Err(e) = c.replace_config(cfg) {
                     engine.lock().unwrap().pin_error = Some(e.clone());
                     c.config_error = Some(e.clone());

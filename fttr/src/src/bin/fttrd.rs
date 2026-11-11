@@ -14,7 +14,7 @@ fn main() {
         return;
     }
     if args == ["--platform-check"] {
-        if openwrt_fttr::platform::runtime::detect().is_err() {
+        if openwrt_fttr::platform::context::PlatformContext::detect().is_err() {
             std::process::exit(1);
         }
         return;
@@ -23,14 +23,15 @@ fn main() {
         eprintln!("Usage: fttrd [--capabilities|--platform-info|--platform-check]");
         std::process::exit(1);
     }
-    if let Err(error) = openwrt_fttr::platform::runtime::detect() {
-        eprintln!("[-] Platform selection failed closed: {error}");
-        std::process::exit(1);
-    }
+    let platform =
+        openwrt_fttr::platform::context::PlatformContext::detect().unwrap_or_else(|error| {
+            eprintln!("[-] Platform selection failed closed: {error}");
+            std::process::exit(1);
+        });
     if let Err(error) = openwrt_fttr::capabilities::publish_menu() {
         eprintln!("[-] Could not refresh LuCI capability markers: {error}");
     }
-    if let Err(error) = openwrt_fttr::platform::runtime::run() {
+    if let Err(error) = openwrt_fttr::platform::runtime::run_selected(platform) {
         eprintln!("[-] Platform runtime failed: {error}");
         std::process::exit(1);
     }

@@ -2,69 +2,75 @@
 use super::inventory::BridgeInventory;
 use crate::controller::business as me;
 use crate::controller::business::{assign_tcont, create_verified_lenient, verify};
+use crate::platform::{context::PlatformContext, openwrt::onu_lock::lock_onu};
 use crate::pon_engine::omci::attributes::AttributeValue as V;
-use crate::pon_engine::omci::{
-    platform::leases::{lock_onu, ChannelLease, StockOmccLease},
-    FmcsTransport, OmciSession,
-};
-use crate::{bosa, pon_engine::ploam::PloamFrame};
+use crate::pon_engine::omci::OmciSession;
+use crate::pon_engine::ploam::PloamFrame;
 use std::{
     io,
     sync::{atomic::AtomicBool, Arc},
 };
 
-pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {
-    configure_with_options(id, cancellation, None, None)
+pub fn configure(
+    platform: PlatformContext,
+    id: u8,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> io::Result<()> {
+    configure_with_options(platform, id, cancellation, None, None)
 }
 
 /// Explicit platform policy supplied by an opt-in adapter, under the same lock
 /// and reversible lease as discovery and provisioning. Tuple is (management, business).
 pub(crate) fn configure_with_grant_floors(
+    platform: PlatformContext,
     id: u8,
     cancellation: Option<Arc<AtomicBool>>,
     floors: Option<(u16, u16)>,
 ) -> io::Result<()> {
-    configure_with_options(id, cancellation, floors, None)
+    configure_with_options(platform, id, cancellation, floors, None)
 }
 
 pub(crate) fn configure_with_evto(
+    platform: PlatformContext,
     id: u8,
     cancellation: Option<Arc<AtomicBool>>,
     configure_evto: Option<fn(&mut OmciSession, u16) -> io::Result<()>>,
 ) -> io::Result<()> {
-    configure_with_options(id, cancellation, None, configure_evto)
+    configure_with_options(platform, id, cancellation, None, configure_evto)
 }
 
 fn configure_with_options(
+    platform: PlatformContext,
     id: u8,
     cancellation: Option<Arc<AtomicBool>>,
     floors: Option<(u16, u16)>,
     configure_evto: Option<fn(&mut OmciSession, u16) -> io::Result<()>>,
 ) -> io::Result<()> {
-    if id >= crate::pon_engine::ONU_SLOTS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "ONU ID must be 0..15",
-        ));
-    }
+    let resources = platform.resources().onu(id)?;
     let _lock = lock_onu(id)?;
-    let mut session = OmciSession::new(FmcsTransport::open(id)?);
+    let mut session = OmciSession::new(platform.transport(id)?);
     session.guard_registration(move || crate::controller::service::operation_confirmed(id));
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let mut lease = StockOmccLease::open(id)?;
-    let _channel = ChannelLease::open(id, 0)?;
+    let mut lease = platform.management_lease(id)?;
+    let _channel = platform.channel(id, 0)?;
     if let Some((management, business)) = floors {
         lease.set_management_grant_floor(management)?;
         lease.set_business_grant_floor(business)?;
     }
 
-    let port = 0x100u16 + id as u16;
+    let port = resources.gem_id;
 
     // Discover before writes: entity IDs are device-owned, not template constants.
     let mib = session.upload_mib()?;
-    let inventory = BridgeInventory::from_mib(&mib, port)?;
+    let owned_allocs: Vec<_> = platform
+        .resources()
+        .allocations
+        .iter()
+        .map(|entry| entry.alloc_id)
+        .collect();
+    let inventory = BridgeInventory::from_mib(&mib, resources.alloc_id, &owned_allocs)?;
     let tcont_inst = inventory.tcont;
     println!(
         "GENERIC_BRIDGE_INVENTORY id={id} tcont={tcont_inst:04x} endpoints={:?} factory_ports={} factory_evtos={} used_port_nums={:?}",
@@ -78,7 +84,7 @@ fn configure_with_options(
     // ANI binding that points at another slot's GEM port before creating ours;
     // otherwise this slot's GEM/ANI entities collide with the leftover ones.
     for &(instance, gem, _) in &inventory.gem_side {
-        if gem == port || !(0x100..=0x10f).contains(&gem) {
+        if gem == port || !platform.resources().owns_gem(gem) {
             continue;
         }
         println!(
@@ -90,9 +96,9 @@ fn configure_with_options(
         let _ = session.delete(84, gem);
     }
 
-    // Send Assign_Alloc-ID downstream PLOAM so the ONU recognizes Alloc-ID = port
+    // Restore the initial, protocol-defined allocation before business setup.
     for _ in 0..3 {
-        let _ = bosa::send_ploam_msg(&PloamFrame::assign_alloc_id(id).to_bytes());
+        let _ = platform.send_ploam(&PloamFrame::assign_alloc_id(id));
     }
     std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -109,8 +115,11 @@ fn configure_with_options(
 
     // T-CONT allocation. Some ONUs refuse to rewrite Alloc-ID; the GEM port can
     // still be created against the existing T-CONT, so a refusal is not fatal.
-    if let Err(error) = assign_tcont(&mut session, tcont_inst, port) {
-        println!("GENERIC_TCONT_ALLOC_SKIPPED instance={tcont_inst:04x} alloc={port:04x}: {error}");
+    if let Err(error) = assign_tcont(&mut session, tcont_inst, resources.alloc_id) {
+        println!(
+            "GENERIC_TCONT_ALLOC_SKIPPED instance={tcont_inst:04x} alloc={:04x}: {error}",
+            resources.alloc_id
+        );
     }
 
     // GAL Ethernet profile (ME 272): reuse a factory profile when present.

@@ -40,8 +40,11 @@ fn capabilities_offline_queries_agree_without_controller_initialization() {
         cli["pages"]["sync"],
         cfg!(feature = "acs") || (cfg!(feature = "device-hl202") && cfg!(feature = "mqtt"))
     );
-    for page in ["status", "hardware", "calibration", "about"] {
+    for page in ["status", "about"] {
         assert_eq!(cli["pages"][page], true);
+    }
+    for page in ["hardware", "calibration"] {
+        assert_eq!(cli["pages"][page], cfg!(feature = "platform-h3c-hm2004-du"));
     }
     let adapters = cli["adapters"]["omci"]
         .as_array()

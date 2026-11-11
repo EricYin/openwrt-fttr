@@ -1,5 +1,5 @@
 //! Bounded hardware ranging diagnostic. Run with fttrd stopped (sole RX owner).
-use openwrt_fttr::{bosa, pon_engine::ploam::PloamFrame};
+use openwrt_fttr::{platform::h3c_hm2004_du::fmcs as bosa, pon_engine::ploam::PloamFrame};
 use std::{
     io, thread,
     time::{Duration, Instant},
@@ -14,6 +14,7 @@ fn send(frame: PloamFrame) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    openwrt_fttr::platform::context::PlatformContext::detect().map_err(io::Error::other)?;
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 4 {
         return Err(io::Error::new(
@@ -77,8 +78,9 @@ fn main() -> io::Result<()> {
     let mut valid = 0;
     while start.elapsed() < Duration::from_secs(seconds) {
         if assigned.is_none() && overhead.elapsed() >= Duration::from_millis(200) {
-            send(PloamFrame::upstream_overhead())?;
-            send(PloamFrame::extended_burst_length())?;
+            for frame in openwrt_fttr::platform::h3c_hm2004_du::activation::discovery_frames() {
+                send(frame)?;
+            }
             overhead = Instant::now();
         }
         if grant.elapsed() >= Duration::from_millis(100) {

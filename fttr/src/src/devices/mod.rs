@@ -321,29 +321,32 @@ impl Adapter {
     }
     pub fn configure(
         self,
+        platform: crate::platform::context::PlatformContext,
         id: u8,
         token: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> std::io::Result<()> {
         match self {
             #[cfg(feature = "device-hl202")]
-            Self::Hl202 => hl202::service::configure(id, Some(0), true, true, true, Some(token)),
+            Self::Hl202 => {
+                hl202::service::configure(platform, id, Some(0), true, true, true, Some(token))
+            }
             #[cfg(feature = "device-hwtc")]
             Self::Hwtc(profile) => match profile {
-                hwtc::Profile::K155 => hwtc::k155::service::configure(id, Some(token)),
-                hwtc::Profile::V152 => hwtc::v152::service::configure(id, Some(token)),
-                hwtc::Profile::Standard => hwtc::service::configure(id, Some(token)),
+                hwtc::Profile::K155 => hwtc::k155::service::configure(platform, id, Some(token)),
+                hwtc::Profile::V152 => hwtc::v152::service::configure(platform, id, Some(token)),
+                hwtc::Profile::Standard => hwtc::service::configure(platform, id, Some(token)),
             },
             #[cfg(feature = "device-star")]
-            Self::Star => generic::service::configure(id, Some(token)),
+            Self::Star => generic::service::configure(platform, id, Some(token)),
             #[cfg(feature = "device-zte")]
-            Self::Zte(profile) => zte::configure(profile, id, Some(token)),
+            Self::Zte(profile) => zte::configure(platform, profile, id, Some(token)),
             #[cfg(feature = "device-scty")]
-            Self::Scty => scty::configure(id, Some(token)),
+            Self::Scty => scty::configure(platform, id, Some(token)),
             #[cfg(feature = "device-fiberhome")]
-            Self::Fiberhome => fiberhome::configure(id, Some(token)),
+            Self::Fiberhome => fiberhome::configure(platform, id, Some(token)),
             #[cfg(feature = "device-realtek")]
-            Self::Realtek => realtek::configure(id, Some(token)),
-            Self::GenericBridge => generic::service::configure(id, Some(token)),
+            Self::Realtek => realtek::configure(platform, id, Some(token)),
+            Self::GenericBridge => generic::service::configure(platform, id, Some(token)),
             _ => {
                 let _ = (id, token);
                 Err(std::io::Error::new(

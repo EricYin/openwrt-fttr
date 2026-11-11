@@ -154,6 +154,12 @@ impl Controller {
     }
 
     pub(super) fn request_config(&mut self, config: Config) {
+        if let Some(resources) = self.resources {
+            if let Err(error) = resources.validate_pins(&config.onu_pins) {
+                self.config_error = Some(error);
+                return;
+            }
+        }
         if config.revision == self.config.revision {
             self.pending_config = None;
             self.config_error = None;
@@ -228,6 +234,9 @@ impl Controller {
     }
 
     pub(super) fn replace_config(&mut self, mut config: Config) -> Result<(), String> {
+        if let Some(resources) = self.resources {
+            resources.validate_pins(&config.onu_pins)?;
+        }
         if self.pending_config.is_some() {
             return Err("configuration reload pending; wait for automatic activation".into());
         }

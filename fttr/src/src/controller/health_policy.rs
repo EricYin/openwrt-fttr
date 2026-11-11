@@ -7,12 +7,12 @@ use std::{
 /// kernel drop every downstream frame, so requiring the first packet to come
 /// from the ONU side deadlocks an idle LAN. Raise the port as soon as OMCI is
 /// alive; the business state still waits for GEM evidence separately.
-pub(super) fn carrier_ready(last_get: Option<Instant>, now: Instant) -> bool {
+pub(crate) fn carrier_ready(last_get: Option<Instant>, now: Instant) -> bool {
     last_get.is_some_and(|time| now.duration_since(time) < Duration::from_secs(15))
 }
 
 #[cfg(test)]
-pub(super) fn link_ready(
+pub(crate) fn link_ready(
     last_get: Option<Instant>,
     last_data: Option<Instant>,
     now: Instant,
@@ -21,7 +21,7 @@ pub(super) fn link_ready(
         && last_data.is_some()
 }
 
-pub(super) struct Observations {
+pub(crate) struct Observations {
     watch: bool,
     receive_errors: u64,
     send_errors: u64,
@@ -29,7 +29,7 @@ pub(super) struct Observations {
 }
 
 impl Observations {
-    pub(super) fn new(watch: bool) -> Self {
+    pub(crate) fn new(watch: bool) -> Self {
         Self {
             watch,
             receive_errors: 0,
@@ -38,7 +38,7 @@ impl Observations {
         }
     }
 
-    pub(super) fn receive<T>(&mut self, result: io::Result<Option<T>>) -> io::Result<Option<T>> {
+    pub(crate) fn receive<T>(&mut self, result: io::Result<Option<T>>) -> io::Result<Option<T>> {
         match result {
             Ok(value) => Ok(value),
             Err(error) if self.watch && resource_pressure(&error) => {
@@ -49,7 +49,7 @@ impl Observations {
         }
     }
 
-    pub(super) fn send(&mut self, result: io::Result<()>) -> io::Result<bool> {
+    pub(crate) fn send(&mut self, result: io::Result<()>) -> io::Result<bool> {
         match result {
             Ok(()) => Ok(true),
             Err(error)
@@ -67,7 +67,7 @@ impl Observations {
         }
     }
 
-    pub(super) fn report(&mut self, id: u8, now: Instant) {
+    pub(crate) fn report(&mut self, id: u8, now: Instant) {
         if now.duration_since(self.last_report) >= Duration::from_secs(30)
             && (self.receive_errors != 0 || self.send_errors != 0)
         {

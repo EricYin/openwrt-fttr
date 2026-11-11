@@ -32,7 +32,7 @@ pub(super) struct BridgeInventory {
 }
 
 impl BridgeInventory {
-    pub fn from_mib(mib: &MibReport, alloc: u16) -> io::Result<Self> {
+    pub fn from_mib(mib: &MibReport, alloc: u16, owned_allocs: &[u16]) -> io::Result<Self> {
         if !mib.uploaded_complete {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -58,11 +58,11 @@ impl BridgeInventory {
             match entity.class_id {
                 262 => {
                     if let Some(value) = attribute(1) {
-                        // This host owns data Alloc-IDs 0x100..=0x10f, one per
-                        // ONU slot. Any other value is free or was assigned by
-                        // another OLT and is therefore available: only our own
-                        // range can belong to another FTTR service.
-                        if value == u32::from(alloc) || !(0x100..=0x10f).contains(&value) {
+                        // Another current host allocation belongs to another service.
+                        // Unassigned or foreign-OLT allocations remain reusable.
+                        if value == u32::from(alloc)
+                            || !owned_allocs.iter().any(|id| u32::from(*id) == value)
+                        {
                             tconts.push((value != u32::from(alloc), entity.entity_id));
                         }
                     }
@@ -195,7 +195,7 @@ mod tests {
             (329, 0x501, 0),
         ]);
         // When: planning the bridge for ONU 2.
-        let plan = BridgeInventory::from_mib(&mib, 0x102).unwrap();
+        let plan = BridgeInventory::from_mib(&mib, 0x102, &[0x100, 0x101, 0x102]).unwrap();
         // Then: use the advertised instances in their bridge configuration order.
         assert_eq!(
             (plan.tcont, plan.endpoints),
@@ -224,7 +224,7 @@ mod tests {
             (329, 0x501, 0),
         ]);
         // When: planning with inventory discovery instead of legacy probes.
-        let plan = BridgeInventory::from_mib(&mib, 0x102).unwrap();
+        let plan = BridgeInventory::from_mib(&mib, 0x102, &[0x100, 0x101, 0x102]).unwrap();
         // Then: new instances do not shift the legacy bridge/EVTO assignments.
         assert_eq!(
             plan.endpoints,
@@ -243,7 +243,7 @@ mod tests {
         // Given: a free T-CONT before the existing business assignment.
         let mib = inventory(&[(262, 0x8001, 255), (262, 0x8002, 0x102), (329, 0x501, 0)]);
         // When: planning a retry.
-        let plan = BridgeInventory::from_mib(&mib, 0x102).unwrap();
+        let plan = BridgeInventory::from_mib(&mib, 0x102, &[0x100, 0x101, 0x102]).unwrap();
         // Then: retain the established allocation.
         assert_eq!(plan.tcont, 0x8002);
     }
@@ -253,11 +253,11 @@ mod tests {
         // Given: one T-CONT from another OLT (Alloc-ID 0x0001) and one owned by slot 3.
         let mib = inventory(&[(262, 0x8001, 0x103), (262, 0x8002, 1), (329, 0x501, 0)]);
         // When: planning for slot 2.
-        let plan = BridgeInventory::from_mib(&mib, 0x102).unwrap();
+        let plan = BridgeInventory::from_mib(&mib, 0x102, &[0x100, 0x101, 0x102, 0x103]).unwrap();
         // Then: the foreign allocation is reused, the other slot's is untouched.
         assert_eq!(plan.tcont, 0x8002);
         let mib = inventory(&[(262, 0x8001, 0x103), (329, 0x501, 0)]);
-        let result = BridgeInventory::from_mib(&mib, 0x102);
+        let result = BridgeInventory::from_mib(&mib, 0x102, &[0x100, 0x101, 0x102, 0x103]);
         assert_eq!(result.err().unwrap().kind(), io::ErrorKind::NotFound);
     }
 
@@ -266,7 +266,7 @@ mod tests {
         // Given: no UNI or VEIP in a complete upload.
         let mib = inventory(&[(262, 0x8001, 255)]);
         // When: planning the bridge.
-        let result = BridgeInventory::from_mib(&mib, 0x102);
+        let result = BridgeInventory::from_mib(&mib, 0x102, &[0x100, 0x101, 0x102]);
         // Then: configuration stops before writes to a guessed instance.
         assert_eq!(result.err().unwrap().kind(), io::ErrorKind::NotFound);
     }
@@ -277,7 +277,7 @@ mod tests {
         let mut mib = inventory(&[(262, 0x8001, 255), (329, 0x501, 0)]);
         mib.uploaded_complete = false;
         // When: planning the bridge.
-        let result = BridgeInventory::from_mib(&mib, 0x102);
+        let result = BridgeInventory::from_mib(&mib, 0x102, &[0x100, 0x101, 0x102]);
         // Then: absence of other entities is not trusted.
         assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidData);
     }

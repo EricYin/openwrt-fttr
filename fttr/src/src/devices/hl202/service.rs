@@ -1,13 +1,10 @@
 //! Verified HL202 service configuration; verify each accepted write by GET.
 use crate::controller::business as me;
 use crate::controller::business::{assign_tcont, create_gem, create_verified, verify};
+use crate::platform::{context::PlatformContext, openwrt::onu_lock::lock_onu};
 use crate::pon_engine::omci::attributes::AttributeValue as V;
-use crate::pon_engine::omci::{
-    error::is_unknown_instance,
-    platform::leases::{lock_onu, ChannelLease, StockOmccLease},
-    FmcsTransport, OmciSession,
-};
-use crate::{bosa, pon_engine::ploam::PloamFrame};
+use crate::pon_engine::omci::{error::is_unknown_instance, OmciSession};
+use crate::pon_engine::ploam::PloamFrame;
 use std::io;
 
 // Do not enable the FPGA ONU/OMCC mapping while discovery/ranging owns it.
@@ -38,11 +35,20 @@ fn wait_for_operation(id: u8) {
     }
 }
 
-fn retire_previous_ani(session: &mut OmciSession, current: u16) -> io::Result<()> {
+fn retire_previous_ani(
+    platform: PlatformContext,
+    session: &mut OmciSession,
+    current: u16,
+) -> io::Result<()> {
     // ONU-ID can change across daemon/main restarts while the child retains
     // its MIB. Two ANI bridge entries with the same port number leave the
     // old GEM selected. Retire ONLY entities matching our verified profile.
-    for old in 0x100u16..=0x10f {
+    for old in platform
+        .resources()
+        .allocations
+        .iter()
+        .map(|entry| entry.gem_id)
+    {
         if old == current {
             continue;
         }
@@ -103,6 +109,7 @@ fn retire_previous_ani(session: &mut OmciSession, current: u16) -> io::Result<()
     Ok(())
 }
 pub fn configure(
+    platform: PlatformContext,
     id: u8,
     seconds: Option<u64>,
     transparent: bool,
@@ -110,10 +117,11 @@ pub fn configure(
     restore_initial: bool,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> io::Result<()> {
-    if id > 15 || seconds.is_some_and(|s| s > 600) {
+    platform.resources().onu(id)?;
+    if seconds.is_some_and(|s| s > 600) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ONU_ID must be 0..15 and hold seconds <=600",
+            "hold seconds must be <=600",
         ));
     }
     if supervised && cancellation.is_none() {
@@ -136,21 +144,21 @@ pub fn configure(
             "ONU went offline before OMCC setup",
         ));
     }
-    let mut session = OmciSession::new(FmcsTransport::open(id)?);
+    let mut session = OmciSession::new(platform.transport(id)?);
     if supervised {
         session.guard_registration(move || crate::controller::service::operation_confirmed(id));
     }
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let mut lease = StockOmccLease::open(id)?;
-    let port = 0x100u16 + id as u16;
-    let _channel = ChannelLease::open(id, 0)?;
+    let mut lease = platform.management_lease(id)?;
+    let port = platform.resources().onu(id)?.gem_id;
+    let _channel = platform.channel(id, 0)?;
     if restore_initial {
         // Assign ONU-ID, not the data T-CONT Alloc-ID.
         // Explicit recovery of earlier diagnostics; require a real GET below.
         for _ in 0..3 {
-            bosa::send_ploam_msg(&PloamFrame::assign_alloc_id(id).to_bytes())?;
+            platform.send_ploam(&PloamFrame::assign_alloc_id(id))?;
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
@@ -166,7 +174,7 @@ pub fn configure(
             ))
         }
         Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-            bosa::exchange_omci_channel(id, port)?;
+            platform.exchange_channel(id, port)?;
             channel = port;
             verify(&mut session, 256, 0, 0x8000, b"H3CT")?;
             println!("EXISTING_ALLOC_CHANNEL_RECOVERED channel={port:04x}");
@@ -198,15 +206,15 @@ pub fn configure(
     session.set(65530, 0, 0x1000, &[1])?;
     verify(&mut session, 65530, 0, 0x1000, &[1])?;
     println!("STOCK_FTTR_AUTH_STATUS_READBACK_OK; existing credentials matched");
-    // Assign Alloc-ID 0x100+ONU-ID to T-CONT 0x8000.
+    // Assign the platform-owned Alloc-ID to the model's T-CONT 0x8000.
     // Create GAL profile 1 and bridge profile 1 first.
     create_verified(&mut session, 272, 1, &me::gal(), &[1])?;
     create_verified(&mut session, 45, 1, &me::bridge_profile(), &[1, 2, 3])?;
-    assign_tcont(&mut session, 0x8000, port)?;
-    // Use GEM-ID=0x100+ONU-ID, bidirectional, with queue pointers 0.
+    assign_tcont(&mut session, 0x8000, platform.resources().onu(id)?.alloc_id)?;
+    // Use the platform-owned GEM-ID, bidirectional, with queue pointers 0.
     // Bind MAC-bridged GEM interworking option 1 to bridge 1/GAL 1.
     create_gem(&mut session, port, port, 0x8000, 1, 1)?;
-    retire_previous_ani(&mut session, port)?;
+    retire_previous_ani(platform, &mut session, port)?;
     // First Ethernet UNI from the actual MIB is 0x0101, not ONU-ID.
     create_verified(
         &mut session,
@@ -293,7 +301,7 @@ pub fn configure(
             }
         }
     }
-    // Complete the ANI bridge with class 84, instance 0x100+ONU-ID:
+    // Complete the ANI bridge with class 84, using the selected GEM instance:
     // zero VLAN entries and forward operation 0.
     // Preserve any existing profile that differs rather than replacing it.
     // This HL202 rejects GET of the entry-count attribute (mask 0x2000,

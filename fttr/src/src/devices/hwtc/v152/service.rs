@@ -5,8 +5,17 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
-pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {
-    super::super::service::configure_profile(id, cancellation, super::super::Profile::V152)
+pub fn configure(
+    platform: crate::platform::context::PlatformContext,
+    id: u8,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> io::Result<()> {
+    super::super::service::configure_profile(
+        platform,
+        id,
+        cancellation,
+        super::super::Profile::V152,
+    )
 }
 
 pub(in crate::devices::hwtc) fn verify_identity(session: &mut OmciSession) -> io::Result<()> {

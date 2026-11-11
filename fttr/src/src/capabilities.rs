@@ -11,6 +11,8 @@ pub fn compiled() -> Capabilities {
     let star = cfg!(feature = "device-star");
     let zte = cfg!(feature = "device-zte");
     let scty = cfg!(feature = "device-scty");
+    let hardware = cfg!(feature = "platform-h3c-hm2004-du");
+    let offload = hardware && cfg!(feature = "npu");
     let adapters = fttr_api::AdapterCapabilities {
         omci: crate::adapters::omci::available(),
         bootstrap: crate::adapters::bootstrap::available(),
@@ -30,9 +32,9 @@ pub fn compiled() -> Capabilities {
             device_scty: scty,
         },
         functions: CapabilityFunctions {
-            optical: true,
-            bridge_offload: cfg!(feature = "npu"),
-            omci_mib: true,
+            optical: hardware,
+            bridge_offload: offload,
+            omci_mib: hardware,
             mqtt_telemetry: mqtt,
             hl202_management: hl202 && mqtt,
             cwmp: acs,
@@ -41,8 +43,8 @@ pub fn compiled() -> Capabilities {
         // Configuration and synchronization are the ACS/CWMP workflow in LuCI.
         pages: CapabilityPages {
             status: true,
-            hardware: true,
-            calibration: true,
+            hardware,
+            calibration: hardware,
             about: true,
             config: acs || (hl202 && mqtt),
             sync: acs || (hl202 && mqtt),

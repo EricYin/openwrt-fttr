@@ -13,8 +13,9 @@
 | STAR 厂商入口、SG631Z-C 身份规则 | `fttr/src/src/devices/star/mod.rs`、`fttr/src/src/devices/star/sg631/mod.rs` |
 | 通用发现与配置 | `fttr/src/src/devices/generic/inventory.rs`、`fttr/src/src/devices/generic/service.rs` |
 | 业务对象与管理关联 | `fttr/src/src/controller/business.rs`、`fttr/src/src/controller/management.rs` |
-| 注册、调度和健康 | `fttr/src/src/controller/runtime.rs`、`fttr/src/src/controller/service.rs`、`fttr/src/src/controller/health.rs` |
-| MIB、传输和资源租约 | `fttr/src/src/pon_engine/omci/mib.rs`、`fttr/src/src/pon_engine/omci/platform/fmcs.rs`、`fttr/src/src/pon_engine/omci/platform/leases.rs` |
+| 注册、调度和健康 | `fttr/src/src/platform/h3c_hm2004_du/runtime.rs`、`fttr/src/src/controller/service.rs`、`fttr/src/src/controller/health.rs` |
+| MIB、平台上下文与资源 | `fttr/src/src/pon_engine/omci/mib.rs`、`fttr/src/src/platform/context.rs`、`fttr/src/src/platform/resources.rs` |
+| H3C 传输和资源租约 | `fttr/src/src/platform/h3c_hm2004_du/omci/fmcs.rs`、`fttr/src/src/platform/h3c_hm2004_du/omci/leases.rs` |
 | CWMP 命令边界 | `fttr/src/src/acs_cli.rs` |
 | 内核收发与通道映射 | `h3c-fmcs/src/fmcs_netdev.c`、`h3c-fmcs/src/fmcs_main.c` |
 | 持久化服务与打包 | `fttr/files/fttr.init`、`fttr/files/fttr.config`、`fttr/Makefile` |
@@ -42,7 +43,7 @@
 通用 profile 的正确性来自"从 MIB 读"，不是"模板写得更全"。当前实现要求的要素：
 
 1. **完整 MIB 上传**后再规划，任何缺记录都不能当成"没有配置"。
-2. **T-CONT**：优先复用已分配给我们 Alloc-ID 的实例；其它 OLT 留下的分配可复用；只把本机槽位段（`0x100..0x10f`）当作可能属于其它业务而排除。Alloc-ID 写不进去时降级为跳过并记录，GEM 仍指向已发现的 T-CONT。
+2. **T-CONT**：优先复用已分配给我们 Alloc-ID 的实例；其它 OLT 留下的分配可复用；按选中平台资源表排除可能属于本机其它业务的 Alloc-ID（H3C 当前为 `0x100..0x10f`）。Alloc-ID 写不进去时降级为跳过并记录，GEM 仍指向已发现的 T-CONT。
 3. **端点**：UNI(11) 与 VEIP(329) 全量发现并保持设备自身顺序；不要为了"顺序好看"重排实例映射。
 4. **桥端口复用**：端点已有 ME 47（TpPointer 命中且 BridgeId 与所选桥一致）就复用，不要给同一 UNI 再建一个——会撞 PortNum，并覆盖厂商自己的管理 VLAN/EVTO。
 5. **PortNum 分配**：新建端口从 MIB 中未占用的号码里取；ANI 端口的 PortNum 要复用本槽位已有值，保证重配幂等。
@@ -65,8 +66,8 @@
 ```powershell
 $previous = $env:RUSTFLAGS
 try {
-    $env:RUSTFLAGS = '-C target-feature=+crt-static'
-    cargo zigbuild --release --locked --target aarch64-unknown-linux-musl --no-default-features --features all-devices,acs,mqtt --bin fttrd --bin fttrctl
+    $env:RUSTFLAGS = '-C target-feature=-crt-static -C link-arg=-dynamic'
+    cargo zigbuild --release --locked --target aarch64-unknown-linux-musl --no-default-features --features platform-h3c-hm2004-du,all-devices,acs,mqtt --bin fttrd --bin fttrctl
 } finally {
     $env:RUSTFLAGS = $previous
 }

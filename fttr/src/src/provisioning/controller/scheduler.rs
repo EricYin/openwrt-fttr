@@ -13,7 +13,17 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
         .map(|o| (u16::from(o.onu_id), o.full_sn_str()))
         .collect();
     let online: BTreeSet<_> = online_onus.values().cloned().collect();
-    let source_links = link_identity::discover(&online_onus);
+    let resources = engine.lock().unwrap().resources;
+    let interfaces = resources
+        .onu_ids
+        .iter()
+        .filter_map(|&id| {
+            resources
+                .interface(id)
+                .map(|name| (u16::from(id), name.to_owned()))
+        })
+        .collect();
+    let source_links = link_identity::discover(&online_onus, &interfaces);
     if let Ok(mut registry) = crate::mqtt_identity::shared().lock() {
         registry.update_topology(online_onus.clone(), source_links, now());
     }

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 /// Process-owned MQTT resources. Process termination reclaims upstream threads;
 /// rumqttd does not expose a graceful shutdown handle.
-pub(super) struct Lifetime {
+pub(crate) struct Lifetime {
     #[cfg(feature = "mqtt")]
     broker: crate::broker::EmbeddedBroker,
     #[cfg(feature = "mqtt")]
@@ -13,7 +13,7 @@ pub(super) struct Lifetime {
 }
 
 impl Lifetime {
-    pub(super) async fn start() -> Result<Self, String> {
+    pub(crate) async fn start() -> Result<Self, String> {
         #[cfg(feature = "mqtt")]
         {
             let lan = std::env::var("FTTR_MQTT_LAN_ADDR")
@@ -32,7 +32,7 @@ impl Lifetime {
         }
     }
 
-    pub(super) async fn wait(self, devices: Arc<Mutex<Vec<SubDevice>>>) -> Result<(), String> {
+    pub(crate) async fn wait(self, devices: Arc<Mutex<Vec<SubDevice>>>) -> Result<(), String> {
         #[cfg(feature = "mqtt")]
         {
             let mut broker = self.broker;

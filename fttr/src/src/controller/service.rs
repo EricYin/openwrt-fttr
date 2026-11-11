@@ -11,14 +11,14 @@ use std::{
 };
 
 #[derive(Clone, Default)]
-pub(super) struct State {
+pub(crate) struct State {
     pub generation: u64,
     pub phase: BusinessPhase,
     pub error: Option<String>,
     pub identity: Option<crate::model::OnuIdentity>,
     pub identity_at: Option<std::time::Instant>,
     pub mib: Option<std::sync::mpsc::SyncSender<super::inventory::WorkerRequest>>,
-    pub wake: Option<Arc<crate::pon_engine::omci::platform::wake::Wake>>,
+    pub wake: Option<Arc<crate::platform::openwrt::wake::Wake>>,
 }
 impl State {
     pub fn business_status(&self, carrier: bool, management_ready: bool) -> BusinessStatus {
@@ -51,7 +51,7 @@ impl State {
         }
     }
 }
-pub(super) type States = Arc<Mutex<BTreeMap<u8, State>>>;
+pub(crate) type States = Arc<Mutex<BTreeMap<u8, State>>>;
 
 // Selection policy can change while an ONU remains registered (config reload).
 // Keep unsupported workers cancellable and re-evaluate without resetting PLOAM
@@ -80,13 +80,15 @@ fn wait_for_adapter(
     None
 }
 
-pub(super) struct Services {
+pub(crate) struct Services {
+    platform: crate::platform::context::PlatformContext,
     pub states: States,
     tokens: BTreeMap<u8, Arc<AtomicBool>>,
 }
 impl Services {
-    pub fn new(states: States) -> Self {
+    pub fn new(platform: crate::platform::context::PlatformContext, states: States) -> Self {
         Self {
+            platform,
             states,
             tokens: BTreeMap::new(),
         }
@@ -124,6 +126,7 @@ impl Services {
         let token = Arc::new(AtomicBool::new(false));
         self.tokens.insert(id, token.clone());
         let states = self.states.clone();
+        let platform = self.platform;
         let _ = thread::Builder::new()
             .name(format!("onu-{id}-svc"))
             .stack_size(256 * 1024)
@@ -131,7 +134,7 @@ impl Services {
             // A transient equipment-ID GET failure must not permanently classify
             // an otherwise supported device as unsupported for this generation.
             let identity = loop {
-                let identity = super::inventory::collect(id, token.clone()).unwrap_or_else(|error| crate::model::OnuIdentity {
+                let identity = super::inventory::collect(platform, id, token.clone()).unwrap_or_else(|error| crate::model::OnuIdentity {
                     errors: vec![error.to_string()], ..Default::default()
                 });
                 if token.load(Ordering::Acquire) { return; }
@@ -176,7 +179,7 @@ impl Services {
                 let result = (|| {
                     // Notification allocation failures use the normal supervisor retry.
                     if wake.is_none() {
-                        let notification = Arc::new(crate::pon_engine::omci::platform::wake::Wake::new()?);
+                        let notification = Arc::new(crate::platform::openwrt::wake::Wake::new()?);
                         let mut states = states.lock().unwrap();
                         if token.load(Ordering::Acquire) { return Ok(()); }
                         if let Some(state) = states.get_mut(&id).filter(|state| state.generation == generation) {
@@ -184,13 +187,13 @@ impl Services {
                         }
                         wake = Some(notification);
                     }
-                    adapter.configure(id, token.clone())
+                    adapter.configure(platform, id, token.clone())
                     .and_then(|()| {
                         if token.load(Ordering::Acquire) { return Ok(()); }
                         let phase = adapter.verification_status();
                         println!("[+] ONU {id} generation={generation}: OMCI profile readback complete; {phase}; starting evidence monitor");
                         set(phase, None);
-                        super::health::watch(id, token.clone(), vendor.as_bytes().try_into().map_err(|_| std::io::Error::other("invalid vendor ID"))?, &requests, wake.as_ref().unwrap().clone())
+                        super::health::watch(platform, id, token.clone(), vendor.as_bytes().try_into().map_err(|_| std::io::Error::other("invalid vendor ID"))?, &requests, wake.as_ref().unwrap().clone())
                     })
                 })();
                 if token.load(Ordering::Acquire) { break; }
@@ -210,7 +213,7 @@ impl Services {
 static PON_ENGINE: std::sync::OnceLock<Arc<Mutex<crate::pon_engine::PonEngine>>> =
     std::sync::OnceLock::new();
 
-pub(super) fn init_pon_engine(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
+pub(crate) fn init_pon_engine(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
     let _ = PON_ENGINE.set(engine);
 }
 
@@ -416,8 +419,7 @@ mod tests {
 
     #[test]
     fn stopping_worker_preserves_generation_and_error() {
-        let wake =
-            std::sync::Arc::new(crate::pon_engine::omci::platform::wake::Wake::new().unwrap());
+        let wake = std::sync::Arc::new(crate::platform::openwrt::wake::Wake::new().unwrap());
         let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (sender, _requests) = std::sync::mpsc::sync_channel(1);
         let states =
@@ -432,7 +434,10 @@ mod tests {
                     ..State::default()
                 },
             )])));
-        let mut services = super::Services::new(states.clone());
+        let mut services = super::Services::new(
+            crate::platform::context::PlatformContext::test_context(),
+            states.clone(),
+        );
         services.tokens.insert(1, token.clone());
         services.stop(1);
         // A stopped worker wakes even with no packet traffic, and cannot accept new MIB work.

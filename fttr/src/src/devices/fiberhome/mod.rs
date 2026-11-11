@@ -8,16 +8,15 @@ pub(super) fn matches(vendor: &str, equipment: Option<&str>) -> bool {
 }
 
 pub(super) fn configure(
+    platform: crate::platform::context::PlatformContext,
     id: u8,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::io::Result<()> {
-    let mut session = crate::pon_engine::omci::OmciSession::new(
-        crate::pon_engine::omci::FmcsTransport::open(id)?,
-    );
+    let mut session = crate::pon_engine::omci::OmciSession::new(platform.transport(id)?);
     let equipment = {
-        let _lock = crate::pon_engine::omci::platform::leases::lock_onu(id)?;
-        let _lease = crate::pon_engine::omci::platform::leases::StockOmccLease::open(id)?;
-        let _channel = crate::pon_engine::omci::platform::leases::ChannelLease::open(id, 0)?;
+        let _lock = crate::platform::openwrt::onu_lock::lock_onu(id)?;
+        let _lease = platform.management_lease(id)?;
+        let _channel = platform.channel(id, 0)?;
         session.guard_registration(move || crate::controller::service::operation_confirmed(id));
         if let Some(token) = &cancellation {
             session.cancel_when(token.clone());
@@ -33,8 +32,8 @@ pub(super) fn configure(
             .to_string()
     };
     match equipment.as_str() {
-        "HG6371F-C" => hg6371f_c::configure(id, cancellation),
-        "HG6371F" => hg6371f::configure(id, cancellation),
+        "HG6371F-C" => hg6371f_c::configure(platform, id, cancellation),
+        "HG6371F" => hg6371f::configure(platform, id, cancellation),
         _ => Err(std::io::Error::other("unsupported FiberHome equipment")),
     }
 }

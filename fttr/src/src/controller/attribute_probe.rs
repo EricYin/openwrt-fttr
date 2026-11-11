@@ -1,5 +1,5 @@
 //! Bounded, identity-bound field experiments, serialized with the health worker.
-use crate::pon_engine::omci::{schema::MeRegistry, FmcsTransport, OmciSession};
+use crate::pon_engine::omci::{schema::MeRegistry, OmciSession};
 use std::{
     io,
     sync::{atomic::AtomicBool, Arc},
@@ -8,7 +8,7 @@ use std::{
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Command {
+pub(crate) struct Command {
     pub onu_id: u8,
     pub serial: String,
     pub generation: u64,
@@ -20,7 +20,7 @@ pub(super) struct Command {
     #[serde(default)]
     pub replacement: Option<Vec<u8>>,
 }
-pub(super) struct Request {
+pub(crate) struct Request {
     pub command: Command,
     pub deadline: Instant,
     pub reply: std::sync::mpsc::Sender<io::Result<serde_json::Value>>,
@@ -55,7 +55,7 @@ impl Command {
                 .is_some_and(|s| s.generation == self.generation)
     }
 }
-pub(super) fn control(
+pub(crate) fn control(
     command: Command,
     states: &super::service::States,
 ) -> io::Result<serde_json::Value> {
@@ -84,7 +84,8 @@ pub(super) fn control(
         .recv_timeout(Duration::from_secs(605))
         .map_err(io::Error::other)?
 }
-pub(super) fn run(
+pub(crate) fn run(
+    platform: crate::platform::context::PlatformContext,
     request: &Request,
     cancellation: Option<Arc<AtomicBool>>,
 ) -> io::Result<serde_json::Value> {
@@ -98,7 +99,7 @@ pub(super) fn run(
             "diagnostic expired or ONU identity changed",
         ));
     }
-    let mut session = OmciSession::new(FmcsTransport::open(command.onu_id)?);
+    let mut session = OmciSession::new(platform.transport(command.onu_id)?);
     let id = command.onu_id;
     let serial = command.serial.clone();
     session.guard_registration(move || {

@@ -6,18 +6,33 @@ use std::io::{self, Read};
 const MAX_FDB_BYTES: u64 = 1024 * 1024;
 const MAX_AGE_TICKS: u32 = 60 * 100; // Linux bridge sysfs exposes USER_HZ (100) ticks.
 
-pub(crate) fn discover(onus: &BTreeMap<u16, String>) -> Result<BTreeMap<String, String>, String> {
-    read_links(onus).map_err(|e| format!("ONU source-link discovery: {e}"))
+pub(crate) fn discover(
+    onus: &BTreeMap<u16, String>,
+    interfaces: &BTreeMap<u16, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    read_links(onus, interfaces).map_err(|e| format!("ONU source-link discovery: {e}"))
 }
 
-fn read_links(onus: &BTreeMap<u16, String>) -> io::Result<BTreeMap<String, String>> {
+fn read_links(
+    onus: &BTreeMap<u16, String>,
+    interfaces: &BTreeMap<u16, String>,
+) -> io::Result<BTreeMap<String, String>> {
     let mut bridges: BTreeMap<String, BTreeMap<u16, String>> = BTreeMap::new();
     for (onu, sn) in onus {
-        let id = u8::try_from(*onu)
-            .ok()
-            .filter(|id| *id < crate::pon_engine::ONU_SLOTS)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid ONU ID"))?;
-        let base = format!("/sys/class/net/{}", crate::pon_engine::onu_interface(id));
+        let Some(interface) = interfaces.get(onu) else {
+            continue;
+        };
+        if interface.is_empty()
+            || !interface
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid ONU interface",
+            ));
+        }
+        let base = format!("/sys/class/net/{interface}");
         let port = match std::fs::read_to_string(format!("{base}/brport/port_no")) {
             Ok(value) => value,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,

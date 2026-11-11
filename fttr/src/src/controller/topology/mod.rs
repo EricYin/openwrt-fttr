@@ -52,7 +52,7 @@ fn nonempty(value: &str) -> Option<String> {
     (!value.is_empty() && !value.eq_ignore_ascii_case("unknown")).then(|| value.into())
 }
 
-pub(in crate::controller) struct Snapshot {
+pub(crate) struct Snapshot {
     pub reply: TopologyReply,
     at: Instant,
     clients: BTreeMap<String, Vec<TopologyClient>>,
@@ -62,7 +62,7 @@ pub(in crate::controller) struct Snapshot {
 }
 
 #[derive(Default)]
-pub(in crate::controller) struct Cache(VecDeque<std::sync::Arc<Snapshot>>);
+pub(crate) struct Cache(VecDeque<std::sync::Arc<Snapshot>>);
 
 impl Cache {
     pub fn insert(&mut self, snapshot: Snapshot) -> std::sync::Arc<Snapshot> {
@@ -166,7 +166,7 @@ impl Snapshot {
     }
 }
 
-pub(in crate::controller) fn build(
+pub(crate) fn build(
     status: StatusReply,
     engine: &std::sync::Arc<std::sync::Mutex<crate::pon_engine::PonEngine>>,
     services: &super::service::States,
@@ -266,6 +266,7 @@ fn project(
     }
     let mut links = Vec::new();
     let mut learned_onus = BTreeMap::new();
+    let mut onu_interfaces = BTreeMap::new();
     let mut node_by_sn = BTreeMap::new();
     let mut seen = BTreeSet::new();
     for onu in status.sub_gateways {
@@ -307,6 +308,7 @@ fn project(
         let operational = onu.state == RegistrationState::O5Operation;
         if unique && operational {
             learned_onus.insert(u16::from(onu.onu_id), sn.clone().unwrap());
+            onu_interfaces.insert(u16::from(onu.onu_id), interface.clone());
             node_by_sn.insert(sn.clone().unwrap(), id.clone());
         }
         let ext = if unique && operational && onu.identity_current {
@@ -478,6 +480,7 @@ fn project(
         }
     }
     let (clients, associated_count, learned_available, client_sources) = collect_clients(
+        &onu_interfaces,
         &nodes,
         &learned_onus,
         &node_by_sn,
@@ -526,6 +529,7 @@ fn read_carrier(interface: &str) -> Option<bool> {
 
 #[allow(clippy::too_many_arguments)]
 fn collect_clients(
+    onu_interfaces: &BTreeMap<u16, String>,
     nodes: &[TopologyNode],
     onus: &BTreeMap<u16, String>,
     node_by_sn: &BTreeMap<String, String>,
@@ -552,17 +556,15 @@ fn collect_clients(
     let eligible: BTreeSet<String> = onus
         .iter()
         .filter_map(|(id, sn)| {
-            std::path::Path::new(&format!(
-                "/sys/class/net/{}/brport/port_no",
-                crate::pon_engine::onu_interface(*id as u8)
-            ))
-            .exists()
-            .then(|| node_by_sn.get(sn).cloned())
-            .flatten()
+            let interface = onu_interfaces.get(id)?;
+            std::path::Path::new(&format!("/sys/class/net/{}/brport/port_no", interface))
+                .exists()
+                .then(|| node_by_sn.get(sn).cloned())
+                .flatten()
         })
         .collect();
     let learned = if !eligible.is_empty() {
-        crate::provisioning::link_identity::discover(onus).ok()
+        crate::provisioning::link_identity::discover(onus, onu_interfaces).ok()
     } else {
         None
     };
@@ -606,7 +608,7 @@ fn collect_clients(
                     interface: onus
                         .iter()
                         .find(|(_, serial)| **serial == sn)
-                        .map(|(id, _)| crate::pon_engine::onu_interface(*id as u8)),
+                        .and_then(|(id, _)| onu_interfaces.get(id).cloned()),
                 });
         }
     }

@@ -5,11 +5,11 @@ use crate::pon_engine::omci::attributes::AttributeValue as V;
 use crate::pon_engine::omci::OmciSession;
 use std::io;
 
-pub(super) fn configure(session: &mut OmciSession, port: u16) -> io::Result<()> {
+pub(super) fn configure(session: &mut OmciSession, port: u16, alloc: u16) -> io::Result<()> {
     let entity = 0x200u16;
     create_verified(session, 272, 1, &me::gal(), &[1])?;
     create_verified(session, 45, entity, &me::bridge_profile(), &[1, 2, 3])?;
-    assign_tcont(session, 0x8000, port)?;
+    assign_tcont(session, 0x8000, alloc)?;
     // Stable instances survive ONU-ID changes; queue 8000 belongs to T-CONT 8000.
     // K155 rejects GET of direction (2000). Read supported pointers separately.
     let mut ctp_readback = Vec::new();

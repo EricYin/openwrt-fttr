@@ -28,8 +28,9 @@ pub fn matches_cwmp(optical_sn: &str, product_class: &str, serial: &str) -> bool
 }
 
 pub fn configure(
+    platform: crate::platform::context::PlatformContext,
     id: u8,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::io::Result<()> {
-    service::configure(id, cancellation)
+    service::configure(platform, id, cancellation)
 }

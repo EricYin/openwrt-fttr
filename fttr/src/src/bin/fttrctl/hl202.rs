@@ -64,7 +64,7 @@ fn parse(args: &[String]) -> Result<Query, String> {
                 onu_id: onu.ok_or(usage)?.parse::<u16>().map_err(|_| usage)?,
                 binding_generation: generation.filter(|value| !value.is_empty()).ok_or(usage)?,
             };
-            if !(0..=15).contains(&target.onu_id) {
+            if !openwrt_fttr::pon_engine::onu_id::is_valid(target.onu_id) {
                 return Err(usage.into());
             }
             Ok(Query::Report { target })

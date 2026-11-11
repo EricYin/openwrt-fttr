@@ -1,5 +1,5 @@
 //! Published management invalidations; health never locks the provisioning controller.
-use crate::pon_engine::omci::platform::wake::Wake;
+use crate::platform::openwrt::wake::Wake;
 use std::{
     collections::BTreeSet,
     sync::{

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 static WORKERS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
 
-pub(super) fn start(
+pub(crate) fn start(
     mut stream: UnixStream,
     input: String,
     engine: Arc<Mutex<PonEngine>>,
@@ -32,7 +32,7 @@ pub(super) fn start(
     });
 }
 
-pub(super) fn control(
+pub(crate) fn control(
     input: &str,
     engine: &Arc<Mutex<PonEngine>>,
     services: &super::service::States,
@@ -48,7 +48,7 @@ pub(super) fn control(
     }
 }
 
-pub(super) fn control_query(
+pub(crate) fn control_query(
     query: fttr_api::HlQuery,
     engine: &Arc<Mutex<PonEngine>>,
     services: &super::service::States,

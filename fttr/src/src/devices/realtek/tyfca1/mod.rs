@@ -1,12 +1,10 @@
 //! Realtek TYFCA1 profile and transparent bridge provisioning.
 use crate::controller::business as me;
 use crate::controller::business::{assign_tcont, create_verified_lenient};
+use crate::platform::{context::PlatformContext, openwrt::onu_lock::lock_onu};
 use crate::pon_engine::omci::attributes::AttributeValue as V;
-use crate::pon_engine::omci::{
-    platform::leases::{lock_onu, ChannelLease, StockOmccLease},
-    FmcsTransport, OmciSession,
-};
-use crate::{bosa, pon_engine::ploam::PloamFrame};
+use crate::pon_engine::omci::OmciSession;
+use crate::pon_engine::ploam::PloamFrame;
 use std::{
     io,
     sync::{atomic::AtomicBool, Arc},
@@ -20,29 +18,33 @@ pub const TYFCA1_VEIP_ENDPOINT: u16 = 0x0601;
 pub const TYFCA1_VEIP_BP: u16 = 0x0201;
 pub const TYFCA1_LAN_PORTS: [u16; 2] = [0x0101, 0x0102];
 
-pub(super) fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {
-    if id >= crate::pon_engine::ONU_SLOTS {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "ONU slot"));
-    }
+pub(super) fn configure(
+    platform: PlatformContext,
+    id: u8,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> io::Result<()> {
+    platform.resources().onu(id)?;
     let _lock = lock_onu(id)?;
-    let mut session = OmciSession::new(FmcsTransport::open(id)?);
+    let mut session = OmciSession::new(platform.transport(id)?);
     session.guard_registration(move || crate::controller::service::operation_confirmed(id));
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let mut lease = StockOmccLease::open(id)?;
-    let _channel = ChannelLease::open(id, 0)?;
-    let port = 0x100 + u16::from(id);
+    let mut lease = platform.management_lease(id)?;
+    let _channel = platform.channel(id, 0)?;
+    let resources = platform.resources().onu(id)?;
+    let port = resources.gem_id;
+    let alloc = resources.alloc_id;
 
     println!("REALTEK_TYFCA1_START id={id} port={port:04x}");
 
     // Send Assign_Alloc-ID downstream PLOAM (0x0A)
     let mut p = [0u8; 10];
-    p[0] = (port >> 4) as u8;
-    p[1] = (port << 4) as u8;
+    p[0] = (alloc >> 4) as u8;
+    p[1] = (alloc << 4) as u8;
     p[2] = 1;
     for _ in 0..3 {
-        let _ = bosa::send_ploam_msg(&PloamFrame::new(id, 0x0a, p).to_bytes());
+        let _ = platform.send_ploam(&PloamFrame::new(id, 0x0a, p));
     }
     std::thread::sleep(Duration::from_millis(50));
 
@@ -61,8 +63,8 @@ pub(super) fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Re
     }
 
     // 1. Assign business Alloc-ID to T-CONT 0x8000
-    println!("REALTEK_TYFCA1_ASSIGN_TCONT id={id} tcont={TYFCA1_TCONT:04x} alloc={port:04x}");
-    assign_tcont(&mut session, TYFCA1_TCONT, port)?;
+    println!("REALTEK_TYFCA1_ASSIGN_TCONT id={id} tcont={TYFCA1_TCONT:04x} alloc={alloc:04x}");
+    assign_tcont(&mut session, TYFCA1_TCONT, alloc)?;
 
     // 2. GAL Ethernet profile (ME 272)
     let _ = create_verified_lenient(&mut session, 272, TYFCA1_GAL_PROFILE, &me::gal(), &[1]);

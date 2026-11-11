@@ -9,6 +9,7 @@ pub fn configure(
 ) -> std::io::Result<()> {
     #[cfg(feature = "device-hl202")]
     return crate::devices::hl202::service::configure(
+        crate::platform::context::PlatformContext::detect().map_err(std::io::Error::other)?,
         id,
         seconds,
         transparent,

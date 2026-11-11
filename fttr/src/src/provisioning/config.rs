@@ -258,14 +258,22 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
             let value = s.get("onu_id");
             if values.len() != 1 || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(format!(
-                    "{id}: onu_id must be a single decimal number 0..15"
+                    "{id}: onu_id must be a single decimal number {}..{}",
+                    crate::pon_engine::onu_id::MIN_ONU_ID,
+                    crate::pon_engine::onu_id::MAX_ONU_ID
                 ));
             }
             let slot = value
                 .parse::<u8>()
                 .ok()
-                .filter(|n| *n < crate::pon_engine::ONU_SLOTS)
-                .ok_or_else(|| format!("{id}: onu_id must be 0..15"))?;
+                .filter(|n| crate::pon_engine::onu_id::is_valid(u16::from(*n)))
+                .ok_or_else(|| {
+                    format!(
+                        "{id}: onu_id must be {}..{}",
+                        crate::pon_engine::onu_id::MIN_ONU_ID,
+                        crate::pon_engine::onu_id::MAX_ONU_ID
+                    )
+                })?;
             if let Some((sn, _)) = cfg.onu_pins.iter().find(|(_, n)| **n == slot) {
                 return Err(format!("{id}: onu_id {slot} already reserved for {sn}"));
             }

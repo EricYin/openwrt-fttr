@@ -64,8 +64,17 @@ fn configure_evto(session: &mut OmciSession, instance: u16) -> io::Result<()> {
     Ok(())
 }
 
-pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {
-    crate::devices::generic::service::configure_with_evto(id, cancellation, Some(configure_evto))
+pub fn configure(
+    platform: crate::platform::context::PlatformContext,
+    id: u8,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> io::Result<()> {
+    crate::devices::generic::service::configure_with_evto(
+        platform,
+        id,
+        cancellation,
+        Some(configure_evto),
+    )
 }
 
 #[cfg(test)]

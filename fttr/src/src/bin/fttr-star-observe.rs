@@ -1,4 +1,4 @@
-use openwrt_fttr::pon_engine::omci::platform::fmcs::PacketSocket;
+use openwrt_fttr::platform::{context::PlatformContext, openwrt::packet::PacketSocket};
 use std::{
     collections::BTreeMap,
     io,
@@ -29,7 +29,14 @@ fn main() -> io::Result<()> {
         })
         .collect::<io::Result<Vec<_>>>()?;
     let expected: [u8; 6] = octets.try_into().map_err(|_| invalid())?;
-    let socket = PacketSocket::open("fttr0")?;
+    let platform = PlatformContext::detect().map_err(io::Error::other)?;
+    let interface = platform.resources().capture_interface.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "platform has no passive data capture interface",
+        )
+    })?;
+    let socket = PacketSocket::open(interface)?;
     let start = Instant::now();
     let mut buffer = [0u8; 4096];
     let mut counts = BTreeMap::new();

@@ -164,21 +164,6 @@ impl PloamFrame {
         out
     }
 
-    /// 1. Upstream Overhead message (broadcast)
-    pub fn upstream_overhead() -> Self {
-        // HM2004 upstream-overhead PLOAM payload.
-        let payload = [0x20, 0, 0, 0xAA, 0xAB, 0x59, 0x83, 0, 0, 0];
-        Self::new(0xFF, PLOAM_UPSTREAM_OVERHEAD, payload)
-    }
-
-    pub fn extended_burst_length() -> Self {
-        Self::new(
-            0xFF,
-            PLOAM_EXTENDED_BURST_LENGTH,
-            [0x40, 0x40, 0, 0, 0, 0, 0, 0, 0, 0],
-        )
-    }
-
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != 13 {
             return None;

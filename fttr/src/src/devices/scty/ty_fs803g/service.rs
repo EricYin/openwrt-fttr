@@ -11,12 +11,10 @@
 
 use crate::controller::business as me;
 use crate::controller::business::{create_verified_lenient, verify};
+use crate::platform::{context::PlatformContext, openwrt::onu_lock::lock_onu};
 use crate::pon_engine::omci::attributes::AttributeValue as V;
-use crate::pon_engine::omci::{
-    platform::leases::{lock_onu, ChannelLease, StockOmccLease},
-    FmcsTransport, OmciSession,
-};
-use crate::{bosa, pon_engine::ploam::PloamFrame};
+use crate::pon_engine::omci::OmciSession;
+use crate::pon_engine::ploam::PloamFrame;
 use std::{
     io,
     sync::{atomic::AtomicBool, Arc},
@@ -31,33 +29,34 @@ pub const TY_FS803G_VEIP_EVTO: u16 = 0x0201;
 pub const TY_FS803G_BRIDGE_PROFILE: u16 = 1;
 pub const TY_FS803G_GAL_PROFILE: u16 = 1;
 
-pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {
-    if id >= crate::pon_engine::ONU_SLOTS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "ONU ID must be 0..15",
-        ));
-    }
+pub fn configure(
+    platform: PlatformContext,
+    id: u8,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> io::Result<()> {
+    platform.resources().onu(id)?;
     let _lock = lock_onu(id)?;
-    let mut session = OmciSession::new(FmcsTransport::open(id)?);
+    let mut session = OmciSession::new(platform.transport(id)?);
     session.guard_registration(move || crate::controller::service::operation_confirmed(id));
     if let Some(token) = cancellation {
         session.cancel_when(token);
     }
-    let mut lease = StockOmccLease::open(id)?;
-    let _channel = ChannelLease::open(id, 0)?;
+    let mut lease = platform.management_lease(id)?;
+    let _channel = platform.channel(id, 0)?;
 
-    let port = 0x100u16 + id as u16;
+    let resources = platform.resources().onu(id)?;
+    let port = resources.gem_id;
+    let alloc = resources.alloc_id;
 
     println!("SCTY_TY_FS803G_PROVISION_START id={id} port={port:04x}");
 
-    // Send Assign_Alloc-ID downstream PLOAM (0x0A) so the ONU hardware recognizes business Alloc-ID = port
+    // Advertise the platform's business Alloc-ID with downstream PLOAM (0x0A).
     let mut p = [0u8; 10];
-    p[0] = (port >> 4) as u8;
-    p[1] = (port << 4) as u8;
+    p[0] = (alloc >> 4) as u8;
+    p[1] = (alloc << 4) as u8;
     p[2] = 1;
     for _ in 0..3 {
-        let _ = bosa::send_ploam_msg(&PloamFrame::new(id, 0x0a, p).to_bytes());
+        let _ = platform.send_ploam(&PloamFrame::new(id, 0x0a, p));
     }
     std::thread::sleep(Duration::from_millis(50));
 
@@ -73,7 +72,7 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
     let _ = session.set_attributes(256, 0, &[(12, V::number(1))]);
 
     // Retire stale ANI/GEM entries from other slots
-    retire_stale_ani(&mut session, port)?;
+    retire_stale_ani(platform, &mut session, port)?;
 
     // Clean up any stale current_port entities before T-CONT transition
     let _ = session.delete(47, port);
@@ -107,15 +106,15 @@ pub fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    println!("SCTY_TY_FS803G_TCONT_SET_TARGET instance={TY_FS803G_TCONT:04x} alloc={port:04x}");
-    session.set_attributes(262, TY_FS803G_TCONT, &[(1, V::number(port.into()))])?;
+    println!("SCTY_TY_FS803G_TCONT_SET_TARGET instance={TY_FS803G_TCONT:04x} alloc={alloc:04x}");
+    session.set_attributes(262, TY_FS803G_TCONT, &[(1, V::number(alloc.into()))])?;
     std::thread::sleep(Duration::from_millis(50));
     verify(
         &mut session,
         262,
         TY_FS803G_TCONT,
         0x8000,
-        &port.to_be_bytes(),
+        &alloc.to_be_bytes(),
     )?;
 
     // Preserve the factory queue scheduler association. This firmware accepts
@@ -299,8 +298,17 @@ fn veip_evto_present(data: &[u8]) -> io::Result<bool> {
     }
 }
 
-fn retire_stale_ani(session: &mut OmciSession, current_port: u16) -> io::Result<()> {
-    for old in 0x100u16..=0x10f {
+fn retire_stale_ani(
+    platform: PlatformContext,
+    session: &mut OmciSession,
+    current_port: u16,
+) -> io::Result<()> {
+    for old in platform
+        .resources()
+        .allocations
+        .iter()
+        .map(|entry| entry.gem_id)
+    {
         if old == current_port {
             continue;
         }

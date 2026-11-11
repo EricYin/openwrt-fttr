@@ -24,7 +24,7 @@ const fn descriptors() -> [PlatformDescriptor; 3] {
     ]
 }
 
-fn is_compiled(id: PlatformId) -> bool {
+pub(crate) fn is_compiled(id: PlatformId) -> bool {
     match id {
         PlatformId::H3cHm2004Du => cfg!(feature = "platform-h3c-hm2004-du"),
         PlatformId::FiberhomeAn4475G2 => cfg!(feature = "platform-fiberhome-an4475-g2"),
@@ -39,6 +39,7 @@ pub enum SelectionError {
     PlatformNotCompiled(PlatformId),
     IdentificationPending(PlatformId),
     BackendNotImplemented(PlatformId),
+    InvalidResources(PlatformId, String),
 }
 
 impl fmt::Display for SelectionError {
@@ -68,6 +69,13 @@ impl fmt::Display for SelectionError {
                 write!(
                     f,
                     "platform {} is recognized but has no hardware backend",
+                    id.as_str()
+                )
+            }
+            Self::InvalidResources(id, reason) => {
+                write!(
+                    f,
+                    "platform {} has invalid resources: {reason}",
                     id.as_str()
                 )
             }
@@ -125,7 +133,7 @@ fn identify_with_descriptors(
     if descriptor.identification != IdentificationStatus::Verified {
         return Err(SelectionError::IdentificationPending(descriptor.id));
     }
-    if descriptor.implementation != PlatformImplementation::ExistingH3cRuntime {
+    if descriptor.implementation != PlatformImplementation::Runtime {
         return Err(SelectionError::BackendNotImplemented(descriptor.id));
     }
 
@@ -156,29 +164,31 @@ pub fn report_json() -> String {
                     IdentificationStatus::PendingHardwareEvidence => "pending-hardware-evidence",
                 },
                 "implementation": match descriptor.implementation {
-                    PlatformImplementation::ExistingH3cRuntime => "existing-h3c-runtime",
+                    PlatformImplementation::Runtime => "runtime",
                     PlatformImplementation::CompileableStub => "stub",
                 },
             })
         })
         .collect::<Vec<_>>();
-    let selected = detect();
+    let selected = super::context::PlatformContext::detect();
     serde_json::json!({
         "schema_version": 1,
         "platforms": platforms,
-        "selected_platform": selected.as_ref().ok().map(|id| id.as_str()),
-        "runtime_ready": selected.is_ok(),
+        "selected_platform": selected.as_ref().ok().map(|platform| platform.id().as_str()),
+        "selection_ready": selected.is_ok(),
+        "runtime_ready": false,
+        "hardware_ready": null,
         "selection_error": selected.err().map(|error| error.to_string()),
     })
     .to_string()
 }
 
 pub fn run() -> Result<(), SelectionError> {
-    match detect()? {
-        PlatformId::H3cHm2004Du => crate::controller::run(),
-        id => return Err(SelectionError::BackendNotImplemented(id)),
-    }
-    Ok(())
+    run_selected(super::context::PlatformContext::detect()?)
+}
+
+pub fn run_selected(platform: super::context::PlatformContext) -> Result<(), SelectionError> {
+    platform.backend().run(platform)
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 //! Serialized, identity-bound downstream FEC PM lifecycle and diagnostics.
-use crate::pon_engine::omci::{error, FmcsTransport, OmciSession};
+use crate::pon_engine::omci::{error, OmciSession};
 use std::{
     io,
     sync::{atomic::AtomicBool, Arc},
@@ -8,7 +8,7 @@ use std::{
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Command {
+pub(crate) struct Command {
     onu_id: u8,
     serial: String,
     generation: u64,
@@ -16,7 +16,7 @@ pub(super) struct Command {
     #[serde(default)]
     create_pm: bool,
 }
-pub(super) struct Request {
+pub(crate) struct Request {
     fec_generation: u64,
     command: Command,
     deadline: Instant,
@@ -59,7 +59,7 @@ pub fn read(id: u8, create_pm: bool) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn control(
+pub(crate) fn control(
     command: Command,
     states: &super::service::States,
 ) -> io::Result<serde_json::Value> {
@@ -95,7 +95,8 @@ pub(super) fn control(
         .map_err(io::Error::other)?
 }
 
-pub(super) fn run(
+pub(crate) fn run(
+    platform: crate::platform::context::PlatformContext,
     request: &Request,
     cancellation: Option<Arc<AtomicBool>>,
 ) -> io::Result<serde_json::Value> {
@@ -109,7 +110,7 @@ pub(super) fn run(
             "FEC diagnostic expired or identity changed",
         ));
     }
-    let mut session = OmciSession::new(FmcsTransport::open(c.onu_id)?);
+    let mut session = OmciSession::new(platform.transport(c.onu_id)?);
     let id = c.onu_id;
     let serial = c.serial.clone();
     let fec_generation = request.fec_generation;

@@ -1,11 +1,11 @@
 //! Desired bits are reconciled only by the PLOAM hardware owner.
 use std::sync::{Mutex, OnceLock};
 
-pub(super) fn apply(
+pub(crate) fn apply<T>(
     desired: (bool, bool),
     quiesce: impl FnOnce() -> std::io::Result<()>,
-    write: impl FnOnce(bool, bool) -> std::io::Result<u32>,
-) -> std::io::Result<u32> {
+    write: impl FnOnce(bool, bool) -> std::io::Result<T>,
+) -> std::io::Result<T> {
     let cleanup = if !desired.0 { quiesce() } else { Ok(()) };
     // Failure to drain workers must not prevent disabling transmission.
     let written = write(desired.0, desired.1);
@@ -23,7 +23,7 @@ fn cache() -> &'static Mutex<Option<fttr_api::PonMacStatus>> {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
-pub(super) fn desired() -> (bool, bool) {
+pub(crate) fn desired() -> (bool, bool) {
     let settings = crate::optical::settings();
     (
         settings.enabled && settings.downstream_tx_enabled,
@@ -31,25 +31,27 @@ pub(super) fn desired() -> (bool, bool) {
     )
 }
 
-pub(super) fn record(result: std::io::Result<u32>) -> bool {
+pub(crate) fn record(result: std::io::Result<crate::platform::resources::PonMacReadback>) -> bool {
     let desired = desired();
-    let (register, error) = match result {
+    let (readback, error) = match result {
         Ok(value) => (Some(value), None),
         Err(error) => (None, Some(error.to_string())),
     };
-    let allowed = register.is_some_and(|value| value & 2 != 0);
+    let allowed = readback
+        .as_ref()
+        .is_some_and(|value| value.tx_enabled == Some(true));
     *cache().lock().unwrap() = Some(fttr_api::PonMacStatus {
         desired_tx_enabled: desired.0,
         desired_fec_enabled: desired.1,
-        register,
-        tx_enabled: register.map(|value| value & 2 != 0),
-        fec_enabled: register.map(|value| value & 8 != 0),
+        register: readback.as_ref().and_then(|value| value.raw),
+        tx_enabled: readback.as_ref().and_then(|value| value.tx_enabled),
+        fec_enabled: readback.as_ref().and_then(|value| value.fec_enabled),
         error,
     });
     allowed
 }
 
-pub(super) fn snapshot() -> fttr_api::PonMacStatus {
+pub(crate) fn snapshot() -> fttr_api::PonMacStatus {
     let desired = desired();
     let mut status = cache()
         .lock()

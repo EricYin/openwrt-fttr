@@ -7,7 +7,7 @@ PROG=/usr/sbin/fttrd
 LAN_STATE=/var/run/fttr-mqtt-lan
 
 start_service() {
-	local acs_state acs_username acs_password lan_addr dev i
+	local acs_state acs_username acs_password lan_addr
 	config_load fttr
 	config_get acs_state acs state_file /var/lib/fttr/acs-state.json
 	config_get acs_username acs username ""
@@ -21,15 +21,6 @@ start_service() {
 	fi
 
 	echo "[*] Initializing FTTR Micro-OLT Subsystem..."
-	# FPGA and BOSA initialization belong exclusively to fttrd.
-	# Setup downstream DSA switch ports (fttr1 ~ fttr16)
-	for i in $(seq 1 16); do
-		dev="fttr${i}"
-		if [ -d "/sys/class/net/${dev}" ]; then
-			ip link set "$dev" up 2>/dev/null
-			ip link set "$dev" master br-lan 2>/dev/null || brctl addif br-lan "$dev" 2>/dev/null
-		fi
-	done
 
 	# Start the controller daemon.
 	procd_open_instance

@@ -6,11 +6,14 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
-pub(super) fn configure(id: u8, cancellation: Option<Arc<AtomicBool>>) -> io::Result<()> {
-    if id >= crate::pon_engine::ONU_SLOTS {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "ONU slot"));
-    }
+pub(super) fn configure(
+    platform: crate::platform::context::PlatformContext,
+    id: u8,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> io::Result<()> {
+    platform.resources().onu(id)?;
     crate::devices::generic::service::configure_with_grant_floors(
+        platform,
         id,
         cancellation,
         Some((60, 1300)),

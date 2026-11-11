@@ -6,10 +6,11 @@ pub(super) fn matches(vendor: &str, equipment: Option<&str>) -> bool {
 }
 
 pub(super) fn configure(
+    platform: crate::platform::context::PlatformContext,
     id: u8,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::io::Result<()> {
-    tyfca1::configure(id, cancellation)
+    tyfca1::configure(platform, id, cancellation)
 }
 
 #[cfg(test)]

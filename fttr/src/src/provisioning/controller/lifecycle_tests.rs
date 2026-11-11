@@ -1,6 +1,22 @@
 use super::tests::operation;
 use super::*;
 
+#[test]
+fn unsupported_platform_pin_is_rejected_before_reload_mutates_active_state() {
+    let mut c = Controller::default();
+    c.resources = Some(crate::pon_engine::test_engine().resources);
+    c.config.revision = "active".into();
+    let mut config = c.config.clone();
+    config.revision = "invalid".into();
+    config.onu_pins.insert("TEST00000001".into(), 72);
+    c.request_config(config.clone());
+    assert!(c.config_error.as_deref().unwrap().contains("unsupported"));
+    assert!(c.pending_config.is_none());
+    assert_eq!(c.config.revision, "active");
+    assert!(c.replace_config(config).is_err());
+    assert_eq!(c.config.revision, "active");
+}
+
 fn configured() -> Controller {
     let op = operation(OperationPhase::Completed, false);
     let device = op.device.clone();

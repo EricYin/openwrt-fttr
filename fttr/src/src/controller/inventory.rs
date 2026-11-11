@@ -1,9 +1,6 @@
 //! Read-only identity/MIB operations coordinated with the registered ONU worker.
-use crate::pon_engine::omci::{
-    mib::MibReport,
-    platform::leases::{lock_onu, ChannelLease, StockOmccLease},
-    FmcsTransport, OmciSession,
-};
+use crate::platform::{context::PlatformContext, openwrt::onu_lock::lock_onu};
+use crate::pon_engine::omci::{mib::MibReport, OmciSession};
 mod tables;
 use std::sync::atomic::AtomicU64;
 use std::{
@@ -21,14 +18,14 @@ use std::{
 static NEXT_PROGRESS_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(serde::Serialize)]
-pub(super) struct MibProgress {
+pub(crate) struct MibProgress {
     pub phase: &'static str,
     pub received: usize,
     pub expected: Option<usize>,
 }
 
 #[derive(Clone)]
-pub(super) enum MibProgressReporter {
+pub(crate) enum MibProgressReporter {
     File(PathBuf),
     Job(fttr_jobs::Progress),
 }
@@ -85,6 +82,7 @@ impl MibProgressReporter {
 }
 
 pub(super) fn collect(
+    platform: PlatformContext,
     id: u8,
     cancellation: Arc<AtomicBool>,
 ) -> io::Result<crate::model::OnuIdentity> {
@@ -95,11 +93,11 @@ pub(super) fn collect(
             "identity collection cancelled",
         ));
     }
-    let mut session = OmciSession::new(FmcsTransport::open(id)?);
+    let mut session = OmciSession::new(platform.transport(id)?);
     session.guard_registration(move || super::service::operation_confirmed(id));
     session.cancel_when(cancellation.clone());
-    let _lease = StockOmccLease::open(id)?;
-    let _channel = ChannelLease::open(id, 0)?;
+    let _lease = platform.management_lease(id)?;
+    let _channel = platform.channel(id, 0)?;
     let mut identity = crate::model::OnuIdentity::default();
     for (class, entity, mask, label) in [
         (257, 0, 0x8000, "equipment"),
@@ -150,28 +148,28 @@ pub(super) fn collect(
         }
     }
     if identity.equipment_id.is_some() {
-        super::telemetry::start(id, cancellation);
+        super::telemetry::start(platform, id, cancellation);
     }
     Ok(identity)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct MibCommand {
+pub(crate) struct MibCommand {
     pub onu_id: u8,
     pub tables: bool,
     #[serde(default)]
     pub progress_id: Option<String>,
 }
-pub(super) struct MibRequest {
+pub(crate) struct MibRequest {
     pub tables: bool,
     pub deadline: Instant,
     pub progress: Option<MibProgressReporter>,
     pub reply: std::sync::mpsc::Sender<io::Result<MibReport>>,
     pub registration: Option<RegistrationGuard>,
 }
-pub(super) type RegistrationGuard = Arc<dyn Fn() -> bool + Send + Sync>;
-pub(super) enum WorkerRequest {
+pub(crate) type RegistrationGuard = Arc<dyn Fn() -> bool + Send + Sync>;
+pub(crate) enum WorkerRequest {
     Mib(MibRequest),
     Attribute(super::attribute_probe::Request),
     Fec(super::fec::Request),
@@ -188,10 +186,14 @@ pub fn read_with_progress(
     tables: bool,
     progress_id: Option<String>,
 ) -> io::Result<()> {
-    if id >= crate::pon_engine::ONU_SLOTS {
+    if !crate::pon_engine::onu_id::is_valid(u16::from(id)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ONU_ID must be 0..15",
+            format!(
+                "ONU_ID must be {}..{}; availability depends on the selected platform",
+                crate::pon_engine::onu_id::MIN_ONU_ID,
+                crate::pon_engine::onu_id::MAX_ONU_ID
+            ),
         ));
     }
     let command = serde_json::to_string(&MibCommand {
@@ -268,7 +270,8 @@ pub fn read_with_progress(
 }
 
 /// Caller owns the ONU lock and OMCC/channel leases; session owns only transactions.
-pub(super) fn read_owned(
+pub(crate) fn read_owned(
+    platform: PlatformContext,
     id: u8,
     tables: bool,
     cancellation: Option<Arc<AtomicBool>>,
@@ -284,7 +287,7 @@ pub(super) fn read_owned(
             "MIB requires a currently registered ONU",
         ));
     }
-    let mut session = OmciSession::new(FmcsTransport::open(id)?);
+    let mut session = OmciSession::new(platform.transport(id)?);
     session.guard_registration(move || {
         super::service::operation_confirmed(id) && registration.as_ref().is_none_or(|guard| guard())
     });
@@ -337,28 +340,25 @@ pub(super) fn read_owned(
     }
     Ok(report)
 }
-pub(super) fn control(
+pub(crate) fn control(
+    platform: PlatformContext,
     id: u8,
     tables: bool,
     progress: Option<MibProgressReporter>,
     states: &super::service::States,
 ) -> io::Result<MibReport> {
-    control_guarded(id, tables, progress, states, None)
+    control_guarded(platform, id, tables, progress, states, None)
 }
 
-pub(super) fn control_guarded(
+pub(crate) fn control_guarded(
+    platform: PlatformContext,
     id: u8,
     tables: bool,
     progress: Option<MibProgressReporter>,
     states: &super::service::States,
     registration: Option<RegistrationGuard>,
 ) -> io::Result<MibReport> {
-    if id >= crate::pon_engine::ONU_SLOTS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "ONU_ID must be 0..15",
-        ));
-    }
+    platform.resources().onu(id)?;
     if !super::service::operation_confirmed(id) {
         return Err(io::Error::new(
             io::ErrorKind::NotConnected,
@@ -376,9 +376,9 @@ pub(super) fn control_guarded(
                     "ONU no longer registered",
                 ));
             }
-            let _lease = StockOmccLease::open(id)?;
-            let _channel = ChannelLease::open(id, 0)?;
-            read_owned(id, tables, None, deadline, progress, registration)
+            let _lease = platform.management_lease(id)?;
+            let _channel = platform.channel(id, 0)?;
+            read_owned(platform, id, tables, None, deadline, progress, registration)
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
             let (sender, wake) = states

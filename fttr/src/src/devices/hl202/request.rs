@@ -27,7 +27,7 @@ pub fn validate(mut request: Request) -> io::Result<Request> {
     }
     if request.target.optical_sn.is_empty()
         || request.target.binding_generation.is_empty()
-        || !(0..=15).contains(&request.target.onu_id)
+        || !crate::pon_engine::onu_id::is_valid(request.target.onu_id)
     {
         return Err(invalid("invalid HL202 device selection"));
     }
@@ -79,7 +79,7 @@ mod tests {
         invalid.schema_version = 2;
         assert!(validate(invalid).is_err());
         let mut invalid = request();
-        invalid.target.onu_id = 16;
+        invalid.target.onu_id = 254;
         assert!(validate(invalid).is_err());
         for action in [
             Action::Exec {
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn hl202_request_accepts_protocol_slot_boundaries() {
-        for (id, valid) in [(0, true), (15, true), (16, false)] {
+        for (id, valid) in [(0, true), (15, true), (72, true), (253, true), (254, false)] {
             let input = serde_json::json!({
                 "schema_version": 1,
                 "target": {"optical_sn":"H3CT12345678","onu_id":id,"binding_generation":"epoch"},

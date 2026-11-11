@@ -2,7 +2,7 @@ use crate::{
     model::{MeasurementEvidence, Measurements},
     pon_engine::omci::{
         attributes::{AttributeBlock, AttributeValue},
-        FmcsTransport, OmciSession,
+        OmciSession,
     },
 };
 use std::{
@@ -16,13 +16,11 @@ use std::{
 
 pub(super) mod fec;
 mod inventory;
-mod network;
 mod poll;
-pub(super) use network::data_path;
 pub(super) use poll::start;
 
 #[derive(Clone)]
-pub(super) struct Snapshot {
+pub(crate) struct Snapshot {
     pub rx: Option<f64>,
     pub tx: Option<f64>,
     pub uptime: Option<f64>,
@@ -68,7 +66,7 @@ fn cache() -> &'static Mutex<BTreeMap<u8, Cached>> {
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-pub(super) fn snapshot(id: u8, online: bool) -> Snapshot {
+pub(crate) fn snapshot(id: u8, online: bool) -> Snapshot {
     let mut snapshot = cached_snapshot(id, online);
     if !crate::optical::fec_enabled() {
         snapshot.fec = fec::unavailable("fec_support_disabled");
@@ -106,7 +104,8 @@ fn cached_snapshot(id: u8, online: bool) -> Snapshot {
     }
 }
 
-pub(super) struct Collector {
+pub(crate) struct Collector {
+    platform: crate::platform::context::PlatformContext,
     id: u8,
     token: Arc<AtomicBool>,
     ani: Option<Result<u16, String>>,
@@ -119,8 +118,13 @@ impl Collector {
     pub fn configuration_changed(&self) -> bool {
         self.fec_generation != crate::optical::fec_generation()
     }
-    pub fn new(id: u8, token: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        platform: crate::platform::context::PlatformContext,
+        id: u8,
+        token: Arc<AtomicBool>,
+    ) -> Self {
         Self {
+            platform,
             id,
             token,
             ani: None,
@@ -139,6 +143,7 @@ impl Collector {
         {
             let started = Instant::now();
             match super::inventory::read_owned(
+                self.platform,
                 self.id,
                 true,
                 Some(self.token.clone()),
@@ -169,7 +174,7 @@ impl Collector {
             self.fec = fec::Poll::default();
             self.fec_generation = fec_generation;
         }
-        let snapshot = match FmcsTransport::open(self.id) {
+        let snapshot = match self.platform.transport(self.id) {
             Ok(transport) => {
                 let mut session = OmciSession::new(transport);
                 let id = self.id;
