@@ -25,6 +25,18 @@ impl PlatformBackend for Hm2004Du {
     fn resources(&self) -> &'static Resources {
         &RESOURCES
     }
+    fn operations(&self) -> fttr_api::PlatformOperations {
+        fttr_api::PlatformOperations {
+            optical_control: true,
+            transceiver_telemetry: true,
+            fpga_diagnostics: true,
+            bosa_diagnostics: true,
+            calibration_profile: Some(fttr_api::PlatformCalibrationProfile::Ux3326),
+            npu_offload: cfg!(feature = "npu"),
+            omci_mib: true,
+            downstream_fec: true,
+        }
+    }
     fn transport(&self, id: u8) -> io::Result<Box<dyn OmciTransport>> {
         Ok(Box::new(omci::fmcs::FmcsTransport::open(id)?))
     }

@@ -226,6 +226,7 @@ macro_rules! fttr_methods {
     ($consumer:ident) => {
         $consumer! {
             GET_CAPABILITIES, get_capabilities, getCapabilities, EmptyRequest, Capabilities, Read, Always, [];
+            GET_PLATFORM_INFO, get_platform_info, getPlatformInfo, EmptyRequest, PlatformInfoReply, Read, Always, [];
             OPTICAL_STATUS, optical_status, opticalStatus, EmptyRequest, OpticalReply, Read, Always, [];
             OPTICAL_SET, optical_set, opticalSet, OpticalSettings, OpticalReply, Write, Always, [enabled, downstream_tx_enabled, fec_enabled];
             GET_STATUS, get_status, getStatus, EmptyRequest, StatusReply, Read, Always, [];

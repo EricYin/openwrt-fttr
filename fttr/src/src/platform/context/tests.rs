@@ -217,6 +217,25 @@ fn registered_h3c_resources_pass_selection_without_opening_hardware() {
         platform.resources().onu_ids.len(),
         crate::platform::h3c_hm2004_du::ONU_COUNT
     );
+    let info = platform.info();
+    assert_eq!(info.selection, fttr_api::PlatformSelection::Selected);
+    assert_eq!(info.platform_id, "h3c-hm2004-du");
+    assert_eq!(info.onus.len(), crate::platform::h3c_hm2004_du::ONU_COUNT);
+    assert_eq!(info.onus[0].onu_id, 0);
+    assert_eq!(info.onus[0].interface.as_deref(), Some("fttr1"));
+    assert_eq!(info.onus[15].onu_id, 15);
+    assert_eq!(info.onus[15].interface.as_deref(), Some("fttr16"));
+    assert!(info.operations.optical_control);
+    assert!(info.operations.transceiver_telemetry);
+    assert!(info.operations.fpga_diagnostics);
+    assert!(info.operations.bosa_diagnostics);
+    assert_eq!(
+        info.operations.calibration_profile,
+        Some(fttr_api::PlatformCalibrationProfile::Ux3326)
+    );
+    assert!(info.operations.omci_mib);
+    assert!(info.operations.downstream_fec);
+    assert_eq!(info.operations.npu_offload, cfg!(feature = "npu"));
 }
 
 #[test]
@@ -224,6 +243,11 @@ fn non_h3c_backend_drives_transport_resources_leases_and_runtime_without_enum_di
     let (platform, events) = recording_platform();
     assert_eq!(platform.id(), PlatformId::FiberhomeAn4475G2);
     assert_eq!(platform.resources().onu(72).unwrap().gem_id, 1200);
+    let info = platform.info();
+    assert_eq!(info.onus.len(), 1);
+    assert_eq!(info.onus[0].onu_id, 72);
+    assert_eq!(info.onus[0].interface, None);
+    assert_eq!(info.operations, fttr_api::PlatformOperations::default());
     // Unsupported IDs never reach a hardware operation, even through another entry.
     assert!(platform.transport(0).is_err());
     assert!(platform.management_lease(0).is_err());

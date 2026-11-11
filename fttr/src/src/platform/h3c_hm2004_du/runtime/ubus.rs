@@ -333,6 +333,9 @@ impl Handlers {
     fn get_capabilities(&self, _: EmptyRequest) -> Result<Capabilities, i32> {
         Ok(crate::capabilities::compiled())
     }
+    fn get_platform_info(&self, _: EmptyRequest) -> Result<PlatformInfoReply, i32> {
+        Ok(self.optics.platform.info())
+    }
     fn optical_status(&self, _: EmptyRequest) -> Result<OpticalReply, i32> {
         optical(&self.optics, OpticalCommand::Status)
     }

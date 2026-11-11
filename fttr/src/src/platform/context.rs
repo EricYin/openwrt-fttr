@@ -61,6 +61,26 @@ impl PlatformContext {
     pub fn resources(self) -> &'static Resources {
         self.backend.resources()
     }
+    pub fn info(self) -> fttr_api::PlatformInfoReply {
+        let descriptor = self.backend.descriptor();
+        fttr_api::PlatformInfoReply {
+            schema_version: 1,
+            selection: fttr_api::PlatformSelection::Selected,
+            platform_id: descriptor.id.as_str().to_owned(),
+            vendor: descriptor.vendor.to_owned(),
+            model: descriptor.model.to_owned(),
+            onus: self
+                .resources()
+                .onu_ids
+                .iter()
+                .map(|&onu_id| fttr_api::PlatformOnuResource {
+                    onu_id,
+                    interface: self.resources().interface(onu_id).map(str::to_owned),
+                })
+                .collect(),
+            operations: self.backend.operations(),
+        }
+    }
     pub(crate) fn backend(self) -> &'static dyn PlatformBackend {
         self.backend
     }

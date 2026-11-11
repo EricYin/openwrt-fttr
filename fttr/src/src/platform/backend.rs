@@ -21,6 +21,9 @@ use std::{
 pub(crate) trait PlatformBackend: Debug + Sync {
     fn descriptor(&self) -> PlatformDescriptor;
     fn resources(&self) -> &'static Resources;
+    fn operations(&self) -> fttr_api::PlatformOperations {
+        fttr_api::PlatformOperations::default()
+    }
     fn transport(&self, id: u8) -> io::Result<Box<dyn OmciTransport>>;
     fn management_lease(&self, id: u8) -> io::Result<Box<dyn ManagementLease>>;
     fn channel(&self, id: u8, channel: u16) -> io::Result<Box<dyn ChannelGuard>>;

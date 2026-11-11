@@ -1,4 +1,53 @@
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct PlatformInfoReply {
+    #[cfg_attr(feature = "codegen", ts(type = "1"))]
+    pub schema_version: u8,
+    pub selection: PlatformSelection,
+    pub platform_id: String,
+    pub vendor: String,
+    pub model: String,
+    pub onus: Vec<PlatformOnuResource>,
+    pub operations: PlatformOperations,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformSelection {
+    Selected,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct PlatformOnuResource {
+    pub onu_id: u8,
+    pub interface: Option<String>,
+}
+
+/// Runtime operations advertised by the selected platform backend, not build features.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct PlatformOperations {
+    pub optical_control: bool,
+    pub transceiver_telemetry: bool,
+    pub fpga_diagnostics: bool,
+    pub bosa_diagnostics: bool,
+    pub calibration_profile: Option<PlatformCalibrationProfile>,
+    pub npu_offload: bool,
+    pub omci_mib: bool,
+    pub downstream_fec: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformCalibrationProfile {
+    Ux3326,
+}
+
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct StatusReply {
