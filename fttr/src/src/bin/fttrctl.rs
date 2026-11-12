@@ -5,6 +5,8 @@ use std::process::exit;
 use openwrt_fttr::ipc;
 use openwrt_fttr::model::FttrSystemStatus;
 use openwrt_fttr::platform::{context::PlatformContext, diagnostics::HardwareDiagnostics};
+#[path = "fttrctl/hardware.rs"]
+mod hardware_command;
 #[cfg(feature = "device-hl202")]
 #[path = "fttrctl/hl202.rs"]
 mod hl202;
@@ -29,6 +31,7 @@ Commands:\n  \
   status [--json|-j]   Display active FTTR optical link and DSA switch ports (table or JSON)\n  \
   mib ONU_ID [--summary|--json] [--tables]  Read structured OMCI inventory (default: JSON)\n  \
   fec ONU_ID [--json] [--create-pm]  Read downstream FEC PM; optionally create missing PM instance\n  \
+  hardware DEVICE COMMAND  Exclusive offline register/memory diagnostics (JSON; hardware help)\n  \
   fpga-read <addr>     Directly read 32-bit FPGA hardware register\n  \
   fpga-diag [ONU_ID|all] [--samples N] [--interval-ms N] [--json] [--offline]\n  \
   fpga-write <a> <v>   Directly write 32-bit FPGA hardware register\n  \
@@ -81,10 +84,10 @@ fn handle_mqtt_command(_: &[String]) -> Result<i32, String> {
 }
 
 fn hardware() -> HardwareDiagnostics {
-    HardwareDiagnostics::new(PlatformContext::detect().unwrap_or_else(|error| {
+    HardwareDiagnostics::detect().unwrap_or_else(|error| {
         eprintln!("Platform selection: {error}");
         exit(1)
-    }))
+    })
 }
 
 fn handle_offload(args: &[String]) {
@@ -669,6 +672,12 @@ fn main() {
         "fpga-diag" => {
             if let Err(error) = hardware().fpga_diag(&args[2..]) {
                 eprintln!("FPGA diagnostics: {error}");
+                exit(1);
+            }
+        }
+        "hardware" => {
+            if let Err(error) = hardware_command::handle(&args[2..]) {
+                eprintln!("[-] Hardware diagnostic: {error}");
                 exit(1);
             }
         }

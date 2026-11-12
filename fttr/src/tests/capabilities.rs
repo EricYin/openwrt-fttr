@@ -74,7 +74,9 @@ fn capabilities_offline_queries_agree_without_controller_initialization() {
         cfg!(all(feature = "device-hl202", feature = "mqtt"))
     );
     assert_eq!(
-        provisioning.iter().any(|a| a["id"] == "cu"),
+        provisioning
+            .iter()
+            .any(|a| a["id"] == "vendor-cu-parent-vlan"),
         cfg!(feature = "acs")
     );
     assert_eq!(

@@ -17,7 +17,7 @@ define Package/openwrt-fttr
   CATEGORY:=Network
   SUBMENU:=PON
   TITLE:=OpenWrt FTTR controller and device management tools
-  DEPENDS:=$(RUST_ARCH_DEPENDS) +FTTR_PLATFORM_H3C_HM2004_DU:kmod-h3c-fmcs +FTTR_NPU&&FTTR_PLATFORM_H3C_HM2004_DU:airoha-en7581-npu-firmware +uci +ubus +firewall4 +dnsmasq
+  DEPENDS:=$(RUST_ARCH_DEPENDS) +FTTR_PLATFORM_H3C_HM2004_DU:kmod-h3c-fmcs +FTTR_PLATFORM_FIBERHOME_AN4475_G2:kmod-fiberhome-fsl +FTTR_NPU&&FTTR_PLATFORM_H3C_HM2004_DU:airoha-en7581-npu-firmware +uci +ubus +firewall4 +dnsmasq
 endef
 
 define Package/openwrt-fttr/description
@@ -31,7 +31,7 @@ define Package/openwrt-fttr/config
     depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_PLATFORM_FIBERHOME_AN4475_G2
-    bool "Compile FiberHome AN4475-G2 platform stub (hardware support pending)"
+    bool "Compile FiberHome AN4475-G2 register diagnostics (runtime pending)"
     depends on PACKAGE_openwrt-fttr
     default n
   config FTTR_PLATFORM_TIANYI_TYFZA1
