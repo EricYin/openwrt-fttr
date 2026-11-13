@@ -83,7 +83,16 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
                 at <= time
                     && time - at <= d.connection_request.effective_freshness(config.freshness)
             });
-        c.management.insert(d.id.clone(), json!({"cwmp_id":d.cwmp_id,"product_class":observed["product_class"],"state":if cwmp_reachable {"online"} else if at.is_none() {"waiting_inform"} else {"offline_or_stale"},"optical_online":online.contains(&d.optical_sn),"last_inform":at,"age_seconds":at.map(|at| time.saturating_sub(at))}));
+        let state = if !d.cwmp_enabled() {
+            "disabled"
+        } else if cwmp_reachable {
+            "online"
+        } else if at.is_none() {
+            "waiting_inform"
+        } else {
+            "offline_or_stale"
+        };
+        c.management.insert(d.id.clone(), json!({"cwmp_id":d.cwmp_id,"product_class":observed["product_class"],"state":state,"optical_online":online.contains(&d.optical_sn),"last_inform":at,"age_seconds":at.map(|at| time.saturating_sub(at))}));
         let mqtt_reachable = online.contains(&d.optical_sn)
             && crate::mqtt_identity::shared()
                 .lock()
@@ -756,5 +765,23 @@ mod reload_boundary_tests {
         assert_eq!(op.stage, OperationPhase::Writing);
         assert_eq!(op.task, Some(1));
         assert!(op.completed_at.is_none());
+    }
+
+    #[test]
+    fn disabled_cwmp_reports_disabled_management_state() {
+        let mut d = super::super::tests::operation(OperationPhase::Completed, false).device;
+        d.bootstrap_adapter = "none".into();
+        d.provisioning_adapter = "hl202-mqtt".into();
+        assert!(!d.cwmp_enabled());
+
+        d.provisioning_adapter = "none".into();
+        assert!(!d.cwmp_enabled());
+
+        d.bootstrap_adapter = "manual-acs".into();
+        assert!(d.cwmp_enabled());
+
+        d.bootstrap_adapter = "none".into();
+        d.provisioning_adapter = "hl202-cu".into();
+        assert!(d.cwmp_enabled());
     }
 }

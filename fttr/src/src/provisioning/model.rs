@@ -199,6 +199,10 @@ impl Device {
         }
     }
 
+    pub fn cwmp_enabled(&self) -> bool {
+        self.bootstrap_adapter != "none" || self.backend() == "acs"
+    }
+
     pub fn backend_view(&self) -> serde_json::Value {
         serde_json::json!({"configured":self.provisioning_adapter,
             "effective":self.backend(), "available":[self.backend()], "reason":""})
