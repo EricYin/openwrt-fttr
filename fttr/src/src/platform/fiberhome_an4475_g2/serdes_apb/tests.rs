@@ -197,3 +197,24 @@ fn shared_apb_control_register_shape_matches_descriptor() {
     assert!(apb.write(0x1234, 0x5a, &mut |_| Ok(())).is_err());
     assert_eq!(bus.0.borrow().calls, 4);
 }
+
+#[test]
+fn set_bus_and_borrowed_helpers_target_expected_bus() {
+    let expected = vec![
+        write(BUS_SELECT, &[2]),
+        read(APB_CTRL, 0),
+        write(APB_CTRL, &[0x30]),
+        read(APB_CTRL, APB_ACK),
+        read(APB_RDATA, 0xab),
+    ];
+    let (mut apb, bus) = session(expected, usize::MAX);
+    apb.set_bus(2).unwrap();
+    assert_eq!(apb.bus(), 2);
+    assert!(matches!(
+        apb.set_bus(4),
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput
+    ));
+    let mut fsl = apb.into_inner();
+    assert_eq!(read_on(&mut fsl, 2, 0x30, &mut |_| Ok(())).unwrap(), 0xab);
+    assert_eq!(bus.0.borrow().calls, 5);
+}

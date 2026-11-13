@@ -17,7 +17,7 @@ pub trait Bus {
 }
 
 pub struct Fsl<B> {
-    bus: B,
+    pub(super) bus: B,
 }
 
 pub fn crc8(bytes: &[u8]) -> u8 {

@@ -6,15 +6,25 @@ use super::adapter::{
 };
 
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
+pub mod activation;
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod calibration;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub(crate) mod diagnostics;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod downstream;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
+pub mod gdba;
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod initialization;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
+pub mod interrupts;
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod management;
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
+pub mod olt;
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
+pub mod omci;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub mod optical;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]

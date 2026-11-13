@@ -39,6 +39,22 @@ impl PloamRecord {
     pub fn stock_error_flag(&self) -> bool {
         self.words[0] & (1 << 4) != 0
     }
+
+    /// Raw ranging time extracted by `fsldrv_gpon_ploamu_receive`:
+    /// `((words[0] >> 5) & 0x1f_ffff) + 0x30`.
+    pub fn ranging_time_raw(&self) -> u32 {
+        ((self.words[0] >> 5) & 0x1f_ffff) + 0x30
+    }
+
+    /// Protocol ONU-ID byte from the 13-byte GPON PLOAM frame (`0xff` is unassigned/invalid).
+    pub fn onu_id(&self) -> Option<u8> {
+        (self.frame[0] != 0xff).then_some(self.frame[0])
+    }
+
+    /// Protocol message-ID byte from the 13-byte GPON PLOAM frame.
+    pub fn message_id(&self) -> u8 {
+        self.frame[1]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
