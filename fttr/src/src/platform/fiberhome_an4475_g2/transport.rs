@@ -9,9 +9,9 @@ use std::{
 };
 
 const MAX_TRANSFER: usize = 128;
-const fn ioc(direction: u32, kind: u8, number: u8, size: usize) -> libc::c_ulong {
+const fn ioc(direction: u32, kind: u8, number: u8, size: usize) -> libc::Ioctl {
     ((direction << 30) | ((size as u32) << 16) | ((kind as u32) << 8) | number as u32)
-        as libc::c_ulong
+        as libc::Ioctl
 }
 
 // Inline arrays, no userspace pointers: identical native/compat layout. Keep in
@@ -24,13 +24,13 @@ struct Transfer {
     tx: [u8; MAX_TRANSFER],
     rx: [u8; MAX_TRANSFER],
 }
-const FSL_TRANSFER: libc::c_ulong = ioc(3, b'F', 1, std::mem::size_of::<Transfer>());
+const FSL_TRANSFER: libc::Ioctl = ioc(3, b'F', 1, std::mem::size_of::<Transfer>());
 
 pub(super) trait Ioctl {
     fn call<T>(
         &mut self,
         fd: libc::c_int,
-        request: libc::c_ulong,
+        request: libc::Ioctl,
         value: &mut T,
     ) -> io::Result<libc::c_int>;
 }
@@ -39,7 +39,7 @@ impl Ioctl for LinuxIoctl {
     fn call<T>(
         &mut self,
         fd: libc::c_int,
-        request: libc::c_ulong,
+        request: libc::Ioctl,
         value: &mut T,
     ) -> io::Result<libc::c_int> {
         let result = unsafe { libc::ioctl(fd, request, value as *mut T) };
@@ -114,14 +114,14 @@ mod tests {
         fn call<T>(
             &mut self,
             _: libc::c_int,
-            request: libc::c_ulong,
+            request: libc::Ioctl,
             arg: &mut T,
         ) -> io::Result<libc::c_int> {
             self.calls += 1;
             if self.fail {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "mock ioctl"));
             }
-            assert_eq!(request, 0xc1104601);
+            assert_eq!(request, 0xc1104601_u32 as libc::Ioctl);
             let transfer = unsafe { &mut *(arg as *mut T as *mut Transfer) };
             assert_eq!(transfer.reserved, [0, 0]);
             assert_eq!(transfer.tx_len, 6);
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn uapi_layout_is_fixed_and_read_uses_one_message() {
         assert_eq!(std::mem::size_of::<Transfer>(), 272);
-        assert_eq!(FSL_TRANSFER, 0xc1104601);
+        assert_eq!(FSL_TRANSFER, 0xc1104601_u32 as libc::Ioctl);
         let mut device = device();
         let mut rx = [0; 4];
         device.transfer(&[0; 6], &mut rx).unwrap();

@@ -7,8 +7,8 @@ use std::{
     path::Path,
 };
 
-const I2C_FUNCS: libc::c_ulong = 0x0705;
-const I2C_RDWR: libc::c_ulong = 0x0707;
+const I2C_FUNCS: libc::Ioctl = 0x0705;
+const I2C_RDWR: libc::Ioctl = 0x0707;
 const I2C_FUNC_I2C: libc::c_ulong = 1;
 const I2C_M_RD: u16 = 1;
 
