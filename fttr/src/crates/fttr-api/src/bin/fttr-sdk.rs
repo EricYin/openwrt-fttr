@@ -66,9 +66,17 @@ fn render() -> BTreeMap<&'static str, String> {
     add::<HlAccountReply>(&mut types);
     add::<HlExecReply>(&mut types);
     add::<HlQuery>(&mut types);
+    add::<FpgaDelta>(&mut types);
     let type_names = imports.into_iter().collect::<Vec<_>>().join(", ");
-    let type_source = format!("{banner}{}", types.values().cloned().collect::<String>());
-    let client = format!("{banner}import type {{ {type_names} }} from \"./types\";\n\nexport const fttrMethods = [\n{metadata}] as const;\n\nexport function createFttrClient<{}>(\n  rpc: typeof L.rpc,\n  validators: {{\n{}  }},\n) {{\n{declarations}  return {{\n{calls}  }};\n}}\n", generics.join(", "), validators.concat());
+    let type_source = format!("{banner}{}", types.values().cloned().collect::<String>())
+        .lines()
+        .map(|line| format!("{}\n", line.trim_end()))
+        .collect::<String>();
+    let client = format!(
+        "{banner}import type {{ {type_names} }} from \"./types\";\n\nexport const fttrMethods = [\n{metadata}] as const;\n\nexport function createFttrClient<{}>(\n  rpc: typeof L.rpc,\n  validators: {{\n{}  }},\n) {{\n{declarations}  return {{\n{calls}  }};\n}}\n",
+        generics.join(", "),
+        validators.concat()
+    );
     BTreeMap::from([("types.ts", type_source), ("luci-client.ts", client)])
 }
 

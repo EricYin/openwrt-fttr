@@ -177,8 +177,22 @@ fn fpga_diagnostic_snapshot(
     request: &fpga_diag::Request,
     pon_engine: &Arc<Mutex<PonEngine>>,
     services: &super::service::States,
+    optics: &OpticalClient,
 ) -> std::io::Result<fpga_diag::Snapshot> {
     let slots = request.slots()?;
+    let ready = || {
+        optics
+            .hardware_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !optics.stopping.load(std::sync::atomic::Ordering::Acquire)
+    };
+    if !ready() {
+        return Err(std::io::Error::other("FPGA hardware unavailable"));
+    }
+    static READING: Mutex<()> = Mutex::new(());
+    let _single_reader = READING
+        .try_lock()
+        .map_err(|_| std::io::Error::other("FPGA diagnostic reader busy"))?;
     // Identity stays inside the daemon. Compare it and the worker generation
     // around the non-atomic reads rather than attributing counters to a new ONU.
     let registrations = || -> std::io::Result<_> {
@@ -208,12 +222,25 @@ fn fpga_diagnostic_snapshot(
             .collect::<std::collections::BTreeMap<_, _>>())
     };
     let before = registrations()?;
+    let epoch = fpga_diag::hardware_epoch()?;
+    static CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let monotonic = CLOCK
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
     let mut snapshot = fpga_diag::snapshot(request, bosa::read_fpga_reg)?;
     if before != registrations()? {
         return Err(std::io::Error::other(
             "ONU registration changed during FPGA diagnostic snapshot",
         ));
     }
+    if !ready() || epoch != fpga_diag::hardware_epoch()? {
+        return Err(std::io::Error::other(
+            "FPGA hardware context changed during diagnostic snapshot",
+        ));
+    }
+    snapshot.hardware_epoch = Some(epoch.to_string());
+    snapshot.started_monotonic_ms = Some(monotonic);
     static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     snapshot.daemon_instance = Some(
         INSTANCE
@@ -233,7 +260,8 @@ fn fpga_diagnostic_snapshot(
         onu.generation = before
             .get(&onu.slot)
             .and_then(|registered| registered.as_ref())
-            .and_then(|(_, generation)| *generation);
+            .and_then(|(_, generation)| *generation)
+            .map(|generation| generation.to_string());
     }
     Ok(snapshot)
 }
@@ -268,7 +296,9 @@ pub(crate) fn ipc_handler(
         } else if let Some(request) = line.strip_prefix("FPGA_DIAG ") {
             let result = serde_json::from_str::<fpga_diag::Request>(request)
                 .map_err(std::io::Error::other)
-                .and_then(|request| fpga_diagnostic_snapshot(&request, &pon_engine, &services));
+                .and_then(|request| {
+                    fpga_diagnostic_snapshot(&request, &pon_engine, &services, &optics)
+                });
             match result {
                 Ok(snapshot) => {
                     let _ = serde_json::to_writer(&mut stream, &snapshot);
