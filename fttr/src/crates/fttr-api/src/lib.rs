@@ -6,6 +6,8 @@ pub const OBJECT: &str = "fttr";
 
 mod queries;
 pub use queries::*;
+mod fpga;
+pub use fpga::*;
 mod hl202;
 mod provisioning;
 mod results;
@@ -227,6 +229,7 @@ macro_rules! fttr_methods {
         $consumer! {
             GET_CAPABILITIES, get_capabilities, getCapabilities, EmptyRequest, Capabilities, Read, Always, [];
             GET_PLATFORM_INFO, get_platform_info, getPlatformInfo, EmptyRequest, PlatformInfoReply, Read, Always, [];
+            FPGA_DIAGNOSTIC, fpga_diagnostic, fpgaDiagnostic, FpgaDiagnosticRequest, FpgaDiagnosticReply, Read, Always, [onu_id];
             OPTICAL_STATUS, optical_status, opticalStatus, EmptyRequest, OpticalReply, Read, Always, [];
             OPTICAL_SET, optical_set, opticalSet, OpticalSettings, OpticalReply, Write, Always, [enabled, downstream_tx_enabled, fec_enabled];
             GET_STATUS, get_status, getStatus, EmptyRequest, StatusReply, Read, Always, [];
