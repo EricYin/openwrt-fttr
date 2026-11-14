@@ -67,10 +67,16 @@ pub fn run(args: &[String]) -> io::Result<()> {
     }
     let options = parse(args)?;
     let mut previous = None;
+    let window = std::time::Instant::now();
+    let mut next = window;
     for sample in 0..options.samples {
         if sample != 0 {
-            std::thread::sleep(Duration::from_millis(options.interval_ms));
+            std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
+            if window.elapsed() > Duration::from_secs(60) {
+                break;
+            }
         }
+        next = std::time::Instant::now() + Duration::from_millis(options.interval_ms);
         let snapshot = if options.offline {
             fpga_diag::snapshot(&options.request, super::fmcs::read_fpga_reg)?
         } else {

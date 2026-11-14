@@ -115,6 +115,7 @@ pub fn write_fpga_reg(addr: u32, val: u32) -> io::Result<()> {
 }
 
 fn write_fpga_reg_unlocked(addr: u32, val: u32) -> io::Result<()> {
+    let _diagnostic_epoch = super::diagnostics::hardware_write(addr);
     #[cfg(unix)]
     {
         let file = mci_file()?;
@@ -560,6 +561,8 @@ pub fn set_optical_tx_enable(enable: bool) -> io::Result<()> {
         None
     };
     let mut runtime = calibration::RUNTIME.write().unwrap();
+    // Cover stabilization delays and calibration programming between raw writes.
+    let _diagnostic_epoch = super::diagnostics::hardware_write(FPGA_REG_OPTICAL_RESET);
     runtime.transition(candidate, |candidate| {
         if enable {
             init_optical_transceiver_with(candidate.unwrap())?;

@@ -1,14 +1,18 @@
 //! Read-only H3C miniOLT diagnostics recovered from the pinned stock moltdbg.
 //! This is an observed register layout, not a hardware revision detector.
-use serde::{Deserialize, Serialize};
+pub use fttr_api::{
+    FpgaDelta as Delta, FpgaDiagnosticRequest as Request, FpgaGrant as Grant, FpgaOnu as Onu,
+    FpgaOnuDelta as OnuDelta, FpgaSnapshot as Snapshot,
+};
 use std::{
     collections::BTreeMap,
     io,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub const SOURCE_SHA256: &str = "b8036696b34d35f9aee68285f4b7f7b55d7f332a2e8e0b22059637db659ab2da";
-pub const LIMITATIONS: &str = "Non-atomic register reads. Modulo deltas cannot distinguish resets or multiple wraps. Slots are not permanent identities. Labels follow stock moltdbg, not complete hardware semantics.";
+pub const LIMITATIONS: &str = "Non-atomic register reads. Modulo deltas cannot distinguish resets or multiple wraps. Known in-daemon hardware writes invalidate continuity; external writers and unannounced hardware resets are not detected. Clear-on-read and saturation behavior are unverified. Global counters cannot be attributed to an ONU. Slots are not permanent identities. Grant bandwidth units are unknown. Labels follow stock moltdbg, not complete hardware semantics.";
 
 // Labels and addresses from moltdbg 0x401a7c, 0x401ce0, 0x401e18,
 // 0x401f04, 0x402030 and 0x402214. No reset or indirect-table operations.
@@ -40,68 +44,91 @@ const COUNTERS: &[(&str, u32)] = &[
     ("downstream_tx_fifo_full", 0x03010020),
 ];
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct Grant {
-    pub bandwidth_raw: u32,
-    pub control_raw: u32,
-    pub enabled_bit28: bool,
-    pub bandwidth: u32,
-    pub weight: u8,
-}
-impl Grant {
-    fn decode(bandwidth_raw: u32, control_raw: u32) -> Self {
-        // moltdbg 0x401490 reports only these fields; retain the entire words.
-        Self {
-            bandwidth_raw,
-            control_raw,
-            enabled_bit28: control_raw & (1 << 28) != 0,
-            bandwidth: bandwidth_raw & 0xfffff,
-            weight: ((bandwidth_raw >> 24) & 0x7f) as u8,
-        }
+fn grant(bandwidth_raw: u32, control_raw: u32) -> Grant {
+    // moltdbg 0x401490 reports only these fields; retain the entire words.
+    Grant {
+        bandwidth_raw,
+        control_raw,
+        enabled_bit28: control_raw & (1 << 28) != 0,
+        bandwidth: bandwidth_raw & 0xfffff,
+        weight: ((bandwidth_raw >> 24) & 0x7f) as u8,
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Onu {
-    pub slot: u8,
-    pub generation: Option<u64>,
-    pub lob: u16,
-    pub bip: u16,
-    pub management: Grant,
-    pub business: Grant,
-}
+const LABELS: &[(&str, &str)] = &[
+    ("burst", "Total bursts"),
+    ("omci", "OMCI alloc vld drop"),
+    ("omci", "OMCI rx long drop"),
+    ("omci", "OMCI packet afull drop"),
+    ("omci", "OMCI packet length error"),
+    ("ethernet", "ETH assemble invalid alloc id"),
+    ("ethernet", "ETH assemble packet too long"),
+    ("ethernet", "ETH assemble afull"),
+    ("ethernet", "ETH CRC error"),
+    ("ethernet", "ETH short <64B"),
+    ("ethernet", "ETH long >2000B"),
+    ("ethernet", "ETH fifo full"),
+    ("upstream", "US info fifo full drop"),
+    ("upstream", "US info error"),
+    ("upstream", "US drift timeout"),
+    ("upstream", "US BCH error"),
+    ("upstream", "US XGEM length error"),
+    ("upstream", "US XGEM fifo full / packet >2044B"),
+    ("upstream", "US no SOP"),
+    ("upstream", "US burst compensate"),
+    ("downstream", "DS Rx error"),
+    ("downstream", "DS ETH >2020B or <60B"),
+    ("downstream", "DS OMCI !=64B"),
+    ("downstream", "DS ETH type !=0x8100"),
+    ("downstream", "DS TX fifo afull drop"),
+];
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Snapshot {
-    pub schema_version: u8,
-    pub source_sha256: String,
-    pub limitations: String,
-    pub started_unix_ms: u128,
-    pub read_duration_us: u128,
-    pub daemon_instance: Option<String>,
-    pub main_bandwidth_raw: u32,
-    pub main_bandwidth_enabled: bool,
-    pub onus: Vec<Onu>,
-    pub counters: BTreeMap<String, u32>,
-    pub raw_registers: BTreeMap<String, u32>,
+// A nonblocking sequence marker: writers never wait for diagnostic reads.
+// Separate active count handles overlapping writers (an odd/even epoch cannot).
+#[derive(Default)]
+struct Continuity {
+    active: AtomicU64,
+    epoch: AtomicU64,
 }
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Request {
-    pub onu_id: Option<u8>,
-}
-impl Request {
-    pub fn slots(&self) -> io::Result<Vec<u8>> {
-        match self.onu_id {
-            Some(id) if id < 16 => Ok(vec![id]),
-            None => Ok((0..16).collect()),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ONU slot must be 0..15",
-            )),
+impl Continuity {
+    fn read(&self) -> io::Result<u64> {
+        let before = self.epoch.load(Ordering::SeqCst);
+        let active = self.active.load(Ordering::SeqCst);
+        let after = self.epoch.load(Ordering::SeqCst);
+        if active != 0 || before != after {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "FPGA hardware context changing",
+            ));
         }
+        Ok(after)
     }
+    fn write(&self) -> WriteMarker<'_> {
+        self.active.fetch_add(1, Ordering::SeqCst);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        WriteMarker(self)
+    }
+}
+pub(super) struct WriteMarker<'a>(&'a Continuity);
+impl Drop for WriteMarker<'_> {
+    fn drop(&mut self) {
+        self.0.epoch.fetch_add(1, Ordering::SeqCst);
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+static CONTINUITY: Continuity = Continuity {
+    active: AtomicU64::new(0),
+    epoch: AtomicU64::new(0),
+};
+pub(super) fn hardware_epoch() -> io::Result<u64> {
+    CONTINUITY.read()
+}
+pub(super) fn hardware_write(address: u32) -> Option<WriteMarker<'static>> {
+    (matches!(address, 0x20 | 0x50 | 0x84 | 0x01000004)
+        || (0x01010000..=0x0101001c).contains(&address)
+        || (0x01010070..=0x0101008c).contains(&address)
+        || COUNTERS.iter().any(|(_, addr)| *addr == address))
+    .then(|| CONTINUITY.write())
 }
 
 pub fn snapshot(
@@ -112,7 +139,7 @@ pub fn snapshot(
     let started_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
+        .as_millis() as u64;
     let started = Instant::now();
     let mut raw = BTreeMap::new();
     let mut get = |address| -> io::Result<u32> {
@@ -139,8 +166,8 @@ pub fn snapshot(
             generation: None,
             lob: (get(0x01010000 + packed)? >> shift) as u16,
             bip: (get(0x01010070 + packed)? >> shift) as u16,
-            management: Grant::decode(get(base)?, get(base + 4)?),
-            business: Grant::decode(get(base + 8)?, get(base + 12)?),
+            management: grant(get(base)?, get(base + 4)?),
+            business: grant(get(base + 8)?, get(base + 12)?),
         });
     }
     let counters = COUNTERS
@@ -148,16 +175,32 @@ pub fn snapshot(
         .map(|&(name, address)| Ok((name.to_string(), get(address)?)))
         .collect::<io::Result<_>>()?;
     Ok(Snapshot {
-        schema_version: 1,
+        schema_version: 2,
         source_sha256: SOURCE_SHA256.into(),
         limitations: LIMITATIONS.into(),
         started_unix_ms,
-        read_duration_us: started.elapsed().as_micros(),
+        read_duration_us: started.elapsed().as_micros() as u64,
+        started_monotonic_ms: None,
         daemon_instance: None,
+        hardware_epoch: None,
         main_bandwidth_raw,
         main_bandwidth_enabled: main_bandwidth_raw == 0x17258,
         onus,
         counters,
+        counter_descriptors: COUNTERS
+            .iter()
+            .zip(LABELS)
+            .map(
+                |(&(key, address), &(group, label))| fttr_api::FpgaCounterDescriptor {
+                    key: key.into(),
+                    label: label.into(),
+                    group: group.into(),
+                    address: format!("0x{address:08x}"),
+                    width_bits: 32,
+                    scope: "global".into(),
+                },
+            )
+            .collect(),
         raw_registers: raw
             .into_iter()
             .map(|(address, value)| (format!("0x{address:08x}"), value))
@@ -165,29 +208,25 @@ pub fn snapshot(
     })
 }
 
-#[derive(Debug, Serialize)]
-pub struct OnuDelta {
-    pub slot: u8,
-    pub registration_continuity_verified: bool,
-    pub lob_modulo_65536: Option<u16>,
-    pub bip_modulo_65536: Option<u16>,
-}
-#[derive(Debug, Serialize)]
-pub struct Delta {
-    pub elapsed_ms: u128,
-    pub same_daemon: bool,
-    pub onus: Vec<OnuDelta>,
-    pub counters_modulo_4294967296: Option<BTreeMap<String, u32>>,
-}
 pub fn delta(first: &Snapshot, second: &Snapshot) -> Delta {
     let same_daemon =
         first.daemon_instance.is_some() && first.daemon_instance == second.daemon_instance;
+    let clock = first
+        .started_monotonic_ms
+        .zip(second.started_monotonic_ms)
+        .filter(|(a, b)| b > a);
+    let continuous = same_daemon
+        && first.schema_version == second.schema_version
+        && first.source_sha256 == second.source_sha256
+        && first.hardware_epoch.is_some()
+        && first.hardware_epoch == second.hardware_epoch
+        && clock.is_some();
     let onus = second
         .onus
         .iter()
         .map(|onu| {
             let previous = first.onus.iter().find(|old| old.slot == onu.slot);
-            let verified = same_daemon
+            let verified = continuous
                 && onu.generation.is_some()
                 && previous.is_some_and(|old| old.generation == onu.generation);
             OnuDelta {
@@ -203,10 +242,11 @@ pub fn delta(first: &Snapshot, second: &Snapshot) -> Delta {
         })
         .collect();
     Delta {
-        elapsed_ms: second.started_unix_ms.saturating_sub(first.started_unix_ms),
+        elapsed_ms: clock.map_or(0, |(a, b)| b - a),
         same_daemon,
+        hardware_continuity_verified: continuous,
         onus,
-        counters_modulo_4294967296: same_daemon.then(|| {
+        counters_modulo_4294967296: continuous.then(|| {
             second
                 .counters
                 .iter()
@@ -270,12 +310,15 @@ mod tests {
     fn deltas_wrap_but_are_withheld_after_registration_or_daemon_changes() {
         let mut first = snapshot(&Request { onu_id: Some(0) }, |_| Ok(0)).unwrap();
         first.daemon_instance = Some("fixture".into());
-        first.onus[0].generation = Some(7);
+        first.hardware_epoch = Some("0".into());
+        first.started_monotonic_ms = Some(1);
+        first.onus[0].generation = Some("7".into());
         first.onus[0].lob = 65530;
         first.counters.insert("upstream_bch".into(), u32::MAX - 1);
         let mut second: Snapshot =
             serde_json::from_value(serde_json::to_value(&first).unwrap()).unwrap();
         second.onus[0].lob = 10;
+        second.started_monotonic_ms = Some(1001);
         second.counters.insert("upstream_bch".into(), 3);
         let change = delta(&first, &second);
         assert_eq!(change.onus[0].lob_modulo_65536, Some(16));
@@ -283,9 +326,24 @@ mod tests {
             change.counters_modulo_4294967296.unwrap()["upstream_bch"],
             5
         );
-        second.onus[0].generation = Some(8);
+        second.onus[0].generation = Some("8".into());
         assert!(delta(&first, &second).onus[0].lob_modulo_65536.is_none());
+        second.hardware_epoch = Some("2".into());
+        assert!(delta(&first, &second).counters_modulo_4294967296.is_none());
         second.daemon_instance = Some("restarted".into());
         assert!(delta(&first, &second).counters_modulo_4294967296.is_none());
+    }
+    #[test]
+    fn overlapping_or_failed_writes_revoke_continuity_without_blocking_writers() {
+        let state = Continuity::default();
+        let before = state.read().unwrap();
+        let a = state.write();
+        let b = state.write();
+        assert!(state.read().is_err());
+        drop(a);
+        assert!(state.read().is_err());
+        drop(b);
+        assert_ne!(state.read().unwrap(), before);
+        assert_eq!(COUNTERS.len(), LABELS.len());
     }
 }

@@ -56,6 +56,21 @@ struct Handlers {
 }
 
 impl Handlers {
+    fn fpga_diagnostic(&self, request: FpgaDiagnosticRequest) -> Result<FpgaDiagnosticReply, i32> {
+        Ok(
+            match super::fpga_diagnostic_snapshot(
+                &request,
+                &self.engine,
+                &self.services,
+                &self.optics,
+            ) {
+                Ok(snapshot) => FpgaDiagnosticReply::Success { snapshot },
+                Err(error) => FpgaDiagnosticReply::Error {
+                    error: error.to_string(),
+                },
+            },
+        )
+    }
     fn npu_set(&self, request: NpuSetRequest) -> Result<NpuSetReply, i32> {
         #[cfg(feature = "npu")]
         {

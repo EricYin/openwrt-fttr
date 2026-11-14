@@ -3,6 +3,27 @@ use serde_json::json;
 use std::sync::{atomic::AtomicUsize, Arc};
 
 #[test]
+fn fpga_native_contract_rejects_write_fields_and_preserves_session_transport() {
+    let (_, handler) = bind(&FPGA_DIAGNOSTIC, |request| {
+        assert_eq!(request.slots().unwrap(), vec![15]);
+        Ok(FpgaDiagnosticReply::Error {
+            error: "fixture read unavailable".into(),
+        })
+    });
+    assert_eq!(
+        handler("fpga_diagnostic", Some(&json!({"onu_id":15,"write":1}))),
+        Err(2)
+    );
+    assert_eq!(
+        handler(
+            "fpga_diagnostic",
+            Some(&json!({"onu_id":15,"ubus_rpc_session":"REDACTED_TEST_SESSION"}))
+        ),
+        Ok(json!({"status":"error","error":"fixture read unavailable"}))
+    );
+}
+
+#[test]
 fn http_session_metadata_is_not_a_topology_business_argument() {
     let (_, node) = bind(&GET_TOPOLOGY_NODE, |request| {
         assert_eq!(request.node_id, "controller");
