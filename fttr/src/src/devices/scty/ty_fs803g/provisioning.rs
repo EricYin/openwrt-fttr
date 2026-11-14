@@ -6,7 +6,7 @@
 //! even slots `{2, 4, 6, 8}` honestly as `accepted_unverified` (due to
 //! `managePlugin` filtering `(Index & 0xFFFFFFF9) == 1`).
 use super::{
-    boot_mock,
+    boot_mock, cmfttr,
     if5::{self, ApConfigSnapshot, WlanConfigEntry},
 };
 use crate::provisioning::{
@@ -114,13 +114,17 @@ fn map_security(
     }
 }
 
-fn entry_matches(desired: &WlanConfigEntry, actual: &WlanConfigEntry) -> bool {
+fn entry_matches_public(desired: &WlanConfigEntry, actual: &WlanConfigEntry) -> bool {
     desired.index == actual.index
         && desired.enable == actual.enable
         && desired.ssid == actual.ssid
         && desired.security_mode == actual.security_mode
         && desired.encrypt == actual.encrypt
         && desired.ssid_advertisement_enabled == actual.ssid_advertisement_enabled
+}
+
+fn entry_matches(desired: &WlanConfigEntry, actual: &WlanConfigEntry) -> bool {
+    entry_matches_public(desired, actual)
         && (desired.security_mode == "None" || desired.pwd == actual.pwd)
 }
 
@@ -286,6 +290,17 @@ pub async fn run(
         &binding_generation,
         &journal_path,
         || if5::query_ap_config_info(broker_addr, &device_id),
+        || {
+            let target_mac = target_mac.clone();
+            async move {
+                if !cmfttr::is_online(&target_mac) {
+                    return None;
+                }
+                cmfttr::query_wifi_snapshot(broker_addr, &target_mac)
+                    .await
+                    .ok()
+            }
+        },
         |entry| {
             let entry = entry.clone();
             let device_id = device_id.clone();
@@ -296,7 +311,7 @@ pub async fn run(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_with_transport<QF, QFut, WF, WFut>(
+async fn run_with_transport<QF, QFut, CF, CFut, WF, WFut>(
     device: Device,
     apply: bool,
     full: bool,
@@ -306,11 +321,14 @@ async fn run_with_transport<QF, QFut, WF, WFut>(
     binding_generation: &str,
     journal_path: &str,
     mut query_fn: QF,
+    mut cmfttr_query_fn: CF,
     mut write_fn: WF,
 ) -> Result<Value, String>
 where
     QF: FnMut() -> QFut,
     QFut: std::future::Future<Output = Result<ApConfigSnapshot, String>>,
+    CF: FnMut() -> CFut,
+    CFut: std::future::Future<Output = Option<BTreeMap<u32, WlanConfigEntry>>>,
     WF: FnMut(&WlanConfigEntry) -> WFut,
     WFut: std::future::Future<Output = Result<(), String>>,
 {
@@ -323,6 +341,7 @@ where
     };
 
     let initial = query_fn().await?;
+    let initial_cmfttr = cmfttr_query_fn().await;
     let plan = compile_plan(&device, &initial, &journal, full)?;
     let initial_map: BTreeMap<u32, &WlanConfigEntry> = initial
         .configurations
@@ -334,7 +353,18 @@ where
     for item in &plan.items {
         let needs_write = match initial_map.get(&item.entry.index) {
             Some(actual) => !entry_matches(&item.entry, actual),
-            None => true,
+            None => match initial_cmfttr
+                .as_ref()
+                .and_then(|m| m.get(&item.entry.index))
+            {
+                Some(actual)
+                    if journal.revision == revision
+                        && entry_matches_public(&item.entry, actual) =>
+                {
+                    false
+                }
+                _ => true,
+            },
         };
         if needs_write {
             writes.push(&item.entry);
@@ -380,6 +410,11 @@ where
     } else {
         initial
     };
+    let final_cmfttr = if write_performed {
+        cmfttr_query_fn().await
+    } else {
+        initial_cmfttr
+    };
     let final_map: BTreeMap<u32, &WlanConfigEntry> = final_snapshot
         .configurations
         .iter()
@@ -420,20 +455,36 @@ where
                     )
                 }
             }
+        } else if let Some(actual) = final_cmfttr.as_ref().and_then(|m| m.get(&idx)) {
+            if entry_matches_public(&item.entry, actual) {
+                (
+                    "verified",
+                    "IF5 write + CMFTTR getsubgwWifiInfo readback matches desired WLAN state"
+                        .to_owned(),
+                )
+            } else {
+                all_verified = false;
+                (
+                    "drift",
+                    format!(
+                        "CMFTTR getsubgwWifiInfo readback differs from desired WLAN state on Index {idx}"
+                    ),
+                )
+            }
         } else {
             all_verified = false;
             if apply && accepted_even.contains(&idx) {
                 (
                     "accepted_unverified",
                     format!(
-                        "IF5 XControl_WiFiParameterSync accepted for even Index {idx}; XQuery_ApConfigInfo only reports odd indices {{1,3,5,7}}"
+                        "IF5 XControl_WiFiParameterSync accepted for even Index {idx}; XQuery_ApConfigInfo only reports odd indices {{1,3,5,7}} and CMFTTR readback unavailable"
                     ),
                 )
             } else {
                 (
                     "unknown",
                     format!(
-                        "IF5 XQuery_ApConfigInfo cannot inspect even Index {idx}; apply required"
+                        "IF5 XQuery_ApConfigInfo cannot inspect even Index {idx}; apply or CMFTTR readback required"
                     ),
                 )
             }
@@ -464,6 +515,7 @@ where
         "items": items_out,
         "if5_device_id": device_id,
         "band_steering_status": final_snapshot.band_steering_status,
+        "cmfttr_readback_used": final_cmfttr.is_some(),
         "write_performed": write_performed,
         "readback_verified": all_verified,
     }))
@@ -552,6 +604,7 @@ mod tests {
                         })
                     }
                 },
+                || async { None },
                 |entry| {
                     let entry = entry.clone();
                     write_order.borrow_mut().push(entry.index);
@@ -563,6 +616,7 @@ mod tests {
 
         assert_eq!(*write_order.borrow(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(result["write_performed"], true);
+        assert_eq!(result["cmfttr_readback_used"], false);
         assert_eq!(result["readback_verified"], false);
         let items = result["items"].as_array().unwrap();
         assert_eq!(items.len(), 8);
@@ -615,6 +669,7 @@ mod tests {
                         })
                     }
                 },
+                || async { None },
                 |entry| {
                     store.borrow_mut().insert(entry.index, entry.clone());
                     async { Ok(()) }
@@ -622,6 +677,64 @@ mod tests {
             ))
             .unwrap();
 
+        assert_eq!(result["readback_verified"], true);
+        for item in result["items"].as_array().unwrap() {
+            assert_eq!(item["state"], "verified");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eight_wlan_with_cmfttr_readback_verifies_all_eight_slots() {
+        let dir =
+            std::env::temp_dir().join(format!("fttr-scty-8wlan-cmfttr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let journal = dir.join("journal.json");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut device = test_device(4);
+        device.optical_sn = "SCTY00000003".into();
+        let store: RefCell<BTreeMap<u32, WlanConfigEntry>> = RefCell::new(BTreeMap::new());
+
+        let result = rt
+            .block_on(run_with_transport(
+                device,
+                true,
+                true,
+                "rev-3".into(),
+                44,
+                "IF5021122334457",
+                "gen-1",
+                journal.to_str().unwrap(),
+                || {
+                    let configs = store
+                        .borrow()
+                        .values()
+                        .filter(|e| odd_index(e.index))
+                        .cloned()
+                        .collect();
+                    async move {
+                        Ok(ApConfigSnapshot {
+                            band_steering_status: Some(0),
+                            configurations: configs,
+                        })
+                    }
+                },
+                || {
+                    let map = store.borrow().clone();
+                    async move { (!map.is_empty()).then_some(map) }
+                },
+                |entry| {
+                    store.borrow_mut().insert(entry.index, entry.clone());
+                    async { Ok(()) }
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(result["write_performed"], true);
+        assert_eq!(result["cmfttr_readback_used"], true);
         assert_eq!(result["readback_verified"], true);
         for item in result["items"].as_array().unwrap() {
             assert_eq!(item["state"], "verified");

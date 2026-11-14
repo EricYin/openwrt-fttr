@@ -6,6 +6,8 @@
 #[cfg(feature = "mqtt")]
 pub mod boot_mock;
 #[cfg(feature = "mqtt")]
+pub mod cmfttr;
+#[cfg(feature = "mqtt")]
 pub mod if5;
 #[cfg(feature = "mqtt")]
 pub mod provisioning;

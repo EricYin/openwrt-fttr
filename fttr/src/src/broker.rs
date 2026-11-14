@@ -16,16 +16,24 @@ pub struct EmbeddedBroker {
 
 /// Production addresses are fixed to loopback and the configured LAN IPv4.
 pub fn lan_addresses(lan: &str) -> Result<Vec<SocketAddr>, String> {
+    adapter_addresses(lan, true, cfg!(feature = "device-scty"))
+}
+
+pub fn adapter_addresses(lan: &str, hl202: bool, ty: bool) -> Result<Vec<SocketAddr>, String> {
     let ip: Ipv4Addr = lan
         .parse()
         .map_err(|_| "FTTR_MQTT_LAN_ADDR must be a LAN IPv4 address")?;
     if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() {
         return Err("FTTR_MQTT_LAN_ADDR must be a non-loopback unicast LAN IPv4 address".into());
     }
-    Ok(vec![
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 1883)),
-        SocketAddr::from((ip, 1883)),
-    ])
+    let mut addresses = Vec::new();
+    for (enabled, port) in [(hl202, 1883), (ty, 11883)] {
+        if enabled {
+            addresses.push(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+            addresses.push(SocketAddr::from((ip, port)));
+        }
+    }
+    Ok(addresses)
 }
 
 fn configuration(addresses: &[SocketAddr]) -> rumqttd::Config {
@@ -288,5 +296,17 @@ mod tests {
             .unwrap();
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("injected broker thread failure"));
+    }
+
+    #[test]
+    fn adapter_addresses_selects_ports_per_adapter() {
+        for (hl202, ty, ports) in [
+            (true, false, vec![1883, 1883]),
+            (false, true, vec![11883, 11883]),
+            (true, true, vec![1883, 1883, 11883, 11883]),
+        ] {
+            let addrs = adapter_addresses("192.168.1.1", hl202, ty).unwrap();
+            assert_eq!(addrs.iter().map(|a| a.port()).collect::<Vec<_>>(), ports);
+        }
     }
 }

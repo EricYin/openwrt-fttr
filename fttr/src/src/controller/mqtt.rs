@@ -25,7 +25,11 @@ pub async fn run(address: SocketAddr, devices: Arc<Mutex<Vec<SubDevice>>>) -> Re
                 .as_nanos()
         );
         match receive(address, &id, &devices).await {
-            Err(error) => eprintln!("[-] MQTT telemetry disconnected: {error}; reconnecting in 2s"),
+            Err(error) => {
+                #[cfg(all(feature = "device-scty", feature = "mqtt"))]
+                crate::devices::scty::ty_fs803g::cmfttr::disconnect_all();
+                eprintln!("[-] MQTT telemetry disconnected: {error}; reconnecting in 2s");
+            }
             Ok(()) => return Err("MQTT telemetry receive loop unexpectedly returned".into()),
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -46,9 +50,17 @@ async fn receive(
         )
         .await?;
     #[cfg(all(feature = "device-scty", feature = "mqtt"))]
-    session
-        .subscribe("/device/+/upward", Instant::now() + Duration::from_secs(5))
-        .await?;
+    {
+        session
+            .subscribe("/device/+/upward", Instant::now() + Duration::from_secs(5))
+            .await?;
+        session
+            .subscribe(
+                crate::devices::scty::ty_fs803g::cmfttr::REPORT_TOPIC,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await?;
+    }
     loop {
         // Keep-alive events refresh this idle deadline. A failed poll drops this
         // session; only telemetry constructs a new one after the bounded delay.
@@ -60,7 +72,13 @@ async fn receive(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            ingest(&packet.topic, Vec::from(packet.payload), now, devices)?;
+            ingest(
+                &packet.topic,
+                Vec::from(packet.payload),
+                packet.retain,
+                now,
+                devices,
+            )?;
         }
     }
 }
@@ -96,9 +114,16 @@ fn observe_device_presence(
 fn ingest(
     topic: &str,
     payload: Vec<u8>,
+    retained: bool,
     now: u64,
     devices: &Mutex<Vec<SubDevice>>,
 ) -> Result<(), String> {
+    #[cfg(all(feature = "device-scty", feature = "mqtt"))]
+    if topic == crate::devices::scty::ty_fs803g::cmfttr::REPORT_TOPIC {
+        let _ = crate::devices::scty::ty_fs803g::cmfttr::observe_packet(topic, &payload, retained);
+        return Ok(());
+    }
+    let _ = retained;
     if let Some(rest) = topic.strip_prefix("/device/") {
         if let Some(device_id) = rest.strip_suffix("/upward") {
             let payload_len = payload.len();
