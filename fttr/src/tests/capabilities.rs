@@ -32,14 +32,10 @@ fn capabilities_offline_queries_agree_without_controller_initialization() {
         cli["pages"]["hl202"],
         cfg!(all(feature = "device-hl202", feature = "mqtt"))
     );
-    assert_eq!(
-        cli["pages"]["config"],
-        cfg!(feature = "acs") || (cfg!(feature = "device-hl202") && cfg!(feature = "mqtt"))
-    );
-    assert_eq!(
-        cli["pages"]["sync"],
-        cfg!(feature = "acs") || (cfg!(feature = "device-hl202") && cfg!(feature = "mqtt"))
-    );
+    let cmd_prov =
+        (cfg!(feature = "device-hl202") || cfg!(feature = "device-scty")) && cfg!(feature = "mqtt");
+    assert_eq!(cli["pages"]["config"], cfg!(feature = "acs") || cmd_prov);
+    assert_eq!(cli["pages"]["sync"], cfg!(feature = "acs") || cmd_prov);
     for page in ["status", "about"] {
         assert_eq!(cli["pages"][page], true);
     }
@@ -72,6 +68,10 @@ fn capabilities_offline_queries_agree_without_controller_initialization() {
     assert_eq!(
         provisioning.iter().any(|a| a["id"] == "hl202-mqtt"),
         cfg!(all(feature = "device-hl202", feature = "mqtt"))
+    );
+    assert_eq!(
+        provisioning.iter().any(|a| a["id"] == "scty-if5-mqtt"),
+        cfg!(all(feature = "device-scty", feature = "mqtt"))
     );
     assert_eq!(
         provisioning.iter().any(|a| a["id"] == "cu"),

@@ -45,6 +45,10 @@ async fn receive(
             Instant::now() + Duration::from_secs(5),
         )
         .await?;
+    #[cfg(all(feature = "device-scty", feature = "mqtt"))]
+    session
+        .subscribe("/device/+/upward", Instant::now() + Duration::from_secs(5))
+        .await?;
     loop {
         // Keep-alive events refresh this idle deadline. A failed poll drops this
         // session; only telemetry constructs a new one after the bounded delay.
@@ -61,18 +65,12 @@ async fn receive(
     }
 }
 
-fn ingest(
-    topic: &str,
-    payload: Vec<u8>,
+fn observe_device_presence(
+    mac: &str,
+    payload_bytes: usize,
     now: u64,
     devices: &Mutex<Vec<SubDevice>>,
 ) -> Result<(), String> {
-    let Some(source) = topic.strip_prefix("/fttr/maindev/data/") else {
-        return Ok(());
-    };
-    let Some(mac) = crate::mqtt_identity::normalize_target(source) else {
-        return Ok(());
-    };
     let protected = crate::mqtt_identity::shared()
         .lock()
         .map_err(|_| "MQTT identity lock poisoned")?
@@ -85,14 +83,39 @@ fn ingest(
     crate::telemetry_sources::observe(
         &mut devs,
         SubDevice {
-            id: mac.clone(),
+            id: mac.to_owned(),
             last_seen: now,
-            payload_bytes: payload.len(),
+            payload_bytes,
         },
         &protected,
     );
     let _ = ipc::update_status_file(&devs);
-    drop(devs);
+    Ok(())
+}
+
+fn ingest(
+    topic: &str,
+    payload: Vec<u8>,
+    now: u64,
+    devices: &Mutex<Vec<SubDevice>>,
+) -> Result<(), String> {
+    if let Some(rest) = topic.strip_prefix("/device/") {
+        if let Some(device_id) = rest.strip_suffix("/upward") {
+            let payload_len = payload.len();
+            if let Some(mac) = crate::devices::observe_if5_mqtt(device_id, &payload, now) {
+                observe_device_presence(&mac, payload_len, now, devices)?;
+                crate::provisioning::observe_mqtt(&mac, now);
+            }
+        }
+        return Ok(());
+    }
+    let Some(source) = topic.strip_prefix("/fttr/maindev/data/") else {
+        return Ok(());
+    };
+    let Some(mac) = crate::mqtt_identity::normalize_target(source) else {
+        return Ok(());
+    };
+    observe_device_presence(&mac, payload.len(), now, devices)?;
     // Observation only, in the same order as the original ingestion path.
     crate::provisioning::observe_mqtt(&mac, now);
     if !crate::devices::observe_mqtt_report(&mac, payload, now) {

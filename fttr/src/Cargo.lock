@@ -1081,14 +1081,18 @@ dependencies = [
  "openwrt-ubus",
  "openwrt-uci",
  "quick-xml",
+ "ring",
  "rumqttc",
  "rumqttd",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
  "tar",
  "tokio",
  "tokio-io-timeout",
+ "tokio-rustls",
 ]
 
 [[package]]

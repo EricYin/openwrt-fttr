@@ -10,6 +10,8 @@ pub(crate) struct Lifetime {
     broker: crate::broker::EmbeddedBroker,
     #[cfg(feature = "mqtt")]
     address: std::net::SocketAddr,
+    #[cfg(all(feature = "device-scty", feature = "mqtt"))]
+    boot_mock: Option<crate::devices::scty::ty_fs803g::boot_mock::BootMockServer>,
 }
 
 impl Lifetime {
@@ -21,9 +23,20 @@ impl Lifetime {
             let addresses = crate::broker::lan_addresses(&lan)?;
             let broker = crate::broker::EmbeddedBroker::start(&addresses).await?;
             println!("[+] Owned MQTT broker ready on {addresses:?}");
+            #[cfg(all(feature = "device-scty", feature = "mqtt"))]
+            let boot_mock = {
+                let lan_addr = addresses
+                    .iter()
+                    .find(|addr| !addr.ip().is_loopback())
+                    .copied()
+                    .unwrap_or(addresses[0]);
+                crate::devices::scty::ty_fs803g::boot_mock::start_from_env(lan_addr).await?
+            };
             Ok(Self {
                 broker,
                 address: addresses[0],
+                #[cfg(all(feature = "device-scty", feature = "mqtt"))]
+                boot_mock,
             })
         }
         #[cfg(not(feature = "mqtt"))]
@@ -36,12 +49,20 @@ impl Lifetime {
         #[cfg(feature = "mqtt")]
         {
             let mut broker = self.broker;
+            #[cfg(all(feature = "device-scty", feature = "mqtt"))]
+            let boot_mock = self.boot_mock;
             let telemetry = super::mqtt::run(self.address, devices);
             tokio::pin!(telemetry);
             loop {
                 tokio::select! {
                     result = &mut telemetry => return Err(format!("telemetry worker stopped: {result:?}")),
-                    _ = tokio::time::sleep(Duration::from_secs(10)) => broker.check_health().await?,
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                        broker.check_health().await?;
+                        #[cfg(all(feature = "device-scty", feature = "mqtt"))]
+                        if boot_mock.as_ref().is_some_and(|server| server.is_finished()) {
+                            return Err("SCTY IF5 Boot Mock stopped".into());
+                        }
+                    }
                 }
             }
         }

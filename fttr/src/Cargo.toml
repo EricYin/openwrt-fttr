@@ -22,7 +22,7 @@ device-hl202 = ["dep:flate2", "dep:tar"]
 device-hwtc = []
 device-star = []
 device-zte = []
-device-scty = []
+device-scty = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:tokio-rustls", "dep:rustls", "dep:rustls-pki-types", "dep:ring"]
 device-fiberhome = []
 device-realtek = []
 all-devices = ["device-hl202", "device-hwtc", "device-star", "device-zte", "device-scty", "device-fiberhome", "device-realtek"]
@@ -53,6 +53,10 @@ bytes = { version = "1.12.1", optional = true }
 base64 = "0.23.1"
 digest_auth = { version = "0.3.1", optional = true }
 hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "ring", "webpki-roots", "tls12"], optional = true }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-pki-types = { version = "1.15.1", default-features = false, features = ["std"], optional = true }
+ring = { version = "0.17.14", default-features = false, features = ["std"], optional = true }
 tokio-io-timeout = { version = "1.2.1", optional = true }
 openwrt-uci = { path = "crates/openwrt-uci" }
 openwrt-ubus = { path = "crates/openwrt-ubus" }

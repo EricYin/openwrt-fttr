@@ -55,7 +55,7 @@ define Package/openwrt-fttr/config
     depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_DEVICE_SCTY
-    bool "Compile SCTY TY-FS803G adapter (OMCI bridge only; CWMP unverified)"
+    bool "Compile SCTY TY-FS803G adapter (OMCI bridge + optional IF5 MQTT Boot Mock)"
     depends on PACKAGE_openwrt-fttr
     default y
   config FTTR_ACS

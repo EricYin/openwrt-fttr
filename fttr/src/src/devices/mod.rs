@@ -13,6 +13,18 @@ pub fn observe_mqtt_report(source: &str, payload: Vec<u8>, received: u64) -> boo
         false
     }
 }
+
+pub fn observe_if5_mqtt(device_id: &str, payload: &[u8], now: u64) -> Option<String> {
+    #[cfg(all(feature = "device-scty", feature = "mqtt"))]
+    {
+        scty::ty_fs803g::if5::observe_upward(device_id, payload, now)
+    }
+    #[cfg(not(all(feature = "device-scty", feature = "mqtt")))]
+    {
+        let _ = (device_id, payload, now);
+        None
+    }
+}
 #[cfg(feature = "device-fiberhome")]
 pub(crate) mod fiberhome;
 pub mod generic;

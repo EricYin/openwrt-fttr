@@ -21,23 +21,33 @@ impl Job {
         let job = Self::default();
         let result = job.clone();
         crate::runtime::spawn(async move {
-            #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
-            let outcome = if device.provisioning_adapter == "hl202-mqtt" {
-                crate::devices::hl202::provisioning::run(
-                    device,
-                    apply,
-                    full,
-                    revision,
-                    operation_id,
-                )
-                .await
-            } else {
-                Err("command provisioning unsupported by this adapter".into())
-            };
-            #[cfg(not(all(feature = "device-hl202", feature = "mqtt")))]
-            let outcome = {
-                let _ = (device, apply, full, revision, operation_id);
-                Err("command provisioning not compiled".into())
+            let outcome = match device.provisioning_adapter.as_str() {
+                #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
+                "hl202-mqtt" => {
+                    crate::devices::hl202::provisioning::run(
+                        device,
+                        apply,
+                        full,
+                        revision,
+                        operation_id,
+                    )
+                    .await
+                }
+                #[cfg(all(feature = "device-scty", feature = "mqtt"))]
+                "scty-if5-mqtt" => {
+                    crate::devices::scty::ty_fs803g::provisioning::run(
+                        device,
+                        apply,
+                        full,
+                        revision,
+                        operation_id,
+                    )
+                    .await
+                }
+                _ => {
+                    let _ = (device, apply, full, revision, operation_id);
+                    Err("command provisioning unsupported or not compiled for this adapter".into())
+                }
             };
             *result.0.lock().unwrap() = Some(outcome);
             crate::provisioning::controller::wake();

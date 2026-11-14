@@ -194,7 +194,7 @@ impl Device {
     pub fn backend(&self) -> &'static str {
         match self.provisioning_adapter.as_str() {
             "none" => "disabled",
-            "hl202-mqtt" => "command",
+            "hl202-mqtt" | "scty-if5-mqtt" => "command",
             _ => "acs", // ACS identifiers are validated by the configuration compiler.
         }
     }
@@ -212,10 +212,10 @@ impl Device {
         if let Some(id) = &self.resolved_contract {
             return crate::cwmp::registry::lookup(id).expect("discovered contract registered");
         }
-        crate::cwmp::registry::lookup(if self.provisioning_adapter == "hl202-mqtt" {
-            "hl202-cu"
-        } else {
-            &self.provisioning_adapter
+        crate::cwmp::registry::lookup(match self.provisioning_adapter.as_str() {
+            "hl202-mqtt" => "hl202-cu",
+            "scty-if5-mqtt" => "cm",
+            other => other,
         })
         .expect("validated provisioning contract")
     }

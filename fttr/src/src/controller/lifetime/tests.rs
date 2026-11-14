@@ -81,6 +81,8 @@ fn controller_mqtt_lifetime_child() {
         Lifetime {
             broker,
             address: addresses[0],
+            #[cfg(all(feature = "device-scty", feature = "mqtt"))]
+            boot_mock: None,
         }
     };
     #[cfg(not(feature = "mqtt"))]

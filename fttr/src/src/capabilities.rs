@@ -38,7 +38,7 @@ pub fn compiled() -> Capabilities {
             mqtt_telemetry: mqtt,
             hl202_management: hl202 && mqtt,
             cwmp: acs,
-            command_provisioning: hl202 && mqtt,
+            command_provisioning: (hl202 || scty) && mqtt,
         },
         // Configuration and synchronization are the ACS/CWMP workflow in LuCI.
         pages: CapabilityPages {
@@ -46,8 +46,8 @@ pub fn compiled() -> Capabilities {
             hardware,
             calibration: hardware,
             about: true,
-            config: acs || (hl202 && mqtt),
-            sync: acs || (hl202 && mqtt),
+            config: acs || ((hl202 || scty) && mqtt),
+            sync: acs || ((hl202 || scty) && mqtt),
             hl202: hl202 && mqtt,
         },
         adapters,

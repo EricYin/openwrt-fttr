@@ -3,6 +3,12 @@
 //! Direct OMCI bridge profile with Broadcom BCM68252 RDPA Root TM activation.
 //! This is an OMCI bridge profile, not a CWMP identity or Wi-Fi contract.
 
+#[cfg(feature = "mqtt")]
+pub mod boot_mock;
+#[cfg(feature = "mqtt")]
+pub mod if5;
+#[cfg(feature = "mqtt")]
+pub mod provisioning;
 pub mod service;
 
 pub(super) fn matches(equipment: Option<&str>) -> bool {

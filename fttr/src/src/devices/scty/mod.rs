@@ -1,4 +1,8 @@
 //! SCTY dispatch; only the observed TY-FS803G model is enrolled.
+//! SCTY dispatch; only the observed TY-FS803G model is enrolled.
+#[cfg(feature = "mqtt")]
+pub(crate) mod ty_fs803g;
+#[cfg(not(feature = "mqtt"))]
 mod ty_fs803g;
 
 pub(super) fn matches(vendor: &str, equipment: Option<&str>) -> bool {

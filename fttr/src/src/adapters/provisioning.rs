@@ -28,6 +28,13 @@ pub fn available() -> Vec<Adapter> {
             contract: registry::lookup("hl202-cu").ok(),
         });
     }
+    if cfg!(all(feature = "device-scty", feature = "mqtt")) {
+        entries.push(Adapter {
+            id: "scty-if5-mqtt",
+            transport: Transport::Mqtt,
+            contract: None,
+        });
+    }
     if cfg!(feature = "acs") {
         entries.extend(registry::available().into_iter().map(|contract| Adapter {
             id: contract.id,
@@ -45,6 +52,7 @@ pub fn capabilities() -> Vec<AdapterCapability> {
             id: entry.id,
             name: match entry.transport {
                 Transport::Disabled => "No business provisioning",
+                Transport::Mqtt if entry.id == "scty-if5-mqtt" => "SCTY IF5 MQTT",
                 Transport::Mqtt => "HL202 MQTT direct",
                 Transport::Acs => entry.id,
             },
