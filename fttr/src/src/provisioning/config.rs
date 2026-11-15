@@ -287,7 +287,10 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
             cfg.onu_pins
                 .insert(s.get("optical_sn").to_ascii_uppercase(), slot);
         }
-        let omci_adapter = s.get("omci_adapter");
+        let omci_adapter = match s.get("omci_adapter") {
+            "" => "auto",
+            other => other,
+        };
         crate::adapters::omci::validate(omci_adapter).map_err(|e| format!("{id}: {e}"))?;
         let provisioning_adapter = s.get("provisioning_adapter");
         crate::adapters::provisioning::lookup(provisioning_adapter)
