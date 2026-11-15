@@ -51,6 +51,44 @@ make package/luci-app-fttr/compile V=s -j2
 
 ## 编译选项
 
+### ONU OMCI 凭据认证
+
+全局认证策略与设备适配器独立，设备默认继承完整全局策略。初始设置及缺少认证段时
+均为 `disabled`：不校验凭据、放行任意凭据，不表示凭据验证成功。
+设备适配和业务准入规则仍独立生效。需要开启认证时使用：
+
+```uci
+config omci_auth 'global'
+	option schema_version '1'
+	option auth_mode 'loid_password'
+	option auth_loid '<EXPECTED_LOID>'
+	option auth_password '<PASSWORD>'
+```
+
+`auth_mode` 支持 `disabled`、`loid_password`；设备还支持 `inherit`（省略或空值
+同义）。设备覆盖时必须提供完整的本地 `auth_loid` 与 `auth_password`，不逐字段回退。
+LOID 为 1–24 字节、密码为 1–12 字节的可打印 ASCII，空格和大小写有意义；
+不截断或去除空白。HL202 私有后端只支持各 10 字节，超出时拒绝认证。
+多个设备可以继承同一组凭据。SN 仍用于身份关联，不作为认证凭据。
+
+标准后端读取 ONU-G（ME 256）Logical ONU ID / Logical Password，比对后写入
+Credentials Status，成功还须回读状态；HL202 使用独立的 ME 65530 私有布局。
+不通过标准 ONU-G 写入 LOID 或密码。本轮不提供 Registration-ID、PLOAM 密码或
+双向认证配置。
+
+仅支持版本 1 配置，不保留旧策略、内置认证凭据或升级迁移分支。配置文件权限为
+0600。禁用认证时仍尝试读取实际上报凭据用于展示，读取失败不影响认证放行。
+
+认证结果绑定光侧身份、注册代次、有效策略和后端；策略变更先撤销业务转发并取消
+旧工作任务，再重新认证。全局变更不影响有效覆盖策略未变化的设备。凭据不匹配
+等待配置变更或重新注册；交换错误最多尝试三轮。业务配置、管理引导、ACS 写任务
+与 carrier 恢复均受认证门控，OMCC 诊断保留。H3C 平台必须配套本次驱动的双向
+carrier 门控，不能仅更新用户态就假定旧业务已隔离。
+
+同步页展示认证模式、来源、状态、后端及子猫实际上报的 LOID/密码（密码默认折叠）。
+这些是设备回读值，不是期望配置；未读到时明确显示未读取。`skipped` 与 `verified`
+分开，认证回读成功仍不能代替真实 GEM 双向数据或真实 CWMP RPC 验收。
+
 ### 三层设备适配
 
 每个 `config device` 必须显式选择三个适配器，候选项由当前编译的

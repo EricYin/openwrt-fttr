@@ -975,6 +975,7 @@ async fn run_async(platform: PlatformContext) {
                     println!("[+] ONU {id} moved to independent online set; discovery remains enabled (online={})", online.len());
                 }
                 let expired: Vec<_> = online
+                    // Authentication changes cancel workers without disturbing PLOAM.
                     .iter()
                     .filter(|(_, session)| session.expired(Instant::now()))
                     .map(|(&id, _)| id)
@@ -987,6 +988,7 @@ async fn run_async(platform: PlatformContext) {
                     pending_cleanup.insert(id);
                     println!("[-] ONU {id} online evidence expired; independent cleanup scheduled");
                 }
+                services.refresh_auth();
                 if let Some(session) = ranging.as_ref().filter(|s| s.expired(Instant::now())) {
                     let id = session.id;
                     println!("[-] ONU {id} activation expired (confirmed={}); revoke O5/EqD and re-register", session.confirmed);

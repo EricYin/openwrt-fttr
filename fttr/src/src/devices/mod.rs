@@ -325,6 +325,7 @@ impl Adapter {
         id: u8,
         token: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> std::io::Result<()> {
+        crate::omci_auth::authenticate(platform, id, token.clone(), self.auth_layout())?;
         match self {
             #[cfg(feature = "device-hl202")]
             Self::Hl202 => {
@@ -354,6 +355,13 @@ impl Adapter {
                     self.status().to_string(),
                 ))
             }
+        }
+    }
+    pub(crate) fn auth_layout(self) -> crate::omci_auth::Layout {
+        match self {
+            #[cfg(feature = "device-hl202")]
+            Self::Hl202 => hl202::AUTH_LAYOUT,
+            _ => crate::omci_auth::STANDARD,
         }
     }
 }
