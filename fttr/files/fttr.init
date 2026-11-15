@@ -8,7 +8,6 @@ LAN_STATE=/var/run/fttr-mqtt-lan
 
 start_service() {
 	local acs_state acs_username acs_password lan_addr
-	chmod 600 /etc/config/fttr || return 1
 	config_load fttr
 	config_get acs_state acs state_file /var/lib/fttr/acs-state.json
 	config_get acs_username acs username ""
@@ -62,7 +61,6 @@ service_triggers() {
 
 reload_service() {
 	local lan_addr applied_lan
-	chmod 600 /etc/config/fttr || return 1
 	lan_addr=$(uci -q get network.lan.ipaddr)
 	lan_addr=${lan_addr%%/*}
 	# A stopped service has no applied listeners. Do not start it via reload.
