@@ -41,50 +41,6 @@ make defconfig
 make package/luci-app-fttr/compile V=s
 ```
 
----
-
-## 运行时配置（`/etc/config/fttr`）
-
-### 1. 三层设备适配
-
-每个 `config device` 需显式指定三个适配器（可用候选项通过 `fttrctl capabilities --json` 查看）：
-
-| 层 | UCI 字段 | 职责 | 示例 |
-| --- | --- | --- | --- |
-| A | `omci_adapter` | 光侧业务配置 | `generic`、`hl202`、`hwtc` |
-| B | `bootstrap_adapter` | 管理引导策略 | `none`、`manual-acs`、`omci-acs`、`hl202-mqtt-acs` |
-| C | `provisioning_adapter` | 业务传输与参数契约 | `none`、`hl202-mqtt`、`hl202-cu`、`hwtc-hw`、`vendor-cu-candidate`、`vendor-ct-candidate` |
-
-示例（HL202 通过 MQTT 下发 ACS 地址，再使用联通参数契约配置业务）：
-
-```uci
-config device 'child'
-	option optical_sn 'H3CT1234ABCD'
-	option omci_adapter 'hl202'
-	option bootstrap_adapter 'hl202-mqtt-acs'
-	option provisioning_adapter 'hl202-cu'
-```
-
-- 三层独立校验，不自动回退或切换；公共配置无需填写 `cwmp_id`。
-- 切换 `provisioning_adapter` 会使旧业务操作失效并要求重新发现；切换 A/B 保留业务历史。
-- 旧配置项 `adapter`、`provisioning_method`、`cwmp_contract`、`omci_management` 已不再使用。
-
-### 2. ONU OMCI 凭据认证
-
-默认全局策略为 `disabled`（不校验凭据，仍尝试读取上报值用于展示）。需要开启认证时：
-
-```uci
-config omci_auth 'global'
-	option schema_version '1'
-	option auth_mode 'loid_password'
-	option auth_loid '<EXPECTED_LOID>'
-	option auth_password '<PASSWORD>'
-```
-
-- 设备级 `auth_mode` 支持 `inherit`（默认）、`disabled`、`loid_password`；设备覆盖时须同时提供本地 `auth_loid` 与 `auth_password`。
-- 标准后端使用 ONU-G（ME 256，LOID 1–24 字节、密码 1–12 字节可打印 ASCII，保留空白与大小写）；HL202 使用 ME 65530 私有布局（各限 10 字节）。
-- 业务配置、管理引导、ACS 写任务与 carrier 恢复均受认证门控；H3C 平台需配套本仓库驱动。
-
 ### 3. HM2004-DU 光模块校准与温补
 
 可在 LuCI 校准页执行 **上传保存 → 保存来源选择 → 应用所选校准**，或通过 UCI / `ubus` 操作：
@@ -149,15 +105,6 @@ cargo test --locked --workspace --features fttr-api/codegen
 cargo test --locked --lib --no-default-features --features platform-h3c-hm2004-du,all-devices,acs,mqtt,npu
 cargo check --locked --all-targets --no-default-features --features all-platforms,all-devices,acs,mqtt,npu,diagnostics
 ```
-
-诊断工具（`fttr-platform-probe`、`fttr-omci-mib`、`fttr-omci-probe`、`fttr-omci-service`、`fttr-ranging` 等）需显式启用 `diagnostics`；`fttr-k155-service` 还需 `device-hwtc`，`fttr-star-observe` 还需 `device-star`：
-
-```sh
-cargo build --locked --features diagnostics,device-star --bin fttr-star-observe
-fttr-star-observe 02:00:00:00:00:01
-```
-
-> CLI 受支持命令以 `fttrctl help` 为准；运行独立 `fttr-ranging` 前需先停止 `fttrd`。
 
 ### Windows Rust 交叉编译
 
