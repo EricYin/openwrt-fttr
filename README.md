@@ -41,24 +41,9 @@ make defconfig
 make package/luci-app-fttr/compile V=s
 ```
 
-### 3. HM2004-DU 光模块校准与温补
+### 3. HM2004-DU 下行光校准
 
-可在 LuCI 校准页执行 **上传保存 → 保存来源选择 → 应用所选校准**，或通过 UCI / `ubus` 操作：
-
-```uci
-config calibration 'calibration'
-	option source 'auto' # auto | factory | firmware | builtin
-```
-
-```sh
-ubus call fttr get_calibration '{}'
-ubus call fttr select_calibration '{"source":"firmware"}'
-ubus call fttr apply_calibration '{}'
-```
-
-- `firmware` 路径为 `/lib/firmware/modified_UX3326.bin`（完整 288 字节启用温补；兼容 56 字节寄存器镜像但不启用温补）。
-- 校准来源与业务同步版本分离，修改来源不会触发 ONU 业务重配。
-- `fttrctl bosa-diag` 可从运行中的 `fttrd` 获取当前遥测与温补状态。
+使用 [h3c-hm2004du-factory](https://github.com/qwe3017/h3c-hm2004du-factory) 导出 1MB `factory` 分区并刷入，或导出校准数据后在本插件校准页上传应用。
 
 ---
 
