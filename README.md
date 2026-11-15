@@ -130,3 +130,10 @@ try {
 cargo run --locked --manifest-path fttr/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --generate --out-dir <OUT_DIR>
 cargo run --locked --manifest-path fttr/src/crates/fttr-api/Cargo.toml --features codegen --bin fttr-sdk -- --check --out-dir <OUT_DIR>
 ```
+
+---
+
+## 开源协议
+
+- `fttr/` 及仓库根目录通用内容采用 [Apache-2.0](LICENSE)（见 [fttr/LICENSE](fttr/LICENSE)）。
+- `h3c-fmcs/` 内核驱动与配套测试代码采用 [GPL-2.0-only](h3c-fmcs/LICENSE)。
