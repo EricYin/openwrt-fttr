@@ -521,16 +521,15 @@ async fn run_async(platform: PlatformContext) {
         eprintln!("[-] Optical ownership failed: {error}");
         std::process::exit(1);
     });
+    let lifetime = tokio::select! {
+        result = super::lifetime::Lifetime::start() => result.unwrap_or_else(|error| {
+            eprintln!("[-] MQTT startup failed: {error}");
+            std::process::exit(1);
+        }),
+        _ = crate::runtime::termination() => return,
+    };
     #[cfg(feature = "npu")]
     let npu = crate::npu::Service::start(platform);
-    let lifetime = super::lifetime::Lifetime::start()
-        .await
-        .unwrap_or_else(|error| {
-            eprintln!("[-] MQTT startup failed: {error}");
-            #[cfg(feature = "npu")]
-            npu.stop();
-            std::process::exit(1);
-        });
     #[cfg(feature = "acs")]
     crate::acs::start_from_env();
 
@@ -1029,31 +1028,34 @@ async fn run_async(platform: PlatformContext) {
     }
 
     // 4. Keep the controller alive and own MQTT supervision when compiled in.
-    tokio::select! {
+    let restart = tokio::select! {
         result = lifetime.wait(devices) => {
             eprintln!("[-] Controller supervision stopped: {result:?}");
-            #[cfg(feature = "npu")]
-            npu.stop();
-            std::process::exit(1);
+            true
         }
         result = crate::runtime::termination() => {
             if let Err(error) = result { eprintln!("[-] Signal handler failed: {error}");
             }
-            #[cfg(feature = "acs")]
-            crate::acs::shutdown();
-            #[cfg(feature = "npu")]
-            npu.stop();
-            crate::runtime::request_stop();
-            let optical = crate::runtime::spawn_blocking(move || shutdown.request(OpticalCommand::Shutdown));
-            let (optical, ()) = tokio::join!(
-                tokio::time::timeout(Duration::from_secs(4), optical),
-                crate::runtime::shutdown(),
-            );
-            match optical {
-                Ok(Ok(Ok(_))) => (),
-                result => eprintln!("[-] Optical shutdown not confirmed: {result:?}"),
-            }
+            false
         }
+    };
+    #[cfg(feature = "acs")]
+    crate::acs::shutdown();
+    #[cfg(feature = "npu")]
+    npu.stop();
+    crate::runtime::request_stop();
+    let optical =
+        crate::runtime::spawn_blocking(move || shutdown.request(OpticalCommand::Shutdown));
+    let (optical, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(4), optical),
+        crate::runtime::shutdown(),
+    );
+    match optical {
+        Ok(Ok(Ok(_))) => (),
+        result => eprintln!("[-] Optical shutdown not confirmed: {result:?}"),
+    }
+    if restart {
+        std::process::exit(1);
     }
 }
 

@@ -14,13 +14,13 @@ pub struct EmbeddedBroker {
     addresses: Vec<SocketAddr>,
 }
 
-/// Production addresses are fixed to loopback and the configured LAN IPv4.
+/// Production addresses are fixed to loopback and the current LAN IPv4.
 pub fn lan_addresses(lan: &str) -> Result<Vec<SocketAddr>, String> {
     let ip: Ipv4Addr = lan
         .parse()
-        .map_err(|_| "FTTR_MQTT_LAN_ADDR must be a LAN IPv4 address")?;
+        .map_err(|_| "MQTT requires a LAN IPv4 address")?;
     if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() {
-        return Err("FTTR_MQTT_LAN_ADDR must be a non-loopback unicast LAN IPv4 address".into());
+        return Err("MQTT requires a non-loopback unicast LAN IPv4 address".into());
     }
     Ok(vec![
         SocketAddr::from((Ipv4Addr::LOCALHOST, 1883)),

@@ -28,7 +28,6 @@ fn child(mode: &str) -> (ChildGuard, mpsc::Receiver<String>) {
         ])
         .env("FTTR_LIFETIME_MODE", mode)
         .env("FTTR_LIFETIME_SOCKET", &path)
-        .env("FTTR_MQTT_LAN_ADDR", "invalid")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -63,10 +62,8 @@ fn controller_mqtt_lifetime_child() {
     #[cfg(feature = "mqtt")]
     let mode = std::env::var("FTTR_LIFETIME_MODE").unwrap();
     #[cfg(feature = "mqtt")]
-    let lifetime = if mode == "invalid" {
-        crate::runtime::block_on(Lifetime::start()).unwrap()
-    } else {
-        // Fixture-only listener addresses; production always validates LAN env.
+    let lifetime = {
+        // Fixture-only listener addresses; production uses the netifd LAN address.
         let addresses = ["127.0.0.1:0", "127.0.0.2:0"].map(|a| {
             std::net::TcpListener::bind(a)
                 .unwrap()
@@ -81,6 +78,7 @@ fn controller_mqtt_lifetime_child() {
         Lifetime {
             broker,
             address: addresses[0],
+            lan: None,
         }
     };
     #[cfg(not(feature = "mqtt"))]
@@ -145,12 +143,4 @@ fn controller_mqtt_lifetime_runtime_broker_failure_is_fatal() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-#[cfg(feature = "mqtt")]
-#[test]
-fn controller_mqtt_lifetime_invalid_lan_never_reports_ready() {
-    let (mut child, rx) = child("invalid");
-    assert!(!child.0.wait().unwrap().success());
-    assert!(!rx.iter().any(|line| line == "LIFETIME_READY"));
 }

@@ -1436,16 +1436,17 @@ async fn run_async(platform: PlatformContext) {
         eprintln!("[-] Optical ownership failed: {error}");
         std::process::exit(1);
     });
+    let lifetime = tokio::select! {
+        result = lifetime::Lifetime::start() => result.unwrap_or_else(|error| {
+            eprintln!("[-] MQTT startup failed: {error}");
+            std::process::exit(1);
+        }),
+        _ = crate::runtime::termination() => return,
+    };
     #[cfg(feature = "npu")]
     let npu = crate::npu::Service::start(platform);
     #[cfg(feature = "npu")]
     let npu_handle = npu.handle();
-    let lifetime = lifetime::Lifetime::start().await.unwrap_or_else(|error| {
-        #[cfg(feature = "npu")]
-        npu.stop();
-        eprintln!("[-] MQTT startup failed: {error}");
-        std::process::exit(1);
-    });
     #[cfg(feature = "acs")]
     crate::acs::start_from_env();
 
