@@ -101,14 +101,6 @@ pub(super) fn snapshot() -> ([Option<f32>; 4], fttr_api::Measurements) {
         };
         evidence.insert(name.into(), measurement);
     }
-    evidence.insert(
-        "cdr_locked".into(),
-        fttr_api::MeasurementEvidence::unavailable(
-            "UX3326S1/FSL",
-            "boolean",
-            "diagnostic_register_unverified",
-        ),
-    );
     (values, evidence)
 }
 

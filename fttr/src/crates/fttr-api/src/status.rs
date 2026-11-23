@@ -88,7 +88,6 @@ pub struct OpticalTransceiverStatus {
     pub laser_bias_current_ma: Option<f32>,
     pub temperature_celsius: Option<f32>,
     pub vcc_voltage: Option<f32>,
-    pub cdr_locked: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "codegen", ts(optional))]
     pub tx_enabled: Option<bool>,

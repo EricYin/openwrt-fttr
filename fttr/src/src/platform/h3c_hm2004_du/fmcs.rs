@@ -798,20 +798,6 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         (temp, volt, bias, tx)
     };
 
-    // CDR locked state remains unknown: reading bit 3 of register 0x00 is not verified as a dynamic hardware indicator.
-    measurements.insert(
-        "cdr_locked".into(),
-        MeasurementEvidence::unavailable(
-            "UX3326/FMCS",
-            "boolean",
-            if tx_enabled == Some(false) {
-                "optical_tx_disabled_hardware_reset"
-            } else {
-                "diagnostic_register_and_scaling_unverified"
-            },
-        ),
-    );
-
     if let Some(enabled) = tx_enabled {
         measurements.insert(
             "tx_enabled".into(),
@@ -837,7 +823,6 @@ pub fn get_optical_status() -> OpticalTransceiverStatus {
         laser_bias_current_ma,
         temperature_celsius,
         vcc_voltage,
-        cdr_locked: None,
         tx_enabled,
         measurements,
         calibration_sha256: runtime
@@ -1265,7 +1250,6 @@ mod tests {
         assert!(status.measurements.contains_key("temperature_celsius"));
         assert!(status.measurements.contains_key("vcc_voltage"));
         assert!(status.measurements.contains_key("laser_bias_current_ma"));
-        assert!(status.measurements.contains_key("cdr_locked"));
     }
 
     #[test]

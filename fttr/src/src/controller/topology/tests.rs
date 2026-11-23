@@ -91,7 +91,6 @@ fn status(onus: Vec<SubGatewayStatus>) -> StatusReply {
             laser_bias_current_ma: None,
             temperature_celsius: None,
             vcc_voltage: None,
-            cdr_locked: None,
             tx_enabled: Some(true),
             measurements: BTreeMap::new(),
         },

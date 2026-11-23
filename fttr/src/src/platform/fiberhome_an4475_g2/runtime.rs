@@ -912,7 +912,6 @@ pub(crate) fn status_snapshot(
                 laser_bias_current_ma: measurements[2],
                 temperature_celsius: measurements[0],
                 vcc_voltage: measurements[1],
-                cdr_locked: None,
                 tx_enabled,
                 measurements: measurement_evidence,
             },

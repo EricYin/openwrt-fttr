@@ -248,11 +248,7 @@ fn project(
                 temperature_celsius: module.temperature_celsius,
                 vcc_voltage: module.vcc_voltage,
                 tx_enabled: module.tx_enabled,
-                measurements: module
-                    .measurements
-                    .into_iter()
-                    .filter(|(k, _)| k != "cdr_locked")
-                    .collect(),
+                measurements: module.measurements,
             },
             interfaces: local.interfaces.clone(),
             uplinks: local.uplinks,

@@ -290,12 +290,6 @@ fn print_status_table(status: &FttrSystemStatus) {
 
     // 1. Optical Link
     let opt = &status.optical_transceiver;
-    let cdr_str = match opt.cdr_locked {
-        Some(true) => "LOCKED (OK)",
-        Some(false) => "UNLOCKED",
-        None => "UNKNOWN",
-    };
-
     let tx_enable_str = match opt.tx_enabled {
         Some(true) => "ENABLED",
         Some(false) => "DISABLED",
@@ -304,8 +298,8 @@ fn print_status_table(status: &FttrSystemStatus) {
 
     println!("[*] Optical Transceiver (BOSA {}):", opt.model);
     println!(
-        "    TX enable/readback: {}  |  Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G  |  CDR: {}",
-        tx_enable_str, opt.wavelength_tx_nm, opt.wavelength_rx_nm, cdr_str
+        "    TX enable/readback: {}  |  Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G",
+        tx_enable_str, opt.wavelength_tx_nm, opt.wavelength_rx_nm
     );
     if opt.temperature_celsius.is_some()
         || opt.vcc_voltage.is_some()
@@ -788,15 +782,10 @@ fn main() {
             if is_json {
                 println!("{}", serde_json::to_string_pretty(&opt).unwrap_or_default());
             } else {
-                let cdr_str = match opt.cdr_locked {
-                    Some(true) => "LOCKED (OK)",
-                    Some(false) => "UNLOCKED",
-                    None => "UNKNOWN",
-                };
                 println!("[*] Optical Transceiver (BOSA {}):", opt.model);
                 println!(
-                    "    Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G  |  CDR: {}",
-                    opt.wavelength_tx_nm, opt.wavelength_rx_nm, cdr_str
+                    "    Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G",
+                    opt.wavelength_tx_nm, opt.wavelength_rx_nm
                 );
                 let temp_str = opt
                     .temperature_celsius
