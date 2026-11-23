@@ -11,8 +11,16 @@ pub fn compiled() -> Capabilities {
     let star = cfg!(feature = "device-star");
     let zte = cfg!(feature = "device-zte");
     let scty = cfg!(feature = "device-scty");
-    let hardware = cfg!(feature = "platform-h3c-hm2004-du");
-    let offload = hardware && cfg!(feature = "npu");
+    let operations: Vec<_> = crate::platform::backend::compiled_operations().collect();
+    let hardware = operations
+        .iter()
+        .any(|ops| ops.fpga_diagnostics || ops.bosa_diagnostics);
+    let optical = operations.iter().any(|ops| ops.optical_control);
+    let omci_mib = operations.iter().any(|ops| ops.omci_mib);
+    let offload = operations.iter().any(|ops| ops.npu_offload);
+    let calibration = operations
+        .iter()
+        .any(|ops| ops.calibration_profile.is_some());
     let adapters = fttr_api::AdapterCapabilities {
         omci: crate::adapters::omci::available(),
         bootstrap: crate::adapters::bootstrap::available(),
@@ -32,9 +40,9 @@ pub fn compiled() -> Capabilities {
             device_scty: scty,
         },
         functions: CapabilityFunctions {
-            optical: hardware,
+            optical,
             bridge_offload: offload,
-            omci_mib: hardware,
+            omci_mib,
             mqtt_telemetry: mqtt,
             hl202_management: hl202 && mqtt,
             cwmp: acs,
@@ -44,7 +52,7 @@ pub fn compiled() -> Capabilities {
         pages: CapabilityPages {
             status: true,
             hardware,
-            calibration: hardware,
+            calibration,
             about: true,
             config: acs || (hl202 && mqtt),
             sync: acs || (hl202 && mqtt),

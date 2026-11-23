@@ -25,6 +25,8 @@ impl PlatformId {
 pub enum PlatformImplementation {
     /// Hardware operations and a runtime entry are implemented by the platform.
     Runtime,
+    /// Raw diagnostics exist; initialization and the full ONU runtime do not.
+    DiagnosticsOnly,
     /// Identity-only adapter. No platform driver or hardware operations exist.
     CompileableStub,
 }
@@ -74,7 +76,7 @@ mod tests {
 
     #[test]
     fn unresearched_platforms_have_no_guessed_runtime_identifiers() {
-        for descriptor in [An4475G2::DESCRIPTOR, Tyfza1::DESCRIPTOR] {
+        for descriptor in [Tyfza1::DESCRIPTOR] {
             assert!(descriptor.device_tree_compatibles.is_empty());
             assert!(descriptor.board_names.is_empty());
             assert_eq!(
@@ -86,5 +88,13 @@ mod tests {
                 PlatformImplementation::CompileableStub
             );
         }
+    }
+
+    #[test]
+    fn fiberhome_source_identity_advertises_runtime() {
+        let descriptor = An4475G2::DESCRIPTOR;
+        assert_eq!(descriptor.device_tree_compatibles, &["fiberhome,an4475-g2"]);
+        assert_eq!(descriptor.board_names, &["fiberhome,an4475-g2"]);
+        assert_eq!(descriptor.implementation, PlatformImplementation::Runtime);
     }
 }

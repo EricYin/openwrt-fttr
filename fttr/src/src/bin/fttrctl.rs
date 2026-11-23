@@ -5,6 +5,8 @@ use std::process::exit;
 use openwrt_fttr::ipc;
 use openwrt_fttr::model::FttrSystemStatus;
 use openwrt_fttr::platform::{context::PlatformContext, diagnostics::HardwareDiagnostics};
+#[path = "fttrctl/hardware.rs"]
+mod hardware_command;
 #[cfg(feature = "device-hl202")]
 #[path = "fttrctl/hl202.rs"]
 mod hl202;
@@ -29,6 +31,7 @@ Commands:\n  \
   status [--json|-j]   Display active FTTR optical link and DSA switch ports (table or JSON)\n  \
   mib ONU_ID [--summary|--json] [--tables]  Read structured OMCI inventory (default: JSON)\n  \
   fec ONU_ID [--json] [--create-pm]  Read downstream FEC PM; optionally create missing PM instance\n  \
+  hardware DEVICE COMMAND  Exclusive offline register/memory diagnostics (JSON; hardware help)\n  \
   fpga-read <addr>     Directly read 32-bit FPGA hardware register\n  \
   fpga-diag [ONU_ID|all] [--samples N] [--interval-ms N] [--json] [--offline]\n  \
   fpga-write <a> <v>   Directly write 32-bit FPGA hardware register\n  \
@@ -81,10 +84,10 @@ fn handle_mqtt_command(_: &[String]) -> Result<i32, String> {
 }
 
 fn hardware() -> HardwareDiagnostics {
-    HardwareDiagnostics::new(PlatformContext::detect().unwrap_or_else(|error| {
+    HardwareDiagnostics::detect().unwrap_or_else(|error| {
         eprintln!("Platform selection: {error}");
         exit(1)
-    }))
+    })
 }
 
 fn handle_offload(args: &[String]) {
@@ -101,7 +104,7 @@ fn handle_offload(args: &[String]) {
             } else {
                 println!("[*] NPU & Hardware Offload Status:");
                 println!(
-                    "    Engine attached: {} | Bridge offload enabled: {}",
+                    "    Engine attached: {} | Offload enabled: {}",
                     if status.engine_attached {
                         "YES (Ready)"
                     } else {
@@ -113,27 +116,49 @@ fn handle_offload(args: &[String]) {
                         "NO"
                     }
                 );
-                println!(
-                    "    Bridge: {} | Mask: 0x{:04x} ({}) | Active ports: {}",
-                    status.bridge,
-                    status.bridge_offload_mask,
-                    status.bridge_offload_mask,
-                    if status.active_ports.is_empty() {
-                        "none".into()
+                let active_ports = if status.active_ports.is_empty() {
+                    "none".into()
+                } else {
+                    status.active_ports.join(", ")
+                };
+                if status.admission_model == Some(fttr_api::NpuAdmissionModel::DirectionOnly) {
+                    let dir = if status.direction_mask_valid {
+                        format!("0x{:x} ({})", status.direction_mask, status.direction_mask)
                     } else {
-                        status.active_ports.join(", ")
-                    }
-                );
-                println!(
-                    "    Routed mask: 0x{:04x} | Driver debug: {} | Hooks ready: {}",
-                    status.routed_offload_mask,
-                    if status.bridge_offload_debug {
-                        "YES"
-                    } else {
-                        "NO"
-                    },
-                    if status.fw4_hooks_ready { "YES" } else { "NO" }
-                );
+                        "unavailable".into()
+                    };
+                    println!(
+                        "    Bridge: {} | Direction mask: {} | Eligible ports: {}",
+                        status.bridge, dir, active_ports
+                    );
+                    println!(
+                        "    PPE debug: {} | Hooks ready: {}",
+                        if status.bridge_offload_debug {
+                            "YES"
+                        } else {
+                            "NO"
+                        },
+                        if status.fw4_hooks_ready { "YES" } else { "NO" }
+                    );
+                } else {
+                    println!(
+                        "    Bridge: {} | Mask: 0x{:04x} ({}) | Active ports: {}",
+                        status.bridge,
+                        status.bridge_offload_mask,
+                        status.bridge_offload_mask,
+                        active_ports
+                    );
+                    println!(
+                        "    Routed mask: 0x{:04x} | Driver debug: {} | Hooks ready: {}",
+                        status.routed_offload_mask,
+                        if status.bridge_offload_debug {
+                            "YES"
+                        } else {
+                            "NO"
+                        },
+                        if status.fw4_hooks_ready { "YES" } else { "NO" }
+                    );
+                }
                 println!(
                     "    FOE Entries: total {} | bound {} (IPv4: {}, IPv6: {}) | Offload traffic: {} pkts, {} bytes",
                     status.total_entries,
@@ -162,14 +187,32 @@ fn handle_offload(args: &[String]) {
         }
         "on" | "off" => {
             let enabled = sub == "on";
-            #[cfg(all(feature = "npu", feature = "platform-h3c-hm2004-du"))]
+            #[cfg(all(
+                feature = "npu",
+                any(
+                    feature = "platform-h3c-hm2004-du",
+                    feature = "platform-fiberhome-an4475-g2"
+                )
+            ))]
             let bridge = args
                 .iter()
                 .position(|a| a == "--bridge")
                 .map(|i| args.get(i + 1).map(String::as_str).unwrap_or(""));
-            #[cfg(all(feature = "npu", feature = "platform-h3c-hm2004-du"))]
+            #[cfg(all(
+                feature = "npu",
+                any(
+                    feature = "platform-h3c-hm2004-du",
+                    feature = "platform-fiberhome-an4475-g2"
+                )
+            ))]
             let result = openwrt_fttr::npu::settings::set(enabled, bridge, None, None, None);
-            #[cfg(not(all(feature = "npu", feature = "platform-h3c-hm2004-du")))]
+            #[cfg(not(all(
+                feature = "npu",
+                any(
+                    feature = "platform-h3c-hm2004-du",
+                    feature = "platform-fiberhome-an4475-g2"
+                )
+            )))]
             let result: std::io::Result<()> = Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "NPU adapter not compiled (enable Cargo feature npu)",
@@ -296,7 +339,7 @@ fn print_status_table(status: &FttrSystemStatus) {
 
     // 2. Switch Ports Table
     println!("------------------------------------------------------------------------------------------");
-    println!(" Downstream DSA Switch Ports (fttr1 ~ fttr16)");
+    println!(" Downstream ports");
     println!("----------------------------------------------------------------------------------------------------");
     println!(
         " {:<6} {:<10} {:<10} {:<12} {:<8} {:<16} {:<24}",
@@ -334,13 +377,14 @@ fn print_status_table(status: &FttrSystemStatus) {
         );
     }
     println!("----------------------------------------------------------------------------------------------------");
+    let total_ports = status.switch_ports.len();
     if in_prog_count > 0 {
         println!(
-            " Downlink Ports: {} Carrier Up, {} Assigned Without Carrier / 16 Total",
-            active_count, in_prog_count
+            " Downlink Ports: {} Carrier Up, {} Assigned Without Carrier / {} Total",
+            active_count, in_prog_count, total_ports
         );
     } else {
-        println!(" Active Downlink Ports: {} / 16", active_count);
+        println!(" Active Downlink Ports: {} / {}", active_count, total_ports);
     }
     println!();
 
@@ -669,6 +713,12 @@ fn main() {
         "fpga-diag" => {
             if let Err(error) = hardware().fpga_diag(&args[2..]) {
                 eprintln!("FPGA diagnostics: {error}");
+                exit(1);
+            }
+        }
+        "hardware" => {
+            if let Err(error) = hardware_command::handle(&args[2..]) {
+                eprintln!("[-] Hardware diagnostic: {error}");
                 exit(1);
             }
         }

@@ -105,6 +105,12 @@ struct MemoryTransport {
     pending: Option<BaselineFrame>,
 }
 impl OmciTransport for MemoryTransport {
+    fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("deadline:{deadline:?}"));
+    }
     fn send(&mut self, frame: &BaselineFrame) -> io::Result<()> {
         self.events.lock().unwrap().push("send".into());
         self.pending = Some(frame.clone());
@@ -133,8 +139,9 @@ impl ManagementLease for Lease {
             .push(format!("management:{bytes}"));
         Ok(())
     }
-    fn disarm(&mut self) {
+    fn disarm(&mut self) -> io::Result<()> {
         self.committed = true;
+        Ok(())
     }
 }
 impl Drop for Lease {
@@ -180,6 +187,32 @@ fn recording_platform() -> (PlatformContext, Events) {
         events: Some(events.clone()),
     }));
     (PlatformContext::from_backend(backend).unwrap(), events)
+}
+
+#[test]
+fn session_deadlines_reach_backend_and_nested_timeout_restores_outer_deadline() {
+    use crate::pon_engine::omci::OmciSession;
+    use std::time::{Duration, Instant};
+
+    let (platform, events) = recording_platform();
+    let mut session = OmciSession::new(platform.transport(72).unwrap());
+    let outer = Instant::now() + Duration::from_secs(10);
+    session.finish_before(outer);
+    session
+        .with_timeout(Duration::from_millis(50), |session| {
+            // An inner operation must not relax its caller's shorter deadline.
+            session.with_timeout(Duration::from_secs(20), |_| {
+                Err::<(), _>(io::Error::other("failed"))
+            })
+        })
+        .unwrap_err();
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 6);
+    assert_eq!(events[1], format!("deadline:{:?}", Some(outer)));
+    assert_ne!(events[1], events[2]);
+    assert_eq!(events[2], events[3]);
+    assert_eq!(events[2], events[4]);
+    assert_eq!(events[1], events[5]);
 }
 
 #[test]
@@ -276,7 +309,7 @@ fn non_h3c_backend_drives_transport_resources_leases_and_runtime_without_enum_di
     drop(channel);
     drop(lease);
     let mut committed = platform.management_lease(72).unwrap();
-    committed.disarm();
+    committed.disarm().unwrap();
     drop(committed);
     crate::platform::runtime::run_selected(platform).unwrap();
     platform.backend().health_diagnostic(platform).unwrap();
@@ -332,15 +365,19 @@ fn optional_diagnostics_do_not_require_fpga_or_bosa_and_never_fall_back_to_h3c()
 
 #[test]
 fn resolver_rejects_stubs_and_uncompiled_platforms() {
-    for id in [PlatformId::FiberhomeAn4475G2, PlatformId::TianyiTyfza1] {
-        let error = PlatformContext::resolve(id).unwrap_err();
-        assert_eq!(
-            error,
-            if crate::platform::runtime::is_compiled(id) {
-                SelectionError::BackendNotImplemented(id)
-            } else {
-                SelectionError::PlatformNotCompiled(id)
-            }
-        );
-    }
+    let stub = PlatformId::TianyiTyfza1;
+    let error = PlatformContext::resolve(stub).unwrap_err();
+    assert_eq!(
+        error,
+        if crate::platform::runtime::is_compiled(stub) {
+            SelectionError::BackendNotImplemented(stub)
+        } else {
+            SelectionError::PlatformNotCompiled(stub)
+        }
+    );
+    let an4475 = PlatformId::FiberhomeAn4475G2;
+    assert_eq!(
+        PlatformContext::resolve(an4475).is_ok(),
+        crate::platform::runtime::is_compiled(an4475)
+    );
 }

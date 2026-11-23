@@ -46,6 +46,7 @@ pub struct PlatformOperations {
 #[serde(rename_all = "snake_case")]
 pub enum PlatformCalibrationProfile {
     Ux3326,
+    Ux3326sFactory,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -195,6 +196,14 @@ pub struct PpeFlowEntry {
     pub bytes_exact: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub enum NpuAdmissionModel {
+    PortMask,
+    DirectionOnly,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct NpuStatus {
@@ -235,4 +244,11 @@ pub struct NpuStatus {
     #[cfg_attr(feature = "codegen", ts(type = "number"))]
     pub total_bytes: u64,
     pub bound_flows: Vec<PpeFlowEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub admission_model: Option<NpuAdmissionModel>,
+    #[serde(default)]
+    pub direction_mask: u8,
+    #[serde(default)]
+    pub direction_mask_valid: bool,
 }

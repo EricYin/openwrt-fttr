@@ -106,6 +106,13 @@ impl Services {
             }
         }
     }
+    /// Cancel workers even when the hardware ONU inventory cannot be read.
+    pub fn stop_all(&mut self) {
+        let ids: Vec<_> = self.tokens.keys().copied().collect();
+        for id in ids {
+            self.stop(id);
+        }
+    }
     pub fn refresh_auth(&mut self) {
         let stale: Vec<_> = self
             .tokens
@@ -169,6 +176,13 @@ impl Services {
                 state.identity_at = Some(std::time::Instant::now());
             }
             let mut reported_unsupported = false;
+            struct CancelOnDrop(Arc<AtomicBool>);
+            impl Drop for CancelOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let unsupported_telemetry = CancelOnDrop(Arc::new(AtomicBool::new(false)));
             let Some(adapter) = wait_for_adapter(&token, || {
                 let serial = super::service::onu_serial(id);
                 crate::devices::select_with_serial(&vendor, &identity, serial.as_deref())
@@ -178,9 +192,11 @@ impl Services {
                 }
                 if !reported_unsupported {
                     println!("[!] ONU {id} generation={generation} vendor={vendor}: identity collected; business profile unsupported; waiting for adapter policy change");
+                    super::telemetry::start(platform, id, unsupported_telemetry.0.clone());
                     reported_unsupported = true;
                 }
             }) else { return; };
+            drop(unsupported_telemetry);
             let set = |phase: BusinessPhase, error: Option<String>| {
                 if token.load(Ordering::Acquire) { return; }
                 if let Some(state) = states.lock().unwrap().get_mut(&id).filter(|state| state.generation == generation) {
@@ -489,5 +505,26 @@ mod tests {
                 "phase": "not_started", "generation": 0, "error": null
             })
         );
+    }
+
+    #[test]
+    fn stop_all_cancels_every_worker_without_a_hardware_inventory() {
+        let mut services = super::Services::new(
+            crate::platform::context::PlatformContext::test_context(),
+            Default::default(),
+        );
+        let tokens: Vec<_> = (0..3)
+            .map(|id| {
+                let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                services.tokens.insert(id, token.clone());
+                token
+            })
+            .collect();
+        services.stop_all();
+        assert!(tokens
+            .iter()
+            .all(|token| token.load(std::sync::atomic::Ordering::Acquire)));
+        assert!(services.tokens.is_empty());
+        services.stop_all();
     }
 }

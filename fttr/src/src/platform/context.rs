@@ -19,7 +19,7 @@ pub struct PlatformContext {
 pub trait ManagementLease {
     fn set_business_grant_floor(&mut self, bytes: u16) -> io::Result<()>;
     fn set_management_grant_floor(&mut self, bytes: u16) -> io::Result<()>;
-    fn disarm(&mut self);
+    fn disarm(&mut self) -> io::Result<()>;
 }
 
 /// Opaque reversible platform state. Dropping it restores the previous mapping.
@@ -32,6 +32,9 @@ impl OmciTransport for Transport {
     }
     fn receive(&mut self) -> io::Result<Option<BaselineFrame>> {
         self.0.receive()
+    }
+    fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.0.set_deadline(deadline);
     }
 }
 

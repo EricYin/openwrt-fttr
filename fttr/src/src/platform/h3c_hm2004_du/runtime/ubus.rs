@@ -1,11 +1,13 @@
 //! HM2004-DU daemon handlers driven by shared wire contracts.
 use super::{OpticalClient, OpticalCommand, OpticalReplyExt};
+use crate::controller::ubus_mib::UBUS_ERROR_INTERNAL;
 use fttr_api::*;
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::atomic::Ordering;
 mod metrics;
 #[cfg(test)]
 mod tests;
+#[path = "../../ubus_topology.rs"]
 mod topology;
 
 fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
@@ -25,7 +27,7 @@ fn bind<Q: DeserializeOwned + 'static, R: Serialize + 'static>(
                     object.remove("ubus_rpc_session");
                 }
                 let request = serde_json::from_value(payload).map_err(|_| 2)?;
-                serde_json::to_value(handler(request)?).map_err(|_| 9)
+                serde_json::to_value(handler(request)?).map_err(|_| UBUS_ERROR_INTERNAL)
             })();
             metrics::record(name, started.elapsed(), result.is_err());
             result
@@ -42,7 +44,7 @@ fn optical(optics: &OpticalClient, command: OpticalCommand) -> Result<OpticalRep
             error,
         ),
     };
-    serde_json::from_value::<OpticalReply>(response).map_err(|_| 9)
+    serde_json::from_value::<OpticalReply>(response).map_err(|_| UBUS_ERROR_INTERNAL)
 }
 
 #[derive(Clone)]
@@ -98,81 +100,13 @@ impl Handlers {
         }
     }
     fn mib_start(&self, request: MibStartRequest) -> Result<JobStartReply, i32> {
-        use crate::pon_engine::ploam::OnuState;
-        if !self
-            .optics
-            .platform
-            .resources()
-            .onu_ids
-            .contains(&request.onu_id)
-        {
-            return Err(2);
-        }
-        let engine = self.engine.try_lock().map_err(|_| 9)?;
-        if !engine.active_onus.iter().any(|onu| {
-            onu.onu_id == request.onu_id
-                && onu.full_sn_str() == request.optical_sn
-                && onu.state == OnuState::O5Operation
-        }) {
-            return response(fttr_jobs::error(
-                "Device registration changed; reopen device details",
-            ));
-        }
-        let generation = self
-            .services
-            .try_lock()
-            .map_err(|_| 9)?
-            .get(&request.onu_id)
-            .map(|s| s.generation)
-            .ok_or(9)?;
-        drop(engine);
-        let handler = self.clone();
-        let guard: crate::controller::inventory::RegistrationGuard =
-            std::sync::Arc::new(move || {
-                let Ok(engine) = handler.engine.lock() else {
-                    return false;
-                };
-                let Ok(services) = handler.services.lock() else {
-                    return false;
-                };
-                engine.active_onus.iter().any(|onu| {
-                    onu.onu_id == request.onu_id
-                        && onu.full_sn_str() == request.optical_sn
-                        && onu.state == OnuState::O5Operation
-                }) && services
-                    .get(&request.onu_id)
-                    .is_some_and(|s| s.generation == generation)
-            });
-        let states = self.services.clone();
-        let id = request.onu_id;
-        let tables = request.tables;
-        let platform = self.optics.platform;
-        response(self.jobs.start_with_progress("mib", move |progress| {
-            progress.update(fttr_jobs::Phase::Starting, 0, None);
-            match crate::controller::inventory::control_guarded(
-                platform,
-                id,
-                tables,
-                Some(crate::controller::inventory::MibProgressReporter::Job(
-                    progress,
-                )),
-                &states,
-                Some(guard.clone()),
-            ) {
-                Ok(report) if guard() => match serde_json::to_value(report)
-                    .and_then(serde_json::from_value::<MibReport>)
-                {
-                    Ok(report) => serde_json::to_value(MibSnapshot {
-                        status: MibReady::Ready,
-                        report,
-                    })
-                    .expect("MIB snapshot is JSON serializable"),
-                    Err(_) => fttr_jobs::error("Invalid MIB report contract"),
-                },
-                Ok(_) => fttr_jobs::error("Device registration changed during MIB read"),
-                Err(error) => fttr_jobs::error(&error.to_string()),
-            }
-        }))
+        crate::controller::ubus_mib::start(
+            self.optics.platform,
+            self.engine.clone(),
+            self.services.clone(),
+            &self.jobs,
+            request,
+        )
     }
     fn mib_result(&self, request: JobRequest) -> Result<JobChunkReply, i32> {
         response(self.jobs.result(&request.job, request.chunk, Some("mib")))
@@ -358,34 +292,37 @@ impl Handlers {
         optical(&self.optics, OpticalCommand::Set(request))
     }
     fn get_status(&self, _: EmptyRequest) -> Result<StatusReply, i32> {
-        let provisioning =
-            serde_json::from_value(crate::provisioning::snapshot()).map_err(|_| 9)?;
-        let devices = self.devices.lock().map_err(|_| 9)?;
-        let engine = self.engine.lock().map_err(|_| 9)?;
+        let provisioning = serde_json::from_value(crate::provisioning::snapshot())
+            .map_err(|_| UBUS_ERROR_INTERNAL)?;
+        let devices = self.devices.lock().map_err(|_| UBUS_ERROR_INTERNAL)?;
+        let engine = self.engine.lock().map_err(|_| UBUS_ERROR_INTERNAL)?;
         let mut status = crate::platform::h3c_hm2004_du::status::snapshot(
             &engine,
             &self.services,
             (&devices, provisioning),
         );
         if let Some(jobs) = self.jobs.snapshot() {
-            status.jobs = Some(serde_json::from_value(jobs).map_err(|_| 9)?);
+            status.jobs = Some(serde_json::from_value(jobs).map_err(|_| UBUS_ERROR_INTERNAL)?);
         }
         status.ubus = metrics::snapshot();
         status.ipc = Some(super::ipc_server::metrics::snapshot());
         Ok(status)
     }
     fn get_sync(&self, _: EmptyRequest) -> Result<SyncStatusReply, i32> {
-        serde_json::from_value(crate::provisioning::snapshot()).map_err(|_| 9)
+        serde_json::from_value(crate::provisioning::snapshot()).map_err(|_| UBUS_ERROR_INTERNAL)
     }
     fn config_check(&self, _: EmptyRequest) -> Result<ConfigCheckReply, i32> {
-        serde_json::from_str(&crate::provisioning::control("{\"op\":\"check\"}")).map_err(|_| 9)
+        serde_json::from_str(&crate::provisioning::control("{\"op\":\"check\"}"))
+            .map_err(|_| UBUS_ERROR_INTERNAL)
     }
     fn config_reload(&self, _: EmptyRequest) -> Result<ConfigReloadReply, i32> {
-        serde_json::from_str(&crate::provisioning::control("{\"op\":\"reload\"}")).map_err(|_| 9)
+        serde_json::from_str(&crate::provisioning::control("{\"op\":\"reload\"}"))
+            .map_err(|_| UBUS_ERROR_INTERNAL)
     }
     fn sync(&self, request: SyncRequest) -> Result<SyncReply, i32> {
         let payload = request.provisioning_request().map_err(|_| 2)?;
-        serde_json::from_str(&crate::provisioning::control(&payload.to_string())).map_err(|_| 9)
+        serde_json::from_str(&crate::provisioning::control(&payload.to_string()))
+            .map_err(|_| UBUS_ERROR_INTERNAL)
     }
     fn restart_service(&self, _: EmptyRequest) -> Result<RestartReply, i32> {
         std::thread::Builder::new()
@@ -407,7 +344,7 @@ impl Handlers {
                     eprintln!("[ubus] service restart request failed: {error}");
                 }
             })
-            .map_err(|_| 9)?;
+            .map_err(|_| UBUS_ERROR_INTERNAL)?;
         Ok(RestartReply { restarting: true })
     }
     fn npu_status(&self, _: EmptyRequest) -> Result<NpuStatus, i32> {
@@ -456,7 +393,7 @@ pub(super) fn methods(
 }
 
 fn response<R: DeserializeOwned>(value: serde_json::Value) -> Result<R, i32> {
-    serde_json::from_value(value).map_err(|_| 9)
+    serde_json::from_value(value).map_err(|_| UBUS_ERROR_INTERNAL)
 }
 
 #[cfg(feature = "device-hl202")]
@@ -480,5 +417,5 @@ fn normalize_hl_result(
 fn normalize<R: DeserializeOwned + Serialize>(
     value: serde_json::Value,
 ) -> Result<serde_json::Value, i32> {
-    serde_json::to_value(response::<R>(value)?).map_err(|_| 9)
+    serde_json::to_value(response::<R>(value)?).map_err(|_| UBUS_ERROR_INTERNAL)
 }

@@ -55,6 +55,25 @@ pub(crate) trait PlatformBackend: Debug + Sync {
 
 /// Optional hardware diagnostics. A platform need not have an FPGA or UX3326.
 pub(crate) trait PlatformDiagnostics: Sync {
+    /// Pure validation, before opening/configuring the endpoint. Limits belong
+    /// to the platform, not to the generic CLI or Linux SPI transport.
+    fn validate_register_access(
+        &self,
+        _space: super::diagnostics::RegisterSpace,
+        _address: u32,
+        _row: u32,
+        _words: usize,
+    ) -> io::Result<()> {
+        Err(unsupported("register access"))
+    }
+    /// Open one exclusive raw-register session. Keep it alive across RMW and
+    /// readback; opening separately for each transfer would lose serialization.
+    fn open_registers(
+        &self,
+        _endpoint: &Path,
+    ) -> io::Result<Box<dyn super::diagnostics::RegisterSession>> {
+        Err(unsupported("register session"))
+    }
     fn read_fpga_reg(&self, _address: u32) -> io::Result<u32> {
         Err(unsupported("FPGA read"))
     }
@@ -79,6 +98,13 @@ pub(crate) trait PlatformDiagnostics: Sync {
     fn set_optical_tx_enable(&self, _enabled: bool) -> io::Result<()> {
         Err(unsupported("optical TX control"))
     }
+    fn calibrate_bosa(
+        &self,
+        _source: &Path,
+        _offset: u64,
+    ) -> io::Result<super::diagnostics::BosaCalibrationEvidence> {
+        Err(unsupported("BOSA calibration"))
+    }
     fn get_optical_tx_enable(&self) -> io::Result<bool> {
         Err(unsupported("optical TX readback"))
     }
@@ -91,6 +117,8 @@ pub(crate) fn resolve(id: PlatformId) -> Result<&'static dyn PlatformBackend, Se
     match id {
         #[cfg(feature = "platform-h3c-hm2004-du")]
         PlatformId::H3cHm2004Du => Ok(&super::h3c_hm2004_du::Hm2004Du),
+        #[cfg(feature = "platform-fiberhome-an4475-g2")]
+        PlatformId::FiberhomeAn4475G2 => Ok(&super::fiberhome_an4475_g2::An4475G2),
         _ => Err(SelectionError::BackendNotImplemented(id)),
     }
 }
@@ -100,4 +128,32 @@ pub(crate) fn unsupported(operation: &str) -> io::Error {
         io::ErrorKind::Unsupported,
         format!("platform {operation} is unavailable"),
     )
+}
+
+pub(crate) fn resolve_diagnostics(
+    id: PlatformId,
+) -> Result<&'static dyn PlatformDiagnostics, SelectionError> {
+    if !super::runtime::is_compiled(id) {
+        return Err(SelectionError::PlatformNotCompiled(id));
+    }
+    #[cfg(feature = "platform-fiberhome-an4475-g2")]
+    if id == PlatformId::FiberhomeAn4475G2 {
+        return Ok(&super::fiberhome_an4475_g2::diagnostics::FslDiagnostics);
+    }
+    resolve(id)?
+        .diagnostics()
+        .ok_or(SelectionError::BackendNotImplemented(id))
+}
+
+/// Compile-time runtime operations; never opens a device or treats a diagnostic
+/// implementation as a fully initialized runtime.
+pub(crate) fn compiled_operations() -> impl Iterator<Item = fttr_api::PlatformOperations> {
+    [
+        PlatformId::H3cHm2004Du,
+        PlatformId::FiberhomeAn4475G2,
+        PlatformId::TianyiTyfza1,
+    ]
+    .into_iter()
+    .filter_map(|id| resolve(id).ok())
+    .map(|backend| backend.operations())
 }

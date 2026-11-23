@@ -1,4 +1,4 @@
-//! Bounded process execution for the offload reconciler.
+//! Bounded process execution for platform workers and reconcilers.
 use std::{
     io::{self, Read},
     os::fd::AsRawFd,
@@ -107,7 +107,7 @@ mod tests {
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "npu::command::tests::sync_rejects_unavailable_exit_status",
+                "platform::openwrt::command::tests::sync_rejects_unavailable_exit_status",
             ])
             .env(ISOLATED, "1")
             .status()
@@ -143,28 +143,4 @@ mod tests {
         }
         assert!(run_sync("sh", &["-c", "exit 1"], Duration::from_secs(1)).is_err());
     }
-}
-
-/// Bounded asynchronous process execution with timeout.
-/// Killing a dropped child ensures task cancellation doesn't leak orphan processes.
-pub async fn run_async(program: &str, args: &[&str], timeout: Duration) -> io::Result<String> {
-    let output = tokio::time::timeout(
-        timeout,
-        tokio::process::Command::new(program)
-            .args(args)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("{program} timed out after {timeout:?}"),
-        )
-    })??;
-
-    if !output.status.success() {
-        return Err(io::Error::other(format!("{program}: {}", output.status)));
-    }
-    String::from_utf8(output.stdout).map_err(io::Error::other)
 }

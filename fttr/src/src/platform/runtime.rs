@@ -99,6 +99,24 @@ fn identify_with_descriptors(
     device_tree_compatible: &[u8],
     descriptors: &[PlatformDescriptor],
 ) -> Result<PlatformId, SelectionError> {
+    identify_for_purpose(board_name, device_tree_compatible, descriptors, false)
+}
+
+/// Same exact identity/compilation checks as runtime selection, but permits a
+/// diagnostic-only implementation. This never authorizes starting the daemon.
+pub fn identify_diagnostics_from_values(
+    board_name: Option<&str>,
+    device_tree_compatible: &[u8],
+) -> Result<PlatformId, SelectionError> {
+    identify_for_purpose(board_name, device_tree_compatible, &descriptors(), true)
+}
+
+fn identify_for_purpose(
+    board_name: Option<&str>,
+    device_tree_compatible: &[u8],
+    descriptors: &[PlatformDescriptor],
+    diagnostics: bool,
+) -> Result<PlatformId, SelectionError> {
     let board_name =
         board_name.map(|value| value.trim_matches(|c: char| c == '\0' || c.is_ascii_whitespace()));
     let compatible_values: Vec<&str> = device_tree_compatible
@@ -133,7 +151,9 @@ fn identify_with_descriptors(
     if descriptor.identification != IdentificationStatus::Verified {
         return Err(SelectionError::IdentificationPending(descriptor.id));
     }
-    if descriptor.implementation != PlatformImplementation::Runtime {
+    if descriptor.implementation != PlatformImplementation::Runtime
+        && !(diagnostics && descriptor.implementation == PlatformImplementation::DiagnosticsOnly)
+    {
         return Err(SelectionError::BackendNotImplemented(descriptor.id));
     }
 
@@ -141,12 +161,24 @@ fn identify_with_descriptors(
 }
 
 pub fn detect() -> Result<PlatformId, SelectionError> {
+    detect_for_purpose(false)
+}
+
+pub fn detect_diagnostics() -> Result<PlatformId, SelectionError> {
+    detect_for_purpose(true)
+}
+
+fn detect_for_purpose(diagnostics: bool) -> Result<PlatformId, SelectionError> {
     let board = fs::read(BOARD_NAME).ok();
     let compatible = fs::read(DEVICE_TREE_COMPATIBLE).unwrap_or_default();
     let board_name = board
         .as_deref()
         .and_then(|bytes| str::from_utf8(bytes).ok());
-    identify_from_values(board_name, &compatible)
+    if diagnostics {
+        identify_diagnostics_from_values(board_name, &compatible)
+    } else {
+        identify_from_values(board_name, &compatible)
+    }
 }
 
 /// Read-only build/runtime summary for support diagnostics.
@@ -165,17 +197,21 @@ pub fn report_json() -> String {
                 },
                 "implementation": match descriptor.implementation {
                     PlatformImplementation::Runtime => "runtime",
+                    PlatformImplementation::DiagnosticsOnly => "diagnostics-only",
                     PlatformImplementation::CompileableStub => "stub",
                 },
             })
         })
         .collect::<Vec<_>>();
     let selected = super::context::PlatformContext::detect();
+    let diagnostic = detect_diagnostics();
     serde_json::json!({
         "schema_version": 1,
         "platforms": platforms,
         "selected_platform": selected.as_ref().ok().map(|platform| platform.id().as_str()),
         "selection_ready": selected.is_ok(),
+        "diagnostic_platform": diagnostic.as_ref().ok().map(|id| id.as_str()),
+        "diagnostic_selection_ready": diagnostic.is_ok(),
         "runtime_ready": false,
         "hardware_ready": null,
         "selection_error": selected.err().map(|error| error.to_string()),
@@ -228,7 +264,7 @@ mod tests {
     #[test]
     fn conflicting_identity_sources_are_ambiguous() {
         let mut fiberhome = An4475G2::DESCRIPTOR;
-        // Synthetic test ID: actual FiberHome identifiers remain unverified.
+        // Synthetic identity to isolate ambiguity handling from board metadata.
         fiberhome.device_tree_compatibles = &["fiberhome,test-board"];
         assert_eq!(
             identify_with_descriptors(
@@ -246,9 +282,10 @@ mod tests {
     #[test]
     fn recognized_stub_never_dispatches_to_h3c_runtime() {
         let mut fiberhome = An4475G2::DESCRIPTOR;
-        // Synthetic test ID: actual FiberHome identifiers remain unverified.
+        // Synthetic stub to test rejection independently of diagnostic support.
         fiberhome.board_names = &["fiberhome,test-board"];
         fiberhome.identification = IdentificationStatus::Verified;
+        fiberhome.implementation = PlatformImplementation::CompileableStub;
         let expected = if cfg!(feature = "platform-fiberhome-an4475-g2") {
             Err(SelectionError::BackendNotImplemented(
                 PlatformId::FiberhomeAn4475G2,
@@ -261,6 +298,32 @@ mod tests {
         assert_eq!(
             identify_with_descriptors(Some("fiberhome,test-board"), b"", &[fiberhome]),
             expected
+        );
+    }
+
+    #[test]
+    fn fiberhome_diagnostics_never_authorize_generic_evb() {
+        let id = PlatformId::FiberhomeAn4475G2;
+        let expected = if cfg!(feature = "platform-fiberhome-an4475-g2") {
+            Ok(id)
+        } else {
+            Err(SelectionError::PlatformNotCompiled(id))
+        };
+        assert_eq!(
+            identify_diagnostics_from_values(None, b"fiberhome,an4475-g2\0"),
+            expected
+        );
+        assert_eq!(
+            identify_from_values(Some("fiberhome,an4475-g2"), b""),
+            expected
+        );
+        assert_eq!(
+            identify_diagnostics_from_values(None, b"airoha,an7581-evb\0airoha,an7581\0"),
+            Err(SelectionError::UnknownPlatform)
+        );
+        assert_eq!(
+            super::super::context::PlatformContext::resolve(id).is_ok(),
+            cfg!(feature = "platform-fiberhome-an4475-g2")
         );
     }
 
