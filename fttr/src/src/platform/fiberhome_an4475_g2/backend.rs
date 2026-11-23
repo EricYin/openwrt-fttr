@@ -1,5 +1,5 @@
 //! FiberHome AN4475-G2 implementation of the shared platform operation boundary.
-use super::{diagnostics::FslDiagnostics, health, runtime, An4475G2, RESOURCES};
+use super::{diagnostics::FslDiagnostics, health, runtime, An4475G2};
 use crate::{
     platform::{
         adapter::{PlatformAdapter, PlatformDescriptor},
@@ -18,7 +18,7 @@ impl PlatformBackend for An4475G2 {
     }
 
     fn resources(&self) -> &'static Resources {
-        &RESOURCES
+        super::active_resources()
     }
 
     fn operations(&self) -> fttr_api::PlatformOperations {
@@ -71,6 +71,8 @@ impl PlatformBackend for An4475G2 {
     }
 
     fn run(&self, platform: PlatformContext) -> Result<(), SelectionError> {
+        super::configure_resources()
+            .map_err(|error| SelectionError::InvalidResources(platform.id(), error))?;
         runtime::run(platform);
         Ok(())
     }

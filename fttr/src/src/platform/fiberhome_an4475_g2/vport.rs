@@ -3,7 +3,7 @@
 //! FSL maps upstream/downstream NNI outer VLAN IDs using `VID = gem_port_id - NNI_GEMPORT_OFFSET`.
 //! Programming the FSL NNI TPID to `0x88a8` lets the standard Linux `8021q` stack demultiplex
 //! each ONU onto its own `fttr1..fttr128` netdev while preserving inner `0x8100` business/TR-069 VLANs.
-use super::RESOURCES;
+use super::active_resources;
 use crate::platform::openwrt::command::run_sync;
 use std::{
     fs, io,
@@ -152,10 +152,71 @@ fn attach_bridge(iface: &str, bridge: &str) -> io::Result<()> {
     run_ip_link(&["set", iface, "master", bridge])
 }
 
+fn verify_no_link_children(net: &Path, iface: &str, index: &str) -> io::Result<()> {
+    for entry in fs::read_dir(net)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == iface {
+            continue;
+        }
+        // /sys/class/net also contains ordinary files, e.g. bonding_masters.
+        // Follow interface symlinks, while tolerating an interface disappearing.
+        match fs::metadata(entry.path()) {
+            Ok(metadata) if !metadata.is_dir() => continue,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        let link = fs::read_to_string(entry.path().join("iflink"))?;
+        if link.trim() == index.trim() {
+            return Err(io::Error::other(format!(
+                "{iface} has dependent interface {}",
+                name.to_string_lossy()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_no_dependencies(iface: &str, bridge: &str) -> io::Result<()> {
+    let network = fs::read_to_string("/etc/config/network")?;
+    if network_references_interface(&network, iface) {
+        return Err(io::Error::other(format!(
+            "{iface} is referenced by network configuration"
+        )));
+    }
+    let path = format!("/sys/class/net/{iface}");
+    let index = fs::read_to_string(format!("{path}/ifindex"))?;
+    verify_no_link_children(Path::new("/sys/class/net"), iface, &index)?;
+    for entry in fs::read_dir(&path)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(upper) = name.strip_prefix("upper_") {
+            if upper != bridge {
+                return Err(io::Error::other(format!(
+                    "{iface} has dependent interface {upper}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn network_references_interface(network: &str, iface: &str) -> bool {
+    network
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .any(|word| {
+            word == iface
+                || word
+                    .strip_prefix(iface)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+}
+
 pub fn prepare_nni_and_ports(nni: &str, gem_offset: u16, stopping: &AtomicBool) -> io::Result<()> {
     let _guard = VPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Reject a foreign or legacy port before changing the NNI or any sibling.
-    for entry in RESOURCES.allocations {
+    for entry in active_resources().allocations {
         // Same responsiveness rule as the creation loop below: this pass also
         // shells out once per port.
         if stopping.load(Ordering::Acquire) {
@@ -168,6 +229,37 @@ pub fn prepare_nni_and_ports(nni: &str, gem_offset: u16, stopping: &AtomicBool) 
         if Path::new(&format!("/sys/class/net/{iface}")).exists() {
             verify_existing_port(iface, nni, vid)?;
         }
+    }
+    // First inspect every owned out-of-range port; foreign interfaces are never removed.
+    let bridge = configured_bridge();
+    let mut stale = Vec::new();
+    for entry in &super::RESOURCES.allocations[active_resources().allocations.len()..] {
+        if stopping.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "stopping"));
+        }
+        let iface = entry.interface.expect("AN4475 port mapping");
+        let path = format!("/sys/class/net/{iface}");
+        if !Path::new(&path).exists() {
+            continue;
+        }
+        let alias = fs::read_to_string(format!("{path}/ifalias"))?;
+        if alias.trim() != PORT_ALIAS {
+            continue;
+        }
+        verify_existing_port(iface, nni, gem_to_vid(entry.gem_id, gem_offset)?)?;
+        verify_no_dependencies(iface, &bridge)?;
+        stale.push(iface);
+    }
+    for iface in stale {
+        // Recheck immediately before deletion to narrow dependency races.
+        let entry = super::RESOURCES
+            .allocations
+            .iter()
+            .find(|entry| entry.interface == Some(iface))
+            .expect("AN4475 port mapping");
+        verify_existing_port(iface, nni, gem_to_vid(entry.gem_id, gem_offset)?)?;
+        verify_no_dependencies(iface, &bridge)?;
+        run_ip_link(&["delete", iface])?;
     }
     let mtu = NNI_MTU.to_string();
     run_ip_link(&["set", nni, "mtu", &mtu, "up"])?;
@@ -188,8 +280,7 @@ pub fn prepare_nni_and_ports(nni: &str, gem_offset: u16, stopping: &AtomicBool) 
         ));
     }
 
-    let bridge = configured_bridge();
-    for entry in RESOURCES.allocations {
+    for entry in active_resources().allocations {
         // 128 ports × several bounded `ip` calls each: keep a shutdown request
         // responsive instead of finishing the whole loop. The next start
         // re-runs this idempotent preparation for the remaining ports.
@@ -217,7 +308,7 @@ pub fn prepare_nni_and_ports(nni: &str, gem_offset: u16, stopping: &AtomicBool) 
 }
 
 fn set_port_up_locked(onu_id: u8, up: bool) -> io::Result<()> {
-    let iface = RESOURCES.interface(onu_id).ok_or_else(|| {
+    let iface = active_resources().interface(onu_id).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("ONU {onu_id} has no assigned VPORT interface"),
@@ -237,7 +328,7 @@ fn set_port_up_locked(onu_id: u8, up: bool) -> io::Result<()> {
             format!("VPORT interface {iface} does not exist"),
         ));
     }
-    let entry = RESOURCES.onu(onu_id)?;
+    let entry = active_resources().onu(onu_id)?;
     let vid = gem_to_vid(
         entry.gem_id,
         super::initialization::defaults::DEFAULT_NNI_GEMPORT_OFFSET,
@@ -262,7 +353,7 @@ pub fn set_port_up(onu_id: u8, up: bool) -> io::Result<()> {
 pub fn bring_all_ports_down() -> io::Result<()> {
     let _guard = VPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut errors = Vec::new();
-    for entry in RESOURCES.allocations {
+    for entry in active_resources().allocations {
         if let Err(error) = set_port_up_locked(entry.onu_id, false) {
             errors.push(format!("ONU {}: {error}", entry.onu_id));
         }
@@ -297,6 +388,34 @@ mod tests {
         assert!(!valid_interface_name("../br-lan"));
         assert!(!valid_interface_name("br lan"));
         assert!(!valid_interface_name("0123456789abcdef"));
+    }
+
+    #[test]
+    fn stale_port_network_references_include_vlan_children_but_not_other_slots() {
+        assert!(network_references_interface(
+            "list ports 'fttr128'",
+            "fttr128"
+        ));
+        assert!(network_references_interface(
+            "option device 'fttr128.46'",
+            "fttr128"
+        ));
+        assert!(!network_references_interface(
+            "list ports 'fttr128'",
+            "fttr12"
+        ));
+    }
+
+    #[test]
+    fn dependency_scan_skips_non_interface_files_and_rejects_children() {
+        let root =
+            std::env::temp_dir().join(format!("fttr-vport-dependencies-{}", std::process::id()));
+        fs::create_dir_all(root.join("fttr128.46")).unwrap();
+        fs::write(root.join("bonding_masters"), "").unwrap();
+        fs::write(root.join("fttr128.46/iflink"), "42\n").unwrap();
+        assert!(verify_no_link_children(&root, "fttr128", "41").is_ok());
+        assert!(verify_no_link_children(&root, "fttr128", "42").is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -558,6 +558,9 @@ pub fn control(request: &str) -> String {
         match v["op"].as_str().unwrap_or("") {
             "check" => {
                 let cfg = config::load()?;
+                if let Some(resources) = controller().lock().unwrap().resources {
+                    lifecycle::validate_desired_pins(resources, &cfg)?;
+                }
                 Ok(json!({"valid":true,"revision":cfg.revision,"devices":cfg.devices.len()}))
             }
             "reload" => {

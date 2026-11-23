@@ -2,6 +2,22 @@ use super::*;
 use serde::ser::{Serialize, SerializeSeq, Serializer};
 use serde::Deserialize;
 
+pub(super) fn validate_desired_pins(
+    resources: &crate::platform::resources::Resources,
+    config: &Config,
+) -> Result<(), String> {
+    #[cfg(feature = "platform-fiberhome-an4475-g2")]
+    if std::ptr::eq(
+        resources,
+        crate::platform::fiberhome_an4475_g2::active_resources(),
+    ) {
+        let count = usize::from(config.fiberhome_onu_count.unwrap_or(128));
+        return crate::platform::fiberhome_an4475_g2::resources_for_count(count)
+            .validate_pins(&config.onu_pins);
+    }
+    resources.validate_pins(&config.onu_pins)
+}
+
 #[derive(Deserialize)]
 struct Recovered {
     operations: Vec<Value>,
@@ -155,7 +171,7 @@ impl Controller {
 
     pub(super) fn request_config(&mut self, config: Config) {
         if let Some(resources) = self.resources {
-            if let Err(error) = resources.validate_pins(&config.onu_pins) {
+            if let Err(error) = validate_desired_pins(resources, &config) {
                 self.config_error = Some(error);
                 return;
             }
@@ -245,7 +261,7 @@ impl Controller {
 
     pub(super) fn replace_config(&mut self, mut config: Config) -> Result<(), String> {
         if let Some(resources) = self.resources {
-            resources.validate_pins(&config.onu_pins)?;
+            validate_desired_pins(resources, &config)?;
         }
         if self.pending_config.is_some() {
             return Err("configuration reload pending; wait for automatic activation".into());

@@ -99,6 +99,36 @@ pub const RESOURCES: super::resources::Resources = super::resources::Resources {
 };
 
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
+static ACTIVE_RESOURCES: std::sync::OnceLock<super::resources::Resources> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
+pub(crate) fn resources_for_count(count: usize) -> super::resources::Resources {
+    super::resources::Resources {
+        onu_ids: &RESOURCES.onu_ids[..count],
+        downstream_interfaces: &RESOURCES.downstream_interfaces[..count],
+        allocations: &RESOURCES.allocations[..count],
+        ..RESOURCES
+    }
+}
+
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
+pub(crate) fn active_resources() -> &'static super::resources::Resources {
+    ACTIVE_RESOURCES.get().unwrap_or(&RESOURCES)
+}
+
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
+fn configure_resources() -> Result<(), String> {
+    let config = crate::provisioning::load_config()?;
+    let count = usize::from(config.fiberhome_onu_count.unwrap_or(ONU_COUNT as u8));
+    let resources = resources_for_count(count);
+    resources.validate_pins(&config.onu_pins)?;
+    ACTIVE_RESOURCES
+        .set(resources)
+        .map_err(|_| "AN4475 resources already configured".to_string())
+}
+
+#[cfg(feature = "platform-fiberhome-an4475-g2")]
 const fn allocations() -> [super::resources::OnuResources; ONU_COUNT] {
     let mut entries = [super::resources::OnuResources {
         onu_id: 0,
@@ -140,6 +170,22 @@ impl PlatformAdapter for An4475G2 {
 #[cfg(all(test, feature = "platform-fiberhome-an4475-g2"))]
 mod resource_tests {
     use super::*;
+
+    #[test]
+    fn configured_prefix_preserves_slot_mappings() {
+        for count in [1, 31, 32, 127, 128] {
+            let resources = resources_for_count(count);
+            assert_eq!(resources.onu_ids.len(), count);
+            assert_eq!(resources.downstream_interfaces.len(), count);
+            assert_eq!(resources.allocations.len(), count);
+            assert_eq!(
+                resources.onu((count - 1) as u8).unwrap().alloc_id,
+                0x400 + count as u16 - 1
+            );
+            assert!(resources.onu(count as u8).is_err());
+            resources.validate().unwrap();
+        }
+    }
 
     #[test]
     fn all_slots_have_distinct_valid_allocations_and_interfaces() {

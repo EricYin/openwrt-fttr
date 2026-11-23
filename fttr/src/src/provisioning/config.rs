@@ -148,6 +148,12 @@ pub(super) fn parse_sections(text: &str) -> Result<Vec<(String, Section)>, Strin
                 {
                     return Err("device onu_id requires one scalar option".into());
                 }
+                if section.kind == "fiberhome"
+                    && w[1] == "onu_count"
+                    && (w[0] != "option" || section.options.contains_key("onu_count"))
+                {
+                    return Err("fiberhome onu_count requires one scalar option".into());
+                }
                 if section.kind == "management" && w[1] == "vlan" && w[0] != "list" {
                     return Err(
                         "management VLAN requires list vlan; scalar option vlan is unsupported"
@@ -281,8 +287,8 @@ pub(super) fn compile_sections(input: Vec<(String, Section)>) -> Result<Config, 
                         crate::pon_engine::onu_id::MAX_ONU_ID
                     )
                 })?;
-            if let Some((sn, _)) = cfg.onu_pins.iter().find(|(_, n)| **n == slot) {
-                return Err(format!("{id}: onu_id {slot} already reserved for {sn}"));
+            if cfg.onu_pins.values().any(|n| *n == slot) {
+                return Err(format!("{id}: onu_id {slot} already reserved"));
             }
             cfg.onu_pins
                 .insert(s.get("optical_sn").to_ascii_uppercase(), slot);

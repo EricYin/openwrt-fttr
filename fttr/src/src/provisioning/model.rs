@@ -229,6 +229,8 @@ impl Device {
 pub struct Config {
     pub omci_auth: crate::omci_auth::Config,
     pub onu_pins: BTreeMap<String, u8>,
+    /// Desired AN4475 slot count, absent on configurations that use the default.
+    pub fiberhome_onu_count: Option<u8>,
     pub revision: String,
     pub business_revision: Option<String>,
     pub enabled: bool,

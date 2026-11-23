@@ -48,6 +48,24 @@ pub fn compile(text: &str) -> Result<Config, String> {
     crate::optical::parse_export(text).map_err(|error| error.to_string())?;
     crate::optical::parse_calibration_mode(text).map_err(|error| error.to_string())?;
     let all = config::parse_sections(text)?;
+    let fiberhome: Vec<_> = all.iter().filter(|(_, s)| s.kind == "fiberhome").collect();
+    if fiberhome.len() > 1 || fiberhome.first().is_some_and(|(id, _)| id != "fiberhome") {
+        return Err("fiberhome requires one named fiberhome section".into());
+    }
+    let onu_count = fiberhome
+        .first()
+        .map(|(_, s)| {
+            let value = s.get("onu_count");
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("fiberhome onu_count must be 1..128".to_string());
+            }
+            value
+                .parse::<u8>()
+                .ok()
+                .filter(|n| (1..=128).contains(n))
+                .ok_or_else(|| "fiberhome onu_count must be 1..128".to_string())
+        })
+        .transpose()?;
     if all.iter().filter(|(_, s)| s.kind == "management").count() > 1 {
         return Err("only one management network allowed".into());
     }
@@ -68,10 +86,12 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 | "offload"
                 | "mqtt"
                 | "omci_auth"
+                | "fiberhome"
         ) {
             return Err(format!("unsupported section: {}", s.kind));
         }
         let allowed: &[&str] = match s.kind.as_str() {
+            "fiberhome" => &["onu_count"],
             "omci_auth" => &["auth_mode", "auth_loid", "auth_password", "schema_version"],
             "optical" => &["enabled", "downstream_tx_enabled", "fec_enabled"],
             "calibration" => &["source"],
@@ -366,6 +386,14 @@ pub fn compile(text: &str) -> Result<Config, String> {
         order.insert(device.clone(), network_ids);
     }
     let mut cfg = config::compile_sections(expanded)?;
+    cfg.fiberhome_onu_count = onu_count;
+    if let Some(count) = onu_count {
+        if cfg.onu_pins.values().any(|id| *id >= count) {
+            return Err(format!(
+                "configured ONU-ID exceeds fiberhome onu_count {count}"
+            ));
+        }
+    }
     cfg.omci_auth = config::compile_auth(&all.iter().cloned().collect())?;
     if let Some((_, s)) = all.iter().find(|(_, s)| s.kind == "management") {
         let acs = all.iter().find(|(_, s)| s.kind == "acs").map(|(_, s)| s);
@@ -436,7 +464,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
     let mut canonical = String::new();
     let mut business_canonical = String::new();
     for (id, s) in &all {
-        if !matches!(s.kind.as_str(), "optical" | "calibration") {
+        if !matches!(s.kind.as_str(), "optical" | "calibration" | "fiberhome") {
             let mut business = s.clone();
             if business.kind == "device" {
                 business.options.remove("onu_id");
@@ -475,6 +503,37 @@ pub fn compile(text: &str) -> Result<Config, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fiberhome_count_and_pins_are_strict_and_redacted() {
+        let base = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'TESTabcdef01'\n option omci_adapter 'generic'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'none'\n option group 'g'\n option onu_id '31'\n";
+        assert_eq!(super::compile(base).unwrap().fiberhome_onu_count, None);
+        for count in [32, 128] {
+            let text = format!("{base}config fiberhome 'fiberhome'\n option onu_count '{count}'\n");
+            assert_eq!(
+                super::compile(&text).unwrap().fiberhome_onu_count,
+                Some(count)
+            );
+        }
+        let conflict = format!("{base}config fiberhome 'fiberhome'\n option onu_count '31'\n");
+        let error = super::compile(&conflict).err().unwrap();
+        assert!(!error.contains("TEST"));
+        for value in ["0", "129", "", "-1", "+1", " 32"] {
+            assert!(super::compile(&format!(
+                "config fiberhome 'fiberhome'\n option onu_count '{value}'\n"
+            ))
+            .is_err());
+        }
+        for options in [
+            "list onu_count '32'",
+            "option onu_count '32'\n option onu_count '32'",
+        ] {
+            assert!(
+                super::compile(&format!("config fiberhome 'fiberhome'\n {options}\n")).is_err()
+            );
+        }
+        assert!(super::compile("config fiberhome 'other'\n option onu_count '32'\n").is_err());
+    }
 
     #[test]
     fn onu_pins_are_strict_unique_and_independent_of_business_revision() {

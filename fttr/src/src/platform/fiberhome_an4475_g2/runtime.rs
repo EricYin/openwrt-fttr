@@ -8,7 +8,6 @@ use super::{
     olt::{FslOltSession, OltSessionConfig, OnuState as FslOnuState, OnuUpstreamRate},
     protocol::Bus,
     transport::Device,
-    ONU_COUNT,
 };
 use crate::{
     controller::{
@@ -52,7 +51,7 @@ fn deactivate_session_onu(session: &mut FslOltSession<Device>, id: u8) -> io::Re
     if session.onu(id).is_none() {
         return Ok(false);
     }
-    let res = super::RESOURCES.onu(id)?;
+    let res = super::active_resources().onu(id)?;
     let max_onus = session.config().init.max_onu_id.min(128) as u8;
     let extra_tconts = alloc_to_tcont(res.alloc_id, 0, max_onus, 0)
         .map(|t| vec![t])
@@ -377,7 +376,7 @@ pub(crate) struct FslManagementLease {
 
 impl FslManagementLease {
     pub(crate) fn open(onu_id: u8) -> io::Result<Self> {
-        if usize::from(onu_id) >= ONU_COUNT {
+        if usize::from(onu_id) >= super::active_resources().onu_ids.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "ONU-ID out of AN4475-G2 range",
@@ -441,7 +440,7 @@ mod commit_tests {
 }
 
 fn configure_business_datapath(onu_id: u8, floor_bytes: Option<u16>) -> io::Result<()> {
-    let res = super::RESOURCES.onu(onu_id)?;
+    let res = super::active_resources().onu(onu_id)?;
     with_session(|session| {
         let onu = session
             .onu(onu_id)
@@ -520,7 +519,7 @@ pub(crate) fn send_ploam(frame: &PloamFrame) -> io::Result<()> {
 /// Revokes only the ONU's business data GEM port and data T-CONT without
 /// deactivating the ONU's O5 registration or OMCC management channel.
 pub(crate) fn revoke_business(id: u8) -> io::Result<()> {
-    let res = super::RESOURCES.onu(id)?;
+    let res = super::active_resources().onu(id)?;
     with_session(|session| {
         let Some(onu) = session.onu(id).copied() else {
             return Ok(());
@@ -733,24 +732,17 @@ fn initialize_hardware(
     engine: &Mutex<PonEngine>,
     stopping: &AtomicBool,
 ) -> io::Result<OpticalState> {
-    // ONU pins are an allocation preference, not a hardware prerequisite: a
-    // malformed UCI section must not take the whole optical service down. Fall
-    // back to pure automatic allocation and surface the reason via the log.
-    let pins = match crate::provisioning::load_config() {
-        Ok(config) => match super::RESOURCES.validate_pins(&config.onu_pins) {
-            Ok(()) => config.onu_pins,
-            Err(error) => {
-                eprintln!("[-] FSL ONU pins invalid, using automatic allocation: {error}");
-                BTreeMap::new()
-            }
-        },
-        Err(error) => {
-            eprintln!("[-] FSL cannot load ONU pins, using automatic allocation: {error}");
-            BTreeMap::new()
-        }
-    };
+    let loaded = crate::provisioning::load_config().map_err(io::Error::other)?;
+    super::active_resources()
+        .validate_pins(&loaded.onu_pins)
+        .map_err(io::Error::other)?;
+    let pins = loaded.onu_pins;
     let config = OltSessionConfig {
         nni_eth_tpid: super::initialization::defaults::IEEE_8021AD_TPID,
+        init: super::initialization::InitConfig {
+            max_onu_id: super::active_resources().onu_ids.len() as u16,
+            ..Default::default()
+        },
         ..OltSessionConfig::default()
     };
     super::vport::prepare_nni_and_ports(NNI_INTERFACE, config.nni_gem_port_offset, stopping)?;
@@ -779,7 +771,7 @@ fn initialize_hardware(
         // Stock `apply_gemport_defaults` pre-maps GEM 256..271 to ONU 0 and enables
         // WMCI on GEM 270. Clear our managed business GEM slots so each ONU's GEM
         // is bound strictly to its own `onu_index` only after provisioning succeeds.
-        for entry in super::RESOURCES.allocations {
+        for entry in super::active_resources().allocations {
             configure_gem_port(session.fsl_mut(), 0, 0, entry.gem_id, false)?;
             set_gem_wmci_aes(session.fsl_mut(), entry.gem_id, false, false)?;
         }
@@ -897,7 +889,7 @@ pub(crate) fn status_snapshot(
         services,
         (&devices, provisioning),
         crate::platform::status::Hardware {
-            switch_port_count: super::ONU_COUNT as u8,
+            switch_port_count: super::active_resources().onu_ids.len() as u8,
             // initialize_hardware publishes the session-enforced pin set to the
             // engine, so the pinning report distinguishes the enforced set from
             // the desired configuration (pending_restart on divergence) instead
@@ -1001,7 +993,7 @@ fn data_path(
     inventory: Option<fttr_api::OnuOmciInventory>,
 ) -> fttr_api::DataPathStatus {
     static SAMPLES: OnceLock<Mutex<BTreeMap<String, PortCounters>>> = OnceLock::new();
-    let interface = super::RESOURCES
+    let interface = super::active_resources()
         .interface(id)
         .unwrap_or("unmapped")
         .to_owned();
@@ -1126,7 +1118,7 @@ fn data_path(
         measurements.insert(name.into(), evidence);
     }
 
-    let olt_channel_gem = super::RESOURCES.onu(id).ok().map(|r| r.gem_id);
+    let olt_channel_gem = super::active_resources().onu(id).ok().map(|r| r.gem_id);
     let gem_ports: Option<Vec<u16>> = inventory
         .as_ref()
         .and_then(|v| v.gem_ports.iter().map(|p| p.port_id).collect());
@@ -1245,7 +1237,7 @@ fn ipc_handler(
 ) -> impl Fn(UnixStream, &str) + Send + Sync + 'static {
     move |mut stream, line| {
         if line == "BRIDGE SETUP" {
-            let response = match network::setup_bridge(&super::RESOURCES, "br-lan") {
+            let response = match network::setup_bridge(super::active_resources(), "br-lan") {
                 Ok(()) => serde_json::json!({"status": "success"}),
                 Err(error) => serde_json::json!({"status": "error", "error": error.to_string()}),
             };
