@@ -11,6 +11,32 @@ pub fn parse(input: &[u8]) -> std::io::Result<Report> {
     Ok(report)
 }
 
+/// Identity claims are only candidates until independently correlated with the
+/// current optical registration and bridge source port.
+pub(crate) fn identity_claim(report: &Report, topic_mac: &str) -> Option<(String, String)> {
+    let member = |name: &str| {
+        report
+            .members
+            .iter()
+            .find(|m| m.name == name)?
+            .text
+            .as_deref()
+            .map(str::trim)
+    };
+    let serial = member("SN")?;
+    if serial.len() != 12 || !serial.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let mac = crate::mqtt_identity::normalize_target(member("sn")?)?;
+    if crate::mqtt_identity::normalize_target(topic_mac)? != mac
+        || u8::from_str_radix(&mac[..2], 16).ok()? & 1 != 0
+        || mac == "000000000000"
+    {
+        return None;
+    }
+    Some((serial.to_ascii_uppercase(), mac))
+}
+
 fn check_json_limit(report: &Report) -> std::io::Result<()> {
     struct ByteCount(usize);
     impl std::io::Write for ByteCount {

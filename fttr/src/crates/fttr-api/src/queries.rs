@@ -104,6 +104,9 @@ pub struct SyncStatusReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "codegen", ts(optional))]
     pub config_load: Option<ConfigLoadStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub mqtt_bridge: Option<crate::MqttBridgeStatus>,
 }
 
 #[derive(Serialize, Deserialize)]

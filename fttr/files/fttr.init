@@ -33,6 +33,8 @@ start_service() {
 
 stop_service() {
 	echo "[*] Stopping FTTR Subsystem..."
+	nft delete table bridge fttr_mqtt_redirect 2>/dev/null || true
+	nft delete table ip fttr_mqtt_redirect 2>/dev/null || true
 	if "$PROG" --platform-check >/dev/null 2>&1; then
 		/usr/sbin/fttrctl optical shutdown --json || logger -t fttr "Owner shutdown failed; checking reset after termination"
 	fi
@@ -41,6 +43,8 @@ stop_service() {
 service_stopped() {
 	# procd deletion is asynchronous. The CLI waits boundedly for ownership;
 	# it never writes hardware while a daemon still owns it.
+	nft delete table bridge fttr_mqtt_redirect 2>/dev/null || true
+	nft delete table ip fttr_mqtt_redirect 2>/dev/null || true
 	if "$PROG" --platform-check >/dev/null 2>&1; then
 		/usr/sbin/fttrctl optical shutdown-offline --json || logger -t fttr "Optical reset not confirmed after stop"
 	fi

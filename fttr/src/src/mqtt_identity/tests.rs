@@ -10,6 +10,31 @@ fn links() -> BTreeMap<String, String> {
 }
 
 #[test]
+fn report_identity_requires_fresh_unambiguous_optical_mapping() {
+    let mut registry = Registry::new("daemon-a".into());
+    assert!(!registry.record_verified_report("H3CT12345678", "02AABBCCDDEE", 100));
+    registry.observe("02AABBCCDDEE", 100);
+    registry.update_topology(online(), Ok(links()), 100);
+    assert!(!registry.record_verified_report("H3CT87654321", "02AABBCCDDEE", 100));
+    assert!(registry.record_verified_report("H3CT12345678", "02AABBCCDDEE", 100));
+    assert_eq!(
+        registry.verified_report_candidate("H3CT12345678", 100),
+        Some("02AABBCCDDEE")
+    );
+    assert!(!registry.record_verified_report("H3CT12345678", "02AABBCCDDEE", 161));
+    assert_eq!(
+        registry.verified_report_candidate("H3CT12345678", 161),
+        None
+    );
+    registry.update_topology(online(), Err("FDB unavailable".into()), 162);
+    assert!(!registry.record_verified_report("H3CT12345678", "02AABBCCDDEE", 162));
+    assert_eq!(
+        registry.verified_report_candidate("H3CT12345678", 162),
+        None
+    );
+}
+
+#[test]
 fn mqtt_identity_resolves_without_acs_and_rejects_stale_selection() {
     let mut registry = Registry::new("daemon-a".into());
     registry.observe("02AABBCCDDEE/fttr_data.tar.gz", 100);

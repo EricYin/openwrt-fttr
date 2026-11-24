@@ -508,6 +508,64 @@ pub struct OmciAuthStatus {
     pub reported_loid: Option<String>,
     pub reported_password: Option<String>,
 }
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct MqttBridgeStatus {
+    pub enabled: bool,
+    pub state: String,
+    pub lan_origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub broker_listen: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub upstream_gateway: Option<String>,
+    pub active_rules: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct DeviceMqttBridgeStatus {
+    pub state: String,
+    pub address_origin: String,
+    pub mode: String,
+    pub rule_installed: bool,
+    pub telemetry_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub interface: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub client_mac: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub client_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub target_broker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub binding_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub evidence_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(type = "number | null", optional = nullable))]
+    pub evidence_updated_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(type = "number | null", optional = nullable))]
+    pub mqtt_last_seen: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub reason: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct DeviceSync {
@@ -527,6 +585,9 @@ pub struct DeviceSync {
     pub omci_management: DeviceOmciManagement,
     pub management: Option<ManagementStatus>,
     pub mqtt: Option<MqttStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub mqtt_bridge: Option<DeviceMqttBridgeStatus>,
     pub acs_bootstrap: AcsBootstrap,
     pub provisioning: ProvisioningStatus,
     pub services: Vec<SyncItem>,

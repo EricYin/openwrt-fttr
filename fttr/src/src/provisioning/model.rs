@@ -243,6 +243,7 @@ pub struct Config {
     pub groups: BTreeMap<String, String>,
     pub management: Option<Management>,
     pub management_network: Option<super::management_network::Desired>,
+    pub mqtt_bridge_enabled: bool,
     pub allow_unsupported_as_bridge: bool,
     pub labels: BTreeMap<String, String>,
 }

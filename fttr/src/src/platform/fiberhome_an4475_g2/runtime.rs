@@ -1535,7 +1535,7 @@ async fn run_async(platform: PlatformContext) {
                 init_retry_backoff(attempt, &stopping_loop);
                 initial = initialize_hardware(&pon_engine_loop, &stopping_loop);
             }
-            let mut permanent_fault =
+            let permanent_fault =
                 init_fault_message(&initial, stopping_loop.load(Ordering::Acquire));
             let (ready, state) = match initial {
                 Ok(state) => (true, state),
@@ -1988,6 +1988,7 @@ async fn run_async(platform: PlatformContext) {
             false
         }
     };
+    crate::controller::mqtt_bridge::shutdown();
     #[cfg(feature = "acs")]
     crate::acs::shutdown();
     #[cfg(feature = "npu")]

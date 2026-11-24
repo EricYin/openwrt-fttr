@@ -60,6 +60,7 @@ mod tests {
                     mask: 24,
                 },
             ],
+            ..Default::default()
         };
         assert_eq!(select_address(&status), None);
         status.up = true;

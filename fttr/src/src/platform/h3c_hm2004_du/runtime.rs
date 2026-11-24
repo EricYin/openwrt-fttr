@@ -1039,6 +1039,7 @@ async fn run_async(platform: PlatformContext) {
             false
         }
     };
+    crate::controller::mqtt_bridge::shutdown();
     #[cfg(feature = "acs")]
     crate::acs::shutdown();
     #[cfg(feature = "npu")]

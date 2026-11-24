@@ -314,6 +314,7 @@ impl Controller {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         crate::omci_auth::bind(&config.devices);
+        crate::controller::mqtt_bridge::configure(config.mqtt_bridge_enabled);
         self.config = config;
         super::super::bootstrap::configure(&self.config.devices);
         super::super::health_watch::config(

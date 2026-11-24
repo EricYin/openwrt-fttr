@@ -69,6 +69,26 @@ pub fn compile(text: &str) -> Result<Config, String> {
     if all.iter().filter(|(_, s)| s.kind == "management").count() > 1 {
         return Err("only one management network allowed".into());
     }
+    let mqtt_bridge: Vec<_> = all
+        .iter()
+        .filter(|(_, s)| s.kind == "mqtt_bridge")
+        .collect();
+    if mqtt_bridge.len() > 1
+        || mqtt_bridge
+            .first()
+            .is_some_and(|(id, _)| id != "mqtt_bridge")
+    {
+        return Err("mqtt_bridge requires one named mqtt_bridge section".into());
+    }
+    let mqtt_bridge_enabled = match mqtt_bridge
+        .first()
+        .map(|(_, s)| s.get("enabled"))
+        .unwrap_or("")
+    {
+        "" | "0" | "false" => false,
+        "1" | "true" => true,
+        _ => return Err("mqtt_bridge enabled must be 0 or 1".into()),
+    };
     // Validate every template, including ones not assigned to a group yet.
     for (id, s) in &all {
         if !matches!(
@@ -85,6 +105,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 | "wifi"
                 | "offload"
                 | "mqtt"
+                | "mqtt_bridge"
                 | "omci_auth"
                 | "fiberhome"
         ) {
@@ -92,6 +113,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
         }
         let allowed: &[&str] = match s.kind.as_str() {
             "fiberhome" => &["onu_count"],
+            "mqtt_bridge" => &["enabled"],
             "omci_auth" => &["auth_mode", "auth_loid", "auth_password", "schema_version"],
             "optical" => &["enabled", "downstream_tx_enabled", "fec_enabled"],
             "calibration" => &["source"],
@@ -387,6 +409,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
     }
     let mut cfg = config::compile_sections(expanded)?;
     cfg.fiberhome_onu_count = onu_count;
+    cfg.mqtt_bridge_enabled = mqtt_bridge_enabled;
     if let Some(count) = onu_count {
         if cfg.onu_pins.values().any(|id| *id >= count) {
             return Err(format!(
@@ -470,7 +493,10 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 business.options.remove("onu_id");
             }
             canonical_section(&mut canonical, id, &business);
-            if !matches!(business.kind.as_str(), "management" | "acs" | "omci_auth") {
+            if !matches!(
+                business.kind.as_str(),
+                "management" | "acs" | "omci_auth" | "mqtt_bridge"
+            ) {
                 if business.kind == "device" {
                     business.options.retain(|key, _| {
                         !matches!(key.as_str(), "omci_adapter" | "bootstrap_adapter")
@@ -599,13 +625,36 @@ mod tests {
     #[test]
     fn packaged_defaults_accept_controller_optical_settings() {
         let defaults = include_str!("../../../files/fttr.config");
-        assert!(super::compile(defaults).is_ok());
+        let compiled = super::compile(defaults).unwrap();
+        assert!(!compiled.mqtt_bridge_enabled);
         let disabled = defaults.replace(
             "config optical 'optical'\n\toption enabled '1'",
             "config optical 'optical'\n\toption enabled '0'",
         );
         assert!(super::compile(&disabled).is_ok());
         assert!(super::compile("config acs 'acs'\n option enabled '0'\n").is_ok());
+    }
+
+    #[test]
+    fn mqtt_bridge_switch_is_strict_and_independent_of_business_revision() {
+        let base = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT1234ABCD'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'hl202-mqtt'\n option group 'g'\n";
+        let off = super::compile(base).unwrap();
+        assert!(!off.mqtt_bridge_enabled);
+        let on = super::compile(&format!(
+            "{base}config mqtt_bridge 'mqtt_bridge'\n option enabled '1'\n"
+        ))
+        .unwrap();
+        assert!(on.mqtt_bridge_enabled);
+        assert_eq!(off.business_revision(), on.business_revision());
+        assert_ne!(off.revision, on.revision);
+        for bad in [
+            "config mqtt_bridge 'other'\n option enabled '1'\n",
+            "config mqtt_bridge 'mqtt_bridge'\n option enabled 'yes'\n",
+            "config mqtt_bridge 'mqtt_bridge'\n list enabled '1'\n",
+            "config mqtt_bridge 'mqtt_bridge'\n option extra '1'\n",
+        ] {
+            assert!(super::compile(&format!("{base}{bad}")).is_err(), "{bad}");
+        }
     }
 
     #[test]

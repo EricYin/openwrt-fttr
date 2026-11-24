@@ -24,6 +24,7 @@ impl Lifetime {
             let lan = lan::wait_for_address().await;
             let addresses = crate::broker::lan_addresses(&lan.to_string())?;
             let broker = crate::broker::EmbeddedBroker::start(&addresses).await?;
+            super::mqtt_bridge::set_broker_address(Some(lan));
             println!("[+] Owned MQTT broker ready on {addresses:?}");
             Ok(Self {
                 broker,

@@ -154,6 +154,12 @@ pub(super) fn parse_sections(text: &str) -> Result<Vec<(String, Section)>, Strin
                 {
                     return Err("fiberhome onu_count requires one scalar option".into());
                 }
+                if section.kind == "mqtt_bridge"
+                    && w[1] == "enabled"
+                    && (w[0] != "option" || section.options.contains_key("enabled"))
+                {
+                    return Err("mqtt_bridge enabled requires one scalar option".into());
+                }
                 if section.kind == "management" && w[1] == "vlan" && w[0] != "list" {
                     return Err(
                         "management VLAN requires list vlan; scalar option vlan is unsupported"

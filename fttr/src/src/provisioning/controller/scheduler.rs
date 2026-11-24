@@ -31,6 +31,7 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     let acs_status = acs(Command::Status);
     controller().lock().unwrap().activate_pending_config();
     let configured = controller().lock().unwrap().config.clone();
+    crate::controller::mqtt_bridge::tick(&online_onus, &interfaces, &configured.devices);
     // Bootstrap-free ACS consumers must also reach the new listener before the
     // old network is retired. They have no bootstrap record to satisfy that gate.
     let cwmp_business_ready =

@@ -11,6 +11,7 @@ pub struct Registry {
     sources: BTreeMap<String, Transport>,
     onus: BTreeMap<u16, String>,
     links: BTreeMap<String, String>,
+    verified_reports: BTreeMap<String, String>,
 }
 
 impl Registry {
@@ -25,6 +26,7 @@ impl Registry {
             sources: BTreeMap::new(),
             onus: BTreeMap::new(),
             links: BTreeMap::new(),
+            verified_reports: BTreeMap::new(),
         }
     }
 
@@ -155,6 +157,125 @@ impl Registry {
 
     pub(crate) fn last_seen(&self, target: &str) -> Option<u64> {
         self.sources.get(target).map(|source| source.last_seen)
+    }
+
+    pub(crate) fn clock(&self) -> u64 {
+        self.clock
+    }
+
+    pub(crate) fn fdb_candidates_for_serial(&self, serial: &str, time: u64) -> Vec<String> {
+        if time < self.clock
+            || self
+                .topology_seen
+                .is_none_or(|seen| seen > time || time - seen > FRESHNESS)
+            || self
+                .onus
+                .values()
+                .filter(|sn| sn.as_str() == serial)
+                .count()
+                != 1
+        {
+            return Vec::new();
+        }
+        self.links
+            .iter()
+            .filter(|(_, sn)| sn.as_str() == serial)
+            .map(|(mac, _)| mac.clone())
+            .collect()
+    }
+
+    pub(crate) fn seed_verified_report(&mut self, serial: &str, mac: &str) -> bool {
+        if serial.len() != 12 || !serial.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return false;
+        }
+        let Some(mac) = super::normalize_target(mac) else {
+            return false;
+        };
+        if u8::from_str_radix(&mac[..2], 16)
+            .ok()
+            .is_none_or(|b| b & 1 != 0)
+            || mac == "000000000000"
+        {
+            return false;
+        }
+        let serial = serial.to_ascii_uppercase();
+        if self
+            .verified_reports
+            .get(&serial)
+            .is_some_and(|old| old != &mac)
+            || self
+                .verified_reports
+                .iter()
+                .any(|(sn, old)| sn != &serial && old == &mac)
+        {
+            self.verified_reports
+                .retain(|sn, old| sn != &serial && old != &mac);
+            return false;
+        }
+        if !self.verified_reports.contains_key(&serial) && self.verified_reports.len() >= 64 {
+            return false;
+        }
+        self.verified_reports.insert(serial, mac);
+        true
+    }
+
+    pub(crate) fn verified_reports_snapshot(&self) -> BTreeMap<String, String> {
+        self.verified_reports.clone()
+    }
+
+    /// Record only a report whose own serial and MAC agree with a fresh,
+    /// unambiguous optical/FDB association. This is evidence, not permission
+    /// to install a redirect; callers must revalidate current topology and lease.
+    pub(crate) fn record_verified_report(&mut self, serial: &str, mac: &str, time: u64) -> bool {
+        if self
+            .automatic_source(serial, time)
+            .ok()
+            .flatten()
+            .map(|(m, _)| m)
+            != Some(mac)
+        {
+            return false;
+        }
+        if self
+            .verified_reports
+            .get(serial)
+            .is_some_and(|old| old != mac)
+            || self
+                .verified_reports
+                .iter()
+                .any(|(sn, old)| sn != serial && old == mac)
+        {
+            self.verified_reports
+                .retain(|sn, old| sn != serial && old != mac);
+            return false;
+        }
+        if !self.verified_reports.contains_key(serial) && self.verified_reports.len() >= 64 {
+            return false;
+        }
+        self.verified_reports
+            .insert(serial.to_owned(), mac.to_owned());
+        true
+    }
+
+    /// A historical report is usable as a candidate only while the current
+    /// optical registration and fresh FDB still agree. DHCP is checked separately.
+    #[allow(dead_code)] // Used by the bridge reconciler when enabled.
+    pub(crate) fn verified_report_candidate(&self, serial: &str, time: u64) -> Option<&str> {
+        if time < self.clock
+            || self
+                .topology_seen
+                .is_none_or(|seen| seen > time || time - seen > FRESHNESS)
+            || self
+                .onus
+                .values()
+                .filter(|sn| sn.as_str() == serial)
+                .count()
+                != 1
+        {
+            return None;
+        }
+        let mac = self.verified_reports.get(serial)?;
+        (self.links.get(mac).is_some_and(|sn| sn == serial)).then_some(mac.as_str())
     }
 
     pub(crate) fn topology_error(&self) -> Option<&str> {

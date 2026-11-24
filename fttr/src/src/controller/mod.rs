@@ -12,6 +12,9 @@ pub(crate) mod lifetime;
 pub mod management;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
+pub mod mqtt_bridge;
+#[cfg(feature = "mqtt")]
+pub mod mqtt_bridge_evidence;
 pub(crate) mod optical_owner;
 pub(crate) mod pon_mac;
 pub mod profile;

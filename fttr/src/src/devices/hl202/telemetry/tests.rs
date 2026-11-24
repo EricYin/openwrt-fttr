@@ -18,6 +18,22 @@ pub(super) fn fixture(members: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 #[test]
+fn identity_claim_requires_matching_unicast_mac_and_serial() {
+    let report = super::parse(&fixture(&[
+        ("SN", b"H3CT12345678\n"),
+        ("sn", b"02:AA:BB:CC:DD:EE\n"),
+    ]))
+    .unwrap();
+    assert_eq!(
+        super::identity_claim(&report, "02AABBCCDDEE"),
+        Some(("H3CT12345678".into(), "02AABBCCDDEE".into()))
+    );
+    assert!(super::identity_claim(&report, "02AABBCCDDEF").is_none());
+    let invalid = super::parse(&fixture(&[("SN", b"invalid"), ("sn", b"02AABBCCDDEE")])).unwrap();
+    assert!(super::identity_claim(&invalid, "02AABBCCDDEE").is_none());
+}
+
+#[test]
 fn hl202_telemetry_decodes_observed_plain_text_members_without_defaults() {
     // Given: sanitized synthetic fields with the authentic archive's names/types.
     let input = fixture(&[

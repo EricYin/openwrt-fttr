@@ -37,6 +37,28 @@ pub(super) async fn run() {
                     }),
                 None => Err("compressed telemetry limit exceeded".to_owned()),
             };
+            if let Ok(report) = &result {
+                if let Some((serial, claimed_mac)) = super::identity_claim(report, &mac) {
+                    let recorded = if let Ok(mut identities) = crate::mqtt_identity::shared().lock()
+                    {
+                        let eval_time = received.max(identities.clock());
+                        identities
+                            .record_verified_report(&serial, &claimed_mac, eval_time)
+                            .then(|| identities.verified_reports_snapshot())
+                    } else {
+                        None
+                    };
+                    if let Some(snapshot) = recorded {
+                        if let Ok(bytes) = serde_json::to_vec(&snapshot) {
+                            let _ = crate::provisioning::storage::write_atomic(
+                                "/var/lib/fttr/mqtt-identities.json",
+                                &bytes,
+                                false,
+                            );
+                        }
+                    }
+                }
+            }
             super::store::complete(mac, received, result);
         })
         .await;
