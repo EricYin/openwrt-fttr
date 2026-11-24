@@ -408,6 +408,15 @@ impl Uci {
 
     /// Export a loaded UCI package into canonical OpenWrt UCI text format.
     pub fn export_package(&mut self, package: &str) -> Result<String, UciError> {
+        self.export_package_with_names(package, false)
+    }
+
+    /// Export with libuci's current IDs for anonymous sections (like `uci -n export`).
+    pub fn export_package_with_names(
+        &mut self,
+        package: &str,
+        names: bool,
+    ) -> Result<String, UciError> {
         let mut ptr = uci_ptr::default();
         let mut buf = package.as_bytes().to_vec();
         buf.push(0);
@@ -442,7 +451,13 @@ impl Uci {
                     return Err(UciError::Backend("open_memstream failed".into()));
                 }
 
+                const UCI_FLAG_EXPORT_NAME: c_int = 1 << 2;
+                let flags = (*self.ctx).flags;
+                if names {
+                    (*self.ctx).flags |= UCI_FLAG_EXPORT_NAME;
+                }
                 let ret = self.lib.uci_export(self.ctx, stream, p, true);
+                (*self.ctx).flags = flags;
                 libc::fclose(stream);
 
                 if ret != UCI_OK {

@@ -32,7 +32,7 @@ pub(crate) fn load() -> Result<View, String> {
 /// Parse an export from a caller-owned context (including private snapshots).
 pub(crate) fn export(uci: &mut openwrt_uci::Uci, package: &str) -> Result<View, String> {
     let text = uci
-        .export_package(package)
+        .export_package_with_names(package, true)
         .map_err(|_| "cannot export UCI package")?;
     View::parse(&text)
 }
@@ -260,6 +260,28 @@ mod tests {
                 .count(),
             1
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn exported_anonymous_section_ids_resolve_references_in_snapshots() {
+        let path = std::env::temp_dir().join(format!("fttr-config-anon-{}", std::process::id()));
+        fs::write(
+            &path,
+            "config template\n option name 'Example'\nconfig group\n",
+        )
+        .unwrap();
+        let view = committed(&path).unwrap();
+        let template = view.sections[0].name.as_ref().unwrap();
+        assert!(template.starts_with("cfg"));
+        assert_ne!(view.sections[1].name.as_ref().unwrap(), template);
+        let text = format!(
+            "config template\n option name 'Example'\nconfig group\n option template '{template}'\n"
+        );
+        fs::write(&path, text).unwrap();
+        let another = committed(&path).unwrap();
+        assert_eq!(another.sections[0].name.as_ref(), Some(template));
+        assert_eq!(another.sections[1].options[0].value, *template);
         fs::remove_file(path).unwrap();
     }
 

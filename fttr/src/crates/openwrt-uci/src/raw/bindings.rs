@@ -96,6 +96,7 @@ pub struct uci_context {
     pub root: uci_list,
     pub pctx: *mut c_void,
     pub backend: *mut c_void,
+    pub backends: uci_list,
     pub flags: c_int,
     pub confdir: *mut c_char,
     pub savedir: *mut c_char,
