@@ -85,7 +85,7 @@ struct Grant {
     backend: Layout,
     token: Arc<AtomicBool>,
     platform: PlatformContext,
-    state: &'static str,
+    state: fttr_api::OmciAuthState,
     reported: Option<(String, String)>,
     epoch: u64,
 }
@@ -124,7 +124,7 @@ fn configure_registry(
         if config.effective(&grant.serial) != &grant.policy
             || selections.get(&grant.serial) != config.selections.get(&grant.serial)
         {
-            grant.state = "pending";
+            grant.state = fttr_api::OmciAuthState::Pending;
             grant.token.store(true, Ordering::Release);
             failed |= revoke(id, grant.platform).is_err();
         }
@@ -143,7 +143,11 @@ pub(crate) fn forget(id: u8) {
     }
 }
 fn permitted(g: &Grant) -> bool {
-    !g.token.load(Ordering::Acquire) && matches!(g.state, "verified" | "skipped")
+    !g.token.load(Ordering::Acquire)
+        && matches!(
+            g.state,
+            fttr_api::OmciAuthState::Verified | fttr_api::OmciAuthState::Skipped
+        )
 }
 pub(crate) fn allowed(serial: &str) -> bool {
     #[cfg(test)]
@@ -170,17 +174,36 @@ pub(crate) fn admit(id: u8, action: impl FnOnce() -> io::Result<()>) -> io::Resu
     }
     action()
 }
-pub(crate) fn view(serial: &str) -> serde_json::Value {
+pub(crate) fn status(serial: &str) -> fttr_api::OmciAuthStatus {
     let r = registry().lock().unwrap();
     let policy = r.config.as_ref().map(|c| c.effective(serial));
     let mode = match policy {
-        Some(Policy::LoidPassword { .. }) => "loid_password",
-        _ => "disabled",
+        Some(Policy::LoidPassword { .. }) => fttr_api::OmciAuthMode::LoidPassword,
+        _ => fttr_api::OmciAuthMode::Disabled,
     };
     let grant = r.grants.values().find(|g| {
         g.serial == serial && Some(&g.policy) == policy && !g.token.load(Ordering::Acquire)
     });
-    serde_json::json!({"mode": mode, "source": if r.config.as_ref().is_some_and(|c| c.devices.contains_key(serial)) { "device" } else { "global" }, "state": grant.map_or("pending", |g| g.state), "backend": grant.map(|g| g.backend.name), "reported_loid": grant.and_then(|g| g.reported.as_ref().map(|v| &v.0)), "reported_password": grant.and_then(|g| g.reported.as_ref().map(|v| &v.1))})
+    fttr_api::OmciAuthStatus {
+        mode,
+        source: if r
+            .config
+            .as_ref()
+            .is_some_and(|c| c.devices.contains_key(serial))
+        {
+            fttr_api::OmciAuthSource::Device
+        } else {
+            fttr_api::OmciAuthSource::Global
+        },
+        state: grant.map_or(fttr_api::OmciAuthState::Pending, |g| g.state),
+        backend: grant.map(|g| g.backend.name.to_string()),
+        reported_loid: grant.and_then(|g| g.reported.as_ref().map(|v| v.0.clone())),
+        reported_password: grant.and_then(|g| g.reported.as_ref().map(|v| v.1.clone())),
+    }
+}
+
+pub(crate) fn view(serial: &str) -> serde_json::Value {
+    serde_json::to_value(status(serial)).expect("OmciAuthStatus serializes")
 }
 
 pub(crate) fn authenticate(
@@ -217,7 +240,7 @@ pub(crate) fn authenticate(
                 backend,
                 token: token.clone(),
                 platform,
-                state: "checking",
+                state: fttr_api::OmciAuthState::Checking,
                 reported: None,
                 epoch,
             },
@@ -286,10 +309,12 @@ pub(crate) fn authenticate(
     {
         grant.reported = reported;
         grant.state = match &result {
-            Ok(()) if policy == Policy::Disabled => "skipped",
-            Ok(()) => "verified",
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => "denied",
-            Err(_) => "error",
+            Ok(()) if policy == Policy::Disabled => fttr_api::OmciAuthState::Skipped,
+            Ok(()) => fttr_api::OmciAuthState::Verified,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                fttr_api::OmciAuthState::Denied
+            }
+            Err(_) => fttr_api::OmciAuthState::Error,
         };
     }
     // Transport errors can contain raw frames; return only a typed, credential-free reason.
@@ -376,7 +401,7 @@ pub(crate) fn exchange_failed(id: u8) -> bool {
         .unwrap()
         .grants
         .get(&id)
-        .is_some_and(|g| g.state == "error")
+        .is_some_and(|g| g.state == fttr_api::OmciAuthState::Error)
 }
 pub(crate) fn cwmp_epoch(device: &str) -> Option<u64> {
     let r = registry().lock().unwrap();
@@ -427,7 +452,7 @@ mod tests {
             backend: STANDARD,
             token: Arc::new(AtomicBool::new(false)),
             platform: PlatformContext::test_context(),
-            state: "verified",
+            state: fttr_api::OmciAuthState::Verified,
             reported: Some(("test-onu".into(), "test-pass".into())),
             epoch: 1,
         }
@@ -463,7 +488,7 @@ mod tests {
         assert!(!permitted(&r.grants[&1]));
         assert!(permitted(&r.grants[&2]));
         // Completing an older exchange cannot undo token cancellation.
-        r.grants.get_mut(&1).unwrap().state = "verified";
+        r.grants.get_mut(&1).unwrap().state = fttr_api::OmciAuthState::Verified;
         assert!(!permitted(&r.grants[&1]));
         changed
             .selections

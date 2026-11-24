@@ -105,6 +105,7 @@ fn onu(sn: &str, id: u8) -> SubGatewayStatus {
         serial_number: sn.into(),
         state: RegistrationState::O5Operation,
         business_status: BusinessStatus::default(),
+        omci_auth: None,
         management: None,
         provisioning: None,
         services: Vec::new(),

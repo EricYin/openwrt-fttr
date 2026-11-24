@@ -278,6 +278,9 @@ pub struct SubGatewayStatus {
     pub serial_number: String,
     pub state: RegistrationState,
     pub business_status: BusinessStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub omci_auth: Option<crate::OmciAuthStatus>,
     pub management: Option<crate::ManagementStatus>,
     pub provisioning: Option<crate::ProvisioningStatus>,
     pub services: Vec<crate::SyncItem>,

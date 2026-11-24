@@ -123,6 +123,7 @@ pub(crate) fn snapshot(
                     .unwrap_or_else(|| onu.model.clone()),
                 serial_number: sn_str.clone(),
                 state: onu.state,
+                omci_auth: Some(crate::omci_auth::status(&sn_str)),
                 management: desired.and_then(|d| d.management.clone()),
                 provisioning: desired.map(|d| d.provisioning.clone()),
                 services: desired.map(|d| d.services.clone()).unwrap_or_default(),

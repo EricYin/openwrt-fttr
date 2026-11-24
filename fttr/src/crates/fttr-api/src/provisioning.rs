@@ -497,12 +497,37 @@ pub struct DeviceOmciManagement {
     #[cfg_attr(feature = "codegen", ts(optional, type = "number"))]
     pub updated_at: Option<u64>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum OmciAuthMode {
+    Disabled,
+    LoidPassword,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum OmciAuthSource {
+    Global,
+    Device,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum OmciAuthState {
+    Pending,
+    Checking,
+    Verified,
+    Skipped,
+    Denied,
+    Error,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct OmciAuthStatus {
-    pub mode: String,
-    pub source: String,
-    pub state: String,
+    pub mode: OmciAuthMode,
+    pub source: OmciAuthSource,
+    pub state: OmciAuthState,
     pub backend: Option<String>,
     /// Actual ONU-reported credentials, never the configured comparison values.
     pub reported_loid: Option<String>,
