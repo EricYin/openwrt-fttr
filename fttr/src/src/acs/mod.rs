@@ -120,26 +120,23 @@ struct Server {
 }
 static SERVER: OnceLock<Mutex<Arc<Server>>> = OnceLock::new();
 static RECONFIGURE: Mutex<()> = Mutex::new(());
-fn env(name: &str, fallback: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| fallback.into())
-}
 fn init() -> Arc<Server> {
     SERVER
         .get_or_init(|| {
             // A configured address is not authorization to activate a listener.
             let enabled = false;
-            let state_file = env("FTTR_ACS_STATE", "/var/lib/fttr/acs-state.json");
+            let config = crate::startup_config::get();
+            let state_file = config.acs_state_file.clone();
             let state = State::load_or_block(&state_file);
             let failure = state.load_failure.clone();
-            let user = env("FTTR_ACS_USERNAME", "");
-            let password = env("FTTR_ACS_PASSWORD", "");
             Mutex::new(Arc::new(Server {
                 state: Arc::new(Mutex::new(state)),
                 enabled,
                 listen: String::new(),
                 path: "/cwmp".into(),
                 state_file,
-                auth: (!user.is_empty()).then(|| http::basic(&user, &password)),
+                auth: (!config.acs_username.is_empty())
+                    .then(|| http::basic(&config.acs_username, &config.acs_password)),
                 failure: Mutex::new(failure),
                 requests: Arc::new(AtomicUsize::new(0)),
                 endpoint_id: String::new(),

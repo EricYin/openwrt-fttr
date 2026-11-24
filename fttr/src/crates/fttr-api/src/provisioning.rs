@@ -510,6 +510,34 @@ pub struct OmciAuthStatus {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct MqttBridgeRule {
+    pub interface: String,
+    pub client_mac: String,
+    pub client_ip: String,
+    pub target_gw: String,
+    pub broker_ip: String,
+    pub bridge_mac: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub optical_sn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub binding_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub evidence_source: Option<String>,
+    pub bridge_rule: String,
+    pub ip_rule: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct MqttBridgeStatus {
     pub enabled: bool,
     pub state: String,
@@ -521,6 +549,8 @@ pub struct MqttBridgeStatus {
     #[cfg_attr(feature = "codegen", ts(optional = nullable))]
     pub upstream_gateway: Option<String>,
     pub active_rules: u32,
+    #[serde(default)]
+    pub rules: Vec<MqttBridgeRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "codegen", ts(optional = nullable))]
     pub reason: Option<String>,

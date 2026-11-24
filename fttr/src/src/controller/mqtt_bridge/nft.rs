@@ -15,6 +15,26 @@ pub(super) struct RedirectRule {
     pub bridge_mac: [u8; 6],
 }
 
+impl RedirectRule {
+    pub(super) fn bridge_rule_expr(&self) -> String {
+        format!(
+            "iifname \"{}\" ether saddr {} ip saddr {} ip daddr {} tcp dport 1883 meta pkttype set host ether daddr set {} counter",
+            self.interface,
+            format_mac(self.client_mac),
+            self.client_ip,
+            self.target_gw,
+            format_mac(self.bridge_mac)
+        )
+    }
+
+    pub(super) fn ip_rule_expr(&self) -> String {
+        format!(
+            "ip saddr {} ip daddr {} tcp dport 1883 counter dnat to {}:1883",
+            self.client_ip, self.target_gw, self.broker_ip
+        )
+    }
+}
+
 pub(super) fn format_mac(mac: [u8; 6]) -> String {
     format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -40,16 +60,8 @@ pub(super) fn render_apply_script(rules: &[RedirectRule]) -> Result<String, Stri
         if !valid_interface(&rule.interface) {
             return Err(format!("invalid ONU interface name: {}", rule.interface));
         }
-        let client_mac = format_mac(rule.client_mac);
-        let bridge_mac = format_mac(rule.bridge_mac);
-        bridge_rules.push_str(&format!(
-            "        iifname \"{}\" ether saddr {} ip saddr {} ip daddr {} tcp dport 1883 meta pkttype set host ether daddr set {} counter\n",
-            rule.interface, client_mac, rule.client_ip, rule.target_gw, bridge_mac
-        ));
-        ip_rules.push_str(&format!(
-            "        ip saddr {} ip daddr {} tcp dport 1883 counter dnat to {}:1883\n",
-            rule.client_ip, rule.target_gw, rule.broker_ip
-        ));
+        bridge_rules.push_str(&format!("        {}\n", rule.bridge_rule_expr()));
+        ip_rules.push_str(&format!("        {}\n", rule.ip_rule_expr()));
     }
     Ok(format!(
         "table bridge {BRIDGE_TABLE}\n\

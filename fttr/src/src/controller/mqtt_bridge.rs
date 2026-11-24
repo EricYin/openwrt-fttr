@@ -16,7 +16,7 @@ mod active {
     use super::{conntrack, nft};
     use crate::platform::openwrt::packet::PacketSocket;
     use crate::provisioning::model::Device;
-    use fttr_api::{DeviceMqttBridgeStatus, MqttBridgeStatus};
+    use fttr_api::{DeviceMqttBridgeStatus, MqttBridgeRule, MqttBridgeStatus};
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, BTreeSet};
     use std::net::Ipv4Addr;
@@ -580,6 +580,7 @@ mod active {
             }
             c.global.enabled = false;
             c.global.active_rules = 0;
+            c.global.rules.clear();
             c.global.state = if c.cleanup_error.is_some() {
                 "cleanup_failed".into()
             } else {
@@ -648,6 +649,7 @@ mod active {
                 broker_listen: c.broker_ip.map(|ip| format!("{ip}:1883")),
                 upstream_gateway: lan.upstream_gateway.map(|ip| ip.to_string()),
                 active_rules: 0,
+                rules: Vec::new(),
                 reason: Some(
                     c.cleanup_error
                         .clone()
@@ -1124,6 +1126,11 @@ mod active {
 
         c.devices = next_devices;
         let active_count = c.devices.values().filter(|d| d.rule_installed).count() as u32;
+        let rules = if active_count > 0 {
+            build_global_rules(&c.applied_rules, &c.devices, configured_devices)
+        } else {
+            Vec::new()
+        };
         c.global = MqttBridgeStatus {
             enabled: true,
             state: if c.rule_error.is_some() || c.cleanup_error.is_some() {
@@ -1137,6 +1144,7 @@ mod active {
             broker_listen: c.broker_ip.map(|ip| format!("{ip}:1883")),
             upstream_gateway: lan.upstream_gateway.map(|ip| ip.to_string()),
             active_rules: active_count,
+            rules,
             reason: c
                 .rule_error
                 .clone()
@@ -1144,6 +1152,48 @@ mod active {
                 .or_else(|| lan.reason.clone()),
             error: c.rule_error.clone().or_else(|| c.cleanup_error.clone()),
         };
+    }
+
+    fn build_global_rules(
+        applied_rules: &[nft::RedirectRule],
+        devices: &BTreeMap<String, DeviceMqttBridgeStatus>,
+        configured_devices: &[Device],
+    ) -> Vec<MqttBridgeRule> {
+        applied_rules
+            .iter()
+            .map(|rule| {
+                let client_mac = nft::format_mac(rule.client_mac);
+                let bridge_mac = nft::format_mac(rule.bridge_mac);
+                let matched = devices.iter().find(|(_, status)| {
+                    status.rule_installed
+                        && status.interface.as_deref() == Some(rule.interface.as_str())
+                        && status.client_mac.as_deref() == Some(client_mac.as_str())
+                });
+                let optical_sn = matched.map(|(sn, _)| sn.clone());
+                let device = optical_sn.as_ref().and_then(|sn| {
+                    configured_devices
+                        .iter()
+                        .find(|d| &d.optical_sn == sn)
+                        .map(|d| d.id.clone())
+                });
+                let status = matched.map(|(_, s)| s);
+                MqttBridgeRule {
+                    interface: rule.interface.clone(),
+                    client_mac,
+                    client_ip: rule.client_ip.to_string(),
+                    target_gw: rule.target_gw.to_string(),
+                    broker_ip: rule.broker_ip.to_string(),
+                    bridge_mac,
+                    device,
+                    optical_sn,
+                    state: status.map(|s| s.state.clone()),
+                    binding_source: status.and_then(|s| s.binding_source.clone()),
+                    evidence_source: status.and_then(|s| s.evidence_source.clone()),
+                    bridge_rule: rule.bridge_rule_expr(),
+                    ip_rule: rule.ip_rule_expr(),
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn global_view() -> Value {
@@ -1214,6 +1264,62 @@ mod active {
                 origins.get(&Ipv4Addr::new(192, 0, 2, 1)),
                 Some(&Origin::Local)
             );
+        }
+
+        #[test]
+        fn build_global_rules_enriches_applied_rules_with_device_metadata_and_nft_expressions() {
+            let applied = vec![nft::RedirectRule {
+                interface: "fttr127".into(),
+                client_mac: [0x02, 0, 0, 0, 0, 1],
+                client_ip: Ipv4Addr::new(192, 0, 2, 244),
+                target_gw: Ipv4Addr::new(192, 0, 2, 1),
+                broker_ip: Ipv4Addr::new(192, 0, 2, 44),
+                bridge_mac: [0x02, 0, 0, 0, 0, 2],
+            }];
+            let mut devices = BTreeMap::new();
+            devices.insert(
+                "H3CT00000001".into(),
+                DeviceMqttBridgeStatus {
+                    state: "verified".into(),
+                    address_origin: "upstream".into(),
+                    mode: "redirected".into(),
+                    rule_installed: true,
+                    telemetry_verified: true,
+                    interface: Some("fttr127".into()),
+                    client_mac: Some("02:00:00:00:00:01".into()),
+                    client_ip: Some("192.0.2.244".into()),
+                    target_broker: Some("192.0.2.1:1883 -> 192.0.2.44:1883".into()),
+                    binding_source: Some("verified_report".into()),
+                    evidence_source: Some("dhcp_ack".into()),
+                    ..Default::default()
+                },
+            );
+            let configured = vec![Device {
+                id: "onu_hl202".into(),
+                optical_sn: "H3CT00000001".into(),
+                cwmp_id: String::new(),
+                omci_adapter: "hl202".into(),
+                bootstrap_adapter: "none".into(),
+                provisioning_adapter: "hl202-mqtt".into(),
+                resolved_contract: None,
+                connection_request: Default::default(),
+                items: Vec::new(),
+                wifi_cleanup: String::new(),
+                wifi_preserve: BTreeSet::new(),
+            }];
+
+            let rules = build_global_rules(&applied, &devices, &configured);
+            assert_eq!(rules.len(), 1);
+            let r = &rules[0];
+            assert_eq!(r.device.as_deref(), Some("onu_hl202"));
+            assert_eq!(r.optical_sn.as_deref(), Some("H3CT00000001"));
+            assert_eq!(r.state.as_deref(), Some("verified"));
+            assert_eq!(r.binding_source.as_deref(), Some("verified_report"));
+            assert_eq!(r.evidence_source.as_deref(), Some("dhcp_ack"));
+            assert_eq!(r.bridge_mac, "02:00:00:00:00:02");
+            assert!(r.bridge_rule.contains("iifname \"fttr127\""));
+            assert!(r.bridge_rule.contains("ether daddr set 02:00:00:00:00:02"));
+            assert!(r.ip_rule.contains("dnat to 192.0.2.44:1883"));
         }
     }
 }

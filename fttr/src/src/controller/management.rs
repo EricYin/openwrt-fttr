@@ -3,6 +3,16 @@ use crate::pon_engine::omci::{
     attributes::AttributeValue, error::is_unknown_instance, wire::unhex, OmciSession,
 };
 use std::io;
+fn ensure_auth_association_supported(username: &str) -> io::Result<()> {
+    if username.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "OMCI authentication association not verified",
+        ))
+    }
+}
 pub fn configure(
     session: &mut OmciSession,
     instance: u16,
@@ -11,12 +21,7 @@ pub fn configure(
     priority: u32,
 ) -> io::Result<()> {
     let tag = management_tag(vlan, priority)?;
-    if std::env::var("FTTR_ACS_USERNAME").is_ok_and(|v| !v.is_empty()) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "OMCI authentication association not verified",
-        ));
-    }
+    ensure_auth_association_supported(&crate::startup_config::get().acs_username)?;
     if !url.starts_with("http://")
         || url.len() > 374
         || !url.is_ascii()
@@ -220,10 +225,17 @@ mod tests {
         }
     }
     #[test]
+    fn configured_acs_auth_rejects_unverified_association() {
+        assert!(super::ensure_auth_association_supported("").is_ok());
+        assert_eq!(
+            super::ensure_auth_association_supported("configured-user")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
+    #[test]
     fn management_failure_restores_and_verifies_original_association() {
-        if std::env::var("FTTR_ACS_USERNAME").is_ok_and(|v| !v.is_empty()) {
-            return;
-        }
         let url = "http://acs.invalid/";
         let mut part = vec![0; 25];
         part[..url.len()].copy_from_slice(url.as_bytes());

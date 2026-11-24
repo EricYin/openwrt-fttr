@@ -94,7 +94,10 @@ pub(crate) fn words(line: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 pub fn load() -> Result<Config, String> {
-    let text = match openwrt_uci::Uci::new() {
+    parse(&load_text()?)
+}
+pub(crate) fn load_text() -> Result<String, String> {
+    Ok(match openwrt_uci::Uci::new() {
         Ok(mut uci) => uci
             .export_package("fttr")
             .map_err(|e| format!("uci: {e}"))?,
@@ -103,8 +106,7 @@ pub fn load() -> Result<Config, String> {
             std::fs::read_to_string("/etc/config/fttr")
                 .map_err(|e| format!("cannot load /etc/config/fttr: {e}"))?
         }
-    };
-    parse(&text)
+    })
 }
 pub fn parse(text: &str) -> Result<Config, String> {
     super::templates::compile(text)

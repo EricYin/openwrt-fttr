@@ -6,13 +6,6 @@ USE_PROCD=1
 PROG=/usr/sbin/fttrd
 
 start_service() {
-	local acs_state acs_username acs_password rx_snapshot
-	config_load fttr
-	config_get acs_state acs state_file /var/lib/fttr/acs-state.json
-	config_get acs_username acs username ""
-	config_get acs_password acs password ""
-	config_get_bool rx_snapshot fiberhome rx_snapshot 0
-
 	# Let fttrd's exact platform registry fail closed before touching hardware.
 	if ! "$PROG" --platform-check >/dev/null 2>&1; then
 		return 0
@@ -23,9 +16,6 @@ start_service() {
 	# Start the controller daemon.
 	procd_open_instance
 	procd_set_param command "$PROG"
-	# ACS listener activation is coordinated by fttrd after management authorization.
-	procd_set_param env FTTR_ACS_STATE="$acs_state" FTTR_ACS_USERNAME="$acs_username" FTTR_ACS_PASSWORD="$acs_password"
-	procd_append_param env FTTR_FSL_RX_SNAPSHOT="$rx_snapshot"
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1

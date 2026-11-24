@@ -1557,7 +1557,7 @@ async fn run_async(platform: PlatformContext) {
             let mut last_timeout_check = Instant::now();
             let mut observation_first = true;
             let mut observation_counts = (0usize, 0usize, 0usize, 0usize);
-            let mut receive_snapshots_remaining = if std::env::var("FTTR_FSL_RX_SNAPSHOT").as_deref() == Ok("1") {
+            let mut receive_snapshots_remaining = if crate::startup_config::get().rx_snapshot {
                 3u8
             } else {
                 0

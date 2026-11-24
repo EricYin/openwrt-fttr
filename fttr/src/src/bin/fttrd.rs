@@ -28,6 +28,10 @@ fn main() {
             eprintln!("[-] Platform selection failed closed: {error}");
             std::process::exit(1);
         });
+    if let Err(error) = openwrt_fttr::startup_config::initialize() {
+        eprintln!("[-] Could not load startup configuration: {error}");
+        std::process::exit(1);
+    }
     if let Err(error) = openwrt_fttr::capabilities::publish_menu() {
         eprintln!("[-] Could not refresh LuCI capability markers: {error}");
     }

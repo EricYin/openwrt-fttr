@@ -54,6 +54,7 @@ pub mod pon_engine;
 pub mod provisioning;
 pub mod provisioning_cli;
 mod runtime;
+pub mod startup_config;
 #[cfg(any(feature = "mqtt", test))]
 mod telemetry_sources;
 

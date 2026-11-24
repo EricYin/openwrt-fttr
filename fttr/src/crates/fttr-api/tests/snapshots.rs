@@ -132,4 +132,45 @@ fn asynchronous_result_contracts_keep_sparse_command_failures_and_literal_guards
     let mut bad: Value = source;
     bad["read_only"] = json!(false);
     assert!(serde_json::from_value::<HlReportReply>(bad).is_err());
+
+    let bridge_without_rules = json!({
+        "enabled": true,
+        "state": "waiting",
+        "lan_origin": "upstream",
+        "active_rules": 0
+    });
+    let parsed: MqttBridgeStatus = serde_json::from_value(bridge_without_rules).unwrap();
+    assert!(parsed.rules.is_empty());
+    assert_eq!(serde_json::to_value(&parsed).unwrap()["rules"], json!([]));
+
+    let bridge_with_rules = MqttBridgeStatus {
+        enabled: true,
+        state: "active".into(),
+        lan_origin: "upstream".into(),
+        broker_listen: Some("192.0.2.44:1883".into()),
+        upstream_gateway: Some("192.0.2.1".into()),
+        active_rules: 1,
+        rules: vec![MqttBridgeRule {
+            interface: "fttr127".into(),
+            client_mac: "02:00:00:00:00:01".into(),
+            client_ip: "192.0.2.244".into(),
+            target_gw: "192.0.2.1".into(),
+            broker_ip: "192.0.2.44".into(),
+            bridge_mac: "02:00:00:00:00:02".into(),
+            device: Some("onu_1".into()),
+            optical_sn: Some("H3CT00000001".into()),
+            state: Some("verified".into()),
+            binding_source: Some("verified_report".into()),
+            evidence_source: Some("dhcp_ack".into()),
+            bridge_rule: "iifname \"fttr127\" ether saddr 02:00:00:00:00:01 ip saddr 192.0.2.244 ip daddr 192.0.2.1 tcp dport 1883 meta pkttype set host ether daddr set 02:00:00:00:00:02 counter".into(),
+            ip_rule: "ip saddr 192.0.2.244 ip daddr 192.0.2.1 tcp dport 1883 counter dnat to 192.0.2.44:1883".into(),
+        }],
+        reason: None,
+        error: None,
+    };
+    let wire = serde_json::to_value(&bridge_with_rules).unwrap();
+    assert_eq!(
+        serde_json::from_value::<MqttBridgeStatus>(wire).unwrap(),
+        bridge_with_rules
+    );
 }
