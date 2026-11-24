@@ -234,4 +234,49 @@ mod tests {
         );
         fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn libuci_normalizes_duplicate_options_and_preserves_values() {
+        let path =
+            std::env::temp_dir().join(format!("fttr-config-duplicates-{}", std::process::id()));
+        fs::write(&path, "config sample 'sample'\n option duplicate 'first'\n option duplicate 'second'\n option empty ''\n option quote 'a'\\''b'\n list values 'one two'\n list values 'three'\n").unwrap();
+        let view = committed(&path).unwrap();
+        assert_eq!(
+            view.option("sample", "duplicate").as_deref(),
+            Some("second")
+        );
+        // libuci treats setting an empty scalar as deleting the option.
+        assert_eq!(view.option("sample", "empty"), None);
+        assert_eq!(view.option("sample", "quote").as_deref(), Some("a'b"));
+        assert_eq!(
+            view.option("sample", "values").as_deref(),
+            Some("one two three")
+        );
+        assert_eq!(
+            view.sections[0]
+                .options
+                .iter()
+                .filter(|o| o.key == "duplicate")
+                .count(),
+            1
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn private_session_is_removed_after_success_and_export_failure() {
+        let path = std::env::temp_dir().join(format!("fttr-config-cleanup-{}", std::process::id()));
+        fs::write(&path, "config sample 'sample'\n option value 'ok'\n").unwrap();
+        let mut session = UciSession::new(&path).unwrap();
+        let dir = session.dir.clone();
+        assert!(export(&mut session.uci, "missing_package").is_err());
+        assert!(dir.exists());
+        drop(session);
+        assert!(!dir.exists());
+        let session = UciSession::new(&path).unwrap();
+        let dir = session.dir.clone();
+        drop(session);
+        assert!(!dir.exists());
+        fs::remove_file(path).unwrap();
+    }
 }
