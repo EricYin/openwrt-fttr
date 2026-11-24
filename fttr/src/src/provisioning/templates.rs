@@ -66,6 +66,11 @@ pub fn compile(text: &str) -> Result<Config, String> {
                 .ok_or_else(|| "fiberhome onu_count must be 1..128".to_string())
         })
         .transpose()?;
+    if let Some((_, s)) = fiberhome.first() {
+        if !matches!(s.get("rx_snapshot"), "" | "0" | "1" | "false" | "true") {
+            return Err("fiberhome rx_snapshot must be 0 or 1".into());
+        }
+    }
     if all.iter().filter(|(_, s)| s.kind == "management").count() > 1 {
         return Err("only one management network allowed".into());
     }
@@ -112,7 +117,7 @@ pub fn compile(text: &str) -> Result<Config, String> {
             return Err(format!("unsupported section: {}", s.kind));
         }
         let allowed: &[&str] = match s.kind.as_str() {
-            "fiberhome" => &["onu_count"],
+            "fiberhome" => &["onu_count", "rx_snapshot"],
             "mqtt_bridge" => &["enabled"],
             "omci_auth" => &["auth_mode", "auth_loid", "auth_password", "schema_version"],
             "optical" => &["enabled", "downstream_tx_enabled", "fec_enabled"],
@@ -559,6 +564,24 @@ mod tests {
             );
         }
         assert!(super::compile("config fiberhome 'other'\n option onu_count '32'\n").is_err());
+    }
+
+    #[test]
+    fn fiberhome_rx_snapshot_accepts_legacy_and_boolean_options() {
+        let base = "config fiberhome 'fiberhome'\n option onu_count '128'\n";
+        let legacy = super::compile(base).unwrap();
+        for value in ["0", "1", "false", "true"] {
+            let updated =
+                super::compile(&format!("{base} option rx_snapshot '{value}'\n")).unwrap();
+            assert_eq!(updated.revision, legacy.revision);
+        }
+        for option in [
+            "option rx_snapshot 'invalid'",
+            "list rx_snapshot '1'",
+            "option rx_snapshot '0'\n option rx_snapshot '1'",
+        ] {
+            assert!(super::compile(&format!("{base} {option}\n")).is_err());
+        }
     }
 
     #[test]

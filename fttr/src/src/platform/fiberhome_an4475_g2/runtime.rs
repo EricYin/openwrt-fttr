@@ -90,7 +90,7 @@ fn log_receive_path_snapshot(session: &mut FslOltSession<Device>) -> io::Result<
         let values = session
             .fsl_mut()
             .read(RegisterSpace::Register, address, 0, words)?;
-        eprintln!("[*] FSL RX snapshot {name}@{address:#x}={values:x?}");
+        println!("[*] FSL RX snapshot {name}@{address:#x}={values:x?}");
     }
     Ok(())
 }
@@ -1557,7 +1557,11 @@ async fn run_async(platform: PlatformContext) {
             let mut last_timeout_check = Instant::now();
             let mut observation_first = true;
             let mut observation_counts = (0usize, 0usize, 0usize, 0usize);
-            let mut receive_snapshots_remaining = 3u8;
+            let mut receive_snapshots_remaining = if std::env::var("FTTR_FSL_RX_SNAPSHOT").as_deref() == Ok("1") {
+                3u8
+            } else {
+                0
+            };
             let mut mac_poll = crate::controller::pon_mac::Poll::default();
             let mut next_transceiver_sample = Instant::now();
             let mut last_unknown_source_log = Instant::now();
@@ -1658,7 +1662,7 @@ async fn run_async(platform: PlatformContext) {
                             }
                         }
                         if observation_first || observation_counts != (0, 0, 0, 0) {
-                            eprintln!(
+                            println!(
                                 "[*] FSL poll 30s: interrupts={} ploam={} flagged={} omci={}",
                                 observation_counts.0,
                                 observation_counts.1,
@@ -1691,7 +1695,7 @@ async fn run_async(platform: PlatformContext) {
                         // Report the accumulated total so the 1s rate limit
                         // cannot undercount sustained unknown-source traffic.
                         last_unknown_source_log = Instant::now();
-                        eprintln!(
+                        println!(
                             "[*] FSL dropped {unknown_source_total} OMCI frame(s) from unknown/inactive ONU sources"
                         );
                         unknown_source_total = 0;
@@ -1701,7 +1705,7 @@ async fn run_async(platform: PlatformContext) {
                     match session.evaluate_alarm_interrupts(&report.interrupts) {
                         Ok(offline) => {
                             for (onu_id, reason) in offline {
-                                eprintln!(
+                                println!(
                                     "[*] FSL offline alarm ({reason}) for ONU {onu_id} -> deactivating"
                                 );
                                 match deactivate_session_onu(session, onu_id) {
@@ -1734,7 +1738,7 @@ async fn run_async(platform: PlatformContext) {
                                         sn.copy_from_slice(&parsed.payload[..8]);
                                         if let Some(existing) = session.find_onu_by_sn(&sn) {
                                             if existing.state == FslOnuState::Active {
-                                                eprintln!(
+                                                println!(
                                                     "[*] O3 SN rediscovery for active ONU {} -> deactivating stale registration",
                                                     existing.onu_id
                                                 );
@@ -1800,7 +1804,7 @@ async fn run_async(platform: PlatformContext) {
                                     .onu(onu_id)
                                     .is_some_and(|onu| onu.state == FslOnuState::Active)
                                 {
-                                    eprintln!(
+                                    println!(
                                         "[*] ONU {onu_id} sent Dying_Gasp PLOAM -> deactivating"
                                     );
                                     match deactivate_session_onu(session, onu_id) {
@@ -1828,7 +1832,7 @@ async fn run_async(platform: PlatformContext) {
                                     if record.frame[2] != PLOAM_MSG_BER_INTERVAL
                                         && record.frame[2] != PLOAM_MSG_ASSIGN_ALLOC_ID =>
                                 {
-                                    eprintln!(
+                                    println!(
                                         "[*] Ignoring unmatched PLOAM ACK onu_id={:?} acked_msg={:#x} enable={} seq={}",
                                         record.onu_id(),
                                         record.frame[2],
@@ -1842,7 +1846,7 @@ async fn run_async(platform: PlatformContext) {
                                 }
                             }
                         } else {
-                            eprintln!(
+                            println!(
                                 "[*] FSL upstream PLOAM msg_id={:#x} onu_id={:?}",
                                 record.message_id(),
                                 record.onu_id()
@@ -1861,7 +1865,7 @@ async fn run_async(platform: PlatformContext) {
                                     || !timeouts.timed_out_ranging.is_empty()
                                     || !timeouts.timed_out_port_id_ack.is_empty() =>
                             {
-                                eprintln!(
+                                println!(
                                     "[*] FSL timeout sweep: expired_acks={} ranging_timeout={:?} port_id_ack_timeout={:?}",
                                     timeouts.expired_acks,
                                     timeouts.timed_out_ranging,

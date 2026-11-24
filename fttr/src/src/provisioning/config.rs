@@ -149,10 +149,10 @@ pub(super) fn parse_sections(text: &str) -> Result<Vec<(String, Section)>, Strin
                     return Err("device onu_id requires one scalar option".into());
                 }
                 if section.kind == "fiberhome"
-                    && w[1] == "onu_count"
-                    && (w[0] != "option" || section.options.contains_key("onu_count"))
+                    && matches!(w[1].as_str(), "onu_count" | "rx_snapshot")
+                    && (w[0] != "option" || section.options.contains_key(&w[1]))
                 {
-                    return Err("fiberhome onu_count requires one scalar option".into());
+                    return Err(format!("fiberhome {} requires one scalar option", w[1]));
                 }
                 if section.kind == "mqtt_bridge"
                     && w[1] == "enabled"
