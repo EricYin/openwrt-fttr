@@ -43,11 +43,14 @@ fn get<'a>(all: &'a [(String, Section)], id: &str, kind: &str) -> Result<&'a Sec
         .ok_or_else(|| format!("unknown {kind}: {id}"))
 }
 pub fn compile(text: &str) -> Result<Config, String> {
+    compile_view(&crate::config::View::parse(text)?)
+}
+pub(super) fn compile_view(view: &crate::config::View) -> Result<Config, String> {
     // Optical state belongs to the controller, not the expanded provisioning plan.
     // Share its validation so config check and optical startup accept the same input.
-    crate::optical::parse_export(text).map_err(|error| error.to_string())?;
-    crate::optical::parse_calibration_mode(text).map_err(|error| error.to_string())?;
-    let all = config::parse_sections(text)?;
+    crate::optical::settings_from_view(view).map_err(|error| error.to_string())?;
+    crate::optical::calibration_from_view(view).map_err(|error| error.to_string())?;
+    let all = config::sections_from_view(view)?;
     let fiberhome: Vec<_> = all.iter().filter(|(_, s)| s.kind == "fiberhome").collect();
     if fiberhome.len() > 1 || fiberhome.first().is_some_and(|(id, _)| id != "fiberhome") {
         return Err("fiberhome requires one named fiberhome section".into());

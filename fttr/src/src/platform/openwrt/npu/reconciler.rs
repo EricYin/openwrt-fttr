@@ -74,17 +74,21 @@ impl Policy {
     }
 
     fn load() -> io::Result<Self> {
+        let fttr = crate::config::load().map_err(io::Error::other)?;
         let mut uci = openwrt_uci::Uci::new().map_err(io::Error::other)?;
         let mut get = |package, section, key| {
             uci.get(package, section, key)
                 .map_err(|e| io::Error::other(format!("{package}.{section}.{key} read error: {e}")))
         };
         Ok(Self {
-            bridge: get("fttr", "offload", "bridge")?.unwrap_or_else(|| "br-lan".into()),
-            enabled: get("fttr", "offload", "enabled")?.as_deref().unwrap_or("1") == "1",
-            wan_upstream: get("fttr", "offload", "wan_upstream")?.as_deref() == Some("1"),
-            wan_downstream: get("fttr", "offload", "wan_downstream")?.as_deref() == Some("1"),
-            onu_bridge: get("fttr", "offload", "onu_bridge")?
+            bridge: fttr
+                .option("offload", "bridge")
+                .unwrap_or_else(|| "br-lan".into()),
+            enabled: fttr.option("offload", "enabled").as_deref().unwrap_or("1") == "1",
+            wan_upstream: fttr.option("offload", "wan_upstream").as_deref() == Some("1"),
+            wan_downstream: fttr.option("offload", "wan_downstream").as_deref() == Some("1"),
+            onu_bridge: fttr
+                .option("offload", "onu_bridge")
                 .as_deref()
                 .unwrap_or("1")
                 == "1",

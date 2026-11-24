@@ -8,8 +8,6 @@ pub(crate) use crate::bootstrap;
 mod config;
 #[cfg(feature = "platform-fiberhome-an4475-g2")]
 pub(crate) use config::load as load_config;
-pub(crate) use config::load_text as load_uci_text;
-pub(crate) use config::words as uci_words;
 pub(crate) mod command;
 pub(crate) mod controller;
 pub(crate) mod health_watch;

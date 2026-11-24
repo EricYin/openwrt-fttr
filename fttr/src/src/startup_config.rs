@@ -23,8 +23,8 @@ static CONFIG: OnceLock<StartupConfig> = OnceLock::new();
 
 /// Read the same UCI package used by provisioning before starting the runtime.
 pub fn initialize() -> Result<(), &'static str> {
-    let text = crate::provisioning::load_uci_text().map_err(|_| "UCI read failed")?;
-    let config = parse(&text)?;
+    let view = crate::config::load().map_err(|_| "UCI read failed")?;
+    let config = from_view(&view)?;
     CONFIG.set(config).map_err(|_| "already initialized")
 }
 
@@ -35,55 +35,49 @@ pub(crate) fn get() -> &'static StartupConfig {
     CONFIG.get().expect("startup configuration not initialized")
 }
 
+#[cfg(test)]
 fn parse(text: &str) -> Result<StartupConfig, &'static str> {
+    let view = crate::config::View::parse(text).map_err(|_| "invalid UCI syntax")?;
+    from_view(&view)
+}
+fn from_view(view: &crate::config::View) -> Result<StartupConfig, &'static str> {
     let mut config = StartupConfig::default();
-    let mut section = "";
     let mut seen_sections = std::collections::BTreeSet::new();
     let mut seen_options = std::collections::BTreeSet::new();
-    for line in text.lines() {
-        let words = crate::provisioning::uci_words(line).map_err(|_| "invalid UCI syntax")?;
-        if words.is_empty() || words[0].starts_with('#') {
-            continue;
+    for item in &view.sections {
+        let section = match item.name.as_deref() {
+            Some("acs") => "acs",
+            Some("fiberhome") => "fiberhome",
+            _ => "",
+        };
+        if !section.is_empty() && !seen_sections.insert(section) {
+            return Err("duplicate startup configuration section");
         }
-        match words[0].as_str() {
-            "package" if words.len() == 2 => (),
-            "config" if words.len() == 2 || words.len() == 3 => {
-                section = match words.get(2).map(String::as_str) {
-                    Some("acs") => "acs",
-                    Some("fiberhome") => "fiberhome",
-                    _ => "",
-                };
-                if !section.is_empty() && !seen_sections.insert(section) {
-                    return Err("duplicate startup configuration section");
-                }
+        for option in &item.options {
+            let key = option.key.as_str();
+            let relevant = matches!(
+                (section, key),
+                ("acs", "state_file" | "username" | "password") | ("fiberhome", "rx_snapshot")
+            );
+            if !relevant {
+                continue;
             }
-            "option" | "list" if words.len() == 3 => {
-                let key = words[1].as_str();
-                let relevant = matches!(
-                    (section, key),
-                    ("acs", "state_file" | "username" | "password") | ("fiberhome", "rx_snapshot")
-                );
-                if !relevant {
-                    continue;
-                }
-                if words[0] != "option" || !seen_options.insert((section, words[1].clone())) {
-                    return Err("startup settings require unique scalar options");
-                }
-                match (section, key) {
-                    ("acs", "state_file") => config.acs_state_file = words[2].clone(),
-                    ("acs", "username") => config.acs_username = words[2].clone(),
-                    ("acs", "password") => config.acs_password = words[2].clone(),
-                    ("fiberhome", "rx_snapshot") => {
-                        config.rx_snapshot = match words[2].as_str() {
-                            "1" | "true" => true,
-                            "" | "0" | "false" => false,
-                            _ => return Err("invalid fiberhome rx_snapshot"),
-                        }
+            if option.is_list || !seen_options.insert((section, option.key.clone())) {
+                return Err("startup settings require unique scalar options");
+            }
+            match (section, key) {
+                ("acs", "state_file") => config.acs_state_file = option.value.clone(),
+                ("acs", "username") => config.acs_username = option.value.clone(),
+                ("acs", "password") => config.acs_password = option.value.clone(),
+                ("fiberhome", "rx_snapshot") => {
+                    config.rx_snapshot = match option.value.as_str() {
+                        "1" | "true" => true,
+                        "" | "0" | "false" => false,
+                        _ => return Err("invalid fiberhome rx_snapshot"),
                     }
-                    _ => unreachable!(),
                 }
+                _ => unreachable!(),
             }
-            _ => return Err("invalid UCI syntax"),
         }
     }
     Ok(config)

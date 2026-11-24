@@ -45,6 +45,7 @@ pub mod npu {
         NpuStatus::default()
     }
 }
+pub(crate) mod config;
 #[cfg(any(feature = "mqtt", test))]
 mod mqtt_limits;
 pub mod omci_auth;

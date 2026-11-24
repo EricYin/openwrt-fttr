@@ -540,7 +540,7 @@ fn parse_export(text: &str, package: &str) -> Result<Sections, String> {
     let mut id = None;
     let mut counts = BTreeMap::<String, usize>::new();
     for line in text.lines() {
-        let w = super::config::words(line)?;
+        let w = crate::config::words(line)?;
         if w.is_empty() {
             continue;
         }

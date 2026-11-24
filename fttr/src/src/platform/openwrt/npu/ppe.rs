@@ -67,45 +67,6 @@ pub fn parse_ppe_entry(line: &str) -> Option<PpeFlowEntry> {
     })
 }
 
-pub(crate) fn parse_uci_option(config: &str, section: &str, option_name: &str) -> Option<String> {
-    let prefix1 = format!("fttr.{section}.{option_name}=");
-    let prefix2 = format!("{section}.{option_name}=");
-    for line in config.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed
-            .strip_prefix(&prefix1)
-            .or_else(|| trimmed.strip_prefix(&prefix2))
-        {
-            return Some(rest.trim_matches('\'').trim_matches('"').to_string());
-        }
-    }
-
-    let mut in_section = false;
-    for line in config.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("config") {
-            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-            if tokens.len() >= 2 {
-                let sec_type = tokens[1].trim_matches('\'').trim_matches('"');
-                let sec_name = tokens
-                    .get(2)
-                    .map(|s| s.trim_matches('\'').trim_matches('"'))
-                    .unwrap_or(sec_type);
-                in_section = sec_name == section;
-            } else {
-                in_section = false;
-            }
-        } else if in_section && trimmed.starts_with("option") {
-            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-            if tokens.len() >= 3 && tokens[1] == option_name {
-                let val = tokens[2..].join(" ");
-                return Some(val.trim_matches('\'').trim_matches('"').to_string());
-            }
-        }
-    }
-    None
-}
-
 fn new_status(model: NpuAdmissionModel) -> NpuStatus {
     NpuStatus {
         supported: true,
@@ -122,14 +83,14 @@ fn new_status(model: NpuAdmissionModel) -> NpuStatus {
 }
 
 fn populate_uci_config(status: &mut NpuStatus, config_path: &Path) {
-    if let Ok(config) = fs::read_to_string(config_path) {
+    if let Ok(config) = crate::config::committed(config_path) {
         status.config_valid = true;
         for (option, flag) in [
             ("wan_upstream", &mut status.wan_upstream),
             ("wan_downstream", &mut status.wan_downstream),
             ("onu_bridge", &mut status.onu_bridge),
         ] {
-            if let Some(value) = parse_uci_option(&config, "offload", option) {
+            if let Some(value) = config.option("offload", option) {
                 *flag = value == "1";
                 if value != "0" && value != "1" {
                     status.config_valid = false;
@@ -139,7 +100,7 @@ fn populate_uci_config(status: &mut NpuStatus, config_path: &Path) {
                 }
             }
         }
-        if let Some(val) = parse_uci_option(&config, "offload", "enabled") {
+        if let Some(val) = config.option("offload", "enabled") {
             status.bridge_offload_enabled = val == "1";
             if val != "0" && val != "1" {
                 status.config_valid = false;
@@ -148,7 +109,7 @@ fn populate_uci_config(status: &mut NpuStatus, config_path: &Path) {
                     .push("offload.enabled: expected 0 or 1".into());
             }
         }
-        if let Some(b) = parse_uci_option(&config, "offload", "bridge") {
+        if let Some(b) = config.option("offload", "bridge") {
             if b.is_empty()
                 || b.len() > 15
                 || !b
@@ -461,7 +422,7 @@ mod tests {
 
         fs::write(
             &cfg_path,
-            "fttr.offload.enabled='1'\nfttr.offload.bridge='br-lan'\n",
+            "config offload 'offload'\n option enabled '1'\n option bridge 'br-lan'\n",
         )
         .unwrap();
         fs::write(ppe_dir.join("config"), "npu_attached: 1\n").unwrap();

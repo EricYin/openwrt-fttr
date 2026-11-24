@@ -50,14 +50,14 @@ fn valid_interface_name(name: &str) -> bool {
 }
 
 pub fn configured_bridge() -> String {
-    let Ok(output) = run_sync(
-        "uci",
-        &["-q", "get", "fttr.offload.bridge"],
-        COMMAND_TIMEOUT,
-    ) else {
+    let Ok(view) = crate::config::load() else {
         return DEFAULT_BRIDGE.into();
     };
-    let name = output.trim().to_owned();
+    let name = view
+        .option("offload", "bridge")
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
     if valid_interface_name(&name) {
         name
     } else {

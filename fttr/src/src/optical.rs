@@ -1,9 +1,9 @@
 //! Optical desired state and process ownership. Hardware transitions belong to the PLOAM owner.
+use crate::config::UciSession;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
 
 pub const OWNER_LOCK: &str = "/var/run/fttr-optical.lock";
 
@@ -81,69 +81,10 @@ pub fn refresh() -> io::Result<fttr_api::OpticalSettings> {
     settings
 }
 
-struct UciSession {
-    dir: PathBuf,
-    conf_dir: PathBuf,
-    package: String,
-    original: Vec<u8>,
-    uci: openwrt_uci::Uci,
-}
 impl UciSession {
-    fn new(config: &std::path::Path) -> io::Result<Self> {
-        // A private snapshot with a unique package name cannot consume fttr's pending edits.
-        let original = fs::read(config)?;
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_nanos();
-        for nonce in 0..100 {
-            let path =
-                std::env::temp_dir().join(format!("fttr-optical-{}-{nonce}", std::process::id()));
-            match fs::DirBuilder::new().mode(0o700).create(&path) {
-                Ok(()) => {
-                    let setup = (|| -> io::Result<Self> {
-                        let conf_dir = path.join("config");
-                        let delta_dir = path.join("delta");
-                        fs::create_dir(&conf_dir)?;
-                        fs::create_dir(&delta_dir)?;
-                        let package = format!("optical_{}_{stamp}_{nonce}", std::process::id());
-                        fs::write(conf_dir.join(&package), &original)?;
-                        let mut uci = openwrt_uci::Uci::new()
-                            .map_err(|e| io::Error::other(format!("Uci::new: {e}")))?;
-                        uci.set_confdir(&conf_dir)
-                            .map_err(|e| io::Error::other(format!("set_confdir: {e}")))?;
-                        uci.set_savedir(&delta_dir)
-                            .map_err(|e| io::Error::other(format!("set_savedir: {e}")))?;
-                        Ok(Self {
-                            dir: path.clone(),
-                            conf_dir,
-                            package,
-                            original,
-                            uci,
-                        })
-                    })();
-                    match setup {
-                        Ok(session) => return Ok(session),
-                        Err(e) => {
-                            let _ = fs::remove_dir_all(&path);
-                            eprintln!("[-] UciSession setup failed at {path:?}: {e}");
-                            return Err(e);
-                        }
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(io::Error::other("cannot allocate optical UCI savedir"))
-    }
-
     fn load(&mut self) -> io::Result<fttr_api::OpticalSettings> {
-        let text = self
-            .uci
-            .export_package(&self.package)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        parse_settings(&text)
+        let view = crate::config::export(&mut self.uci, &self.package).map_err(io::Error::other)?;
+        settings_from_view(&view)
     }
 
     fn set_optical(&mut self, settings: fttr_api::OpticalSettings) -> io::Result<()> {
@@ -165,12 +106,6 @@ impl UciSession {
         Ok(())
     }
 }
-impl Drop for UciSession {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
 pub fn load_enabled() -> io::Result<bool> {
     refresh().map(|settings| settings.enabled)
 }
@@ -199,44 +134,40 @@ pub fn load_calibration_mode() -> io::Result<fttr_api::CalibrationMode> {
     if !config.exists() {
         return Ok(fttr_api::CalibrationMode::Auto);
     }
-    let mut session = UciSession::new(config)?;
-    let text = session
-        .uci
-        .export_package(&session.package)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    parse_calibration_mode(&text)
+    let view = crate::config::committed(config).map_err(io::Error::other)?;
+    calibration_from_view(&view)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_calibration_mode(text: &str) -> io::Result<fttr_api::CalibrationMode> {
-    let mut section = false;
+    calibration_from_view(&crate::config::View::parse(text).map_err(io::Error::other)?)
+}
+pub(crate) fn calibration_from_view(
+    view: &crate::config::View,
+) -> io::Result<fttr_api::CalibrationMode> {
     let mut seen = false;
     let mut mode = fttr_api::CalibrationMode::Auto;
     let mut source_seen = false;
-    for line in text.lines() {
-        let words = crate::provisioning::uci_words(line).map_err(io::Error::other)?;
-        match words.first().map(String::as_str) {
-            Some("config") => {
-                section = words.get(1).is_some_and(|w| w == "calibration");
-                if section {
-                    if seen || words.get(2).is_none_or(|w| w != "calibration") {
-                        return Err(io::Error::other("expected one named calibration section"));
-                    }
-                    seen = true;
-                } else if words.get(2).is_some_and(|w| w == "calibration") {
-                    return Err(io::Error::other(
-                        "fttr.calibration has the wrong section type",
-                    ));
-                }
+    for section in &view.sections {
+        if section.kind == "calibration" {
+            if seen || section.name.as_deref() != Some("calibration") {
+                return Err(io::Error::other("expected one named calibration section"));
             }
-            Some("option" | "list") if section => {
-                if source_seen || words.len() != 3 || words[0] != "option" || words[1] != "source" {
+            seen = true;
+        } else if section.name.as_deref() == Some("calibration") {
+            return Err(io::Error::other(
+                "fttr.calibration has the wrong section type",
+            ));
+        }
+        if section.kind == "calibration" {
+            for option in &section.options {
+                if source_seen || option.is_list || option.key != "source" {
                     return Err(io::Error::other("invalid calibration source option"));
                 }
                 source_seen = true;
-                mode = serde_json::from_value(serde_json::Value::String(words[2].clone()))
+                mode = serde_json::from_value(serde_json::Value::String(option.value.clone()))
                     .map_err(io::Error::other)?;
             }
-            _ => (),
         }
     }
     Ok(mode)
@@ -271,7 +202,9 @@ pub fn save_calibration_mode(mode: fttr_api::CalibrationMode) -> io::Result<()> 
         .commit(&session.package)
         .map_err(|e| io::Error::other(e.to_string()))?;
     let bytes = fs::read(session.conf_dir.join(&session.package))?;
-    if parse_calibration_mode(std::str::from_utf8(&bytes).map_err(io::Error::other)?)? != mode {
+    let view = crate::config::committed(&session.conf_dir.join(&session.package))
+        .map_err(io::Error::other)?;
+    if calibration_from_view(&view)? != mode {
         return Err(io::Error::other("calibration source readback mismatch"));
     }
     replace_config(config, &source, &session.original, &bytes, &session.package)
@@ -350,56 +283,51 @@ fn replace_config(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn parse_export(text: &str) -> io::Result<bool> {
     parse_settings(text).map(|settings| settings.enabled)
 }
 
 pub(crate) fn parse_settings(text: &str) -> io::Result<fttr_api::OpticalSettings> {
-    let mut optical = false;
-    let mut provisioning = false;
+    settings_from_view(&crate::config::View::parse(text).map_err(io::Error::other)?)
+}
+pub(crate) fn settings_from_view(
+    view: &crate::config::View,
+) -> io::Result<fttr_api::OpticalSettings> {
     let mut seen = false;
     let mut settings = fttr_api::OpticalSettings {
         enabled: true,
         downstream_tx_enabled: true,
         fec_enabled: false,
     };
-    for line in text.lines() {
-        let words = crate::provisioning::uci_words(line).map_err(io::Error::other)?;
-        match words.first().map(String::as_str) {
-            Some("config") => {
-                let kind = words.get(1).map(String::as_str);
-                let name = words.get(2).map(String::as_str);
-                optical = kind == Some("optical");
-                provisioning = kind == Some("provisioning");
-                if optical {
-                    if seen || name != Some("optical") {
-                        return Err(io::Error::other(
-                            "expected one named config optical 'optical' section",
-                        ));
-                    }
-                    seen = true;
-                } else if name == Some("optical") {
-                    return Err(io::Error::other("fttr.optical has the wrong section type"));
-                }
+    for section in &view.sections {
+        let name = section.name.as_deref();
+        if section.kind == "optical" {
+            if seen || name != Some("optical") {
+                return Err(io::Error::other(
+                    "expected one named config optical 'optical' section",
+                ));
             }
-            Some("option" | "list")
-                if provisioning
-                    && words.get(1).is_some_and(|key| {
-                        matches!(
-                            key.as_str(),
-                            "fec_enabled" | "downstream_tx_enabled" | "downstream_fec_enabled"
-                        )
-                    }) =>
+            seen = true;
+        } else if name == Some("optical") {
+            return Err(io::Error::other("fttr.optical has the wrong section type"));
+        }
+        for option in &section.options {
+            if section.kind == "provisioning"
+                && matches!(
+                    option.key.as_str(),
+                    "fec_enabled" | "downstream_tx_enabled" | "downstream_fec_enabled"
+                )
             {
                 return Err(io::Error::other(
                     "optical controls must be configured in fttr.optical, not provisioning",
                 ));
             }
-            Some("option" | "list") if optical => {
-                let key = words.get(1).map(String::as_str).unwrap_or("");
-                let value = match (words[0].as_str(), words.get(2).map(String::as_str)) {
-                    ("option", Some("1")) => true,
-                    ("option", Some("0")) => false,
+            if section.kind == "optical" {
+                let key = option.key.as_str();
+                let value = match (option.is_list, option.value.as_str()) {
+                    (false, "1") => true,
+                    (false, "0") => false,
                     _ => {
                         return Err(io::Error::other(format!(
                             "fttr.optical.{key} must be 0 or 1"
@@ -417,7 +345,6 @@ pub(crate) fn parse_settings(text: &str) -> io::Result<fttr_api::OpticalSettings
                     }
                 }
             }
-            _ => (),
         }
     }
     Ok(settings)
@@ -483,6 +410,22 @@ mod tests {
                 parse_settings(&format!("config optical 'optical'\noption {key} 'yes'\n")).is_err()
             );
         }
+    }
+
+    #[test]
+    fn optical_save_round_trips_through_libuci_and_preserves_other_sections() {
+        let dir = std::env::temp_dir().join(format!("fttr-optical-uci-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("fttr");
+        fs::write(&path, "config acs 'acs'\n option password 'test-value'\nconfig optical 'optical'\n option enabled '1'\n").unwrap();
+        save_at(&path, false).unwrap();
+        assert!(!load_settings_from(&path).unwrap().enabled);
+        let view = crate::config::committed(&path).unwrap();
+        assert_eq!(
+            view.option("acs", "password").as_deref(),
+            Some("test-value")
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

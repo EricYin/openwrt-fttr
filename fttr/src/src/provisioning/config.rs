@@ -56,130 +56,78 @@ pub(super) fn normalize_custom_vlan_service_list(values: &[String]) -> Result<Ve
     Ok(tokens)
 }
 
-// UCI export uses shell quoting, including the '\'' sequence inside strings.
-pub(crate) fn words(line: &str) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
-    let mut word = String::new();
-    let mut quote = None;
-    let mut started = false;
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some('\''), c) => word.push(c),
-            (_, '\\') => word.push(chars.next().ok_or("dangling escape")?),
-            (Some(_), c) => word.push(c),
-            (None, '\'' | '"') => {
-                quote = Some(c);
-                started = true;
-            }
-            (None, c) if c.is_whitespace() => {
-                if started {
-                    out.push(std::mem::take(&mut word));
-                    started = false;
-                }
-            }
-            (None, c) => {
-                word.push(c);
-                started = true;
-            }
-        }
-    }
-    if quote.is_some() {
-        return Err("unterminated UCI quote".into());
-    }
-    if started {
-        out.push(word);
-    }
-    Ok(out)
-}
 pub fn load() -> Result<Config, String> {
-    parse(&load_text()?)
-}
-pub(crate) fn load_text() -> Result<String, String> {
-    Ok(match openwrt_uci::Uci::new() {
-        Ok(mut uci) => uci
-            .export_package("fttr")
-            .map_err(|e| format!("uci: {e}"))?,
-        Err(_) => {
-            // Direct file fallback when running outside standard OpenWrt environment
-            std::fs::read_to_string("/etc/config/fttr")
-                .map_err(|e| format!("cannot load /etc/config/fttr: {e}"))?
-        }
-    })
+    super::templates::compile_view(&crate::config::load()?)
 }
 pub fn parse(text: &str) -> Result<Config, String> {
     super::templates::compile(text)
 }
 /// Decode UCI once at the input boundary; compilers pass sections directly.
 pub(super) fn parse_sections(text: &str) -> Result<Vec<(String, Section)>, String> {
+    sections_from_view(&crate::config::View::parse(text)?)
+}
+pub(super) fn sections_from_view(
+    view: &crate::config::View,
+) -> Result<Vec<(String, Section)>, String> {
     let mut sections = Vec::<(String, Section)>::new();
-    for line in text.lines() {
-        let w = words(line)?;
-        if w.is_empty() || w[0].starts_with('#') {
-            continue;
+    for input in &view.sections {
+        let id = input
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("_anon_{}_{}", input.kind, sections.len()));
+        if sections.iter().any(|(existing, _)| existing == &id) {
+            return Err("duplicate section".into());
         }
-        match w[0].as_str() {
-            "config" if w.len() == 2 || w.len() == 3 => {
-                let id = w
-                    .get(2)
-                    .cloned()
-                    .unwrap_or_else(|| format!("_anon_{}_{}", w[1], sections.len()));
-                if sections.iter().any(|(existing, _)| existing == &id) {
-                    return Err("duplicate section".into());
-                }
-                sections.push((
-                    id,
-                    Section {
-                        kind: w[1].clone(),
-                        ..Section::default()
-                    },
-                ));
+        sections.push((
+            id,
+            Section {
+                kind: input.kind.clone(),
+                ..Section::default()
+            },
+        ));
+        for option in &input.options {
+            let section = &mut sections.last_mut().ok_or("option without section")?.1;
+            let key = &option.key;
+            if (section.kind == "omci_auth" || section.kind == "device")
+                && (key.starts_with("auth_") || key == "schema_version")
+                && (option.is_list || section.options.contains_key(key))
+            {
+                return Err("OMCI authentication fields require unique scalar options".into());
             }
-            "option" | "list" if w.len() == 3 => {
-                let section = &mut sections.last_mut().ok_or("option without section")?.1;
-                if (section.kind == "omci_auth" || section.kind == "device")
-                    && (w[1].starts_with("auth_") || w[1] == "schema_version")
-                    && (w[0] != "option" || section.options.contains_key(&w[1]))
-                {
-                    return Err("OMCI authentication fields require unique scalar options".into());
-                }
-                if section.kind == "device"
-                    && w[1] == "onu_id"
-                    && (w[0] != "option" || section.options.contains_key("onu_id"))
-                {
-                    return Err("device onu_id requires one scalar option".into());
-                }
-                if section.kind == "fiberhome"
-                    && matches!(w[1].as_str(), "onu_count" | "rx_snapshot")
-                    && (w[0] != "option" || section.options.contains_key(&w[1]))
-                {
-                    return Err(format!("fiberhome {} requires one scalar option", w[1]));
-                }
-                if section.kind == "mqtt_bridge"
-                    && w[1] == "enabled"
-                    && (w[0] != "option" || section.options.contains_key("enabled"))
-                {
-                    return Err("mqtt_bridge enabled requires one scalar option".into());
-                }
-                if section.kind == "management" && w[1] == "vlan" && w[0] != "list" {
-                    return Err(
-                        "management VLAN requires list vlan; scalar option vlan is unsupported"
-                            .into(),
-                    );
-                }
-                if w[0] == "option" {
-                    section.options.insert(w[1].clone(), vec![w[2].clone()]);
-                } else {
-                    section
-                        .options
-                        .entry(w[1].clone())
-                        .or_default()
-                        .push(w[2].clone());
-                }
+            if section.kind == "device"
+                && key == "onu_id"
+                && (option.is_list || section.options.contains_key("onu_id"))
+            {
+                return Err("device onu_id requires one scalar option".into());
             }
-            "package" => (),
-            _ => return Err("invalid UCI export".into()),
+            if section.kind == "fiberhome"
+                && matches!(key.as_str(), "onu_count" | "rx_snapshot")
+                && (option.is_list || section.options.contains_key(key))
+            {
+                return Err(format!("fiberhome {} requires one scalar option", key));
+            }
+            if section.kind == "mqtt_bridge"
+                && key == "enabled"
+                && (option.is_list || section.options.contains_key("enabled"))
+            {
+                return Err("mqtt_bridge enabled requires one scalar option".into());
+            }
+            if section.kind == "management" && key == "vlan" && !option.is_list {
+                return Err(
+                    "management VLAN requires list vlan; scalar option vlan is unsupported".into(),
+                );
+            }
+            if !option.is_list {
+                section
+                    .options
+                    .insert(key.clone(), vec![option.value.clone()]);
+            } else {
+                section
+                    .options
+                    .entry(key.clone())
+                    .or_default()
+                    .push(option.value.clone());
+            }
         }
     }
     Ok(sections)
@@ -692,6 +640,7 @@ mod connection_request_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::words;
     #[test]
     fn auth_versions_and_atomic_overrides() {
         use crate::omci_auth::Policy;
