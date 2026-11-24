@@ -21,6 +21,9 @@ use std::{
 pub(crate) trait PlatformBackend: Debug + Sync {
     fn descriptor(&self) -> PlatformDescriptor;
     fn resources(&self) -> &'static Resources;
+    fn all_allocations(&self) -> &'static [super::resources::OnuResources] {
+        self.resources().allocations
+    }
     fn operations(&self) -> fttr_api::PlatformOperations {
         fttr_api::PlatformOperations::default()
     }

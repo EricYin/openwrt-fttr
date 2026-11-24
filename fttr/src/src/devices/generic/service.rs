@@ -65,8 +65,7 @@ fn configure_with_options(
     // Discover before writes: entity IDs are device-owned, not template constants.
     let mib = session.upload_mib()?;
     let owned_allocs: Vec<_> = platform
-        .resources()
-        .allocations
+        .all_allocations()
         .iter()
         .map(|entry| entry.alloc_id)
         .collect();
@@ -84,7 +83,12 @@ fn configure_with_options(
     // ANI binding that points at another slot's GEM port before creating ours;
     // otherwise this slot's GEM/ANI entities collide with the leftover ones.
     for &(instance, gem, _) in &inventory.gem_side {
-        if gem == port || !platform.resources().owns_gem(gem) {
+        if gem == port
+            || !platform
+                .all_allocations()
+                .iter()
+                .any(|entry| entry.gem_id == gem)
+        {
             continue;
         }
         println!(

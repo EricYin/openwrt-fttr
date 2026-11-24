@@ -21,6 +21,10 @@ impl PlatformBackend for An4475G2 {
         super::active_resources()
     }
 
+    fn all_allocations(&self) -> &'static [crate::platform::resources::OnuResources] {
+        &super::RESOURCES.allocations
+    }
+
     fn operations(&self) -> fttr_api::PlatformOperations {
         fttr_api::PlatformOperations {
             optical_control: true,

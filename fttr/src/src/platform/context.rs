@@ -64,6 +64,9 @@ impl PlatformContext {
     pub fn resources(self) -> &'static Resources {
         self.backend.resources()
     }
+    pub fn all_allocations(self) -> &'static [super::resources::OnuResources] {
+        self.backend.all_allocations()
+    }
     pub fn info(self) -> fttr_api::PlatformInfoReply {
         let descriptor = self.backend.descriptor();
         fttr_api::PlatformInfoReply {

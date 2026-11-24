@@ -43,12 +43,7 @@ fn retire_previous_ani(
     // ONU-ID can change across daemon/main restarts while the child retains
     // its MIB. Two ANI bridge entries with the same port number leave the
     // old GEM selected. Retire ONLY entities matching our verified profile.
-    for old in platform
-        .resources()
-        .allocations
-        .iter()
-        .map(|entry| entry.gem_id)
-    {
+    for old in platform.all_allocations().iter().map(|entry| entry.gem_id) {
         if old == current {
             continue;
         }
