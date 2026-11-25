@@ -48,6 +48,7 @@ jobs:
       - run: cargo fmt --all --check --manifest-path openwrt-fttr/fttr/src/Cargo.toml
       - run: cargo test --locked --workspace --manifest-path openwrt-fttr/fttr/src/Cargo.toml --features fttr-api/codegen
       - run: cargo test --locked --manifest-path openwrt-fttr/fttr/src/Cargo.toml --lib --no-default-features --features all-devices,acs,mqtt,npu
+      - run: cargo check --locked --manifest-path openwrt-fttr/fttr/src/Cargo.toml --all-targets --no-default-features --features all-devices,acs,mqtt,mqtt-bridge,npu,diagnostics
       - run: cargo check --locked --manifest-path openwrt-fttr/fttr/src/Cargo.toml --all-targets --no-default-features --features all-devices,acs,mqtt,npu,diagnostics
       - run: cargo check --locked --manifest-path openwrt-fttr/fttr/src/Cargo.toml --all-targets --no-default-features --features all-devices,acs,diagnostics
       - run: cargo check --locked --manifest-path openwrt-fttr/fttr/src/Cargo.toml --all-targets --no-default-features

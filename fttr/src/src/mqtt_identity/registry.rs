@@ -163,6 +163,7 @@ impl Registry {
         self.clock
     }
 
+    #[cfg_attr(not(feature = "mqtt-bridge"), allow(dead_code))]
     pub(crate) fn fdb_candidates_for_serial(&self, serial: &str, time: u64) -> Vec<String> {
         if time < self.clock
             || self
@@ -184,6 +185,7 @@ impl Registry {
             .collect()
     }
 
+    #[cfg_attr(not(feature = "mqtt-bridge"), allow(dead_code))]
     pub(crate) fn seed_verified_report(&mut self, serial: &str, mac: &str) -> bool {
         if serial.len() != 12 || !serial.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return false;

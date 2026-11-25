@@ -6,6 +6,7 @@ use std::{fs, io, path::Path};
 pub fn compiled() -> Capabilities {
     let acs = cfg!(feature = "acs");
     let mqtt = cfg!(feature = "mqtt");
+    let mqtt_bridge = cfg!(feature = "mqtt-bridge");
     let hl202 = cfg!(feature = "device-hl202");
     let hwtc = cfg!(feature = "device-hwtc");
     let star = cfg!(feature = "device-star");
@@ -32,6 +33,7 @@ pub fn compiled() -> Capabilities {
         features: CapabilityFeatures {
             acs,
             mqtt,
+            mqtt_bridge,
             npu: cfg!(feature = "npu"),
             device_hl202: hl202,
             device_hwtc: hwtc,

@@ -8,7 +8,7 @@ PKG_URL:=https://github.com/LazuliKao/openwrt-fttr/tree/main/fttr
 
 PKG_BUILD_DEPENDS:=rust/host
 PKG_BUILD_PARALLEL:=1
-PKG_CONFIG_DEPENDS:=CONFIG_FTTR_PLATFORM_H3C_HM2004_DU CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2 CONFIG_FTTR_PLATFORM_TIANYI_TYFZA1 CONFIG_FTTR_DEVICE_HL202 CONFIG_FTTR_DEVICE_HWTC CONFIG_FTTR_DEVICE_STAR CONFIG_FTTR_DEVICE_ZTE CONFIG_FTTR_DEVICE_SCTY CONFIG_FTTR_DEVICE_FIBERHOME CONFIG_FTTR_DEVICE_REALTEK CONFIG_FTTR_ACS CONFIG_FTTR_MQTT CONFIG_FTTR_NPU CONFIG_FTTR_MIMALLOC
+PKG_CONFIG_DEPENDS:=CONFIG_FTTR_PLATFORM_H3C_HM2004_DU CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2 CONFIG_FTTR_PLATFORM_TIANYI_TYFZA1 CONFIG_FTTR_DEVICE_HL202 CONFIG_FTTR_DEVICE_HWTC CONFIG_FTTR_DEVICE_STAR CONFIG_FTTR_DEVICE_ZTE CONFIG_FTTR_DEVICE_SCTY CONFIG_FTTR_DEVICE_FIBERHOME CONFIG_FTTR_DEVICE_REALTEK CONFIG_FTTR_ACS CONFIG_FTTR_MQTT CONFIG_FTTR_MQTT_BRIDGE CONFIG_FTTR_NPU CONFIG_FTTR_MIMALLOC
 
 include $(INCLUDE_DIR)/package.mk
 include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk
@@ -75,6 +75,14 @@ define Package/openwrt-fttr/config
     bool "Compile controller-owned MQTT broker and clients"
     depends on PACKAGE_openwrt-fttr
     default y
+  config FTTR_MQTT_BRIDGE
+    bool "Compile selective bridge-mode MQTT redirect (runtime UCI switch)"
+    depends on PACKAGE_openwrt-fttr && FTTR_MQTT
+    default y
+    help
+      Passively observe bridge-port DHCP/1883 SYN evidence and selectively
+      redirect verified HL202 sub-gateways to the local MQTT broker in
+      upstream-DHCP bridge mode.
   config FTTR_MIMALLOC
     bool "Use mimalloc for fttrd Rust allocations (experimental)"
     depends on PACKAGE_openwrt-fttr
@@ -91,7 +99,7 @@ define Package/openwrt-fttr/config
       Disable to build without the NPU control service; software bridging remains available.
 endef
 
-RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_PLATFORM_H3C_HM2004_DU),platform-h3c-hm2004-du) $(if $(CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2),platform-fiberhome-an4475-g2) $(if $(CONFIG_FTTR_PLATFORM_TIANYI_TYFZA1),platform-tianyi-tyfza1) $(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC),device-hwtc) $(if $(CONFIG_FTTR_DEVICE_STAR),device-star) $(if $(CONFIG_FTTR_DEVICE_ZTE),device-zte) $(if $(CONFIG_FTTR_DEVICE_SCTY),device-scty) $(if $(CONFIG_FTTR_DEVICE_FIBERHOME),device-fiberhome) $(if $(CONFIG_FTTR_DEVICE_REALTEK),device-realtek) $(if $(CONFIG_FTTR_ACS),acs) $(if $(CONFIG_FTTR_MQTT),mqtt) $(if $(and $(CONFIG_FTTR_NPU),$(or $(CONFIG_FTTR_PLATFORM_H3C_HM2004_DU),$(CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2))),npu) $(if $(CONFIG_FTTR_MIMALLOC),allocator-mimalloc)
+RUST_PKG_FEATURES:=$(if $(CONFIG_FTTR_PLATFORM_H3C_HM2004_DU),platform-h3c-hm2004-du) $(if $(CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2),platform-fiberhome-an4475-g2) $(if $(CONFIG_FTTR_PLATFORM_TIANYI_TYFZA1),platform-tianyi-tyfza1) $(if $(CONFIG_FTTR_DEVICE_HL202),device-hl202) $(if $(CONFIG_FTTR_DEVICE_HWTC),device-hwtc) $(if $(CONFIG_FTTR_DEVICE_STAR),device-star) $(if $(CONFIG_FTTR_DEVICE_ZTE),device-zte) $(if $(CONFIG_FTTR_DEVICE_SCTY),device-scty) $(if $(CONFIG_FTTR_DEVICE_FIBERHOME),device-fiberhome) $(if $(CONFIG_FTTR_DEVICE_REALTEK),device-realtek) $(if $(CONFIG_FTTR_ACS),acs) $(if $(CONFIG_FTTR_MQTT),mqtt) $(if $(and $(CONFIG_FTTR_MQTT),$(CONFIG_FTTR_MQTT_BRIDGE)),mqtt-bridge) $(if $(and $(CONFIG_FTTR_NPU),$(or $(CONFIG_FTTR_PLATFORM_H3C_HM2004_DU),$(CONFIG_FTTR_PLATFORM_FIBERHOME_AN4475_G2))),npu) $(if $(CONFIG_FTTR_MIMALLOC),allocator-mimalloc)
 # Keep production installation independent of workspace SDK/diagnostic binaries.
 CARGO_PKG_ARGS+= --no-default-features --frozen --bin fttrd --bin fttrctl
 

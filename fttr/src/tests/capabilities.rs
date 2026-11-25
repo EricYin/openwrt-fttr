@@ -19,6 +19,10 @@ fn capabilities_offline_queries_agree_without_controller_initialization() {
     assert_eq!(cli, daemon);
     assert_eq!(cli["schema_version"], 1);
     assert_eq!(cli["features"]["mqtt"], cfg!(feature = "mqtt"));
+    assert_eq!(
+        cli["features"]["mqtt-bridge"],
+        cfg!(feature = "mqtt-bridge")
+    );
     assert_eq!(cli["features"]["acs"], cfg!(feature = "acs"));
     assert_eq!(
         cli["features"]["device-hl202"],
