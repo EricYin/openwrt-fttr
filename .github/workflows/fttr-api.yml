@@ -25,6 +25,23 @@ jobs:
           ref: ${{ inputs.frontend_ref || vars.FTTR_FRONTEND_REF || 'main' }}
           path: luci-app-fttr
       - uses: dtolnay/rust-toolchain@stable
+      - name: Build libuci for host tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libjson-c-dev pkg-config
+          prefix="$RUNNER_TEMP/openwrt-uci"
+          git clone https://git.openwrt.org/project/libubox.git "$RUNNER_TEMP/libubox"
+          git -C "$RUNNER_TEMP/libubox" checkout a396f38a8568a1d670c240465cd8d24fdfdf6463
+          cmake -S "$RUNNER_TEMP/libubox" -B "$RUNNER_TEMP/libubox-build" -DCMAKE_INSTALL_PREFIX="$prefix" -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF
+          cmake --build "$RUNNER_TEMP/libubox-build" --parallel
+          cmake --install "$RUNNER_TEMP/libubox-build"
+          git clone https://git.openwrt.org/project/uci.git "$RUNNER_TEMP/uci"
+          # Match the version used by the Rust ABI bindings.
+          git -C "$RUNNER_TEMP/uci" checkout 74f6277aabffc943d026f406df57c22595134c42
+          cmake -S "$RUNNER_TEMP/uci" -B "$RUNNER_TEMP/uci-build" -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_PREFIX_PATH="$prefix" -DBUILD_LUA=OFF
+          cmake --build "$RUNNER_TEMP/uci-build" --parallel
+          cmake --install "$RUNNER_TEMP/uci-build"
+          echo "LD_LIBRARY_PATH=$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
       # UAPI drift guard: the C static asserts mirror the Rust transport tests.
       - run: cc -std=c11 -Wall -Werror -Ifiberhome-fsl/src fiberhome-fsl/tests/check-uapi.c -o /tmp/check-uapi && /tmp/check-uapi
         working-directory: openwrt-fttr
