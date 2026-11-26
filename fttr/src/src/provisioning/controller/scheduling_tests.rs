@@ -163,6 +163,36 @@ fn interrupted_history_requires_reconciliation_before_periodic_sync() {
 }
 
 #[test]
+fn new_plan_or_apply_cannot_replace_unresolved_history() {
+    for recovered in [false, true] {
+        for apply in [false, true] {
+            for outcome in ["unknown", "accepted_pending_apply"] {
+                let mut c = periodic_controller();
+                c.config.enabled = true;
+                let mut op = operation(OperationPhase::Completed, false);
+                op.results
+                    .insert("wifi".into(), json!({"id":"wifi","state":outcome}));
+                crate::omci_auth::test_authorize(&op.device.optical_sn);
+                c.config.devices.push(op.device.clone());
+                if recovered {
+                    c.recovered.insert("child".into(), op.view());
+                } else {
+                    c.operations.insert("child".into(), op);
+                }
+                let history = c.history();
+                let next_id = c.next_id;
+                assert!(c
+                    .start("child", apply, false)
+                    .unwrap_err()
+                    .contains("unresolved prior write"));
+                assert_eq!(c.history(), history);
+                assert_eq!(c.next_id, next_id);
+            }
+        }
+    }
+}
+
+#[test]
 fn disabled_periodic_and_clock_rollback_do_not_trigger_sync() {
     let mut c = periodic_controller();
     assert!(c.periodic_due("new", 100));

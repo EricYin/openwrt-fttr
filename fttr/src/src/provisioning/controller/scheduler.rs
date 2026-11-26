@@ -484,10 +484,11 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
             }
         } else if !needs_manual
             && previous.as_ref().is_some_and(|p| {
-                p["items"].as_array().is_some_and(|a| {
-                    a.iter()
-                        .any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::Drift))
-                })
+                p["mode"] != "plan"
+                    && p["items"].as_array().is_some_and(|a| {
+                        a.iter()
+                            .any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::Drift))
+                    })
             })
         {
             let attempts = c.attempts.get(&d.id).copied().unwrap_or(0);
@@ -583,6 +584,21 @@ mod config_change_tests {
         c.config.triggers.clear();
         schedule(&mut c, &device, true, false, 101);
         assert_eq!(c.operations[&device.id].revision, "rev");
+    }
+
+    #[test]
+    fn read_only_plan_drift_does_not_schedule_an_apply() {
+        let (mut c, device) = fixture();
+        c.config.triggers.clear();
+        let op = c.operations.get_mut(&device.id).unwrap();
+        op.apply = false;
+        op.results
+            .insert("wifi".into(), json!({"id":"wifi","state":"drift"}));
+        let id = op.id;
+        schedule(&mut c, &device, true, false, 100);
+        assert_eq!(c.operations[&device.id].id, id);
+        assert!(!c.operations[&device.id].apply);
+        assert!(!c.attempts.contains_key(&device.id));
     }
 
     #[test]

@@ -158,6 +158,7 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
             op.uncertain = state == TaskOutcome::Unknown;
             op.pending = state == TaskOutcome::AcceptedPendingApply;
             op.written = state != TaskOutcome::Unknown;
+            op.credential_write = op.changes.iter().any(|p| p.secret).then_some(state);
             let delay = op.device.contract().requirements.settle_seconds;
             if delay == 0 {
                 queue_read(op, OperationPhase::Verifying);
@@ -355,10 +356,9 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
     }
     let mut changes = Vec::new();
     for p in &item.parameters {
-        // Credential parameters are write-only on the supported ONUs. A
-        // successful SetParameterValues is sufficient; never fail an item
-        // because CWMP cannot return the password.
-        if op.stage == OperationPhase::Verifying && p.secret {
+        // Only a credential actually submitted in this RPC has acceptance
+        // evidence. Its unknown/pending outcome is checked before settlement.
+        if op.stage == OperationPhase::Verifying && p.secret && op.credential_write.is_some() {
             continue;
         }
         let value = values
@@ -378,8 +378,12 @@ pub(super) fn advance(op: &mut Operation, reachable: bool) {
         }
     }
     if op.stage == OperationPhase::Verifying {
-        if changes.is_empty() {
-            op.finish_item(ItemOutcome::Verified,"readable CWMP parameters match; credential write was accepted (password readback is write-only)");
+        if op.credential_write == Some(TaskOutcome::Unknown) {
+            op.finish_item(ItemOutcome::Unknown, "credential write outcome unknown; readable matches cannot verify a write-only value");
+        } else if op.credential_write == Some(TaskOutcome::AcceptedPendingApply) {
+            op.finish_item(ItemOutcome::AcceptedPendingApply, "credential write returned Status=1; write-only value application remains unverified");
+        } else if changes.is_empty() {
+            op.finish_item(ItemOutcome::Verified, if op.credential_write == Some(TaskOutcome::Completed) { "readable CWMP parameters match; credential RPC completed successfully (write-only value not read back)" } else { "CWMP parameter readback matches desired state" });
         } else if op.pending {
             op.finish_item(
                 ItemOutcome::AcceptedPendingApply,

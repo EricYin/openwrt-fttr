@@ -57,7 +57,7 @@ mod tests {
         }
     }
     fn reply(instances: &[u32]) -> Value {
-        json!({"state":"completed","result":{"parameters":instances.iter().map(|n|json!({"name":format!("{ROOT}{n}.")})).collect::<Vec<_>>()}})
+        json!({"state":"completed","result":{"parameters":instances.iter().map(|n|json!({"name":format!("{ROOT}{n}."),"writable":"1"})).collect::<Vec<_>>()}})
     }
     fn responses(v: Vec<Value>) {
         RPC.with(|r| *r.borrow_mut() = (v.into(), Vec::new()));
@@ -213,6 +213,75 @@ mod tests {
             )
         });
     }
+    #[test]
+    fn malformed_inventory_never_erases_ownership_or_confirms_delete() {
+        let d = device();
+        let valid = json!({"name":format!("{ROOT}1."),"writable":"1"});
+        for result in [
+            json!({}),
+            json!({"parameters":null}),
+            json!({"parameters":[valid.clone(), {"name":"wrong.2.","writable":"1"}]}),
+            json!({"parameters":[valid.clone(), valid.clone()]}),
+            json!({"parameters":[{"name":format!("{ROOT}2.SSID"),"writable":"1"}]}),
+            json!({"parameters":[{"name":format!("{ROOT}0."),"writable":"1"}]}),
+            json!({"parameters":[{"name":format!("{ROOT}2."),"value":"1"}]}),
+            json!({"parameters":[{"name":format!("{ROOT}2.")}]}),
+        ] {
+            for stage in [WifiPhase::Inventory, WifiPhase::VerifyDelete] {
+                let mut r = initialized(&d);
+                r.stage = stage;
+                r.registry.owned.insert(2);
+                r.registry.pending = Some(WifiPendingAction::Deleting);
+                r.registry.pending_instance = Some(2);
+                r.current = Some(2);
+                responses(vec![json!({"state":"completed","result":result})]);
+                assert!(r.tick(&d, true, true, true, true));
+                assert!(r.registry.owned.contains(&2));
+                assert_eq!(r.registry.pending, Some(WifiPendingAction::Deleting));
+                assert_eq!(r.results["2"]["state"], "unknown");
+                RPC.with(|rpc| assert!(rpc.borrow().1.iter().all(|v| v["op"] != "queue")));
+            }
+        }
+        let data = serde_json::from_value(json!({"parameters":[]})).unwrap();
+        assert!(inventory(&data).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn fresh_inventory_and_plan_do_not_settle_interrupted_delete() {
+        let d = device();
+        for apply in [false, true] {
+            let mut r = initialized(&d);
+            r.registry.owned.insert(2);
+            r.registry.pending = Some(WifiPendingAction::Deleting);
+            r.registry.pending_instance = Some(2);
+            responses(vec![reply(&[1])]);
+            assert!(r.tick(&d, apply, true, true, true));
+            assert!(r.registry.owned.contains(&2));
+            assert_eq!(r.registry.pending, Some(WifiPendingAction::Deleting));
+        }
+    }
+
+    #[test]
+    fn save_retries_directory_barrier_after_rename_and_identical_content() {
+        use super::super::storage::test_io::{self, Point};
+        let d = device();
+        let r = Reconciler::new(&d, Registry::default(), true);
+        test_io::fail_next(Point::DirectorySync);
+        assert!(r.save(&d.cwmp_id).is_err());
+        assert!(std::path::Path::new(&path(&d.cwmp_id)).exists());
+        test_io::events();
+        test_io::fail_next(Point::DirectorySync);
+        assert!(r.save(&d.cwmp_id).is_err());
+        assert_eq!(
+            test_io::events(),
+            vec![Point::FileSync, Point::DirectorySync]
+        );
+        r.save(&d.cwmp_id).unwrap();
+        let events = test_io::events();
+        assert_eq!(events[0], Point::FileSync);
+        assert!(events[1..].iter().all(|p| *p == Point::DirectorySync));
+        assert!(events.len() > 2);
+    }
 }
 pub fn load(id: &str) -> Result<Registry, String> {
     let text = match std::fs::read_to_string(path(id)) {
@@ -235,19 +304,34 @@ pub fn reset(id: &str) -> Result<(), String> {
 pub fn instance(name: &str) -> Option<u32> {
     name.strip_prefix(ROOT)?.split('.').next()?.parse().ok()
 }
-fn inventory(v: &crate::cwmp::response::Data) -> BTreeSet<u32> {
-    v.rows()
-        .into_iter()
-        .flatten()
-        .filter_map(|p| {
-            p["name"]
-                .as_str()?
-                .strip_prefix(ROOT)?
-                .strip_suffix('.')?
-                .parse()
-                .ok()
-        })
-        .collect()
+struct CompleteInventory(BTreeSet<u32>);
+
+fn inventory(v: &crate::cwmp::response::Data) -> Result<CompleteInventory, &'static str> {
+    let rows = v.rows().ok_or("missing WLAN inventory rows")?;
+    let mut instances = BTreeSet::new();
+    for row in rows {
+        if !matches!(row, crate::cwmp::response::Row::Info { .. })
+            || !matches!(row["writable"].as_str(), Some("0" | "1" | "false" | "true"))
+        {
+            return Err("invalid WLAN inventory row type");
+        }
+        let token = row["name"]
+            .as_str()
+            .and_then(|name| name.strip_prefix(ROOT))
+            .and_then(|name| name.strip_suffix('.'))
+            .ok_or("out of scope WLAN inventory row")?;
+        let n = token
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n > 0 && n.to_string() == token)
+            .ok_or("invalid WLAN inventory instance")?;
+        if !instances.insert(n) {
+            return Err("duplicate WLAN inventory instance");
+        }
+    }
+    // An explicit empty ParameterList from a completed RPC is valid. A missing
+    // list, malformed row or filtered subset is never evidence of absence.
+    Ok(CompleteInventory(instances))
 }
 #[derive(Clone)]
 pub struct Reconciler {
@@ -307,21 +391,9 @@ impl Reconciler {
         }
     }
     pub fn save(&self, id: &str) -> Result<(), String> {
-        #[cfg(test)]
-        {
-            let _ = id;
-            return Ok(());
-        }
-        #[cfg(not(test))]
-        {
-            let text = json!({"cwmp_id":id,"registry":self.registry}).to_string();
-            let path = path(id);
-            if std::fs::read_to_string(&path).ok().as_deref() == Some(&text) {
-                return Ok(());
-            }
-            super::storage::write_atomic(&path, text.as_bytes(), true)
-                .map_err(|e| format!("persist Wi-Fi ownership: {e}"))
-        }
+        let text = json!({"cwmp_id":id,"registry":self.registry}).to_string();
+        super::storage::write_atomic(&path(id), text.as_bytes(), true)
+            .map_err(|e| format!("persist Wi-Fi ownership: {e}"))
     }
     fn fail(&mut self, state: ItemOutcome, reason: &str) {
         self.results.insert(
@@ -445,24 +517,37 @@ impl Reconciler {
                 );
                 return true;
             }
+            let complete_inventory = if matches!(
+                self.stage,
+                WifiPhase::Inventory | WifiPhase::VerifyAdd | WifiPhase::VerifyDelete
+            ) {
+                match inventory(v.result()) {
+                    Ok(CompleteInventory(instances)) => Some(instances),
+                    Err(reason) => {
+                        self.fail(
+                            if self.registry.pending.is_some() {
+                                ItemOutcome::Unknown
+                            } else {
+                                ItemOutcome::Blocked
+                            },
+                            reason,
+                        );
+                        return true;
+                    }
+                }
+            } else {
+                None
+            };
             self.task = None;
             match self.stage {
                 WifiPhase::Inventory => {
-                    self.existing = inventory(v.result());
-                    self.registry.owned.retain(|n| self.existing.contains(n));
+                    self.existing = complete_inventory.unwrap();
                     if self.registry.pending.is_some() {
-                        if self.registry.pending == Some(WifiPendingAction::Deleting)
-                            && self
-                                .registry
-                                .pending_instance
-                                .is_some_and(|n| !self.existing.contains(&n))
-                        {
-                            self.registry.pending = None;
-                            self.registry.pending_instance = None;
-                        } else {
-                            self.fail(ItemOutcome::Unknown,"interrupted Wi-Fi lifecycle; inspect registry and inventory before retry");
-                            return true;
-                        }
+                        self.fail(ItemOutcome::Unknown,"interrupted Wi-Fi lifecycle; fresh inventory does not prove the old RPC stopped");
+                        return true;
+                    }
+                    if apply {
+                        self.registry.owned.retain(|n| self.existing.contains(n));
                     }
                 }
                 WifiPhase::Adding => {
@@ -493,7 +578,7 @@ impl Reconciler {
                 }
                 WifiPhase::VerifyAdd => {
                     let before = self.existing.clone();
-                    self.existing = inventory(v.result());
+                    self.existing = complete_inventory.unwrap();
                     let n = self.current.unwrap();
                     if !self.existing.contains(&n) {
                         self.fail(
@@ -526,7 +611,7 @@ impl Reconciler {
                     return false;
                 }
                 WifiPhase::VerifyDelete => {
-                    self.existing = inventory(v.result());
+                    self.existing = complete_inventory.unwrap();
                     let n = self.current.unwrap();
                     if self.existing.contains(&n) {
                         self.fail(

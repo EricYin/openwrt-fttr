@@ -1,5 +1,5 @@
 //! Desired-state controller. CWMP traffic runs independently of optical workers.
-use super::model::{ItemKind, ItemOutcome, OperationPhase, ParameterKind};
+use super::model::{ItemKind, ItemOutcome, OperationPhase, ParameterKind, TaskOutcome};
 use super::{config, wan, wifi};
 #[path = "controller/lifecycle.rs"]
 mod lifecycle;
@@ -106,6 +106,7 @@ struct Operation {
     uncertain: bool,
     pending: bool,
     written: bool,
+    credential_write: Option<TaskOutcome>,
     passphrase_fallback: bool,
     results: BTreeMap<String, Value>,
     started: u64,
@@ -325,6 +326,41 @@ impl Controller {
             })
         }) {
             return Err("device already has an active operation".into());
+        }
+        // Until transaction-aware recovery is available, neither a plan nor a
+        // new apply may replace the only record of an unresolved write.
+        if devices.iter().any(|d| {
+            let previous = self.operations.get(&d.id).map(Operation::view);
+            previous
+                .as_ref()
+                .or_else(|| self.recovered.get(&d.id))
+                .is_some_and(|p| {
+                    (p["state"] == "interrupted" && p["mode"] != "plan")
+                        || p["unresolved_operation"].is_object()
+                        || p["items"].as_array().is_some_and(|items| {
+                            items.iter().any(|i| {
+                                matches!(
+                                    ItemOutcome::from_result(i),
+                                    Some(ItemOutcome::Unknown | ItemOutcome::AcceptedPendingApply)
+                                )
+                            })
+                        })
+                        || ["wan_lifecycle", "wifi_lifecycle"].iter().any(|key| {
+                            p[*key].as_object().is_some_and(|items| {
+                                items.values().any(|i| {
+                                    matches!(
+                                        ItemOutcome::from_result(i),
+                                        Some(
+                                            ItemOutcome::Unknown
+                                                | ItemOutcome::AcceptedPendingApply
+                                        )
+                                    )
+                                })
+                            })
+                        })
+                })
+        }) {
+            return Err("unresolved prior write; transaction-aware recovery required before a new plan or apply".into());
         }
         let mut ids = Vec::new();
         for d in devices {
@@ -988,6 +1024,44 @@ mod tests {
         advance(&mut o, true);
         assert_eq!(o.results["wifi"]["state"], "verified");
         assert!(!o.view().to_string().contains("wanted"));
+    }
+    #[test]
+    #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 contract")]
+    fn matching_readable_values_do_not_settle_unknown_or_pending_credentials() {
+        for secret in [false, true] {
+            for (state, expected) in [
+                ("unknown", "unknown"),
+                ("accepted_pending_apply", "accepted_pending_apply"),
+                ("completed", "verified"),
+            ] {
+                let mut o = operation(OperationPhase::Writing, false);
+                if secret {
+                    let key = Parameter { name: "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.KeyPassphrase".into(), value: "test-only-key".into(), kind: ParameterKind::String, secret: true };
+                    o.device.items[0].parameters.push(key.clone());
+                    o.changes.push(key);
+                } else {
+                    o.changes = o.item().parameters.clone();
+                }
+                responses(vec![
+                    json!({"state":state}),
+                    json!({"id":2}),
+                    readback("wanted"),
+                ]);
+                advance(&mut o, true);
+                advance(&mut o, true);
+                assert_eq!(
+                    o.results["wifi"]["state"],
+                    if secret { expected } else { "verified" },
+                    "secret={secret}, write={state}"
+                );
+                if secret && state == "unknown" {
+                    assert!(!o.results["wifi"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("was accepted"));
+                }
+            }
+        }
     }
     #[test]
     #[cfg_attr(not(feature = "device-hl202"), ignore = "requires HL202 contract")]

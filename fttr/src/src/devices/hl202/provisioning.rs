@@ -12,7 +12,7 @@ use std::{
 };
 
 type Fields = BTreeMap<(String, String), String>;
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Inventory {
     fields: Fields,
     parents: BTreeSet<u32>,
@@ -56,20 +56,66 @@ fn now() -> u64 {
 }
 
 async fn execute(selection: &Selection, script: &str) -> Result<String, String> {
+    execute_once(selection, script)
+        .await
+        .map_err(|(reason, _)| reason)
+}
+
+async fn execute_once(selection: &Selection, script: &str) -> Result<String, (String, bool)> {
     let reply = command_binding::execute_async(selection, script, Duration::from_secs(90))
         .await
-        .map_err(|_| "command transport failed; rediscovery required")?;
-    if !reply.binding_current
-        || reply.result.status != CommandStatus::Executed
-        || reply.result.exit_code != Some(0)
-        || reply.result.output_truncated
-    {
-        return Err("command completion or identity not verified; rediscovery required".into());
+        .map_err(|_| {
+            (
+                "command transport failed; rediscovery required".into(),
+                false,
+            )
+        })?;
+    if !reply.binding_current {
+        return Err((
+            "command identity changed; rediscovery required".into(),
+            false,
+        ));
+    }
+    if reply.result.status == CommandStatus::Timeout {
+        return Err((
+            "command response timed out; execution outcome unknown".into(),
+            true,
+        ));
+    }
+    if reply.result.status != CommandStatus::Executed || reply.result.exit_code != Some(0) {
+        return Err((format!("command did not complete successfully (status={:?}, exit={:?}); rediscovery required", reply.result.status, reply.result.exit_code), false));
+    }
+    if reply.result.output_truncated {
+        return Err((
+            "command output truncated; rediscovery required".into(),
+            false,
+        ));
     }
     reply
         .result
         .output
-        .ok_or("command returned no framed output".into())
+        .ok_or(("command returned no framed output".into(), false))
+}
+
+async fn initial_inventory_with_retry<F, Fut, Check>(
+    mut read: F,
+    check_auth: Check,
+    retry_delay: Duration,
+) -> Result<String, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<String, (String, bool)>>,
+    Check: Fn() -> Result<(), String>,
+{
+    match read().await {
+        Err((_, true)) => {
+            tokio::time::sleep(retry_delay).await;
+            check_auth()?;
+            read().await.map_err(|(reason, _)| reason)
+        }
+        Err((reason, _)) => Err(reason),
+        Ok(text) => Ok(text),
+    }
 }
 
 const INVENTORY: &str = r#"read_fields() {
@@ -111,6 +157,9 @@ fn parse(text: &str) -> Result<Inventory, String> {
     let mut inventory = Inventory::default();
     let mut complete = false;
     for line in text.lines() {
+        if complete {
+            return Err("data after inventory completion".into());
+        }
         let parts: Vec<_> = line.split('|').collect();
         match parts.as_slice() {
             ["P", p] => {
@@ -129,7 +178,7 @@ fn parse(text: &str) -> Result<Inventory, String> {
                 }
             }
             ["V", node, key, hex] => {
-                if hex.len() % 2 != 0 {
+                if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                     return Err("invalid field encoding".into());
                 }
                 let bytes = (0..hex.len())
@@ -162,6 +211,52 @@ fn parse(text: &str) -> Result<Inventory, String> {
         if get(&inventory, &format!("{radio}_Common"), "BssidNum") != "4" {
             return Err("unverified Wi-Fi slot layout".into());
         }
+    }
+    // A terminator alone does not prove every declared object was read. Missing
+    // fields must never be interpreted as an absent WAN or an empty credential.
+    let mut expected = BTreeSet::new();
+    let mut require = |node: String, keys: &str| {
+        expected.extend(
+            keys.split_whitespace()
+                .map(|key| (node.clone(), key.into())),
+        );
+    };
+    for p in &inventory.parents {
+        require(
+            format!("Wan_PVC{p}"),
+            "VLANMode VLANID DOT1P EPONEnable GPONEnable",
+        );
+    }
+    for (p, c) in &inventory.children {
+        require(format!("Wan_PVC{p}_Entry{c}"), "ServiceList Active WanMode ISP VLANMode VLANID dot1q dot1p dot1pData IPVERSION LinkMode BridgeMode NATENABLE LAN1 LAN2 LAN3 LAN4 SSID1 SSID2 SSID3 SSID4 SSIDAC1 SSIDAC2 SSIDAC3 SSIDAC4 __runtime_present");
+    }
+    for radio in ["WLan", "WLan11ac"] {
+        require(format!("{radio}_Common"), "APOn BssidNum");
+        for slot in 0..4 {
+            require(
+                format!("{radio}_Entry{slot}"),
+                "SSID EnableSSID HideSSID AuthMode EncrypType WPAPSK PMFMFPC PMFMFPR PMFSHA256",
+            );
+        }
+    }
+    if expected.len() != inventory.fields.len()
+        || expected
+            .iter()
+            .any(|key| !inventory.fields.contains_key(key))
+    {
+        return Err("incomplete or out of scope inventory fields".into());
+    }
+    if inventory.children.iter().any(|(p, c)| {
+        !matches!(
+            get(
+                &inventory,
+                &format!("Wan_PVC{p}_Entry{c}"),
+                "__runtime_present"
+            ),
+            "0" | "1"
+        )
+    }) {
+        return Err("invalid runtime presence".into());
     }
     Ok(inventory)
 }
@@ -568,12 +663,83 @@ pub async fn run(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ownership::default(),
         Err(_) => return Err("cannot read command ownership journal".into()),
     };
-    let inventory = parse(&execute(&selection, INVENTORY).await?)?;
+    // Inventory is read-only. A timeout does not cancel the remote shell, so
+    // only retry this initial read, never a write or its uncertain readback.
+    let inventory_text = initial_inventory_with_retry(
+        || execute_once(&selection, INVENTORY),
+        check_auth,
+        Duration::from_secs(2),
+    )
+    .await?;
+    let inventory = parse(&inventory_text)?;
     check_auth()?;
-    let mut desired = compile(&device, &inventory, owned, full)?;
-    desired.owned.revision = revision;
-    desired.owned.operation_id = operation_id;
-    desired.owned.binding_generation = selection.binding_generation.clone();
+    reconcile(
+        Transaction {
+            device: &device,
+            apply,
+            full,
+            revision: &revision,
+            operation_id,
+            binding_generation: &selection.binding_generation,
+        },
+        inventory,
+        owned,
+        |script| {
+            let selection = &selection;
+            async move { execute(selection, &script).await }
+        },
+        |owned| {
+            storage::write_atomic(
+                &path,
+                &serde_json::to_vec(owned).map_err(|_| "serialize command journal")?,
+                true,
+            )
+            .map_err(|_| "persist command journal".to_string())
+        },
+        check_auth,
+    )
+    .await
+}
+
+struct Transaction<'a> {
+    device: &'a Device,
+    apply: bool,
+    full: bool,
+    revision: &'a str,
+    operation_id: u64,
+    binding_generation: &'a str,
+}
+
+async fn reconcile<F, Fut, P, C>(
+    transaction: Transaction<'_>,
+    inventory: Inventory,
+    owned: Ownership,
+    mut execute: F,
+    mut persist: P,
+    check_auth: C,
+) -> Result<Value, String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+    P: FnMut(&Ownership) -> Result<(), String>,
+    C: Fn() -> Result<(), String>,
+{
+    let Transaction {
+        device,
+        apply,
+        full,
+        revision,
+        operation_id,
+        binding_generation,
+    } = transaction;
+    let unresolved = owned.pending;
+    let unresolved_operation = unresolved.then(|| json!({"revision":owned.revision,"operation_id":owned.operation_id,"binding_generation":owned.binding_generation}));
+    let mut desired = compile(device, &inventory, owned, full)?;
+    if !unresolved {
+        desired.owned.revision = revision.into();
+        desired.owned.operation_id = operation_id;
+        desired.owned.binding_generation = binding_generation.into();
+    }
     let mut diff = differences(&desired, &inventory);
     // Matching persistent fields do not prove the firmware applied a WAN.
     for owned in desired.owned.wan.values() {
@@ -601,27 +767,24 @@ pub async fn run(
     }
     let changed = !diff.is_empty() || !desired.removed.is_empty();
     let mut actual = inventory;
-    let mut uncertain = false;
-    if apply && changed && !desired.owned.pending {
+    // Legacy pending has neither the original intent nor remote terminal proof.
+    // Even a no-diff snapshot (or a plan) cannot settle that old transaction.
+    let mut uncertain = unresolved;
+    let mut write_dispatched = false;
+    if apply && changed && !unresolved {
         desired.owned.pending = true;
-        storage::write_atomic(
-            &path,
-            &serde_json::to_vec(&desired.owned).map_err(|_| "serialize command journal")?,
-            true,
-        )
-        .map_err(|_| "persist command write intent")?;
+        persist(&desired.owned)?;
         let script = write_script(&diff, &desired.removed);
         check_auth()?;
-        uncertain = execute(&selection, &script)
+        write_dispatched = true;
+        uncertain = execute(script)
             .await
             .map_or(true, |s| s.trim() != "FTTR_WRITE_COMPLETE");
         check_auth()?;
-        match execute(&selection, INVENTORY).await.and_then(|s| parse(&s)) {
+        match execute(INVENTORY.into()).await.and_then(|s| parse(&s)) {
             Ok(readback) => actual = readback,
             Err(_) => uncertain = true,
         }
-    } else if apply && changed && desired.owned.pending {
-        uncertain = true;
     }
     let remaining = differences(&desired, &actual);
     let removed_verified = desired
@@ -648,12 +811,7 @@ pub async fn run(
             .wan
             .retain(|_, owned| !desired.removed.contains(&(owned.parent, owned.child)));
         desired.owned.pending = false;
-        storage::write_atomic(
-            &path,
-            &serde_json::to_vec(&desired.owned).map_err(|_| "serialize command journal")?,
-            true,
-        )
-        .map_err(|_| "persist verified command ownership")?;
+        persist(&desired.owned)?;
     }
     let result_for = |id: &str, fields: &BTreeSet<(String, String)>| {
         let matches = fields
@@ -684,13 +842,251 @@ pub async fn run(
         .get("wifi_cleanup")
         .map(|fields| result_for("wifi_cleanup", fields));
     Ok(
-        json!({"items":items,"wifi_lifecycle":cleanup.map(|v|json!({"native_cleanup":v})).unwrap_or(json!({})),"wan_lifecycle":{"final_inventory":{"state":if uncertain {"unknown"} else if verified {"verified"} else {"drift"},"reason":"native inventory; management/shared parents protected"}},"native_ownership":desired.owned.wan,"write_performed":apply && changed && !uncertain,"readback_verified":verified}),
+        json!({"items":items,"wifi_lifecycle":cleanup.map(|v|json!({"native_cleanup":v})).unwrap_or(json!({})),"wan_lifecycle":{"final_inventory":{"state":if uncertain {"unknown"} else if verified {"verified"} else {"drift"},"reason":"native inventory; management/shared parents protected"}},"native_ownership":desired.owned.wan,"write_performed":write_dispatched,"readback_verified":verified,"unresolved_operation":unresolved_operation}),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn complete_wifi_text(ssid: &str) -> String {
+        let mut text = String::new();
+        for radio in ["WLan", "WLan11ac"] {
+            for (node, keys) in std::iter::once((format!("{radio}_Common"), "APOn BssidNum")).chain(
+                (0..4).map(|slot| {
+                    (
+                    format!("{radio}_Entry{slot}"),
+                    "SSID EnableSSID HideSSID AuthMode EncrypType WPAPSK PMFMFPC PMFMFPR PMFSHA256",
+                )
+                }),
+            ) {
+                for key in keys.split_whitespace() {
+                    let value = match key {
+                        "BssidNum" => "4",
+                        "SSID" => ssid,
+                        _ => "1",
+                    };
+                    text.push_str(&format!(
+                        "V|{node}|{key}|{}\n",
+                        value
+                            .bytes()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    ));
+                }
+            }
+        }
+        text.push_str("FTTR_INVENTORY_COMPLETE\n");
+        text
+    }
+
+    #[test]
+    fn inventory_requires_every_field_and_rejects_non_ascii_hex_without_panicking() {
+        let text = complete_wifi_text("test");
+        assert!(parse(&text).is_ok());
+        let lines: Vec<_> = text.lines().collect();
+        for skip in 0..lines.len() {
+            let incomplete = lines
+                .iter()
+                .enumerate()
+                .filter(|(n, _)| *n != skip)
+                .map(|(_, line)| *line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(parse(&incomplete).is_err(), "accepted missing line {skip}");
+        }
+        for hex in ["a中", "é", "zz", "0"] {
+            assert!(parse(&text.replacen("|74657374", &format!("|{hex}"), 1)).is_err());
+        }
+        assert!(parse(&(text.clone() + "P|0\n")).is_err());
+        assert!(parse(&format!("P|0\n{text}")).is_err());
+        assert!(parse(&format!("C|0|0\n{text}")).is_err());
+        assert!(parse(&format!("V|Wan_PVC7|VLANID|31\n{text}")).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_pending_never_settles_or_dispatches_even_when_current_desired_matches() {
+        let (device, _) = fixture();
+        let desired = compile(&device, &Inventory::default(), Ownership::default(), true).unwrap();
+        let mut inventory = Inventory {
+            fields: desired.fields.clone(),
+            ..Inventory::default()
+        };
+        inventory.parents.insert(0);
+        inventory.children.insert((0, 0));
+        inventory.fields.insert(
+            ("Wan_PVC0_Entry0".into(), "__runtime_present".into()),
+            "1".into(),
+        );
+        let mut owned = desired.owned;
+        owned.pending = true;
+        owned.operation_id = 9;
+        owned.revision = "original-revision".into();
+        owned.binding_generation = "original-binding".into();
+        for apply in [false, true] {
+            for drift in [false, true] {
+                let mut actual = inventory.clone();
+                if drift {
+                    actual
+                        .fields
+                        .remove(&("Wan_PVC0_Entry0".into(), "LAN2".into()));
+                }
+                let result = reconcile(
+                    Transaction {
+                        device: &device,
+                        apply,
+                        full: true,
+                        revision: "new-revision",
+                        operation_id: 42,
+                        binding_generation: "new-binding",
+                    },
+                    actual,
+                    owned.clone(),
+                    |_| async { panic!("pending must not dispatch") },
+                    |_| panic!("pending journal must remain byte-for-byte unchanged"),
+                    || Ok(()),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result["items"][0]["state"], "unknown");
+                assert_eq!(result["readback_verified"], false);
+                assert_eq!(result["write_performed"], false);
+                assert_eq!(result["unresolved_operation"]["operation_id"], 9);
+                assert_eq!(
+                    result["unresolved_operation"]["revision"],
+                    "original-revision"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_writes_require_durable_intent_and_terminal_plus_complete_readback() {
+        use std::cell::RefCell;
+        let (mut device, _) = fixture();
+        device.items[0].wan_intent = None;
+        device.items[0].wlan_intent = Some(WlanIntent {
+            endpoint: EndpointRef::Ssid { radio: 2, slot: 1 },
+            ssid: "wanted".into(),
+            enabled: None,
+            broadcast: None,
+            security: None,
+            key: None,
+        });
+        let transaction = || Transaction {
+            device: &device,
+            apply: true,
+            full: true,
+            revision: "new",
+            operation_id: 42,
+            binding_generation: "binding",
+        };
+        let result = reconcile(
+            transaction(),
+            parse(&complete_wifi_text("old")).unwrap(),
+            Ownership::default(),
+            |_| async { panic!("failed intent must not dispatch") },
+            |_| Err("injected save failure".into()),
+            || Ok(()),
+        )
+        .await;
+        assert!(result.is_err());
+        for terminal in [true, false] {
+            let saves = RefCell::new(Vec::new());
+            let calls = RefCell::new(0);
+            let result = reconcile(
+                transaction(),
+                parse(&complete_wifi_text("old")).unwrap(),
+                Ownership::default(),
+                |_| {
+                    *calls.borrow_mut() += 1;
+                    let n = *calls.borrow();
+                    async move {
+                        if n == 1 {
+                            if terminal {
+                                Ok("FTTR_WRITE_COMPLETE".into())
+                            } else {
+                                Err("timeout".into())
+                            }
+                        } else {
+                            Ok(complete_wifi_text("wanted"))
+                        }
+                    }
+                },
+                |owned| {
+                    saves.borrow_mut().push(owned.pending);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["write_performed"], true);
+            assert_eq!(result["readback_verified"], terminal);
+            assert_eq!(
+                *saves.borrow(),
+                if terminal {
+                    vec![true, false]
+                } else {
+                    vec![true]
+                }
+            );
+            assert_eq!(
+                result["items"][0]["state"],
+                if terminal { "verified" } else { "unknown" }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_inventory_retries_only_timeout_and_checks_auth() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let read = || {
+            calls.set(calls.get() + 1);
+            async {
+                if calls.get() == 1 {
+                    Err(("timeout".into(), true))
+                } else {
+                    Ok("inventory".into())
+                }
+            }
+        };
+        assert_eq!(
+            initial_inventory_with_retry(read, || Ok(()), Duration::ZERO)
+                .await
+                .unwrap(),
+            "inventory"
+        );
+        assert_eq!(calls.get(), 2);
+
+        let calls = Cell::new(0);
+        let read = || {
+            calls.set(calls.get() + 1);
+            async { Err(("identity changed".into(), false)) }
+        };
+        assert_eq!(
+            initial_inventory_with_retry(read, || Ok(()), Duration::ZERO)
+                .await
+                .unwrap_err(),
+            "identity changed"
+        );
+        assert_eq!(calls.get(), 1);
+
+        let calls = Cell::new(0);
+        let read = || {
+            calls.set(calls.get() + 1);
+            async { Err(("timeout".into(), true)) }
+        };
+        assert_eq!(
+            initial_inventory_with_retry(read, || Err("auth changed".into()), Duration::ZERO)
+                .await
+                .unwrap_err(),
+            "auth changed"
+        );
+        assert_eq!(calls.get(), 1);
+    }
     fn fixture() -> (Device, Inventory) {
         let item = Item {
             id: "wan".into(),

@@ -8,6 +8,8 @@ pub(super) fn registry_path(directory: &str, id: &str) -> String {
     let hash = id.bytes().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
+    #[cfg(test)]
+    let directory = test_io::registry_directory(directory);
     format!("{directory}/{hash:016x}.json")
 }
 
@@ -37,11 +39,20 @@ pub(crate) fn remove_registry(path: &str) -> Result<(), String> {
 }
 
 fn sync_directories(directory: &Path) -> io::Result<()> {
-    fs::File::open(directory)?.sync_all()?;
-    if let Some(parent) = directory.parent() {
-        fs::File::open(parent)?.sync_all()?;
+    // create_dir_all may have created several ancestors. Retrying after a
+    // failed barrier must also make those directory entries durable.
+    for ancestor in directory.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+        #[cfg(test)]
+        test_io::barrier(test_io::Point::DirectorySync)?;
+        fs::File::open(ancestor)?.sync_all()?;
     }
     Ok(())
+}
+
+fn sync_file(file: &fs::File) -> io::Result<()> {
+    #[cfg(test)]
+    test_io::barrier(test_io::Point::FileSync)?;
+    file.sync_all()
 }
 
 /// Avoid rewriting identical snapshots. Keep durability barriers even on the
@@ -57,7 +68,7 @@ pub(crate) fn write_atomic(path: &str, data: &[u8], sync_directory: bool) -> io:
             if existing.metadata()?.permissions().mode() & 0o777 != 0o600 {
                 existing.set_permissions(fs::Permissions::from_mode(0o600))?;
             }
-            existing.sync_all()?;
+            sync_file(&existing)?;
             if sync_directory {
                 sync_directories(directory)?;
             }
@@ -74,12 +85,71 @@ pub(crate) fn write_atomic(path: &str, data: &[u8], sync_directory: bool) -> io:
         .open(&temporary)?;
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     file.write_all(data)?;
-    file.sync_all()?;
+    sync_file(&file)?;
+    #[cfg(test)]
+    test_io::barrier(test_io::Point::Rename)?;
     fs::rename(temporary, path)?;
     if sync_directory {
         sync_directories(directory)?;
     }
     Ok(())
+}
+
+// Tests run the production save/rename/fsync path in a per-test-thread sandbox.
+// Only the directory and fault injection points differ; no save is stubbed out.
+#[cfg(test)]
+pub(super) mod test_io {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Point {
+        FileSync,
+        Rename,
+        DirectorySync,
+    }
+
+    struct Sandbox(PathBuf);
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    thread_local! {
+        static DIRECTORY: Sandbox = Sandbox(std::env::temp_dir().join(format!("fttr-registries-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())));
+        static FAILURE: Cell<Option<Point>> = const { Cell::new(None) };
+        static EVENTS: RefCell<Vec<Point>> = const { RefCell::new(Vec::new()) };
+    }
+    pub fn registry_directory(directory: &str) -> String {
+        if !directory.starts_with("/etc/fttr/") {
+            return directory.to_owned();
+        }
+        DIRECTORY.with(|root| {
+            root.0
+                .join(directory.trim_start_matches('/'))
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+    pub fn fail_next(point: Point) {
+        FAILURE.with(|f| f.set(Some(point)));
+    }
+    pub fn events() -> Vec<Point> {
+        EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()))
+    }
+    pub fn barrier(point: Point) -> io::Result<()> {
+        EVENTS.with(|e| e.borrow_mut().push(point));
+        FAILURE.with(|f| {
+            if f.get() == Some(point) {
+                f.set(None);
+                Err(io::Error::other("injected durability barrier failure"))
+            } else {
+                Ok(())
+            }
+        })
+    }
 }
 
 #[cfg(test)]

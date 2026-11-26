@@ -1041,36 +1041,24 @@ impl Reconciler {
         }
     }
     pub fn save(&self, id: &str) -> Result<(), String> {
-        #[cfg(test)]
-        {
-            let _ = id;
-            return Ok(());
-        }
-        #[cfg(not(test))]
-        {
-            let protected_parents: BTreeSet<_> = self
-                .discovered
-                .iter()
-                .filter(|o| o.state == WanOwnershipState::Protected)
-                .map(|o| o.parent)
-                .chain(self.protected_roots.iter().filter_map(|root| {
-                    root.strip_prefix(ROOT)?
-                        .split('.')
-                        .next()?
-                        .parse::<u32>()
-                        .ok()
-                }))
-                .collect();
-            let text =
-                json!({"cwmp_id":id,"owned":self.owned,"protected_parents":protected_parents})
-                    .to_string();
-            let path = registry_path(id);
-            if std::fs::read_to_string(&path).ok().as_deref() == Some(&text) {
-                return Ok(());
-            }
-            super::storage::write_atomic(&path, text.as_bytes(), true)
-                .map_err(|e| format!("persist WAN ownership: {e}"))
-        }
+        let protected_parents: BTreeSet<_> = self
+            .discovered
+            .iter()
+            .filter(|o| o.state == WanOwnershipState::Protected)
+            .map(|o| o.parent)
+            .chain(self.protected_roots.iter().filter_map(|root| {
+                root.strip_prefix(ROOT)?
+                    .split('.')
+                    .next()?
+                    .parse::<u32>()
+                    .ok()
+            }))
+            .collect();
+        let text = json!({"cwmp_id":id,"owned":self.owned,"protected_parents":protected_parents})
+            .to_string();
+        let path = registry_path(id);
+        super::storage::write_atomic(&path, text.as_bytes(), true)
+            .map_err(|e| format!("persist WAN ownership: {e}"))
     }
 }
 fn classification_names(
@@ -1148,6 +1136,24 @@ mod tests {
     }
     fn responses(v: Vec<Value>) {
         RPC.with(|r| *r.borrow_mut() = (v.into(), Vec::new()));
+    }
+    #[test]
+    fn save_retries_directory_barrier_after_rename_and_identical_content() {
+        use super::super::storage::test_io::{self, Point};
+        let d = device();
+        let r = Reconciler::new(&d, BTreeMap::new(), true);
+        test_io::fail_next(Point::DirectorySync);
+        assert!(r.save(&d.cwmp_id).is_err());
+        assert!(std::path::Path::new(&registry_path(&d.cwmp_id)).exists());
+        test_io::events();
+        test_io::fail_next(Point::DirectorySync);
+        assert!(r.save(&d.cwmp_id).is_err());
+        assert_eq!(
+            test_io::events(),
+            vec![Point::FileSync, Point::DirectorySync]
+        );
+        r.save(&d.cwmp_id).unwrap();
+        assert_eq!(test_io::events()[0], Point::FileSync);
     }
     fn ok(parameters: Value) -> Value {
         json!({"state":"completed","result":{"parameters":parameters}})

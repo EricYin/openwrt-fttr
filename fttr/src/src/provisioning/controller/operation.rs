@@ -77,6 +77,7 @@ impl Operation {
             uncertain: false,
             pending: false,
             written: false,
+            credential_write: None,
             passphrase_fallback: false,
             results: BTreeMap::new(),
             started: now(),
@@ -120,6 +121,7 @@ impl Operation {
         self.uncertain = false;
         self.pending = false;
         self.written = false;
+        self.credential_write = None;
         self.passphrase_fallback = false;
         if self.index >= self.device.items.len() {
             self.stage = OperationPhase::WifiReconciling;
