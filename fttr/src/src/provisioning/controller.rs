@@ -329,10 +329,7 @@ impl Controller {
         }
         // Until transaction-aware recovery is available, neither a plan nor a
         // new apply may replace the only record of an unresolved write.
-        if devices.iter().any(|d| {
-            self.previous_facts(&d.id)
-                .is_some_and(|facts| facts.unresolved)
-        }) {
+        if devices.iter().any(|d| self.unresolved_owner(d)) {
             return Err("unresolved prior write; transaction-aware recovery required before a new plan or apply".into());
         }
         let mut ids = Vec::new();
@@ -342,7 +339,7 @@ impl Controller {
             let mut op = Operation::new(
                 self.next_id,
                 d.clone(),
-                self.config.business_revision().to_owned(),
+                self.config.device_revision(&d.id).to_owned(),
                 apply,
                 management,
             );
@@ -393,7 +390,8 @@ impl Controller {
             if d.backend() == "disabled" {
                 operation = json!({"state":"disabled","items":[],"backend":d.backend_view(),"reason":"business provisioning is disabled for this device"});
             }
-            operation["current_revision"] = json!(operation["revision"] == self.config.business_revision());
+            operation["desired_revision"] = json!(self.config.device_revision(&d.id));
+            operation["current_revision"] = json!(operation["revision"] == self.config.device_revision(&d.id));
             if self.resets.blocks(&d.optical_sn) {
                 operation = json!({"state":"reset_pending","items":[],"reason":self.resets.reason(&d.optical_sn)});
             }
@@ -414,7 +412,7 @@ impl Controller {
             let items: Vec<_>=d.items.iter().filter(|_| d.backend() != "disabled").map(|desired| {
                 let mut item=previous.iter().find(|i| i["id"] == desired.id).cloned().unwrap_or_else(|| json!({"id":desired.id,"kind":desired.kind,"service_type":desired.service_type,"state":"not_started"}));
                 item["name"]=json!(self.config.labels.get(desired.id.rsplit("__").next().unwrap_or(&desired.id)));
-                item["current_revision"]=json!(item["revision"] == self.config.business_revision());
+                item["current_revision"]=json!(item["revision"] == self.config.device_revision(&d.id));
                 item["management_fresh"]=operation["management_fresh"].clone();
                 if item.get("service_type").is_none() {
                     item["service_type"] = json!(desired.service_type);

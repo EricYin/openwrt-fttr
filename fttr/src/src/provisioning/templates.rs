@@ -687,6 +687,38 @@ pub(super) fn compile_view(view: &crate::config::View) -> Result<Config, String>
             .fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64)
                 .wrapping_mul(0x100000001b3))
     ));
+    // Hash only compiled intent for this device. Host/listener settings and
+    // another template's edits must not manufacture a new business generation.
+    struct Fingerprint(u64);
+    impl std::io::Write for Fingerprint {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            for byte in bytes {
+                self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    for device in &cfg.devices {
+        let mut hash = Fingerprint(0xcbf29ce484222325);
+        serde_json::to_writer(
+            &mut hash,
+            &(
+                crate::cwmp::registry::VERSION,
+                &device.optical_sn,
+                &device.cwmp_id,
+                &device.provisioning_adapter,
+                &device.wifi_cleanup,
+                &device.wifi_preserve,
+                &device.items,
+            ),
+        )
+        .map_err(|_| "cannot fingerprint compiled device intent")?;
+        cfg.device_revisions
+            .insert(device.id.clone(), format!("{:016x}", hash.0));
+    }
     Ok(cfg)
 }
 

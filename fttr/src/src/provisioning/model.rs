@@ -103,7 +103,7 @@ pub struct Parameter {
     pub secret: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub struct Item {
     pub wlan_intent: Option<WlanIntent>,
     pub binding_intent: Option<BindingIntent>,
@@ -309,6 +309,8 @@ pub struct Config {
     pub fiberhome_onu_count: Option<u8>,
     pub revision: String,
     pub business_revision: Option<String>,
+    /// Fingerprints of compiled, immutable per-device business intent.
+    pub device_revisions: BTreeMap<String, String>,
     pub enabled: bool,
     pub automatic: bool,
     pub triggers: BTreeSet<String>,
@@ -327,6 +329,12 @@ pub struct Config {
 
 pub use fttr_api::ManagementDesired as Management;
 impl Config {
+    pub fn device_revision(&self, id: &str) -> &str {
+        self.device_revisions
+            .get(id)
+            .map_or_else(|| self.business_revision(), String::as_str)
+    }
+
     pub fn business_revision(&self) -> &str {
         self.business_revision.as_deref().unwrap_or(&self.revision)
     }

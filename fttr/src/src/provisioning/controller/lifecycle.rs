@@ -45,6 +45,67 @@ impl Serialize for Operations<'_> {
 }
 
 impl Controller {
+    fn same_transport(previous: &Device, next: &Device) -> bool {
+        let a = &previous.connection_request;
+        let b = &next.connection_request;
+        previous.id == next.id
+            && previous.optical_sn == next.optical_sn
+            && (previous.cwmp_id == next.cwmp_id || next.cwmp_id.starts_with("pending:"))
+            && previous.omci_adapter == next.omci_adapter
+            && previous.bootstrap_adapter == next.bootstrap_adapter
+            && previous.provisioning_adapter == next.provisioning_adapter
+            && a.enabled == b.enabled
+            && a.defaults == b.defaults
+            && a.username == b.username
+            && a.password == b.password
+            && a.port == b.port
+    }
+
+    fn independent_business_reload(&self, next: &Config) -> bool {
+        fn same<T: serde::Serialize>(a: &T, b: &T) -> bool {
+            matches!((serde_json::to_vec(a), serde_json::to_vec(b)), (Ok(a), Ok(b)) if a == b)
+        }
+        // Missing generation evidence is not authority to bypass the shared
+        // resource barrier. All normal compiled configurations supply it.
+        !self.config.devices.is_empty()
+            && self.config.device_revisions.len() == self.config.devices.len()
+            && next.device_revisions.len() == next.devices.len()
+            && self.config.devices.len() == next.devices.len()
+            && self.config.devices.iter().all(|previous| {
+                next.devices
+                    .iter()
+                    .any(|d| Self::same_transport(previous, d))
+            })
+            && self.config.enabled == next.enabled
+            && self.config.onu_pins == next.onu_pins
+            && self.config.fiberhome_onu_count == next.fiberhome_onu_count
+            && self.config.allow_unsupported_as_bridge == next.allow_unsupported_as_bridge
+            && self.config.omci_auth == next.omci_auth
+            && self.config.mqtt_bridge_enabled == next.mqtt_bridge_enabled
+            && self.config.acs_bridge == next.acs_bridge
+            && same(&self.config.management, &next.management)
+            && same(&self.config.management_network, &next.management_network)
+    }
+
+    fn unresolved_binding_change(&self, next: &Config) -> bool {
+        self.config.devices.iter().any(|previous| {
+            self.previous_facts(&previous.id)
+                .is_some_and(|facts| facts.unresolved)
+                && !next
+                    .devices
+                    .iter()
+                    .any(|d| Self::same_transport(previous, d))
+        })
+    }
+
+    fn activate_without_drain(&self, next: &Config) -> bool {
+        self.independent_business_reload(next)
+            || (self.config.device_revisions.is_empty()
+                && next.device_revisions.is_empty()
+                && next.business_revision.is_some()
+                && next.business_revision == self.config.business_revision)
+    }
+
     pub(super) fn begin_history_tick(&mut self) {
         self.dirty |= self.operations.values().any(|op| {
             op.stage != OperationPhase::Completed && op.stage != OperationPhase::Interrupted
@@ -163,10 +224,14 @@ impl Controller {
                 OperationPhase::Completed | OperationPhase::Interrupted
             )
         }) || self
-            .config
-            .devices
-            .iter()
-            .any(|d| self.resets.blocks(&d.optical_sn))
+            .pending_config
+            .as_ref()
+            .is_some_and(|(next, _)| self.unresolved_binding_change(next))
+            || self
+                .config
+                .devices
+                .iter()
+                .any(|d| self.resets.blocks(&d.optical_sn))
     }
 
     pub(super) fn request_config(&mut self, config: Config) {
@@ -191,7 +256,7 @@ impl Controller {
             return;
         }
         // A/bootstrap/host settings do not supersede an unrelated business transaction.
-        if config.business_revision() == self.config.business_revision()
+        if self.activate_without_drain(&config)
             && !self
                 .config
                 .devices
@@ -248,10 +313,25 @@ impl Controller {
     }
 
     pub(super) fn config_load_view(&self) -> Value {
-        let blockers: Vec<_> = self.operations.values()
+        let mut blockers: Vec<_> = self.operations.values()
             .filter(|op| !matches!(op.stage, OperationPhase::Completed | OperationPhase::Interrupted))
             .map(|op| json!({"operation_id":op.id,"device":op.device.id,"state":op.stage,"started_at":op.started}))
             .collect();
+        if let Some((next, _)) = &self.pending_config {
+            for previous in &self.config.devices {
+                if self
+                    .previous_facts(&previous.id)
+                    .is_some_and(|facts| facts.unresolved)
+                    && !next
+                        .devices
+                        .iter()
+                        .any(|d| Self::same_transport(previous, d))
+                    && !blockers.iter().any(|v| v["device"] == previous.id)
+                {
+                    blockers.push(json!({"device":previous.id,"state":"unresolved","reason":"configuration would remove or rebind an unresolved transaction owner"}));
+                }
+            }
+        }
         json!({"state":if self.pending_config.is_some() {"waiting"} else {"applied"},
             "requested_revision":self.pending_config.as_ref().map_or(&self.config.revision, |(cfg, _)| &cfg.revision),
             "requested_at":self.pending_config.as_ref().map(|(_, at)| at),
@@ -266,6 +346,9 @@ impl Controller {
         if self.pending_config.is_some() {
             return Err("configuration reload pending; wait for automatic activation".into());
         }
+        if self.unresolved_binding_change(&config) {
+            return Err("unresolved prior write: configuration cannot remove or rebind its transaction owner".into());
+        }
         if self
             .config
             .devices
@@ -274,8 +357,7 @@ impl Controller {
         {
             return Err("device reset pending; retry reset before reload".into());
         }
-        if !(config.business_revision.is_some()
-            && config.business_revision == self.config.business_revision)
+        if !self.activate_without_drain(&config)
             && self.operations.values().any(|op| {
                 !matches!(
                     op.stage,
@@ -293,6 +375,17 @@ impl Controller {
                     device.cwmp_id.clone_from(&previous.cwmp_id);
                 }
             }
+            if let Some(previous) = self
+                .config
+                .devices
+                .iter()
+                .find(|previous| Self::same_transport(previous, device))
+            {
+                // Preserve live connection-request authorization for an unchanged
+                // transport. Old operations still own this exact policy snapshot.
+                device.connection_request.authorization =
+                    previous.connection_request.authorization.clone();
+            }
         }
         crate::omci_auth::configure(&config.omci_auth)?;
         for previous in &self.config.devices {
@@ -308,6 +401,14 @@ impl Controller {
             }
         }
         for previous in &self.config.devices {
+            if config.devices.iter().any(|d| {
+                std::sync::Arc::ptr_eq(
+                    &d.connection_request.authorization,
+                    &previous.connection_request.authorization,
+                )
+            }) {
+                continue;
+            }
             previous
                 .connection_request
                 .authorization
@@ -344,6 +445,9 @@ impl Controller {
             .map(|(id, op)| (id, op.view()))
             .chain(self.recovered.iter().map(|(id, op)| (id, op.clone())))
         {
+            if facts::Facts::recovered(&view).unresolved {
+                continue;
+            }
             if devices.iter().any(|d| {
                 &d.id == id
                     && view["optical_sn"] == d.optical_sn
@@ -359,25 +463,27 @@ impl Controller {
             self.retired.drain(..self.retired.len() - 32);
         }
         self.operations.retain(|id, op| {
-            devices.iter().any(|d| {
-                &d.id == id
-                    && d.backend() == op.device.backend()
-                    && d.provisioning_adapter == op.device.provisioning_adapter
-                    && d.optical_sn == op.device.optical_sn
-                    && (d.cwmp_id.starts_with("pending:")
-                        || op.device.cwmp_id.starts_with("pending:")
-                        || d.cwmp_id == op.device.cwmp_id)
-            })
+            op.facts().unresolved
+                || devices.iter().any(|d| {
+                    &d.id == id
+                        && d.backend() == op.device.backend()
+                        && d.provisioning_adapter == op.device.provisioning_adapter
+                        && d.optical_sn == op.device.optical_sn
+                        && (d.cwmp_id.starts_with("pending:")
+                            || op.device.cwmp_id.starts_with("pending:")
+                            || d.cwmp_id == op.device.cwmp_id)
+                })
         });
         self.recovered.retain(|id, op| {
             !self.operations.contains_key(id)
-                && devices.iter().any(|d| {
-                    &d.id == id
-                        && op["optical_sn"] == d.optical_sn
-                        && op["backend"]["effective"].as_str().unwrap_or("acs") == d.backend()
-                        && op["provisioning_adapter"] == d.provisioning_adapter
-                        && (d.cwmp_id.starts_with("pending:") || op["cwmp_id"] == d.cwmp_id)
-                })
+                && (facts::Facts::recovered(op).unresolved
+                    || devices.iter().any(|d| {
+                        &d.id == id
+                            && op["optical_sn"] == d.optical_sn
+                            && op["backend"]["effective"].as_str().unwrap_or("acs") == d.backend()
+                            && op["provisioning_adapter"] == d.provisioning_adapter
+                            && (d.cwmp_id.starts_with("pending:") || op["cwmp_id"] == d.cwmp_id)
+                    }))
         });
         self.management
             .retain(|id, _| devices.iter().any(|d| &d.id == id));

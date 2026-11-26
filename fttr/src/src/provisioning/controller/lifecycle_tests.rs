@@ -1,6 +1,182 @@
 use super::tests::operation;
 use super::*;
 
+pub(super) fn two_device_config(slow: &str, fast: &str) -> Config {
+    crate::provisioning::templates::compile(&format!(
+        "config provisioning 'p'\n option enabled '1'\n option mode 'auto'\n list trigger 'config_change'\nconfig template 'slow-template'\nconfig template 'fast-template'\nconfig group 'slow-group'\n option template 'slow-template'\nconfig group 'fast-group'\n option template 'fast-template'\nconfig device 'slow'\n option optical_sn 'TEST00000001'\n option omci_adapter 'generic'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'hl202-cu'\n option group 'slow-group'\nconfig device 'fast'\n option optical_sn 'TEST00000002'\n option omci_adapter 'generic'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'hl202-cu'\n option group 'fast-group'\nconfig wifi 'slow-wifi'\n option template 'slow-template'\n option radio '2g'\n option ssid '{slow}'\nconfig wifi 'fast-wifi'\n option template 'fast-template'\n option radio '2g'\n option ssid '{fast}'\n"
+    )).unwrap()
+}
+
+#[test]
+#[cfg_attr(
+    not(all(feature = "device-hl202", feature = "acs")),
+    ignore = "requires HL202 ACS adapter"
+)]
+fn independent_reload_keeps_old_transaction_snapshot_and_admits_other_device() {
+    let mut c = Controller::default();
+    c.replace_config(two_device_config("old-slow", "old-fast"))
+        .unwrap();
+    let slow = c
+        .config
+        .devices
+        .iter()
+        .find(|d| d.id == "slow")
+        .unwrap()
+        .clone();
+    let old_revision = c.config.device_revision("slow").to_owned();
+    let mut op = Operation::new(41, slow.clone(), old_revision.clone(), true, false);
+    op.stage = OperationPhase::Writing;
+    op.work_started = true;
+    op.task = Some(42);
+    let old_intent = serde_json::to_value(&op.device.items).unwrap();
+    c.operations.insert("slow".into(), op);
+    c.attempts.insert("slow".into(), 4);
+    c.next_retry_at.insert("slow".into(), 500);
+    c.request_config(two_device_config("new-slow", "new-fast"));
+    assert!(c.pending_config.is_none());
+    assert_eq!(c.config_load_view()["state"], "applied");
+    assert_eq!(c.operations["slow"].revision, old_revision);
+    assert_eq!(c.operations["slow"].task, Some(42));
+    assert_eq!(
+        serde_json::to_value(&c.operations["slow"].device.items).unwrap(),
+        old_intent
+    );
+    assert!(slow
+        .connection_request
+        .authorization
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(c.attempts["slow"], 4);
+    assert_eq!(c.next_retry_at["slow"], 500);
+    assert!(c
+        .start("slow", false, false)
+        .unwrap_err()
+        .contains("active operation"));
+    let id = c.start("fast", false, false).unwrap()[0];
+    assert_eq!(
+        c.operation_view(id).unwrap()["revision"],
+        c.config.device_revision("fast")
+    );
+    let mut restored = Controller::default();
+    restored.config = c.config.clone();
+    restored.recover(c.history().as_bytes());
+    assert_eq!(restored.recovered["slow"]["revision"], old_revision);
+    assert!(restored
+        .start("slow", false, false)
+        .unwrap_err()
+        .contains("unresolved prior write"));
+}
+
+#[test]
+#[cfg_attr(
+    not(all(feature = "device-hl202", feature = "acs")),
+    ignore = "requires HL202 ACS adapter"
+)]
+fn shared_resource_change_still_waits_for_the_original_transaction() {
+    for management_change in [false, true] {
+        for business_changed in [false, true] {
+            let mut c = Controller::default();
+            c.replace_config(two_device_config("old-slow", "old-fast"))
+                .unwrap();
+            let mut op = Operation::new(
+                41,
+                c.config.devices[0].clone(),
+                c.config.device_revision(&c.config.devices[0].id).into(),
+                true,
+                false,
+            );
+            op.stage = OperationPhase::Writing;
+            op.work_started = true;
+            c.operations.insert(op.device.id.clone(), op);
+            let previous = c.config.revision.clone();
+            let mut next = if business_changed {
+                two_device_config("new-slow", "new-fast")
+            } else {
+                two_device_config("old-slow", "old-fast")
+            };
+            next.revision = "shared-resource-change".into();
+            if management_change {
+                next.management = Some(fttr_api::ManagementDesired {
+                    vlan: 4090,
+                    vlans: vec![4090],
+                    priority: 0,
+                    acs_url: "http://acs.invalid/cwmp".into(),
+                });
+            } else {
+                next.mqtt_bridge_enabled = !next.mqtt_bridge_enabled;
+            }
+            c.request_config(next);
+            assert!(c.pending_config.is_some());
+            assert_eq!(c.config.revision, previous);
+        }
+    }
+}
+
+#[test]
+fn unresolved_owner_cannot_be_pruned_by_removal_or_adapter_change() {
+    for live in [false, true] {
+        for remove in [false, true] {
+            let mut c = configured();
+            let mut op = operation(OperationPhase::Completed, true);
+            op.results
+                .insert("wifi".into(), json!({"id":"wifi","state":"unknown"}));
+            let original = op.view();
+            if live {
+                c.operations.insert("child".into(), op);
+            } else {
+                c.recovered.insert("child".into(), original.clone());
+            }
+            let mut next = c.config.clone();
+            next.revision = "new-owner".into();
+            if remove {
+                next.devices.clear();
+            } else {
+                next.devices[0].provisioning_adapter = "none".into();
+            }
+            c.request_config(next);
+            assert!(c.pending_config.is_some());
+            assert!(!c.activate_pending_config());
+            assert_eq!(
+                c.operation_view(original["operation_id"].as_u64().unwrap())
+                    .unwrap(),
+                original
+            );
+        }
+    }
+}
+
+#[test]
+fn restart_with_changed_configuration_retains_unresolved_owner_and_serial_quarantine() {
+    let mut previous = configured();
+    let mut op = operation(OperationPhase::Completed, true);
+    op.results
+        .insert("wifi".into(), json!({"id":"wifi","state":"unknown"}));
+    let id = op.id;
+    previous.operations.insert("child".into(), op);
+    for removed in [false, true] {
+        let mut c = Controller::default();
+        c.config = previous.config.clone();
+        if removed {
+            c.config.devices.clear();
+        } else {
+            c.config.devices[0].provisioning_adapter = "cu".into();
+        }
+        c.recover(previous.history().as_bytes());
+        c.retain_configured_state();
+        assert_eq!(
+            c.operation_view(id).unwrap()["items"][0]["state"],
+            "unknown"
+        );
+        assert!(c.owned.contains_key("id"));
+        let mut returning = previous.config.devices[0].clone();
+        returning.id = "renamed".into();
+        c.config.devices = vec![returning];
+        assert!(c
+            .start("renamed", false, false)
+            .unwrap_err()
+            .contains("unresolved prior write"));
+    }
+}
+
 #[test]
 fn unsupported_platform_pin_is_rejected_before_reload_mutates_active_state() {
     let mut c = Controller::default();

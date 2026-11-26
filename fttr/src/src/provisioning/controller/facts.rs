@@ -133,6 +133,16 @@ impl Operation {
 }
 
 impl Controller {
+    pub(super) fn unresolved_owner(&self, device: &Device) -> bool {
+        self.operations.values().any(|op| {
+            (op.device.id == device.id || op.device.optical_sn == device.optical_sn)
+                && op.facts().unresolved
+        }) || self.recovered.values().any(|op| {
+            (op["device"] == device.id || op["optical_sn"] == device.optical_sn)
+                && Facts::recovered(op).unresolved
+        })
+    }
+
     pub(super) fn previous_facts(&self, device: &str) -> Option<Facts> {
         self.operations
             .get(device)

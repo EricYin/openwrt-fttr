@@ -1,5 +1,5 @@
 //! Business intent, independent of device adapters and wire parameter paths.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct WlanIntent {
     pub endpoint: EndpointRef,
     pub ssid: String,
@@ -8,11 +8,11 @@ pub struct WlanIntent {
     pub security: Option<WifiSecurity>,
     pub key: Option<String>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct BindingIntent {
     pub endpoints: Vec<EndpointRef>,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct WanIntent {
     pub services: Vec<String>,
     pub vlan: VlanMode,
@@ -22,17 +22,17 @@ pub struct WanIntent {
     pub internet: bool,
     pub enabled: bool,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum VlanMode {
     Untagged,
     Tagged(u16),
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum ConnectionMode {
     Bridge,
     Routed,
 }
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum EndpointRef {
     Lan(u32),
     Ssid { radio: u8, slot: u32 },

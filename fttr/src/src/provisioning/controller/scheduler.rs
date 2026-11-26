@@ -176,7 +176,10 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
             .hash(&mut epoch_hash);
         let capability_epoch = epoch_hash.finish();
         let availability_changed = reachable != c.last_online.contains(&d.id);
-        let reload_pending = c.pending_config.is_some();
+        let reload_pending = c.pending_config.is_some()
+            || c.operations
+                .get(&d.id)
+                .is_some_and(|op| op.revision != config.device_revision(&d.id));
         if let Some(op) = c.operations.get_mut(&d.id) {
             if op.stage == OperationPhase::Completed
                 && (new_boot
@@ -430,7 +433,7 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
     let config_changed = c.config.triggers.contains("config_change")
         && previous
             .as_ref()
-            .is_none_or(|p| p.revision != c.config.business_revision());
+            .is_none_or(|p| p.revision != c.config.device_revision(&d.id));
     let periodic = c.periodic_due(&d.id, time);
     if !active_op && reachable && c.config.enabled && c.config.automatic {
         if needs_reconcile {
@@ -463,6 +466,53 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
 #[cfg(test)]
 mod config_change_tests {
     use super::*;
+
+    #[test]
+    #[cfg_attr(
+        not(all(feature = "device-hl202", feature = "acs")),
+        ignore = "requires HL202 ACS adapter"
+    )]
+    fn unrelated_template_edit_does_not_reschedule_a_verified_device() {
+        let mut c = Controller::default();
+        c.replace_config(super::super::lifecycle_tests::two_device_config(
+            "slow-before",
+            "fast-unchanged",
+        ))
+        .unwrap();
+        let fast = c
+            .config
+            .devices
+            .iter()
+            .find(|d| d.id == "fast")
+            .unwrap()
+            .clone();
+        crate::omci_auth::test_authorize(&fast.optical_sn);
+        let revision = c.config.device_revision("fast").to_owned();
+        let mut op = Operation::new(41, fast.clone(), revision.clone(), true, false);
+        for item in &fast.items {
+            op.results.insert(
+                item.id.clone(),
+                json!({"id":item.id,"state":"verified","revision":revision}),
+            );
+        }
+        op.complete(100);
+        c.operations.insert("fast".into(), op);
+        c.request_config(super::super::lifecycle_tests::two_device_config(
+            "slow-after",
+            "fast-unchanged",
+        ));
+        assert_eq!(c.config.device_revision("fast"), revision);
+        schedule(&mut c, &fast, true, false, 101);
+        assert_eq!(c.operations["fast"].id, 41);
+        // Host changes leave both business generations intact.
+        let mut host = c.config.clone();
+        host.revision = "host-only".into();
+        host.mqtt_bridge_enabled = !host.mqtt_bridge_enabled;
+        c.request_config(host);
+        assert_eq!(c.config.device_revision("fast"), revision);
+        schedule(&mut c, &fast, true, false, 102);
+        assert_eq!(c.operations["fast"].id, 41);
+    }
 
     fn fixture() -> (Controller, Device) {
         let mut op = super::super::tests::operation(OperationPhase::Completed, false);
