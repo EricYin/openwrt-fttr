@@ -10,6 +10,7 @@ pub(super) struct Facts {
     pub reconcile: bool,
     pub drift: bool,
     pub verified: bool,
+    pub failed: bool,
 }
 
 impl Facts {
@@ -31,6 +32,7 @@ impl Facts {
             unresolved: unresolved || (phase == Some(OperationPhase::Interrupted) && apply),
             reconcile,
             drift: false,
+            failed: false,
             verified: phase == Some(OperationPhase::Completed),
         };
         let mut count = 0;
@@ -54,6 +56,7 @@ impl Facts {
         );
         self.reconcile |= state == Some(ItemOutcome::ReconcileRequired);
         self.drift |= state == Some(ItemOutcome::Drift);
+        self.failed |= matches!(state, Some(ItemOutcome::Blocked | ItemOutcome::Failed));
         self.verified &= matches!(state, Some(ItemOutcome::Verified))
             || (lifecycle
                 && matches!(

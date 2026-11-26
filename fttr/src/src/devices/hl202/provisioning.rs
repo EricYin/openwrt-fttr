@@ -674,7 +674,7 @@ pub async fn run(
     };
     // Separate from per-publication transport locks; held for the complete transaction.
     let transaction = super::command::Transaction::acquire(&target_mac)
-        .map_err(|_| "device transaction already active")?;
+        .map_err(|e| format!("device transaction admission rejected: {e}"))?;
     let path = ownership_path(&device.optical_sn);
     let owned: Ownership = match std::fs::read(&path) {
         Ok(bytes) => {

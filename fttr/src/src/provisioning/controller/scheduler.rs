@@ -84,6 +84,11 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     c.begin_history_tick();
     c.collect_commands(time);
     bootstrap::collect();
+    // Retry a failed barrier before considering any dependent work. A corrupt
+    // load remains blocked; observations must never overwrite that evidence.
+    if !c.persist_snapshots() {
+        return Duration::from_secs(10);
+    }
     let mut history_changed = false;
     for d in &config.devices {
         if !crate::omci_auth::allowed(&d.optical_sn) {
@@ -164,6 +169,9 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
             fresh.insert(d.id.clone());
         }
         schedule(&mut c, d, reachable, new_boot, time);
+        if !c.persist_snapshots() {
+            continue;
+        }
         let capability_identity = identity(d, observed);
         use std::hash::{Hash, Hasher};
         let mut epoch_hash = std::collections::hash_map::DefaultHasher::new();
@@ -273,15 +281,24 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
             c.owned.insert(d.cwmp_id.clone(), owned);
         }
     }
-    c.admit_commands(&command_ready, time, |op| {
-        crate::provisioning::command::Job::start(
-            op.device.clone(),
-            op.apply,
-            op.full_sync,
-            op.revision.clone(),
-            op.id,
-        )
-    });
+    let durable = c.persist_snapshots();
+    c.admit_commands(
+        &if durable {
+            command_ready
+        } else {
+            BTreeSet::new()
+        },
+        time,
+        |op| {
+            crate::provisioning::command::Job::start(
+                op.device.clone(),
+                op.apply,
+                op.full_sync,
+                op.revision.clone(),
+                op.id,
+            )
+        },
+    );
     c.compact_completed();
     c.last_online = fresh;
     c.dirty |= history_changed;
@@ -414,8 +431,8 @@ fn bootstrap_free_acs_consumers_require_current_listener_evidence_before_network
     ));
 }
 
-#[derive(Clone, Copy, Default)]
-pub(super) struct Reasons(u8);
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub(super) struct Reasons(pub(super) u8);
 impl Reasons {
     fn add(&mut self, bit: u8, present: bool) {
         if present {
@@ -489,6 +506,36 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
         }
     }
     if !active_op && reachable && c.config.enabled && c.config.automatic {
+        // Recovery of a completed read-only failure has its own bounded episode;
+        // it never grants write authority, even when periodic sync is disabled.
+        if previous.as_ref().is_some_and(|p| {
+            !p.apply
+                && ((p.phase == Some(OperationPhase::Completed) && p.failed)
+                    || (p.phase == Some(OperationPhase::Interrupted) && p.reconcile))
+        }) {
+            let episode = c.read_recovery.entry(d.id.clone()).or_default();
+            if let Some(completed) = previous.as_ref().and_then(|p| p.completed_at) {
+                episode.retry_at = episode
+                    .retry_at
+                    .max(completed.saturating_add(retry_delay(episode.attempts + 1)));
+            } else if episode.retry_at == 0 {
+                episode.retry_at = time.saturating_add(retry_delay(episode.attempts + 1));
+            }
+            let attempt = episode.attempts;
+            if attempt < 3
+                && time >= episode.retry_at
+                && c.start_selected(&d.id, false, false, None).is_ok()
+            {
+                let episode = c.read_recovery.entry(d.id.clone()).or_default();
+                episode.attempts += 1;
+            }
+            return;
+        }
+        if previous.as_ref().is_some_and(|p| {
+            !p.apply && p.verified && p.revision == c.config.device_revision(&d.id)
+        }) {
+            c.read_recovery.remove(&d.id);
+        }
         if needs_reconcile {
             let _ = c.start_selected(&d.id, false, false, None);
         } else if reasons.0 != 0
@@ -702,6 +749,92 @@ mod config_change_tests {
         schedule(&mut c, &device, true, false, 115);
         assert_ne!(c.operations[&device.id].id, id);
         assert_eq!(c.attempts[&device.id], 2);
+    }
+
+    #[test]
+    fn interval_zero_read_failure_retries_only_reads_with_its_own_finite_budget() {
+        let (mut c, device) = fixture();
+        c.config.triggers.clear();
+        c.config.interval_seconds = 0;
+        c.attempts.insert(device.id.clone(), 5);
+        let op = c.operations.get_mut(&device.id).unwrap();
+        op.apply = false;
+        op.results.insert("wifi".into(), json!({"state":"blocked"}));
+        op.complete(100);
+        let old = op.id;
+        schedule(&mut c, &device, true, false, 114);
+        assert_eq!(c.operations[&device.id].id, old);
+        for (i, time) in [(1, 115), (2, 145), (3, 205)] {
+            schedule(&mut c, &device, true, false, time);
+            let op = c.operations.get_mut(&device.id).unwrap();
+            assert!(!op.apply);
+            assert_eq!(c.read_recovery[&device.id].attempts, i);
+            assert_eq!(c.attempts[&device.id], 5);
+            op.results.insert("wifi".into(), json!({"state":"blocked"}));
+            op.completed_at = None;
+            op.complete(time);
+        }
+        let last = c.operations[&device.id].id;
+        schedule(&mut c, &device, true, false, 10000);
+        assert_eq!(c.operations[&device.id].id, last);
+        assert_eq!(c.read_recovery[&device.id].attempts, 3);
+    }
+
+    #[test]
+    fn read_recovery_never_replaces_unknown_and_success_does_not_rearm_write_budget() {
+        let (mut c, device) = fixture();
+        c.config.triggers.clear();
+        c.attempts.insert(device.id.clone(), 5);
+        c.read_recovery.insert(
+            device.id.clone(),
+            snapshots::ReadRecovery {
+                attempts: 2,
+                retry_at: 100,
+            },
+        );
+        let op = c.operations.get_mut(&device.id).unwrap();
+        op.apply = false;
+        op.revision = "new-revision".into();
+        op.results.insert("wifi".into(), json!({"state":"unknown"}));
+        op.complete(100);
+        let id = op.id;
+        schedule(&mut c, &device, true, false, 1000);
+        assert_eq!(c.operations[&device.id].id, id);
+        assert_eq!(c.read_recovery[&device.id].attempts, 2);
+        c.operations
+            .get_mut(&device.id)
+            .unwrap()
+            .results
+            .insert("wifi".into(), json!({"state":"verified"}));
+        schedule(&mut c, &device, true, false, 1001);
+        assert!(!c.read_recovery.contains_key(&device.id));
+        assert_eq!(c.attempts[&device.id], 5);
+    }
+
+    #[test]
+    fn restart_of_an_inflight_read_does_not_bypass_its_recovered_budget() {
+        let (mut c, device) = fixture();
+        c.config.triggers.clear();
+        let op = c.operations.get_mut(&device.id).unwrap();
+        op.apply = false;
+        op.stage = OperationPhase::Reading;
+        let history = c.history();
+        c.operations.clear();
+        c.recover(history.as_bytes());
+        c.read_recovery.insert(
+            device.id.clone(),
+            snapshots::ReadRecovery {
+                attempts: 3,
+                retry_at: 200,
+            },
+        );
+        let id = c.recovered[&device.id]["operation_id"].clone();
+        for time in [1000, 10000] {
+            schedule(&mut c, &device, true, false, time);
+            assert!(c.operations.is_empty());
+            assert_eq!(c.recovered[&device.id]["operation_id"], id);
+            assert_eq!(c.read_recovery[&device.id].attempts, 3);
+        }
     }
 
     #[test]

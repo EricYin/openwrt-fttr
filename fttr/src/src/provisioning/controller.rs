@@ -24,6 +24,8 @@ mod scheduler;
 #[cfg(test)]
 #[path = "controller/scheduling_tests.rs"]
 mod scheduling_tests;
+#[path = "controller/snapshots.rs"]
+mod snapshots;
 use crate::cwmp::transport::Command;
 use config::{Config, Device, Item, Parameter};
 use parameters::advance;
@@ -92,6 +94,7 @@ pub(crate) fn external_write_allowed(serial: &str) -> bool {
         .iter()
         .find(|d| d.optical_sn == serial)
         .is_some_and(|d| !c.unresolved_owner(d) && !c.resets.blocks(serial))
+        && !c.snapshots.as_ref().is_some_and(|s| s.blocked())
 }
 
 struct AcsExecution {
@@ -210,6 +213,8 @@ struct Controller {
     attempts: BTreeMap<String, u32>,
     next_retry_at: BTreeMap<String, u64>,
     automatic_ready: BTreeMap<String, scheduler::Reasons>,
+    read_recovery: BTreeMap<String, snapshots::ReadRecovery>,
+    snapshots: Option<snapshots::Store>,
     command_cursor: Option<String>,
 }
 static CONTROLLER: OnceLock<Mutex<Controller>> = OnceLock::new();
@@ -317,6 +322,9 @@ impl Controller {
         management: bool,
         item: Option<&str>,
     ) -> Result<Vec<u64>, String> {
+        if self.snapshots.as_ref().is_some_and(|s| s.blocked()) {
+            return Err("durable recovery state unavailable; repair snapshot storage before synchronization".into());
+        }
         if self.pending_config.is_some() {
             return Err("configuration reload pending; new synchronization will use the latest configuration".into());
         }
@@ -446,6 +454,7 @@ impl Controller {
         status["onu_pins"] = json!(self.config.onu_pins);
         status["config_error"] = json!(self.config_error);
         status["config_load"] = self.config_load_view();
+        status["recovery_storage"] = self.snapshots.as_ref().map_or(Value::Null, |s| s.view());
         status
     }
 
@@ -469,6 +478,7 @@ impl Controller {
             if let Some(next_retry) = self.next_retry_at.get(&d.id) {
                 operation["next_retry_at"] = json!(next_retry);
             }
+            operation["read_recovery"] = json!(self.read_recovery.get(&d.id));
             if !management_fresh && matches!(operation["state"].as_str(), Some("waiting" | "recovering")) {
                 operation["state"] = json!("waiting_management");
             }
@@ -699,17 +709,24 @@ pub fn control(request: &str) -> String {
             "reconcile" => {
                 let target = v["target"].as_str().unwrap_or("all");
                 let mut c = controller().lock().unwrap();
-                c.attempts.remove(target);
-                c.next_retry_at.remove(target);
                 let ids = c.start_selected(target, false, false, None)?;
                 Ok(json!({"operation_ids":ids,"mode":"plan","reconcile":true}))
             }
             "retry" => {
                 let target = v["target"].as_str().unwrap_or("all");
                 let mut c = controller().lock().unwrap();
-                c.attempts.remove(target);
-                c.next_retry_at.remove(target);
                 let ids = c.start(target, true, false)?;
+                let devices: Vec<_> = c
+                    .operations
+                    .iter()
+                    .filter(|(_, op)| ids.contains(&op.id))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in devices {
+                    c.attempts.remove(&id);
+                    c.next_retry_at.remove(&id);
+                    c.read_recovery.remove(&id);
+                }
                 Ok(json!({"operation_ids":ids,"mode":"apply","retry":true}))
             }
             _ => Err("unknown provisioning operation".into()),
@@ -757,9 +774,7 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
             }
         }
         c.load_reset_intents();
-        if let Ok(data) = std::fs::read("/var/lib/fttr/provisioning-state.json") {
-            c.recover(&data);
-        }
+        c.load_snapshots();
         c.retain_configured_state();
         c.resume_resets();
         c.startup_pending = c

@@ -193,6 +193,9 @@ impl Controller {
             storage::remove_registry(&storage::registry_path(&self.resets.wan, &intent.cwmp_id))?;
             storage::remove_registry(&storage::registry_path(&self.resets.wifi, &intent.cwmp_id))?;
         }
+        if !self.persist_snapshots() {
+            return Err("persist reset recovery snapshot failed".into());
+        }
         self.complete_reset(serial)
     }
 
