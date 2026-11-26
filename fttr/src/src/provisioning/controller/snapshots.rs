@@ -75,10 +75,21 @@ impl Snapshot {
                 || op["optical_sn"] != self.serial
                 || op["operation_id"].as_u64().is_none()
                 || !matches!(op["mode"].as_str(), Some("plan" | "apply"))
-                || op["state"].as_str().is_none()
+                || serde_json::from_value::<OperationPhase>(op["state"].clone()).is_err()
                 || !op["items"].is_array()
             {
                 return Err(invalid());
+            }
+            for item in op["items"].as_array().unwrap() {
+                // Active operations also contain phase/pending placeholders. An
+                // unrecognized state must not become an apparently resolved
+                // owner just because the history decoder ignores that state.
+                if item["state"] != "pending"
+                    && ItemOutcome::from_result(item).is_none()
+                    && serde_json::from_value::<OperationPhase>(item["state"].clone()).is_err()
+                {
+                    return Err(invalid());
+                }
             }
         }
         Ok(())
@@ -447,7 +458,7 @@ mod tests {
 
     #[test]
     fn missing_schema_identity_budget_and_size_evidence_fail_closed() {
-        for mode in 0..7 {
+        for mode in 0..9 {
             let mut s = store(&format!("invalid-{mode}"));
             let f = frame();
             s.frames.insert(f.device.clone(), f.clone());
@@ -472,7 +483,18 @@ mod tests {
                 }
                 4 => write(&path, &vec![b' '; MAX_BYTES + 1]).unwrap(),
                 5 => write(&path, b"{corrupt").unwrap(),
-                _ => storage::remove_registry(&s.index_path()).unwrap(),
+                6 => storage::remove_registry(&s.index_path()).unwrap(),
+                7 | 8 => {
+                    let mut f = f.clone();
+                    if mode == 7 {
+                        f.operation.as_mut().unwrap()["state"] = json!("unrecognized_phase");
+                    } else {
+                        f.operation.as_mut().unwrap()["items"][0]["state"] =
+                            json!("unrecognized_outcome");
+                    }
+                    write(&path, &serde_json::to_vec(&f).unwrap()).unwrap();
+                }
+                _ => unreachable!(),
             }
             assert!(
                 Store::new(s.directory.clone()).load().is_err(),
