@@ -50,6 +50,7 @@ impl Operation {
         Self {
             work_started: false,
             command_job: None,
+            command_reservation: 0,
             command_result: None,
             full_sync: true,
             verify_after: 0,

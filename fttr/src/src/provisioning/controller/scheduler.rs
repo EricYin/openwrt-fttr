@@ -80,7 +80,9 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
         }
     }
     let mut fresh = BTreeSet::new();
+    let mut command_ready = BTreeSet::new();
     c.begin_history_tick();
+    c.collect_commands(time);
     let mut history_changed = false;
     for d in &config.devices {
         if !crate::omci_auth::allowed(&d.optical_sn) {
@@ -140,36 +142,16 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
                 authorization: management_network::grant(&d.id, &d.optical_sn),
             });
         }
-        if d.backend() == "disabled" {
+        if d.backend_kind() == Backend::Disabled {
             continue;
         }
-        if d.backend() == "command" {
+        if d.backend_kind() == Backend::Command {
             let reachable = mqtt_reachable;
             if reachable {
                 fresh.insert(d.id.clone());
+                command_ready.insert(d.id.clone());
             }
             schedule(&mut c, d, reachable, false, time);
-            if let Some(op) = c.operations.get_mut(&d.id) {
-                if let Some(job) = &op.command_job {
-                    if let Some(outcome) = job.take() {
-                        op.command_result = Some(outcome.unwrap_or_else(|reason| json!({"items":op.device.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":"blocked","reason":reason})).collect::<Vec<_>>()})));
-                        op.command_job = None;
-                        op.complete(time);
-                        history_changed = true;
-                    }
-                } else if op.stage != OperationPhase::Completed && reachable {
-                    op.work_started = true;
-                    op.command_job = Some(crate::provisioning::command::Job::start(
-                        op.device.clone(),
-                        op.apply,
-                        op.full_sync,
-                        op.revision.clone(),
-                        op.id,
-                    ));
-                    op.stage = OperationPhase::Reading;
-                    history_changed = true;
-                }
-            }
             continue;
         }
         let host_matches = config
@@ -287,6 +269,16 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
             c.owned.insert(d.cwmp_id.clone(), owned);
         }
     }
+    c.admit_commands(&command_ready, time, |op| {
+        crate::provisioning::command::Job::start(
+            op.device.clone(),
+            op.apply,
+            op.full_sync,
+            op.revision.clone(),
+            op.id,
+        )
+    });
+    c.compact_completed();
     c.last_online = fresh;
     c.dirty |= history_changed;
     c.persist_history(|data| {
@@ -419,43 +411,14 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
     if c.pending_config.is_some() {
         return;
     }
-    let previous = c
-        .operations
-        .get(&d.id)
-        .map(Operation::view)
-        .or_else(|| c.recovered.get(&d.id).cloned());
-    let needs_reconcile = previous.as_ref().is_some_and(|p| {
-        p["reconcile_required"] == true
-            || p["items"].as_array().is_some_and(|a| {
-                a.iter()
-                    .any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::ReconcileRequired))
-            })
-    });
+    let previous = c.previous_facts(&d.id);
+    let needs_reconcile = previous
+        .as_ref()
+        .is_some_and(|p| p.reconcile && !p.unresolved);
     let needs_manual = previous.as_ref().is_some_and(|p| {
-        (p["state"] == "interrupted" && p["reconcile_required"] != true)
-            || ["wan_lifecycle", "wifi_lifecycle"].iter().any(|key| {
-                p[*key].as_object().is_some_and(|m| {
-                    m.values()
-                        .any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::Unknown))
-                })
-            })
-            || p["items"].as_array().is_some_and(|a| {
-                a.iter().any(|i| {
-                    matches!(
-                        ItemOutcome::from_result(i),
-                        Some(ItemOutcome::Unknown | ItemOutcome::AcceptedPendingApply)
-                    )
-                })
-            })
+        p.unresolved || (p.phase == Some(OperationPhase::Interrupted) && !p.reconcile)
     });
-    let all_verified = previous.as_ref().is_some_and(|p| {
-        p["state"] == "completed"
-            && p["items"].as_array().is_some_and(|a| {
-                !a.is_empty()
-                    && a.iter()
-                        .all(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::Verified))
-            })
-    });
+    let all_verified = previous.as_ref().is_some_and(|p| p.verified);
     if all_verified {
         c.attempts.remove(&d.id);
         c.next_retry_at.remove(&d.id);
@@ -467,7 +430,7 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
     let config_changed = c.config.triggers.contains("config_change")
         && previous
             .as_ref()
-            .is_none_or(|p| p["revision"] != c.config.business_revision());
+            .is_none_or(|p| p.revision != c.config.business_revision());
     let periodic = c.periodic_due(&d.id, time);
     if !active_op && reachable && c.config.enabled && c.config.automatic {
         if needs_reconcile {
@@ -482,22 +445,15 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
             if c.start(&d.id, true, false).is_ok() && startup_trigger {
                 c.startup_pending.remove(&d.id);
             }
-        } else if !needs_manual
-            && previous.as_ref().is_some_and(|p| {
-                p["mode"] != "plan"
-                    && p["items"].as_array().is_some_and(|a| {
-                        a.iter()
-                            .any(|i| ItemOutcome::from_result(i) == Some(ItemOutcome::Drift))
-                    })
-            })
-        {
+        } else if !needs_manual && previous.as_ref().is_some_and(|p| p.apply && p.drift) {
             let attempts = c.attempts.get(&d.id).copied().unwrap_or(0);
             let next = c.next_retry_at.get(&d.id).copied().unwrap_or(0);
-            if attempts < 5 && now() >= next {
+            if attempts < 5 && time >= next {
                 let next_attempts = attempts + 1;
                 c.attempts.insert(d.id.clone(), next_attempts);
                 let delay = (15 * (1 << (next_attempts - 1))).min(300);
-                c.next_retry_at.insert(d.id.clone(), now() + delay);
+                c.next_retry_at
+                    .insert(d.id.clone(), time.saturating_add(delay));
                 let _ = c.start(&d.id, true, false);
             }
         }

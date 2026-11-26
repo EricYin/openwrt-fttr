@@ -624,7 +624,7 @@ pub async fn run(
     revision: String,
     operation_id: u64,
     auth_epoch: u64,
-) -> Result<Value, String> {
+) -> Result<Value, crate::provisioning::command::Failure> {
     let check_auth = || {
         if crate::omci_auth::serial_epoch(&device.optical_sn) == Some(auth_epoch) {
             Ok(())
@@ -663,6 +663,13 @@ pub async fn run(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ownership::default(),
         Err(_) => return Err("cannot read command ownership journal".into()),
     };
+    let read_failure = |reason: String| {
+        if owned.pending {
+            crate::provisioning::command::Failure::uncertain(reason)
+        } else {
+            reason.into()
+        }
+    };
     // Inventory is read-only. A timeout does not cancel the remote shell, so
     // only retry this initial read, never a write or its uncertain readback.
     let inventory_text = initial_inventory_with_retry(
@@ -670,9 +677,10 @@ pub async fn run(
         check_auth,
         Duration::from_secs(2),
     )
-    .await?;
-    let inventory = parse(&inventory_text)?;
-    check_auth()?;
+    .await
+    .map_err(read_failure)?;
+    let inventory = parse(&inventory_text).map_err(read_failure)?;
+    check_auth().map_err(read_failure)?;
     reconcile(
         Transaction {
             device: &device,
@@ -717,7 +725,7 @@ async fn reconcile<F, Fut, P, C>(
     mut execute: F,
     mut persist: P,
     check_auth: C,
-) -> Result<Value, String>
+) -> Result<Value, crate::provisioning::command::Failure>
 where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
@@ -734,7 +742,13 @@ where
     } = transaction;
     let unresolved = owned.pending;
     let unresolved_operation = unresolved.then(|| json!({"revision":owned.revision,"operation_id":owned.operation_id,"binding_generation":owned.binding_generation}));
-    let mut desired = compile(device, &inventory, owned, full)?;
+    let mut desired = compile(device, &inventory, owned, full).map_err(|reason| {
+        if unresolved {
+            crate::provisioning::command::Failure::uncertain(reason)
+        } else {
+            reason.into()
+        }
+    })?;
     if !unresolved {
         desired.owned.revision = revision.into();
         desired.owned.operation_id = operation_id;
@@ -780,7 +794,7 @@ where
         uncertain = execute(script)
             .await
             .map_or(true, |s| s.trim() != "FTTR_WRITE_COMPLETE");
-        check_auth()?;
+        check_auth().map_err(crate::provisioning::command::Failure::uncertain)?;
         match execute(INVENTORY.into()).await.and_then(|s| parse(&s)) {
             Ok(readback) => actual = readback,
             Err(_) => uncertain = true,
@@ -811,7 +825,13 @@ where
             .wan
             .retain(|_, owned| !desired.removed.contains(&(owned.parent, owned.child)));
         desired.owned.pending = false;
-        persist(&desired.owned)?;
+        persist(&desired.owned).map_err(|reason| {
+            if write_dispatched {
+                crate::provisioning::command::Failure::uncertain(reason)
+            } else {
+                reason.into()
+            }
+        })?;
     }
     let result_for = |id: &str, fields: &BTreeSet<(String, String)>| {
         let matches = fields
@@ -1036,6 +1056,49 @@ mod tests {
                 result["items"][0]["state"],
                 if terminal { "verified" } else { "unknown" }
             );
+        }
+        // Errors after dispatch (including a failed durable settlement) must
+        // retain uncertainty instead of becoming an ordinary blocked read.
+        for auth_revoked in [false, true] {
+            let calls = RefCell::new(0);
+            let auth_checks = RefCell::new(0);
+            let saves = RefCell::new(0);
+            let failure = reconcile(
+                transaction(),
+                parse(&complete_wifi_text("old")).unwrap(),
+                Ownership::default(),
+                |_| {
+                    *calls.borrow_mut() += 1;
+                    let n = *calls.borrow();
+                    async move {
+                        Ok(if n == 1 {
+                            "FTTR_WRITE_COMPLETE".into()
+                        } else {
+                            complete_wifi_text("wanted")
+                        })
+                    }
+                },
+                |_| {
+                    *saves.borrow_mut() += 1;
+                    if *saves.borrow() == 2 {
+                        Err("injected settlement barrier failure".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    *auth_checks.borrow_mut() += 1;
+                    if auth_revoked && *auth_checks.borrow() == 2 {
+                        Err("authorization revoked".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(failure.uncertain);
+            assert_eq!(*calls.borrow(), if auth_revoked { 1 } else { 2 });
         }
     }
 

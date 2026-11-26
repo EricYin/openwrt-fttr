@@ -432,6 +432,12 @@ pub(crate) fn test_authorize(serial: &str) {
         s.borrow_mut().insert(serial.into());
     });
 }
+#[cfg(test)]
+pub(crate) fn test_revoke(serial: &str) {
+    TEST_AUTHORIZED.with(|s| {
+        s.borrow_mut().remove(serial);
+    });
+}
 fn read_credentials(session: &mut OmciSession, layout: Layout) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let loid = session.get(layout.class, 0, layout.loid_mask)?;
     let password = session.get(layout.class, 0, layout.password_mask)?;

@@ -35,6 +35,12 @@ wire_enum!(TaskOutcome {
     Missing => "missing",
 });
 
+wire_enum!(Backend {
+    Command => "command",
+    Acs => "acs",
+    Disabled => "disabled",
+});
+
 impl TaskOutcome {
     pub(super) fn from_task(task: &serde_json::Value) -> Self {
         serde_json::from_value(task["state"].clone()).unwrap_or(Self::Missing)
@@ -191,12 +197,16 @@ impl ConnectionRequest {
 }
 
 impl Device {
-    pub fn backend(&self) -> &'static str {
+    pub fn backend_kind(&self) -> Backend {
         match self.provisioning_adapter.as_str() {
-            "none" => "disabled",
-            "hl202-mqtt" => "command",
-            _ => "acs", // ACS identifiers are validated by the configuration compiler.
+            "none" => Backend::Disabled,
+            "hl202-mqtt" => Backend::Command,
+            _ => Backend::Acs, // ACS identifiers are validated by the configuration compiler.
         }
+    }
+
+    pub fn backend(&self) -> &'static str {
+        self.backend_kind().as_str()
     }
 
     pub fn cwmp_enabled(&self) -> bool {

@@ -42,7 +42,8 @@ fn long_tail_devices_wait_independently_from_completion_without_backlog() {
     let mut c = periodic_controller();
     let mut slow = operation(OperationPhase::WifiReconciling, false);
     slow.started = 100;
-    let mut fast = slow.clone();
+    let mut fast = operation(OperationPhase::WifiReconciling, false);
+    fast.started = 100;
     fast.device.id = "fast".into();
     fast.complete(200);
     c.operations.insert("child".into(), slow);

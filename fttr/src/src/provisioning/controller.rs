@@ -1,6 +1,10 @@
 //! Desired-state controller. CWMP traffic runs independently of optical workers.
-use super::model::{ItemKind, ItemOutcome, OperationPhase, ParameterKind, TaskOutcome};
+use super::model::{Backend, ItemKind, ItemOutcome, OperationPhase, ParameterKind, TaskOutcome};
 use super::{config, wan, wifi};
+#[path = "controller/admission.rs"]
+mod admission;
+#[path = "controller/facts.rs"]
+mod facts;
 #[path = "controller/lifecycle.rs"]
 mod lifecycle;
 #[cfg(test)]
@@ -82,10 +86,10 @@ pub(crate) fn wake_device(device: &str) {
     WAKE.notify_one();
 }
 
-#[derive(Clone)]
 struct Operation {
     work_started: bool,
     command_job: Option<crate::provisioning::command::Job>,
+    command_reservation: usize,
     command_result: Option<Value>,
     full_sync: bool,
     submission: Option<crate::cwmp::transport::Pending<OperationPhase>>,
@@ -140,6 +144,7 @@ struct Controller {
     acs_status: Value,
     attempts: BTreeMap<String, u32>,
     next_retry_at: BTreeMap<String, u64>,
+    command_cursor: Option<String>,
 }
 static CONTROLLER: OnceLock<Mutex<Controller>> = OnceLock::new();
 fn controller() -> &'static Mutex<Controller> {
@@ -225,16 +230,11 @@ impl Controller {
         if self.config.interval_seconds == 0 || !self.config.triggers.contains("periodic") {
             return false;
         }
-        let completed_at = if let Some(op) = self.operations.get(device) {
-            if op.stage != OperationPhase::Completed {
+        let completed_at = if let Some(facts) = self.previous_facts(device) {
+            if facts.phase != Some(OperationPhase::Completed) {
                 return false;
             }
-            op.completed_at
-        } else if let Some(op) = self.recovered.get(device) {
-            if op["state"] != "completed" {
-                return false;
-            }
-            op["completed_at"].as_u64()
+            facts.completed_at
         } else {
             // A device with no previous operation can run its first periodic sync.
             return true;
@@ -330,35 +330,8 @@ impl Controller {
         // Until transaction-aware recovery is available, neither a plan nor a
         // new apply may replace the only record of an unresolved write.
         if devices.iter().any(|d| {
-            let previous = self.operations.get(&d.id).map(Operation::view);
-            previous
-                .as_ref()
-                .or_else(|| self.recovered.get(&d.id))
-                .is_some_and(|p| {
-                    (p["state"] == "interrupted" && p["mode"] != "plan")
-                        || p["unresolved_operation"].is_object()
-                        || p["items"].as_array().is_some_and(|items| {
-                            items.iter().any(|i| {
-                                matches!(
-                                    ItemOutcome::from_result(i),
-                                    Some(ItemOutcome::Unknown | ItemOutcome::AcceptedPendingApply)
-                                )
-                            })
-                        })
-                        || ["wan_lifecycle", "wifi_lifecycle"].iter().any(|key| {
-                            p[*key].as_object().is_some_and(|items| {
-                                items.values().any(|i| {
-                                    matches!(
-                                        ItemOutcome::from_result(i),
-                                        Some(
-                                            ItemOutcome::Unknown
-                                                | ItemOutcome::AcceptedPendingApply
-                                        )
-                                    )
-                                })
-                            })
-                        })
-                })
+            self.previous_facts(&d.id)
+                .is_some_and(|facts| facts.unresolved)
         }) {
             return Err("unresolved prior write; transaction-aware recovery required before a new plan or apply".into());
         }

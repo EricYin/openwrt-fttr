@@ -1,14 +1,99 @@
 //! Backend-neutral asynchronous command job. Device contracts live in their adapters.
 use crate::provisioning::model::Device;
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
-#[derive(Clone, Default)]
-pub struct Job(Arc<Mutex<Option<Result<Value, String>>>>);
+#[derive(Debug)]
+pub struct Failure {
+    pub reason: String,
+    pub uncertain: bool,
+}
+
+impl Failure {
+    pub fn uncertain(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            uncertain: true,
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            uncertain: false,
+        }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
+}
+
+// A single owner consumes the terminal result once. The JoinHandle is retained,
+// so cancellation/panic cannot leave an empty mailbox waiting forever.
+pub struct Job {
+    task: Option<tokio::task::JoinHandle<Result<Value, Failure>>>,
+    apply: bool,
+}
 
 impl Job {
-    pub fn take(&self) -> Option<Result<Value, String>> {
-        self.0.lock().unwrap().take()
+    #[cfg(test)]
+    pub(crate) fn test_spawn(
+        work: impl Future<Output = Result<Value, Failure>> + Send + 'static,
+    ) -> Self {
+        Self::spawn(true, Duration::from_secs(60), work)
+    }
+    pub fn take(&mut self) -> Option<Result<Value, Failure>> {
+        let task = self.task.as_mut()?;
+        match std::pin::Pin::new(task).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Pending => None,
+            Poll::Ready(outcome) => {
+                self.task = None;
+                Some(outcome.unwrap_or_else(|_| {
+                    Err(Failure {
+                        reason: "command executor terminated; execution outcome not established"
+                            .into(),
+                        uncertain: self.apply,
+                    })
+                }))
+            }
+        }
+    }
+
+    fn spawn(
+        apply: bool,
+        deadline: Duration,
+        work: impl Future<Output = Result<Value, Failure>> + Send + 'static,
+    ) -> Self {
+        struct WakeOnDrop;
+        impl Drop for WakeOnDrop {
+            fn drop(&mut self) {
+                crate::provisioning::controller::wake();
+            }
+        }
+        let task = crate::runtime::spawn(async move {
+            let _wake = WakeOnDrop;
+            tokio::time::timeout(deadline, work)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Failure {
+                        reason:
+                            "command effect deadline exceeded; remote execution is not cancelled"
+                                .into(),
+                        uncertain: apply,
+                    })
+                })
+        });
+        Self {
+            task: Some(task),
+            apply,
+        }
     }
 
     pub fn start(
@@ -18,10 +103,8 @@ impl Job {
         revision: String,
         operation_id: u64,
     ) -> Self {
-        let job = Self::default();
-        let result = job.clone();
         let auth_epoch = crate::omci_auth::serial_epoch(&device.optical_sn);
-        crate::runtime::spawn(async move {
+        Self::spawn(apply, Duration::from_secs(8 * 60), async move {
             #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
             let outcome = if auth_epoch.is_none() {
                 Err("OMCI authentication pending".into())
@@ -43,9 +126,47 @@ impl Job {
                 let _ = (device, apply, full, revision, operation_id, auth_epoch);
                 Err("command provisioning not compiled".into())
             };
-            *result.0.lock().unwrap() = Some(outcome);
-            crate::provisioning::controller::wake();
-        });
-        job
+            outcome
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn terminal(job: &mut Job) -> Result<Value, Failure> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(result) = job.take() {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supervised job must terminate")
+    }
+
+    #[tokio::test]
+    async fn supervised_effects_have_one_terminal_result_on_success_panic_abort_and_deadline() {
+        for apply in [false, true] {
+            let mut job = Job::spawn(apply, Duration::from_secs(1), async {
+                Ok(serde_json::json!({"ok":true}))
+            });
+            assert_eq!(terminal(&mut job).await.unwrap()["ok"], true);
+            assert!(job.take().is_none());
+            let mut job = Job::spawn(apply, Duration::from_secs(1), async {
+                panic!("injected effect panic")
+            });
+            assert_eq!(terminal(&mut job).await.unwrap_err().uncertain, apply);
+            assert!(job.take().is_none());
+            let mut job = Job::spawn(apply, Duration::from_secs(1), std::future::pending());
+            job.task.as_ref().unwrap().abort();
+            assert_eq!(terminal(&mut job).await.unwrap_err().uncertain, apply);
+            let mut job = Job::spawn(apply, Duration::from_millis(1), std::future::pending());
+            assert_eq!(terminal(&mut job).await.unwrap_err().uncertain, apply);
+            assert!(job.take().is_none());
+        }
     }
 }
