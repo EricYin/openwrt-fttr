@@ -455,6 +455,7 @@ impl Controller {
         status["config_error"] = json!(self.config_error);
         status["config_load"] = self.config_load_view();
         status["recovery_storage"] = self.snapshots.as_ref().map_or(Value::Null, |s| s.view());
+        status["process_memory"] = crate::memory::view();
         status
     }
 

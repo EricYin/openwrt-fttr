@@ -178,10 +178,14 @@ impl Controller {
         self.forget_device(serial, &intent.cwmp_id);
         #[cfg(not(test))]
         storage::remove_registry(&format!("/etc/fttr/command-owned/{serial}.json"))?;
-        let saved = self.history();
-        storage::write_atomic(&self.resets.history, saved.as_bytes(), true)
-            .map_err(|e| format!("persist reset history: {e}"))?;
-        self.saved = saved;
+        if self.snapshots.is_none() {
+            let saved = self.history();
+            storage::write_atomic(&self.resets.history, saved.as_bytes(), true)
+                .map_err(|e| format!("persist reset history: {e}"))?;
+            self.saved = saved;
+        } else {
+            self.saved.clear();
+        }
         self.dirty = false;
         #[cfg(not(test))]
         {

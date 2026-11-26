@@ -4,6 +4,7 @@
 /etc/fttr/command-owned/
 /etc/fttr/command-external/
 /etc/fttr/provisioning-snapshots/
+/etc/fttr/provisioning-snapshots.json
 /etc/fttr/acs-bootstrap.json
 /etc/fttr/reset-pending/
 /etc/fttr/management-applied.json

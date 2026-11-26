@@ -13,6 +13,7 @@ pub mod domain;
 mod effects;
 pub mod hl202_ipc;
 pub mod ipc;
+pub mod memory;
 pub mod model;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;

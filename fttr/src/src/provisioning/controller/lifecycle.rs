@@ -113,6 +113,13 @@ impl Controller {
     }
 
     pub(super) fn persist_history(&mut self, write: impl FnOnce(&[u8]) -> std::io::Result<()>) {
+        // Production recovery has one durable authority. Rendering/writing the
+        // old UI cache duplicates the same histories and cannot settle a write.
+        if self.snapshots.is_some() {
+            self.saved.clear();
+            self.dirty = false;
+            return;
+        }
         if !self.dirty && !self.saved.is_empty() {
             return;
         }

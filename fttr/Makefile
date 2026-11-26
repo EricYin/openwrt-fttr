@@ -93,9 +93,10 @@ define Package/openwrt-fttr/config
   config FTTR_MIMALLOC
     bool "Use mimalloc for fttrd Rust allocations (experimental)"
     depends on PACKAGE_openwrt-fttr
-    default y
+    default n
     help
       Select mimalloc 3.5.3 for the daemon only, without explicit THP advice.
+      The system allocator is the footprint-oriented default on musl targets.
       Compare target RSS, swap and service behavior before enabling in production.
   config FTTR_NPU
     bool "Compile fttrd NPU offload coordination (runtime UCI switch)"

@@ -1,15 +1,16 @@
-//! Durable per-device recovery boundary. The old history remains a UI cache.
+//! One bounded, atomic recovery file. Device frames preserve their own intent.
 use super::*;
 use crate::provisioning::storage;
 use serde::{Deserialize, Serialize};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 const DIRECTORY: &str = "/etc/fttr/provisioning-snapshots";
 const MAX_DEVICES: usize = 256; // Includes retained orphan transactions.
 const MAX_BYTES: usize = 128 * 1024;
 const LEGACY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ReadRecovery {
     pub attempts: u32,
@@ -38,10 +39,88 @@ struct Index {
     devices: BTreeSet<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryFile {
+    schema: u32,
+    #[serde(deserialize_with = "unique_frames")]
+    devices: BTreeMap<String, Snapshot>,
+}
+#[derive(Serialize)]
+struct RecoveryView<'a> {
+    schema: u32,
+    devices: &'a BTreeMap<String, Snapshot>,
+}
+fn unique_frames<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Snapshot>, D::Error> {
+    struct Frames;
+    impl<'de> serde::de::Visitor<'de> for Frames {
+        type Value = BTreeMap<String, Snapshot>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("unique bounded device frames")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut frames = BTreeMap::new();
+            while let Some((id, frame)) = map.next_entry::<String, Snapshot>()? {
+                if frames.len() >= MAX_DEVICES || frames.insert(id, frame).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate or excessive recovery devices",
+                    ));
+                }
+            }
+            Ok(frames)
+        }
+    }
+    deserializer.deserialize_map(Frames)
+}
+
+// Compare a serialization against the durable acknowledgement without allocating
+// another JSON buffer on every idle tick. Also bounds changed serializations.
+struct Compare<'a> {
+    acknowledged: &'a [u8],
+    length: usize,
+    equal: bool,
+    limit: usize,
+}
+impl Write for Compare<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let end = self.length.checked_add(bytes.len()).ok_or_else(invalid)?;
+        if end > self.limit {
+            return Err(io::Error::other("recovery state exceeds size limit"));
+        }
+        self.equal &= self.acknowledged.get(self.length..end) == Some(bytes);
+        self.length = end;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn check_frame(frame: &Snapshot) -> io::Result<()> {
+    frame.validate()?;
+    serde_json::to_writer(
+        Compare {
+            acknowledged: &[],
+            length: 0,
+            equal: false,
+            limit: MAX_BYTES,
+        },
+        frame,
+    )?;
+    Ok(())
+}
+
 pub(super) struct Store {
     directory: String,
     frames: BTreeMap<String, Snapshot>,
-    acknowledged: BTreeMap<String, Vec<u8>>,
+    acknowledged: Vec<u8>,
+    scratch: Vec<u8>,
+    legacy_pending: bool,
     error: Option<String>,
     load_error: bool,
 }
@@ -100,7 +179,9 @@ impl Store {
         Self {
             directory,
             frames: BTreeMap::new(),
-            acknowledged: BTreeMap::new(),
+            acknowledged: Vec::new(),
+            scratch: Vec::new(),
+            legacy_pending: false,
             error: None,
             load_error: false,
         }
@@ -109,7 +190,10 @@ impl Store {
         self.error.is_some()
     }
     pub(super) fn view(&self) -> Value {
-        json!({"schema":1,"state":if self.blocked() {"blocked"} else {"durable"},"error":self.error,"devices":self.frames.len(),"per_device_limit":MAX_BYTES})
+        json!({"schema":2,"state":if self.blocked() {"blocked"} else {"durable"},"error":self.error,"devices":self.frames.len(),"files":1,"per_device_limit":MAX_BYTES,"total_limit":MAX_TOTAL_BYTES,"durable_bytes":self.acknowledged.len()})
+    }
+    fn file_path(&self) -> String {
+        format!("{}.json", self.directory)
     }
     fn index_path(&self) -> String {
         format!("{}/index.json", self.directory)
@@ -118,6 +202,33 @@ impl Store {
         storage::registry_path(&self.directory, id)
     }
     fn load(&mut self) -> io::Result<bool> {
+        match read_bounded(&self.file_path(), MAX_TOTAL_BYTES) {
+            Ok(bytes) => {
+                let file: RecoveryFile = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+                if file.schema != 2 || file.devices.len() > MAX_DEVICES {
+                    return Err(invalid());
+                }
+                for (id, frame) in &file.devices {
+                    if id != &frame.device {
+                        return Err(invalid());
+                    }
+                    check_frame(frame)?;
+                }
+                self.frames = file.devices;
+                self.legacy_pending = std::path::Path::new(&self.directory).is_dir();
+                // Re-establish all barriers after process restart, including
+                // identical bytes left by an unacknowledged rename.
+                self.acknowledged.clear();
+                return Ok(true);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e), // Never fall back to stale split files.
+        }
+        let loaded = self.load_split()?;
+        self.legacy_pending = loaded;
+        Ok(loaded)
+    }
+    fn load_split(&mut self) -> io::Result<bool> {
         let bytes = match read_bounded(&self.index_path(), MAX_BYTES) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -172,7 +283,6 @@ impl Store {
             {
                 return Err(invalid());
             }
-            self.acknowledged.insert(file, bytes);
         }
         self.frames = frames;
         // Re-establish file/directory barriers even when the previous process
@@ -199,36 +309,35 @@ impl Store {
         if self.frames.len() > MAX_DEVICES {
             return Err(invalid());
         }
-        if self
-            .frames
-            .keys()
-            .map(|id| self.path(id))
-            .collect::<BTreeSet<_>>()
-            .len()
-            != self.frames.len()
-        {
-            return Err(invalid());
-        }
         for frame in self.frames.values() {
-            frame.validate()?;
-            let bytes = serde_json::to_vec(frame)?;
-            if bytes.len() > MAX_BYTES {
-                return Err(invalid());
-            }
-            let path = self.path(&frame.device);
-            if self.acknowledged.get(&path) != Some(&bytes) {
-                write(&path, &bytes)?;
-                self.acknowledged.insert(path, bytes);
-            }
+            check_frame(frame)?;
         }
-        let bytes = serde_json::to_vec(&Index {
-            schema: 1,
-            devices: self.frames.keys().cloned().collect(),
-        })?;
-        let path = self.index_path();
-        if self.acknowledged.get(&path) != Some(&bytes) {
-            write(&path, &bytes)?;
-            self.acknowledged.insert(path, bytes);
+        let file = RecoveryView {
+            schema: 2,
+            devices: &self.frames,
+        };
+        let mut compare = Compare {
+            acknowledged: &self.acknowledged,
+            length: 0,
+            equal: true,
+            limit: MAX_TOTAL_BYTES,
+        };
+        serde_json::to_writer(&mut compare, &file)?;
+        if !compare.equal || compare.length != self.acknowledged.len() {
+            self.scratch.clear();
+            // The bounded comparison above checks size before this allocation.
+            serde_json::to_writer(&mut self.scratch, &file)?;
+            write(&self.file_path(), &self.scratch)?;
+            std::mem::swap(&mut self.acknowledged, &mut self.scratch);
+        }
+        if self.legacy_pending {
+            // The single file is durable before retiring any predecessor. A
+            // crash during cleanup always loads the new authority, not a subset.
+            for id in self.frames.keys() {
+                storage::remove_registry(&self.path(id)).map_err(io::Error::other)?;
+            }
+            storage::remove_registry(&self.index_path()).map_err(io::Error::other)?;
+            self.legacy_pending = false;
         }
         Ok(())
     }
@@ -307,52 +416,69 @@ impl Controller {
             }
         }
         self.snapshots = Some(store);
-        self.persist_snapshots(); // Migration must be durable before program_start.
+        if self.persist_snapshots() {
+            // Migration is durable before program_start.
+            #[cfg(not(test))]
+            if let Err(e) = storage::remove_registry("/var/lib/fttr/provisioning-state.json") {
+                eprintln!("[provisioning] retire obsolete UI cache: {e}");
+            }
+        }
     }
 
     pub(super) fn persist_snapshots(&mut self) -> bool {
         let Some(mut store) = self.snapshots.take() else {
             return true;
         };
-        let mut identities: BTreeMap<String, (String, String)> = self
+        let mut identities: BTreeMap<&str, (&str, &str)> = self
             .config
             .devices
             .iter()
-            .map(|d| (d.id.clone(), (d.optical_sn.clone(), d.cwmp_id.clone())))
+            .map(|d| (d.id.as_str(), (d.optical_sn.as_str(), d.cwmp_id.as_str())))
             .collect();
         for (id, view) in &self.recovered {
             if let (Some(sn), Some(cwmp)) = (view["optical_sn"].as_str(), view["cwmp_id"].as_str())
             {
-                identities.insert(id.clone(), (sn.into(), cwmp.into()));
+                identities.insert(id, (sn, cwmp));
             }
         }
         for (id, op) in &self.operations {
-            identities.insert(
-                id.clone(),
-                (op.device.optical_sn.clone(), op.device.cwmp_id.clone()),
-            );
+            identities.insert(id, (&op.device.optical_sn, &op.device.cwmp_id));
         }
         for (id, (serial, cwmp_id)) in identities {
-            let operation = self
-                .operations
-                .get(&id)
-                .map(Operation::view)
-                .or_else(|| self.recovered.get(&id).cloned());
-            store.frames.insert(
-                id.clone(),
-                Snapshot {
-                    schema: 1,
-                    serial,
-                    cwmp_id: cwmp_id.clone(),
-                    operation,
-                    owned: self.owned.get(&cwmp_id).cloned().unwrap_or_default(),
-                    attempts: self.attempts.get(&id).copied().unwrap_or(0),
-                    retry_at: self.next_retry_at.get(&id).copied().unwrap_or(0),
-                    reasons: self.automatic_ready.get(&id).copied().unwrap_or_default(),
-                    read: self.read_recovery.get(&id).cloned().unwrap_or_default(),
-                    device: id,
-                },
-            );
+            let active = self.operations.get(id).map(Operation::view);
+            let operation = active.as_ref().or_else(|| self.recovered.get(id));
+            let empty_owned = BTreeMap::new();
+            let owned = self.owned.get(cwmp_id).unwrap_or(&empty_owned);
+            let frame = store.frames.entry(id.into()).or_insert_with(|| Snapshot {
+                schema: 1,
+                serial: serial.into(),
+                cwmp_id: cwmp_id.into(),
+                operation: None,
+                owned: BTreeMap::new(),
+                attempts: 0,
+                retry_at: 0,
+                reasons: scheduler::Reasons::default(),
+                read: ReadRecovery::default(),
+                device: id.into(),
+            });
+            if frame.serial != serial {
+                frame.serial = serial.into();
+            }
+            if frame.cwmp_id != cwmp_id {
+                frame.cwmp_id = cwmp_id.into();
+            }
+            // Completed histories dominate idle ticks. Compare borrowed state
+            // before cloning it, instead of rebuilding every JSON tree/map.
+            if frame.operation.as_ref() != operation {
+                frame.operation = operation.cloned();
+            }
+            if &frame.owned != owned {
+                frame.owned.clone_from(owned);
+            }
+            frame.attempts = self.attempts.get(id).copied().unwrap_or(0);
+            frame.retry_at = self.next_retry_at.get(id).copied().unwrap_or(0);
+            frame.reasons = self.automatic_ready.get(id).copied().unwrap_or_default();
+            frame.read = self.read_recovery.get(id).cloned().unwrap_or_default();
         }
         let success = match store.save(|path, bytes| storage::write_atomic(path, bytes, true)) {
             Ok(()) => {
@@ -463,27 +589,45 @@ mod tests {
             let f = frame();
             s.frames.insert(f.device.clone(), f.clone());
             s.save(write).unwrap();
-            let path = s.path(&f.device);
+            let path = s.file_path();
+            let encode = |f: Snapshot| {
+                serde_json::to_vec(&RecoveryView {
+                    schema: 2,
+                    devices: &BTreeMap::from([(f.device.clone(), f)]),
+                })
+                .unwrap()
+            };
             match mode {
-                0 => storage::remove_registry(&path).unwrap(),
+                0 => {
+                    storage::remove_registry(&path).unwrap();
+                    write(
+                        &s.index_path(),
+                        &serde_json::to_vec(&Index {
+                            schema: 1,
+                            devices: BTreeSet::from([f.device.clone()]),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
                 1 => {
                     let mut f = f.clone();
                     f.schema = 2;
-                    write(&path, &serde_json::to_vec(&f).unwrap()).unwrap();
+                    write(&path, &encode(f)).unwrap();
                 }
                 2 => {
                     let mut f = f.clone();
                     f.attempts = 6;
-                    write(&path, &serde_json::to_vec(&f).unwrap()).unwrap();
+                    write(&path, &encode(f)).unwrap();
                 }
                 3 => {
                     let mut f = f.clone();
                     f.operation.as_mut().unwrap()["optical_sn"] = json!("TEST_OTHER");
-                    write(&path, &serde_json::to_vec(&f).unwrap()).unwrap();
+                    write(&path, &encode(f)).unwrap();
                 }
-                4 => write(&path, &vec![b' '; MAX_BYTES + 1]).unwrap(),
+                4 => write(&path, &vec![b' '; MAX_TOTAL_BYTES + 1]).unwrap(),
                 5 => write(&path, b"{corrupt").unwrap(),
-                6 => storage::remove_registry(&s.index_path()).unwrap(),
+                6 => write(&path, b"{\"schema\":3,\"devices\":{}}").unwrap(),
                 7 | 8 => {
                     let mut f = f.clone();
                     if mode == 7 {
@@ -492,7 +636,7 @@ mod tests {
                         f.operation.as_mut().unwrap()["items"][0]["state"] =
                             json!("unrecognized_outcome");
                     }
-                    write(&path, &serde_json::to_vec(&f).unwrap()).unwrap();
+                    write(&path, &encode(f)).unwrap();
                 }
                 _ => unreachable!(),
             }
@@ -506,7 +650,7 @@ mod tests {
     #[test]
     fn unindexed_rename_and_removed_configuration_cannot_drop_an_orphan() {
         let mut s = store("orphan");
-        s.save(write).unwrap();
+        write(&s.index_path(), br#"{"schema":1,"devices":[]}"#).unwrap();
         let f = frame();
         write(&s.path(&f.device), &serde_json::to_vec(&f).unwrap()).unwrap();
         assert!(s.load().unwrap());
@@ -534,6 +678,96 @@ mod tests {
             .unwrap_err()
             .contains("durable recovery state"));
         assert!(!c.persist_snapshots());
-        assert!(!std::path::Path::new(&c.snapshots.as_ref().unwrap().index_path()).exists());
+        assert!(!std::path::Path::new(&c.snapshots.as_ref().unwrap().file_path()).exists());
+    }
+
+    #[test]
+    fn split_migration_retires_files_only_after_single_file_commit_and_never_falls_back() {
+        let mut s = store("migration");
+        let f = frame();
+        write(
+            &s.index_path(),
+            &serde_json::to_vec(&Index {
+                schema: 1,
+                devices: BTreeSet::from([f.device.clone()]),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        write(&s.path(&f.device), &serde_json::to_vec(&f).unwrap()).unwrap();
+        assert!(s.load().unwrap());
+        test_io::fail_next(Point::FileSync);
+        assert!(s.save(write).is_err());
+        assert!(std::path::Path::new(&s.path(&f.device)).exists());
+        assert!(std::path::Path::new(&s.index_path()).exists());
+        s.save(write).unwrap();
+        assert!(!std::path::Path::new(&s.path(&f.device)).exists());
+        assert!(!std::path::Path::new(&s.index_path()).exists());
+        assert!(Store::new(s.directory.clone()).load().unwrap());
+        write(&s.file_path(), b"corrupt new authority").unwrap();
+        // Even a valid stale predecessor must never override a corrupt authority.
+        write(&s.index_path(), br#"{"schema":1,"devices":[]}"#).unwrap();
+        assert!(Store::new(s.directory).load().is_err());
+    }
+
+    #[test]
+    fn stable_checkpoints_reuse_trees_and_buffers_without_io_or_duplicate_history() {
+        let mut c = Controller::default();
+        let mut s = store("stable");
+        let f = frame();
+        s.frames.insert(f.device.clone(), f.clone());
+        c.restore_frames(&s);
+        c.snapshots = Some(s);
+        assert!(c.persist_snapshots());
+        let before = c.snapshots.as_ref().unwrap();
+        let tree = before.frames[&f.device].operation.as_ref().unwrap() as *const Value;
+        let bytes = before.acknowledged.as_ptr();
+        test_io::events();
+        for _ in 0..20 {
+            assert!(c.persist_snapshots());
+        }
+        let after = c.snapshots.as_ref().unwrap();
+        assert_eq!(
+            tree,
+            after.frames[&f.device].operation.as_ref().unwrap() as *const Value
+        );
+        assert_eq!(bytes, after.acknowledged.as_ptr());
+        assert!(
+            test_io::events().is_empty(),
+            "unchanged frames must not hit persistence barriers"
+        );
+        c.persist_history(|_| panic!("no duplicate legacy UI file"));
+        assert!(c.saved.is_empty());
+    }
+
+    #[test]
+    fn duplicate_devices_and_individual_or_aggregate_oversize_fail_closed() {
+        let mut s = store("bounds");
+        let f = frame();
+        let device = serde_json::to_string(&f.device).unwrap();
+        let bytes = serde_json::to_string(&f).unwrap();
+        write(
+            &s.file_path(),
+            format!("{{\"schema\":2,\"devices\":{{{device}:{bytes},{device}:{bytes}}}}}")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(s.load().is_err());
+        let mut huge = f.clone();
+        huge.operation.as_mut().unwrap()["padding"] = json!("x".repeat(MAX_BYTES));
+        s.frames.insert(huge.device.clone(), huge);
+        assert!(s.save(|_, _| panic!("oversize cannot write")).is_err());
+        s.frames.clear();
+        for n in 0..200 {
+            let mut f = f.clone();
+            f.device = format!("device-{n}");
+            let op = f.operation.as_mut().unwrap();
+            op["device"] = json!(f.device);
+            op["padding"] = json!("x".repeat(24 * 1024));
+            s.frames.insert(f.device.clone(), f);
+        }
+        assert!(s
+            .save(|_, _| panic!("aggregate bound cannot write"))
+            .is_err());
     }
 }

@@ -1,7 +1,6 @@
 // Only the daemon selects this allocator; CLI and standalone tools keep System.
-#[cfg(feature = "allocator-mimalloc")]
 #[global_allocator]
-static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOCATOR: openwrt_fttr::memory::Allocator = openwrt_fttr::memory::Allocator;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

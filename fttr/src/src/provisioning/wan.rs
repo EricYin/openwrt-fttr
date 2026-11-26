@@ -40,7 +40,7 @@ pub fn parent_protected(id: &str, parent: u32) -> bool {
                 .is_some_and(|a| a.iter().any(|p| p.as_u64() == Some(parent as u64)))
         })
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Owned {
     pub parent: u32,
     pub connection: u32,
