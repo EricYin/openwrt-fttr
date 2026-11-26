@@ -209,6 +209,7 @@ struct Controller {
     acs_status: Value,
     attempts: BTreeMap<String, u32>,
     next_retry_at: BTreeMap<String, u64>,
+    automatic_ready: BTreeMap<String, scheduler::Reasons>,
     command_cursor: Option<String>,
 }
 static CONTROLLER: OnceLock<Mutex<Controller>> = OnceLock::new();

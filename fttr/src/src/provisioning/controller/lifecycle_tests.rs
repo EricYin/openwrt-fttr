@@ -420,8 +420,8 @@ fn reload_queues_latest_revision_without_pruning_and_activates_after_drain() {
     assert!(c.activate_pending_config());
     assert_eq!(c.config.revision, "latest");
     assert!(c.pending_config.is_none());
-    assert!(c.attempts.is_empty());
-    assert!(c.next_retry_at.is_empty());
+    assert_eq!(c.attempts["child"], 4);
+    assert_eq!(c.next_retry_at["child"], u64::MAX);
     assert!(c.owned.contains_key("id"));
     assert_eq!(c.snapshot()["config_load"]["state"], "applied");
     let wire: fttr_api::ConfigLoadStatus = serde_json::from_value(c.config_load_view()).unwrap();

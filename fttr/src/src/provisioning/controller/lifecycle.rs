@@ -303,8 +303,6 @@ impl Controller {
         }
         self.config_error = None;
         self.failure = None;
-        self.attempts.clear();
-        self.next_retry_at.clear();
         true
     }
 
@@ -496,6 +494,8 @@ impl Controller {
         self.attempts
             .retain(|id, _| devices.iter().any(|d| &d.id == id));
         self.next_retry_at
+            .retain(|id, _| devices.iter().any(|d| &d.id == id));
+        self.automatic_ready
             .retain(|id, _| devices.iter().any(|d| &d.id == id));
         let retained_binding = |id: &String| {
             devices.iter().any(|d| &d.cwmp_id == id)

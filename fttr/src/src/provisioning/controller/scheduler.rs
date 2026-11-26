@@ -414,6 +414,19 @@ fn bootstrap_free_acs_consumers_require_current_listener_evidence_before_network
     ));
 }
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct Reasons(u8);
+impl Reasons {
+    fn add(&mut self, bit: u8, present: bool) {
+        if present {
+            self.0 |= bit;
+        }
+    }
+}
+fn retry_delay(attempts: u32) -> u64 {
+    (15u64 * (1u64 << attempts.saturating_sub(1).min(5))).min(300)
+}
+
 fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, time: u64) {
     if c.pending_config.is_some() {
         return;
@@ -425,7 +438,9 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
     let needs_manual = previous.as_ref().is_some_and(|p| {
         p.unresolved || (p.phase == Some(OperationPhase::Interrupted) && !p.reconcile)
     });
-    let all_verified = previous.as_ref().is_some_and(|p| p.verified);
+    let all_verified = previous
+        .as_ref()
+        .is_some_and(|p| p.verified && p.apply && p.revision == c.config.device_revision(&d.id));
     if all_verified {
         c.attempts.remove(&d.id);
         c.next_retry_at.remove(&d.id);
@@ -439,29 +454,58 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
             .as_ref()
             .is_none_or(|p| p.revision != c.config.device_revision(&d.id));
     let periodic = c.periodic_due(&d.id, time);
+    // Merge independent trigger authority into one bounded per-device ready set.
+    // A read-only plan's drift never contributes write authority.
+    let reasons = c.automatic_ready.entry(d.id.clone()).or_default();
+    reasons.add(1, config_changed);
+    reasons.add(2, startup_trigger);
+    reasons.add(4, periodic);
+    reasons.add(
+        8,
+        c.config.triggers.contains("device_online") && !c.last_online.contains(&d.id),
+    );
+    reasons.add(16, new_boot && c.config.triggers.contains("cwmp_boot"));
+    reasons.add(32, previous.as_ref().is_some_and(|p| p.apply && p.drift));
+    reasons.add(
+        64,
+        c.attempts.get(&d.id).is_some_and(|n| *n > 0)
+            && previous.as_ref().is_some_and(|p| {
+                p.apply && p.phase == Some(OperationPhase::Completed) && !p.verified
+            }),
+    );
+    let reasons = *reasons;
+    if needs_manual {
+        c.automatic_ready.remove(&d.id);
+        return;
+    }
+    let attempts = c.attempts.get(&d.id).copied().unwrap_or(0);
+    // Backoff starts at terminal completion, not the start of a potentially
+    // slow operation. Repeated observations cannot move this fixed anchor.
+    if !active_op && attempts != 0 {
+        if let Some(completed) = previous.as_ref().and_then(|p| p.completed_at) {
+            let at = completed.saturating_add(retry_delay(attempts));
+            let deadline = c.next_retry_at.entry(d.id.clone()).or_default();
+            *deadline = (*deadline).max(at);
+        }
+    }
     if !active_op && reachable && c.config.enabled && c.config.automatic {
         if needs_reconcile {
             let _ = c.start_selected(&d.id, false, false, None);
-        } else if !needs_manual
-            && (config_changed
-                || startup_trigger
-                || periodic
-                || (c.config.triggers.contains("device_online") && !c.last_online.contains(&d.id))
-                || (new_boot && c.config.triggers.contains("cwmp_boot")))
+        } else if reasons.0 != 0
+            && attempts < 5
+            && time >= c.next_retry_at.get(&d.id).copied().unwrap_or(0)
         {
-            if c.start(&d.id, true, false).is_ok() && startup_trigger {
-                c.startup_pending.remove(&d.id);
-            }
-        } else if !needs_manual && previous.as_ref().is_some_and(|p| p.apply && p.drift) {
-            let attempts = c.attempts.get(&d.id).copied().unwrap_or(0);
-            let next = c.next_retry_at.get(&d.id).copied().unwrap_or(0);
-            if attempts < 5 && time >= next {
+            if c.start(&d.id, true, false).is_ok() {
                 let next_attempts = attempts + 1;
                 c.attempts.insert(d.id.clone(), next_attempts);
-                let delay = (15 * (1 << (next_attempts - 1))).min(300);
-                c.next_retry_at
-                    .insert(d.id.clone(), time.saturating_add(delay));
-                let _ = c.start(&d.id, true, false);
+                c.next_retry_at.insert(
+                    d.id.clone(),
+                    time.saturating_add(retry_delay(next_attempts)),
+                );
+                c.automatic_ready.remove(&d.id);
+                if reasons.0 & 2 != 0 {
+                    c.startup_pending.remove(&d.id);
+                }
             }
         }
     }
@@ -520,11 +564,14 @@ mod config_change_tests {
 
     fn fixture() -> (Controller, Device) {
         let mut op = super::super::tests::operation(OperationPhase::Completed, false);
+        op.started = 0;
+        op.completed_at = None;
         op.results
             .insert("wifi".into(), json!({"id":"wifi","state":"verified"}));
         let device = op.device.clone();
         crate::omci_auth::test_authorize(&device.optical_sn);
         let mut c = Controller::default();
+        c.next_id = 100;
         c.config.enabled = true;
         c.config.automatic = true;
         c.config.revision = "new-revision".into();
@@ -609,6 +656,90 @@ mod config_change_tests {
         assert_eq!(c.operations[&device.id].id, id);
         assert!(!c.operations[&device.id].apply);
         assert!(!c.attempts.contains_key(&device.id));
+    }
+
+    #[test]
+    fn automatic_causes_share_one_budget_and_keep_backoff_from_completion() {
+        let (mut c, device) = fixture();
+        c.config
+            .triggers
+            .extend(["device_online".into(), "cwmp_boot".into()]);
+        c.attempts.insert(device.id.clone(), 4);
+        c.operations.get_mut(&device.id).unwrap().complete(100);
+        schedule(&mut c, &device, true, true, 200);
+        assert_eq!(c.operations[&device.id].revision, "rev");
+        assert_eq!(c.next_retry_at[&device.id], 220);
+        assert_ne!(c.automatic_ready[&device.id].0, 0);
+        // Re-observation cannot push the completion-anchored deadline forward.
+        schedule(&mut c, &device, true, false, 219);
+        assert_eq!(c.next_retry_at[&device.id], 220);
+        schedule(&mut c, &device, true, false, 220);
+        assert_eq!(c.attempts[&device.id], 5);
+        let op = c.operations.get_mut(&device.id).unwrap();
+        op.results.insert("wifi".into(), json!({"state":"blocked"}));
+        op.started = 220;
+        op.complete(1000);
+        let id = op.id;
+        for time in [1001, 2000, 10000] {
+            schedule(&mut c, &device, true, true, time);
+            assert_eq!(c.operations[&device.id].id, id);
+            assert_eq!(c.attempts[&device.id], 5);
+        }
+    }
+
+    #[test]
+    fn safe_failed_apply_retries_without_needing_a_second_external_trigger() {
+        let (mut c, device) = fixture();
+        c.config.triggers.clear();
+        c.attempts.insert(device.id.clone(), 1);
+        let op = c.operations.get_mut(&device.id).unwrap();
+        op.revision = "new-revision".into();
+        op.results.insert("wifi".into(), json!({"state":"blocked"}));
+        op.complete(100);
+        let id = op.id;
+        schedule(&mut c, &device, true, false, 114);
+        assert_eq!(c.operations[&device.id].id, id);
+        schedule(&mut c, &device, true, false, 115);
+        assert_ne!(c.operations[&device.id].id, id);
+        assert_eq!(c.attempts[&device.id], 2);
+    }
+
+    #[test]
+    fn only_current_verified_apply_settles_the_automatic_episode() {
+        for plan in [false, true] {
+            for current in [false, true] {
+                let (mut c, device) = fixture();
+                c.config.triggers.clear();
+                c.attempts.insert(device.id.clone(), 5);
+                let op = c.operations.get_mut(&device.id).unwrap();
+                op.apply = !plan;
+                if current {
+                    op.revision = "new-revision".into();
+                }
+                op.complete(100);
+                schedule(&mut c, &device, true, false, 1000);
+                assert_eq!(c.attempts.contains_key(&device.id), plan || !current);
+            }
+        }
+    }
+
+    #[test]
+    fn drained_configuration_reload_does_not_rearm_an_exhausted_episode() {
+        let (mut c, device) = fixture();
+        c.attempts.insert(device.id.clone(), 5);
+        c.next_retry_at.insert(device.id.clone(), 900);
+        let mut blocker = super::super::tests::operation(OperationPhase::Writing, false);
+        blocker.device.id = "busy".into();
+        c.operations.insert("busy".into(), blocker);
+        let mut next = c.config.clone();
+        next.revision = "latest".into();
+        c.request_config(next);
+        c.operations.get_mut("busy").unwrap().complete(101);
+        assert!(c.activate_pending_config());
+        assert_eq!(c.attempts[&device.id], 5);
+        schedule(&mut c, &device, true, true, 10000);
+        assert_eq!(c.operations[&device.id].revision, "rev");
+        assert_eq!(c.attempts[&device.id], 5);
     }
 
     #[test]
