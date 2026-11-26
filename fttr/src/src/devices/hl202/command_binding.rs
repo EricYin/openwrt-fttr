@@ -96,8 +96,10 @@ pub async fn execute_async(
 }
 
 pub(super) fn ensure_no_pending(serial: &str) -> io::Result<()> {
-    for directory in ["/etc/fttr/command-external", "/etc/fttr/command-owned"] {
-        let path = crate::provisioning::storage::registry_path(directory, serial);
+    for path in [
+        crate::provisioning::storage::registry_path("/etc/fttr/command-external", serial),
+        super::provisioning::ownership_path(serial),
+    ] {
         match std::fs::read(path) {
             Ok(bytes) => {
                 let value: serde_json::Value =
@@ -222,8 +224,12 @@ mod tests {
     #[test]
     fn external_and_native_pending_or_corrupt_intents_block_every_transaction() {
         let serial = "TEST00000017";
-        for directory in ["/etc/fttr/command-external", "/etc/fttr/command-owned"] {
-            let path = crate::provisioning::storage::registry_path(directory, serial);
+        let native = super::super::provisioning::ownership_path(serial);
+        assert!(native.ends_with("/TEST00000017.json"));
+        for path in [
+            crate::provisioning::storage::registry_path("/etc/fttr/command-external", serial),
+            native,
+        ] {
             for bytes in [b"{\"pending\":true}".as_slice(), b"{", b"{}"] {
                 crate::provisioning::storage::write_atomic(&path, bytes, true).unwrap();
                 assert!(ensure_no_pending(serial).is_err());
