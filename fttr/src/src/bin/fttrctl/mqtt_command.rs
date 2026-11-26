@@ -207,6 +207,11 @@ fn daemon_execute_with(
         Duration::from_secs(seconds + 15),
     )?;
     if reply["operation"]["result"].is_object() {
+        if reply["operation"]["binding_current"] != true {
+            return Err(std::io::Error::other(
+                "command identity changed; execution not established; intent remains unresolved",
+            ));
+        }
         serde_json::from_value(reply["operation"]["result"].clone()).map_err(std::io::Error::other)
     } else {
         Err(std::io::Error::other(
@@ -238,7 +243,7 @@ mod tests {
                     let fttr_api::HlAction::Exec { script: received, timeout_seconds } = request.action else { panic!("exec required") };
                     assert_eq!(received, script);
                     assert_eq!(timeout_seconds, 9);
-                    Ok(json!({"operation":{"result":{"target":"020000000071","status":"executed","exit_code":7,"output":"猫\nfixture stderr\n","output_truncated":false}}}))
+                    Ok(json!({"operation":{"binding_current":true,"result":{"target":"020000000071","status":"executed","exit_code":7,"output":"猫\nfixture stderr\n","output_truncated":false}}}))
                 }
                 _ => panic!("unexpected command"),
             }
@@ -247,5 +252,26 @@ mod tests {
         assert_eq!(result.exit_code, Some(7));
         assert_eq!(result.output.as_deref(), Some("猫\nfixture stderr\n"));
         assert!(!result.success());
+    }
+
+    #[test]
+    fn daemon_exec_never_reports_success_from_a_rebound_or_unverified_selection() {
+        for binding_current in [serde_json::Value::Bool(false), serde_json::Value::Null] {
+            let result = daemon_execute_with("020000000071", "printf fixture", 9, |value, _| {
+                if value["method"] == "list" {
+                    Ok(
+                        json!({"devices":[{"can_execute":true,"optical_sn":"TEST00000071","onu_id":7,"mqtt":{"mqtt_mac":"020000000071","binding_generation":"original"}}]}),
+                    )
+                } else {
+                    Ok(
+                        json!({"operation":{"binding_current":binding_current,"result":{"target":"020000000071","status":"executed","exit_code":0,"output":"fixture","output_truncated":false}}}),
+                    )
+                }
+            });
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("intent remains unresolved"));
+        }
     }
 }
