@@ -24,6 +24,7 @@ fn capabilities_offline_queries_agree_without_controller_initialization() {
         cfg!(feature = "mqtt-bridge")
     );
     assert_eq!(cli["features"]["acs"], cfg!(feature = "acs"));
+    assert_eq!(cli["features"]["acs-bridge"], cfg!(feature = "acs-bridge"));
     assert_eq!(
         cli["features"]["device-hl202"],
         cfg!(feature = "device-hl202")

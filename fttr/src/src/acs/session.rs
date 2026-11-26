@@ -38,7 +38,7 @@ impl Session {
         self.requests += 1;
         server.requests.fetch_add(1, Ordering::Relaxed);
         let matches = |s: &Server| {
-            req.path == s.path
+            super::path_allowed(s, &req.path)
                 && s.auth
                     .as_ref()
                     .is_none_or(|auth| req.headers.get("authorization") == Some(auth))
@@ -55,7 +55,7 @@ impl Session {
                 .cloned()
         };
         let policy = legacy.as_deref().unwrap_or(server);
-        if req.path != policy.path {
+        if !super::path_allowed(policy, &req.path) {
             return Ok(Reply::empty(404));
         }
         if !matches(policy) {
@@ -125,7 +125,7 @@ impl Session {
                     }
                     state.sessions.retain(|_, (id, _, _)| *id != device);
                     state.sessions.insert(key.clone(), (device.clone(), self.peer.clone(), now()));
-                    cookie = Some(format!("fttr_session={key}; Path={}; HttpOnly; SameSite=Strict", policy.path));
+                    cookie = Some(format!("fttr_session={key}; Path={}; HttpOnly; SameSite=Strict", super::cookie_path(policy)));
                     state.devices.insert(device.clone(), Device {
                         serial: message.serial, oui: message.oui, product_class: message.product,
                         peer: self.peer.clone(), namespace: message.namespace.clone(), last_inform: now(),

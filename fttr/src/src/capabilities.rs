@@ -5,6 +5,7 @@ use std::{fs, io, path::Path};
 
 pub fn compiled() -> Capabilities {
     let acs = cfg!(feature = "acs");
+    let acs_bridge = cfg!(feature = "acs-bridge");
     let mqtt = cfg!(feature = "mqtt");
     let mqtt_bridge = cfg!(feature = "mqtt-bridge");
     let hl202 = cfg!(feature = "device-hl202");
@@ -32,6 +33,7 @@ pub fn compiled() -> Capabilities {
         version: env!("CARGO_PKG_VERSION"),
         features: CapabilityFeatures {
             acs,
+            acs_bridge,
             mqtt,
             mqtt_bridge,
             npu: cfg!(feature = "npu"),

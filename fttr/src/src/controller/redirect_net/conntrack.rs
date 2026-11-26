@@ -1,4 +1,4 @@
-//! Exact Netlink CTNETLINK conntrack cleanup for redirected MQTT TCP tuples.
+//! Exact Netlink CTNETLINK conntrack cleanup for redirected TCP tuples.
 use std::io;
 use std::net::Ipv4Addr;
 
@@ -42,7 +42,7 @@ struct NfGenMsg {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct Tuple4 {
+pub(crate) struct Tuple4 {
     pub src_ip: Option<Ipv4Addr>,
     pub dst_ip: Option<Ipv4Addr>,
     pub proto: Option<u8>,
@@ -51,7 +51,7 @@ pub(super) struct Tuple4 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ConntrackEntry {
+pub(crate) struct ConntrackEntry {
     pub orig: Tuple4,
     pub reply: Tuple4,
     pub orig_nla_payload: Vec<u8>,
@@ -59,36 +59,69 @@ pub(super) struct ConntrackEntry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct FlowMatcher {
-    pub client_ip: Ipv4Addr,
-    pub target_gw: Ipv4Addr,
-    pub broker_ip: Ipv4Addr,
+pub(crate) struct FlowMatcher {
+    pub orig_src: Option<Ipv4Addr>,
+    pub orig_dst: Ipv4Addr,
+    pub orig_dst_prefix: u8,
+    pub orig_port: u16,
+    /// Required local DNAT reply endpoint `(ip, port)` so non-hijacked flows
+    /// matching `orig_dst/orig_port` are never deleted.
+    pub reply_target: (Ipv4Addr, u16),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FallbackSweep<'a> {
+    pub reply_ip: Ipv4Addr,
+    pub reply_port: u16,
+    pub allowed_orig_ports: &'a [u16],
+}
+
+fn ip_in_cidr(ip: Ipv4Addr, net: Ipv4Addr, prefix: u8) -> bool {
+    if prefix == 0 {
+        return true;
+    }
+    if prefix > 32 {
+        return false;
+    }
+    let mask = if prefix == 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (u32::from(ip) & mask) == (u32::from(net) & mask)
 }
 
 impl ConntrackEntry {
-    pub(super) fn matches_redirect(
+    pub(crate) fn matches_redirect(
         &self,
         matchers: &[FlowMatcher],
-        broker_ip: Option<Ipv4Addr>,
+        fallback: &[FallbackSweep<'_>],
     ) -> bool {
-        if self.orig.proto != Some(6) || self.orig.dst_port != Some(1883) {
+        if self.orig.proto != Some(6) {
             return false;
         }
-        let (Some(orig_src), Some(orig_dst)) = (self.orig.src_ip, self.orig.dst_ip) else {
+        let (Some(orig_src), Some(orig_dst), Some(orig_port)) =
+            (self.orig.src_ip, self.orig.dst_ip, self.orig.dst_port)
+        else {
             return false;
         };
-        if matchers
-            .iter()
-            .any(|m| m.client_ip == orig_src && m.target_gw == orig_dst)
-        {
+        if matchers.iter().any(|m| {
+            orig_port == m.orig_port
+                && m.orig_src.is_none_or(|src| src == orig_src)
+                && ip_in_cidr(orig_dst, m.orig_dst, m.orig_dst_prefix)
+                && (orig_dst, orig_port) != m.reply_target
+                && self.reply.src_ip == Some(m.reply_target.0)
+                && self.reply.src_port == Some(m.reply_target.1)
+        }) {
             return true;
         }
-        // Also match any DNAT'd TCP 1883 flow whose reply source was rewritten to our broker IP
-        // (covers cleanup after a daemon crash/restart when exact in-memory matchers were lost).
-        broker_ip.is_some_and(|broker| {
-            orig_dst != broker
-                && self.reply.src_ip == Some(broker)
-                && self.reply.src_port == Some(1883)
+        // Crash/restart fallback: only delete flows that came from an allowed
+        // original target port and were DNAT'd to our local endpoint.
+        fallback.iter().any(|f| {
+            f.allowed_orig_ports.contains(&orig_port)
+                && (orig_dst, orig_port) != (f.reply_ip, f.reply_port)
+                && self.reply.src_ip == Some(f.reply_ip)
+                && self.reply.src_port == Some(f.reply_port)
         })
     }
 }
@@ -160,7 +193,7 @@ fn parse_tuple(bytes: &[u8]) -> Tuple4 {
     tuple
 }
 
-pub(super) fn parse_conntrack_payload(payload: &[u8]) -> Option<ConntrackEntry> {
+pub(crate) fn parse_conntrack_payload(payload: &[u8]) -> Option<ConntrackEntry> {
     let hdr_size = std::mem::size_of::<NfGenMsg>();
     if payload.len() < hdr_size {
         return None;
@@ -189,7 +222,7 @@ pub(super) fn parse_conntrack_payload(payload: &[u8]) -> Option<ConntrackEntry> 
     }
 }
 
-pub(super) fn build_request(msg: u16, flags: u16, seq: u32, attrs: &[u8]) -> Vec<u8> {
+fn build_request(msg: u16, flags: u16, seq: u32, attrs: &[u8]) -> Vec<u8> {
     let hdr_len = std::mem::size_of::<NlMsgHdr>();
     let gen_len = std::mem::size_of::<NfGenMsg>();
     let total = hdr_len + gen_len + attrs.len();
@@ -220,7 +253,7 @@ pub(super) fn build_request(msg: u16, flags: u16, seq: u32, attrs: &[u8]) -> Vec
     buf
 }
 
-pub(super) fn build_delete_attrs(entry: &ConntrackEntry) -> Vec<u8> {
+fn build_delete_attrs(entry: &ConntrackEntry) -> Vec<u8> {
     let mut attrs = Vec::new();
     push_nla(
         &mut attrs,
@@ -352,7 +385,7 @@ impl NetlinkSocket {
 
 fn dump_matching(
     matchers: &[FlowMatcher],
-    broker_ip: Option<Ipv4Addr>,
+    fallback: &[FallbackSweep<'_>],
 ) -> Result<Vec<ConntrackEntry>, String> {
     let sock = NetlinkSocket::open().map_err(|e| format!("open netfilter netlink: {e}"))?;
     let req = build_request(
@@ -368,15 +401,15 @@ fn dump_matching(
         .map_err(|e| format!("read conntrack dump: {e}"))?;
     Ok(all
         .into_iter()
-        .filter(|e| e.matches_redirect(matchers, broker_ip))
+        .filter(|e| e.matches_redirect(matchers, fallback))
         .collect())
 }
 
-pub(super) fn cleanup_redirected_flows(
+pub(crate) fn cleanup_redirected_flows(
     matchers: &[FlowMatcher],
-    broker_ip: Option<Ipv4Addr>,
+    fallback: &[FallbackSweep<'_>],
 ) -> Result<usize, String> {
-    let matching = dump_matching(matchers, broker_ip)?;
+    let matching = dump_matching(matchers, fallback)?;
     if matching.is_empty() {
         return Ok(0);
     }
@@ -399,7 +432,7 @@ pub(super) fn cleanup_redirected_flows(
             Err(e) => return Err(format!("conntrack delete failed: {e}")),
         }
     }
-    let remaining = dump_matching(matchers, broker_ip)?;
+    let remaining = dump_matching(matchers, fallback)?;
     if !remaining.is_empty() {
         return Err(format!(
             "{} redirected conntrack flow(s) remained after cleanup",
@@ -428,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_conntrack_payload_and_matches_only_redirected_mqtt_flows() {
+    fn parses_conntrack_payload_and_matches_redirected_mqtt_and_acs_flows() {
         let client = Ipv4Addr::new(192, 0, 2, 244);
         let gw = Ipv4Addr::new(192, 0, 2, 1);
         let broker = Ipv4Addr::new(192, 0, 2, 44);
@@ -446,15 +479,37 @@ mod tests {
         assert_eq!(parsed.orig.dst_ip, Some(gw));
         assert_eq!(parsed.orig.dst_port, Some(1883));
         assert_eq!(parsed.reply.src_ip, Some(broker));
-        assert!(parsed.matches_redirect(
-            &[FlowMatcher {
-                client_ip: client,
-                target_gw: gw,
-                broker_ip: broker,
-            }],
-            Some(broker)
-        ));
-        assert!(parsed.matches_redirect(&[], Some(broker)));
+        let mqtt_matcher = FlowMatcher {
+            orig_src: Some(client),
+            orig_dst: gw,
+            orig_dst_prefix: 32,
+            orig_port: 1883,
+            reply_target: (broker, 1883),
+        };
+        let mqtt_fallback = [FallbackSweep {
+            reply_ip: broker,
+            reply_port: 1883,
+            allowed_orig_ports: &[1883],
+        }];
+        assert!(parsed.matches_redirect(&[mqtt_matcher], &mqtt_fallback));
+        assert!(parsed.matches_redirect(&[], &mqtt_fallback));
+
+        // Unrelated port DNAT targeting broker:1883 must NOT match MQTT fallback.
+        let other_port_orig = encode_tuple(other, gw, 6, 45002, 8443);
+        let other_port_reply = encode_tuple(broker, other, 6, 1883, 45002);
+        let mut other_port_payload = vec![libc::AF_INET as u8, 0, 0, 0];
+        push_nla(
+            &mut other_port_payload,
+            CTA_TUPLE_ORIG | NLA_F_NESTED,
+            &other_port_orig,
+        );
+        push_nla(
+            &mut other_port_payload,
+            CTA_TUPLE_REPLY | NLA_F_NESTED,
+            &other_port_reply,
+        );
+        let other_port = parse_conntrack_payload(&other_port_payload).unwrap();
+        assert!(!other_port.matches_redirect(&[mqtt_matcher], &mqtt_fallback));
 
         // Direct connection to broker (non-redirected) must NOT match even with empty matchers.
         let direct_orig = encode_tuple(other, broker, 6, 45001, 1883);
@@ -471,13 +526,41 @@ mod tests {
             &direct_reply,
         );
         let direct = parse_conntrack_payload(&direct_payload).unwrap();
-        assert!(!direct.matches_redirect(
-            &[FlowMatcher {
-                client_ip: client,
-                target_gw: gw,
-                broker_ip: broker,
-            }],
-            Some(broker)
-        ));
+        assert!(!direct.matches_redirect(&[mqtt_matcher], &mqtt_fallback));
+
+        // Arbitrary CIDR + port ACS redirect match.
+        let acs_target = Ipv4Addr::new(10, 20, 30, 40);
+        let acs_orig = encode_tuple(client, acs_target, 6, 46000, 9090);
+        let acs_reply = encode_tuple(broker, client, 6, 7547, 46000);
+        let mut acs_payload = vec![libc::AF_INET as u8, 0, 0, 0];
+        push_nla(&mut acs_payload, CTA_TUPLE_ORIG | NLA_F_NESTED, &acs_orig);
+        push_nla(&mut acs_payload, CTA_TUPLE_REPLY | NLA_F_NESTED, &acs_reply);
+        let acs_parsed = parse_conntrack_payload(&acs_payload).unwrap();
+        let acs_matcher = FlowMatcher {
+            orig_src: None,
+            orig_dst: Ipv4Addr::new(10, 0, 0, 0),
+            orig_dst_prefix: 8,
+            orig_port: 9090,
+            reply_target: (broker, 7547),
+        };
+        assert!(acs_parsed.matches_redirect(&[acs_matcher], &[]));
+        assert!(!acs_parsed.matches_redirect(&[mqtt_matcher], &mqtt_fallback));
+
+        // Unhijacked LAN/WAN flow to 10.20.30.40:9090 (reply.src == 10.20.30.40) must NEVER match.
+        let direct_10_orig = encode_tuple(other, acs_target, 6, 46001, 9090);
+        let direct_10_reply = encode_tuple(acs_target, other, 6, 9090, 46001);
+        let mut direct_10_payload = vec![libc::AF_INET as u8, 0, 0, 0];
+        push_nla(
+            &mut direct_10_payload,
+            CTA_TUPLE_ORIG | NLA_F_NESTED,
+            &direct_10_orig,
+        );
+        push_nla(
+            &mut direct_10_payload,
+            CTA_TUPLE_REPLY | NLA_F_NESTED,
+            &direct_10_reply,
+        );
+        let direct_10 = parse_conntrack_payload(&direct_10_payload).unwrap();
+        assert!(!direct_10.matches_redirect(&[acs_matcher], &[]));
     }
 }

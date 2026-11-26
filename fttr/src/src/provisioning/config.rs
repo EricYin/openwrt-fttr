@@ -112,6 +112,21 @@ pub(super) fn sections_from_view(
             {
                 return Err("mqtt_bridge enabled requires one scalar option".into());
             }
+            if section.kind == "acs_bridge"
+                && matches!(key.as_str(), "enabled" | "management_gateway")
+                && (option.is_list || section.options.contains_key(key))
+            {
+                return Err(format!("acs_bridge {key} requires one scalar option"));
+            }
+            if section.kind == "acs_redirect"
+                && matches!(
+                    key.as_str(),
+                    "enabled" | "scope" | "target_ip" | "target_port" | "path" | "device" | "name"
+                )
+                && (option.is_list || section.options.contains_key(key))
+            {
+                return Err(format!("acs_redirect {key} requires one scalar option"));
+            }
             if section.kind == "management" && key == "vlan" && !option.is_list {
                 return Err(
                     "management VLAN requires list vlan; scalar option vlan is unsupported".into(),

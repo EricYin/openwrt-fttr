@@ -40,6 +40,8 @@ pub struct Desired {
     username: String,
     password: String,
     #[serde(default)]
+    pub management_gateway: bool,
+    #[serde(default)]
     pub devices: BTreeMap<String, String>,
 }
 impl Desired {
@@ -158,6 +160,7 @@ impl Desired {
             path,
             username,
             password,
+            management_gateway: false,
             devices: BTreeMap::new(),
         })
     }
@@ -169,7 +172,7 @@ impl Desired {
         format!("{hash:016x}")
     }
     fn public(&self) -> Value {
-        json!({"enabled":self.enabled,"mode":if self.automatic {"auto"} else {"manual"},"vlan":self.management.vlans,"priority":self.management.priority,"address":format!("{}/{}",self.address,self.prefix),"acs_url":self.management.acs_url,"port":self.port,"path":self.path,"dhcp_enabled":self.dhcp})
+        json!({"enabled":self.enabled,"mode":if self.automatic {"auto"} else {"manual"},"vlan":self.management.vlans,"priority":self.management.priority,"address":format!("{}/{}",self.address,self.prefix),"acs_url":self.management.acs_url,"port":self.port,"path":self.path,"dhcp_enabled":self.dhcp,"management_gateway":self.management_gateway})
     }
 }
 fn cidr(value: &str) -> Result<(Ipv4Addr, u8), String> {
@@ -679,10 +682,15 @@ fn expected(d: &Desired) -> Sections {
                 .map(|v| format!("br-lan.{v}"))
                 .collect(),
         );
+    let dhcp_options = if d.management_gateway {
+        vec![format!("3,{}", d.address), "6".into()]
+    } else {
+        vec!["3".into(), "6".into()]
+    };
     out.get_mut("dhcp.fttr_tr069")
         .unwrap()
         .options
-        .insert("dhcp_option".into(), vec!["3".into(), "6".into()]);
+        .insert("dhcp_option".into(), dhcp_options);
     add_section(
         &mut out,
         "firewall.fttr_tr069",
@@ -1718,5 +1726,30 @@ mod tests {
             .unwrap()
             .push(json!({"rule":{"chain":"forward_fttr_tr069","expr":[{"accept":null}]}}));
         assert!(verify_firewall(&d, None, &rules).is_err());
+    }
+    #[test]
+    fn management_gateway_advertises_router_option_while_preserving_isolated_forward_reject() {
+        let mut d = desired();
+        assert!(!d.management_gateway);
+        let default_expected = expected(&d);
+        assert_eq!(
+            default_expected["dhcp.fttr_tr069"].options["dhcp_option"],
+            vec!["3", "6"]
+        );
+        assert_eq!(
+            default_expected["firewall.fttr_tr069"].options["forward"],
+            vec!["REJECT"]
+        );
+
+        d.management_gateway = true;
+        let gateway_expected = expected(&d);
+        assert_eq!(
+            gateway_expected["dhcp.fttr_tr069"].options["dhcp_option"],
+            vec!["3,192.0.2.1", "6"]
+        );
+        assert_eq!(
+            gateway_expected["firewall.fttr_tr069"].options["forward"],
+            vec!["REJECT"]
+        );
     }
 }

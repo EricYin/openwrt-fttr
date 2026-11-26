@@ -173,4 +173,40 @@ fn asynchronous_result_contracts_keep_sparse_command_failures_and_literal_guards
         serde_json::from_value::<MqttBridgeStatus>(wire).unwrap(),
         bridge_with_rules
     );
+
+    let acs_bridge = AcsBridgeStatus {
+        enabled: true,
+        management_gateway: true,
+        state: "active".into(),
+        lan_origin: "upstream".into(),
+        lan_listen: Some("192.0.2.44:7547".into()),
+        management_listen: Some("192.0.2.1:7547".into()),
+        path_mode: "wildcard".into(),
+        accepted_paths: vec!["/cwmp".into(), "/tr069".into()],
+        active_rules: 1,
+        rules: vec![AcsBridgeRule {
+            id: "rule_1".into(),
+            name: Some("Default 10/8".into()),
+            scope: "lan".into(),
+            target_ip: "10.0.0.0/8".into(),
+            target_port: 7547,
+            path: None,
+            path_mode: "wildcard".into(),
+            device: Some("onu_1".into()),
+            optical_sn: Some("H3CT00000001".into()),
+            interfaces: vec!["fttr1".into()],
+            acs_target: Some("192.0.2.44:7547".into()),
+            bridge_rules: vec!["iifname \"fttr1\" ip daddr 10.0.0.0/8 tcp dport 7547 meta pkttype set host ether daddr set 02:00:00:00:00:02 counter".into()],
+            ip_rules: vec!["ip daddr 10.0.0.0/8 tcp dport 7547 counter dnat to 192.0.2.44:7547".into()],
+            state: "active".into(),
+            reason: None,
+        }],
+        reason: None,
+        error: None,
+    };
+    let acs_wire = serde_json::to_value(&acs_bridge).unwrap();
+    assert_eq!(
+        serde_json::from_value::<AcsBridgeStatus>(acs_wire).unwrap(),
+        acs_bridge
+    );
 }

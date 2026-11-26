@@ -586,6 +586,68 @@ pub struct MqttBridgeStatus {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct AcsBridgeRule {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub name: Option<String>,
+    pub scope: String,
+    pub target_ip: String,
+    pub target_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub path: Option<String>,
+    pub path_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub optical_sn: Option<String>,
+    #[serde(default)]
+    pub interfaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub acs_target: Option<String>,
+    #[serde(default)]
+    pub bridge_rules: Vec<String>,
+    #[serde(default)]
+    pub ip_rules: Vec<String>,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
+pub struct AcsBridgeStatus {
+    pub enabled: bool,
+    pub management_gateway: bool,
+    pub state: String,
+    pub lan_origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub lan_listen: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub management_listen: Option<String>,
+    pub path_mode: String,
+    #[serde(default)]
+    pub accepted_paths: Vec<String>,
+    pub active_rules: u32,
+    #[serde(default)]
+    pub rules: Vec<AcsBridgeRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional = nullable))]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct DeviceMqttBridgeStatus {
     pub state: String,
     pub address_origin: String,

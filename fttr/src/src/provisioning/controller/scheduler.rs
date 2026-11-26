@@ -25,7 +25,7 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
         .collect();
     let source_links = link_identity::discover(&online_onus, &interfaces);
     if let Ok(mut registry) = crate::mqtt_identity::shared().lock() {
-        registry.update_topology(online_onus.clone(), source_links, now());
+        registry.update_topology(online_onus.clone(), source_links.clone(), now());
     }
     let devices = acs(Command::Devices);
     let acs_status = acs(Command::Status);
@@ -38,6 +38,15 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
         bootstrap_free_consumers_ready(&configured, &devices, &acs_status, &online, now());
     management_network::tick(configured.management_network.as_ref(), cwmp_business_ready);
     let active_management = management_network::active();
+    crate::controller::acs_bridge::tick(
+        &online_onus,
+        &interfaces,
+        &configured.devices,
+        configured.management_network.as_ref(),
+        active_management.is_some(),
+        &devices,
+        source_links.as_ref().ok(),
+    );
     let mut c = controller().lock().unwrap();
     c.acs_status = acs_status.into_metadata();
     c.resolve_pending_identities(&devices);
@@ -327,12 +336,19 @@ fn bootstrap_free_consumers_ready(
 }
 
 fn current_inform(observed: &Value, acs: &Value) -> Option<u64> {
-    (observed["endpoint_id"] == acs["endpoint_id"]
-        && acs["enabled"] == true
-        && acs["error"].is_null()
-        && acs["endpoint_id"].as_str().is_some_and(|id| !id.is_empty()))
-    .then(|| observed["last_inform"].as_u64())
-    .flatten()
+    let obs_ep = observed["endpoint_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())?;
+    if acs["enabled"] != true || !acs["error"].is_null() {
+        return None;
+    }
+    let matches_primary = acs["endpoint_id"].as_str() == Some(obs_ep);
+    let matches_active_list = acs["active_endpoint_ids"]
+        .as_array()
+        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(obs_ep)));
+    (matches_primary || matches_active_list)
+        .then(|| observed["last_inform"].as_u64())
+        .flatten()
 }
 
 #[cfg(test)]
@@ -377,6 +393,26 @@ fn bootstrap_free_acs_consumers_require_current_listener_evidence_before_network
             101
         ));
     }
+
+    // Extra LAN listener endpoint IDs are recognized even when primary endpoint_id is empty/different,
+    // while retired/stale endpoints are still rejected.
+    config.devices[0].provisioning_adapter = "hl202-cu".into();
+    let extra_acs = json!({
+        "enabled": true,
+        "endpoint_id": "",
+        "active_endpoint_ids": ["extra-lan-listener"],
+        "error": null
+    });
+    devices["devices"][&device.cwmp_id] =
+        json!({"endpoint_id": "extra-lan-listener", "last_inform": 100});
+    assert!(bootstrap_free_consumers_ready(
+        &config, &devices, &extra_acs, &online, 101
+    ));
+    devices["devices"][&device.cwmp_id] =
+        json!({"endpoint_id": "retired-extra-listener", "last_inform": 100});
+    assert!(!bootstrap_free_consumers_ready(
+        &config, &devices, &extra_acs, &online, 101
+    ));
 }
 
 fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, time: u64) {

@@ -6,8 +6,6 @@
 #[cfg(feature = "mqtt-bridge")]
 mod capture;
 #[cfg(feature = "mqtt-bridge")]
-mod conntrack;
-#[cfg(feature = "mqtt-bridge")]
 mod evidence;
 #[cfg(feature = "mqtt-bridge")]
 mod lan;

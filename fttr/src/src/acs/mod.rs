@@ -12,7 +12,10 @@ mod state;
 use endpoint::stop_listener;
 #[cfg(test)]
 use endpoint::transition;
-pub use endpoint::{configuration_matches, reconfigure, retire_previous};
+pub use endpoint::{
+    configuration_matches, configure_extra_listener, extra_listener_addr, reconfigure,
+    retire_previous,
+};
 #[cfg(test)]
 mod compact_tests;
 #[cfg(test)]
@@ -103,11 +106,18 @@ struct TaskView<'a> {
     #[serde(flatten)]
     result_info: Option<&'a retention::ResultInfo>,
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PathPolicy {
+    pub allow_any: bool,
+    pub extra_paths: Vec<String>,
+}
+
 struct Server {
     state: Arc<Mutex<State>>,
     enabled: bool,
     listen: String,
     path: String,
+    path_policy: Arc<Mutex<PathPolicy>>,
     state_file: String,
     auth: Option<String>,
     failure: Mutex<Option<String>>,
@@ -134,6 +144,7 @@ fn init() -> Arc<Server> {
                 enabled,
                 listen: String::new(),
                 path: "/cwmp".into(),
+                path_policy: Arc::new(Mutex::new(PathPolicy::default())),
                 state_file,
                 auth: (!config.acs_username.is_empty())
                     .then(|| http::basic(&config.acs_username, &config.acs_password)),
@@ -149,6 +160,57 @@ fn init() -> Arc<Server> {
         .lock()
         .unwrap()
         .clone()
+}
+
+fn normalize_policy(policy: PathPolicy) -> PathPolicy {
+    let extra_paths = policy
+        .extra_paths
+        .into_iter()
+        .filter(|p| {
+            p.starts_with('/')
+                && !p.contains(['?', '#'])
+                && !p.contains("..")
+                && !p.contains('\\')
+                && !p.chars().any(char::is_control)
+                && !p.chars().any(char::is_whitespace)
+        })
+        .collect::<Vec<_>>();
+    PathPolicy {
+        allow_any: policy.allow_any,
+        extra_paths,
+    }
+}
+
+pub fn set_redirect_paths(management: PathPolicy, lan: PathPolicy) {
+    let s = init();
+    *s.path_policy.lock().unwrap() = normalize_policy(management);
+    *endpoint::lan_path_policy().lock().unwrap() = normalize_policy(lan);
+}
+
+fn path_allowed(server: &Server, req_path: &str) -> bool {
+    if req_path == server.path {
+        return true;
+    }
+    if !req_path.starts_with('/') || req_path.contains("..") || req_path.contains('\\') {
+        return false;
+    }
+    if req_path.chars().any(char::is_control) {
+        return false;
+    }
+    let policy = server.path_policy.lock().unwrap();
+    policy.allow_any || policy.extra_paths.iter().any(|p| p == req_path)
+}
+
+fn cookie_path(server: &Server) -> &str {
+    let redirected = {
+        let policy = server.path_policy.lock().unwrap();
+        policy.allow_any || !policy.extra_paths.is_empty()
+    };
+    if redirected {
+        "/"
+    } else {
+        &server.path
+    }
 }
 impl Server {
     fn execute_value(&self, request: Value) -> Value {
@@ -216,7 +278,18 @@ impl Server {
             }
             Command::Status => {
                 let resources = state.resources_view();
-                json!({"compiled":true, "enabled":self.enabled && !self.stopped.load(Ordering::Acquire), "listen":self.listen, "path":self.path, "endpoint_id":self.endpoint_id,"auth":self.auth.is_some(), "devices":state.devices.len(), "tasks":state.tasks.len(), "response_bytes":state.budget.used(), "response_budget":resources::RESULT_BYTES, "resources":resources, "waiting_capacity":state.tasks.keys().filter(|id| state.waiting_capacity(**id)).count(), "http_requests":self.requests.load(Ordering::Relaxed), "error":self.failure.lock().unwrap().clone()})
+                let primary_active = self.enabled && !self.stopped.load(Ordering::Acquire);
+                let mut active_endpoint_ids = Vec::new();
+                if primary_active && !self.endpoint_id.is_empty() {
+                    active_endpoint_ids.push(self.endpoint_id.clone());
+                }
+                if let Some(extra_ep) = endpoint::extra_endpoint_id() {
+                    if !extra_ep.is_empty() && !active_endpoint_ids.contains(&extra_ep) {
+                        active_endpoint_ids.push(extra_ep);
+                    }
+                }
+                let enabled = primary_active || !active_endpoint_ids.is_empty();
+                json!({"compiled":true, "enabled":enabled, "listen":self.listen, "path":self.path, "endpoint_id":self.endpoint_id, "active_endpoint_ids":active_endpoint_ids, "auth":self.auth.is_some(), "devices":state.devices.len(), "tasks":state.tasks.len(), "response_bytes":state.budget.used(), "response_budget":resources::RESULT_BYTES, "resources":resources, "waiting_capacity":state.tasks.keys().filter(|id| state.waiting_capacity(**id)).count(), "http_requests":self.requests.load(Ordering::Relaxed), "error":self.failure.lock().unwrap().clone()})
             }
             Command::Devices => {
                 json!({"devices":state.devices,"connection_requests":state.connection_requests,"periodic_inform":state.periodic_inform})
@@ -238,7 +311,7 @@ impl Server {
                 method,
                 mut args,
             } => {
-                if !self.enabled {
+                if !self.enabled && !endpoint::extra_listener_active() {
                     return error("ACS disabled by UCI");
                 }
                 if !state.devices.contains_key(&device) {
@@ -349,6 +422,7 @@ pub fn start_from_env() {
 }
 
 pub(crate) fn shutdown() {
+    let _ = configure_extra_listener(None);
     let server = init();
     stop_listener(&server);
     for old in server.legacy.lock().unwrap().iter() {
@@ -581,6 +655,7 @@ mod tests {
             enabled: false,
             listen: String::new(),
             path: "/cwmp".into(),
+            path_policy: Arc::new(Mutex::new(PathPolicy::default())),
             state_file: format!(
                 "/tmp/fttr-listener-test-{}-{}.json",
                 std::process::id(),
@@ -696,6 +771,7 @@ mod tests {
             enabled: true,
             listen: address.to_string(),
             path: "/cwmp".into(),
+            path_policy: Arc::new(Mutex::new(PathPolicy::default())),
             state_file: state_file.clone(),
             auth: Some(http::basic("test", "secret")),
             failure: Mutex::new(None),
@@ -765,5 +841,101 @@ mod tests {
             "mock"
         );
         fs::remove_file(state_file).unwrap();
+    }
+    #[test]
+    fn redirect_path_policy_handles_wildcard_exact_and_shared_state_inform() {
+        let state_file = format!("/tmp/fttr-acs-redirect-test-{}.json", std::process::id());
+        let shared_state = Arc::new(Mutex::new(State::default()));
+        let primary_policy = Arc::new(Mutex::new(PathPolicy::default()));
+        let lan_policy = Arc::new(Mutex::new(PathPolicy::default()));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let make_server = |listen: String, policy: Arc<Mutex<PathPolicy>>, ep: &str| {
+            Arc::new(Server {
+                state: shared_state.clone(),
+                enabled: true,
+                listen,
+                path: "/cwmp".into(),
+                path_policy: policy,
+                state_file: state_file.clone(),
+                auth: None,
+                failure: Mutex::new(None),
+                requests: requests.clone(),
+                endpoint_id: ep.into(),
+                drain_deadline: Mutex::new(None),
+                legacy: Mutex::new(Vec::new()),
+                stopping: AtomicBool::new(false),
+                stopped: AtomicBool::new(false),
+            })
+        };
+        let primary = make_server(
+            "127.0.0.1:7547".into(),
+            primary_policy.clone(),
+            "primary-ep",
+        );
+        assert_eq!(cookie_path(&primary), "/cwmp");
+        assert!(!path_allowed(&primary, "/vendor/tr069"));
+
+        *primary_policy.lock().unwrap() = PathPolicy {
+            allow_any: false,
+            extra_paths: vec!["/exact/acs".into()],
+        };
+        assert_eq!(cookie_path(&primary), "/");
+        assert!(path_allowed(&primary, "/exact/acs"));
+        assert!(!path_allowed(&primary, "/other/acs"));
+
+        // Widening LAN policy must NOT widen primary management listener policy.
+        *lan_policy.lock().unwrap() = PathPolicy {
+            allow_any: true,
+            extra_paths: Vec::new(),
+        };
+        assert!(!path_allowed(&primary, "/vendor/tr069"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let extra = make_server(addr.to_string(), lan_policy.clone(), "extra-ep");
+        assert!(path_allowed(&extra, "/vendor/tr069"));
+        assert!(!path_allowed(&extra, "/vendor/../etc/passwd"));
+        let handler = extra.clone();
+        let thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve(&handler, stream).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let inform = soap::envelope(
+            "urn:dslforum-org:cwmp-1-0",
+            "cpe1",
+            "<cwmp:Inform><DeviceId><OUI>001122</OUI><ProductClass>HN8245Q</ProductClass><SerialNumber>H3CT00000001</SerialNumber></DeviceId></cwmp:Inform>",
+        );
+        write!(
+            client,
+            "POST /vendor/tr069 HTTP/1.1\r\nHost: 10.0.0.1\r\nContent-Length: {}\r\n\r\n{}",
+            inform.len(),
+            inform
+        )
+        .unwrap();
+        client.flush().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut headers = String::new();
+        loop {
+            use std::io::BufRead;
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            headers.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        assert!(headers.starts_with("HTTP/1.1 200"));
+        assert!(headers.contains("Path=/;"));
+        drop(reader);
+        drop(client);
+        thread.join().unwrap();
+        let device = &primary.state.lock().unwrap().devices["001122:HN8245Q:H3CT00000001"];
+        assert_eq!(device.endpoint_id, "extra-ep");
+        let _ = fs::remove_file(state_file);
     }
 }

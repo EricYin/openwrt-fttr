@@ -42,6 +42,139 @@ fn get<'a>(all: &'a [(String, Section)], id: &str, kind: &str) -> Result<&'a Sec
         .map(|(_, s)| s)
         .ok_or_else(|| format!("unknown {kind}: {id}"))
 }
+
+fn parse_bool_flag(raw: &str, default: bool, label: &str) -> Result<bool, String> {
+    match raw {
+        "" => Ok(default),
+        "0" | "false" => Ok(false),
+        "1" | "true" => Ok(true),
+        _ => Err(format!("{label} must be 0 or 1")),
+    }
+}
+
+fn parse_target_cidr(raw: &str) -> Result<(std::net::Ipv4Addr, u8), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("acs_redirect target_ip is required".into());
+    }
+    let (ip_str, prefix) = match trimmed.split_once('/') {
+        Some((ip_part, prefix_part)) => {
+            if prefix_part.is_empty() || !prefix_part.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("invalid acs_redirect CIDR prefix: {trimmed}"));
+            }
+            let prefix = prefix_part
+                .parse::<u8>()
+                .ok()
+                .filter(|p| (1..=32).contains(p))
+                .ok_or_else(|| format!("acs_redirect CIDR prefix must be 1..32: {trimmed}"))?;
+            (ip_part, prefix)
+        }
+        None => (trimmed, 32),
+    };
+    let ip: std::net::Ipv4Addr = ip_str
+        .parse()
+        .map_err(|_| format!("invalid acs_redirect target_ip: {trimmed}"))?;
+    if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() {
+        return Err(format!("invalid acs_redirect target_ip: {trimmed}"));
+    }
+    let mask = if prefix == 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Ok((std::net::Ipv4Addr::from(u32::from(ip) & mask), prefix))
+}
+
+fn parse_acs_bridge(all: &[(String, Section)]) -> Result<super::model::AcsBridgeConfig, String> {
+    use super::model::{AcsBridgeConfig, AcsPathMatch, AcsRedirectRuleConfig, AcsRedirectScope};
+    let switches: Vec<_> = all.iter().filter(|(_, s)| s.kind == "acs_bridge").collect();
+    if switches.len() > 1 || switches.first().is_some_and(|(id, _)| id != "acs_bridge") {
+        return Err("acs_bridge requires one named acs_bridge section".into());
+    }
+    let (enabled, management_gateway) = if let Some((_, s)) = switches.first() {
+        (
+            parse_bool_flag(s.get("enabled"), false, "acs_bridge enabled")?,
+            parse_bool_flag(
+                s.get("management_gateway"),
+                false,
+                "acs_bridge management_gateway",
+            )?,
+        )
+    } else {
+        (false, false)
+    };
+
+    let mut rules = Vec::new();
+    for (id, s) in all.iter().filter(|(_, s)| s.kind == "acs_redirect") {
+        let rule_enabled = parse_bool_flag(
+            s.get("enabled"),
+            true,
+            &format!("acs_redirect {id} enabled"),
+        )?;
+        let scope = match s.get("scope") {
+            "" | "lan" => AcsRedirectScope::Lan,
+            "management" => AcsRedirectScope::Management,
+            "both" => AcsRedirectScope::Both,
+            other => {
+                return Err(format!(
+                    "acs_redirect {id} unsupported scope {other}; expected lan, management or both"
+                ))
+            }
+        };
+        let (target_ip, target_prefix) = parse_target_cidr(s.get("target_ip"))?;
+        let port_raw = s.get("target_port");
+        let target_port = if port_raw.is_empty() {
+            7547
+        } else {
+            if !port_raw.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("acs_redirect {id} invalid target_port: {port_raw}"));
+            }
+            port_raw
+                .parse::<u16>()
+                .ok()
+                .filter(|p| *p > 0)
+                .ok_or_else(|| format!("acs_redirect {id} target_port must be 1..65535"))?
+        };
+        let path_raw = s.get("path").trim();
+        let path = if path_raw.is_empty() {
+            return Err(format!(
+                "acs_redirect {id} path is required: enter an exact path starting with '/' or '*' for wildcard"
+            ));
+        } else if path_raw == "*" {
+            AcsPathMatch::Wildcard
+        } else {
+            if !path_raw.starts_with('/')
+                || path_raw
+                    .bytes()
+                    .any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
+                || path_raw.contains(['?', '#'])
+                || path_raw.contains("..")
+                || path_raw.contains('\\')
+            {
+                return Err(format!("acs_redirect {id} invalid path: {path_raw}"));
+            }
+            AcsPathMatch::Exact(path_raw.to_owned())
+        };
+        let name = (!s.get("name").is_empty()).then(|| s.get("name").to_owned());
+        let device = (!s.get("device").is_empty()).then(|| s.get("device").to_owned());
+        rules.push(AcsRedirectRuleConfig {
+            id: id.clone(),
+            name,
+            enabled: rule_enabled,
+            scope,
+            target_ip,
+            target_prefix,
+            target_port,
+            path,
+            device,
+        });
+    }
+    Ok(AcsBridgeConfig {
+        enabled,
+        management_gateway,
+        rules,
+    })
+}
 pub fn compile(text: &str) -> Result<Config, String> {
     compile_view(&crate::config::View::parse(text)?)
 }
@@ -97,6 +230,7 @@ pub(super) fn compile_view(view: &crate::config::View) -> Result<Config, String>
         "1" | "true" => true,
         _ => return Err("mqtt_bridge enabled must be 0 or 1".into()),
     };
+    let acs_bridge = parse_acs_bridge(&all)?;
     // Validate every template, including ones not assigned to a group yet.
     for (id, s) in &all {
         if !matches!(
@@ -114,6 +248,8 @@ pub(super) fn compile_view(view: &crate::config::View) -> Result<Config, String>
                 | "offload"
                 | "mqtt"
                 | "mqtt_bridge"
+                | "acs_bridge"
+                | "acs_redirect"
                 | "omci_auth"
                 | "fiberhome"
         ) {
@@ -122,6 +258,16 @@ pub(super) fn compile_view(view: &crate::config::View) -> Result<Config, String>
         let allowed: &[&str] = match s.kind.as_str() {
             "fiberhome" => &["onu_count", "rx_snapshot"],
             "mqtt_bridge" => &["enabled"],
+            "acs_bridge" => &["enabled", "management_gateway"],
+            "acs_redirect" => &[
+                "enabled",
+                "scope",
+                "target_ip",
+                "target_port",
+                "path",
+                "device",
+                "name",
+            ],
             "omci_auth" => &["auth_mode", "auth_loid", "auth_password", "schema_version"],
             "optical" => &["enabled", "downstream_tx_enabled", "fec_enabled"],
             "calibration" => &["source"],
@@ -418,6 +564,13 @@ pub(super) fn compile_view(view: &crate::config::View) -> Result<Config, String>
     let mut cfg = config::compile_sections(expanded)?;
     cfg.fiberhome_onu_count = onu_count;
     cfg.mqtt_bridge_enabled = mqtt_bridge_enabled;
+    for rule in &acs_bridge.rules {
+        if let Some(target) = &rule.device {
+            super::model::resolve_configured_device(&cfg.devices, target)
+                .map_err(|err| format!("acs_redirect {}: {err}", rule.id))?;
+        }
+    }
+    cfg.acs_bridge = acs_bridge;
     if let Some(count) = onu_count {
         if cfg.onu_pins.values().any(|id| *id >= count) {
             return Err(format!(
@@ -429,6 +582,9 @@ pub(super) fn compile_view(view: &crate::config::View) -> Result<Config, String>
     if let Some((_, s)) = all.iter().find(|(_, s)| s.kind == "management") {
         let acs = all.iter().find(|(_, s)| s.kind == "acs").map(|(_, s)| s);
         let mut desired = super::management_network::Desired::parse(s, acs)?;
+        desired.management_gateway = cfg!(feature = "acs-bridge")
+            && cfg.acs_bridge.enabled
+            && cfg.acs_bridge.management_gateway;
         desired.devices = cfg
             .devices
             .iter()
@@ -503,7 +659,7 @@ pub(super) fn compile_view(view: &crate::config::View) -> Result<Config, String>
             canonical_section(&mut canonical, id, &business);
             if !matches!(
                 business.kind.as_str(),
-                "management" | "acs" | "omci_auth" | "mqtt_bridge"
+                "management" | "acs" | "omci_auth" | "mqtt_bridge" | "acs_bridge" | "acs_redirect"
             ) {
                 if business.kind == "device" {
                     business.options.retain(|key, _| {
@@ -678,6 +834,53 @@ mod tests {
             "config mqtt_bridge 'mqtt_bridge'\n option enabled 'yes'\n",
             "config mqtt_bridge 'mqtt_bridge'\n list enabled '1'\n",
             "config mqtt_bridge 'mqtt_bridge'\n option extra '1'\n",
+        ] {
+            assert!(super::compile(&format!("{base}{bad}")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn acs_bridge_and_redirect_rules_validate_cidr_port_path_and_device_and_keep_business_revision()
+    {
+        let base = "config template 't'\nconfig group 'g'\n option template 't'\nconfig device 'd'\n option optical_sn 'H3CT1234ABCD'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\n";
+        let off = super::compile(base).unwrap();
+        assert!(!off.acs_bridge.enabled);
+        let on = super::compile(&format!(
+            "{base}config management 'management'\n option enabled '1'\n option mode 'auto'\n list vlan '46'\n option address '192.0.2.1/24'\nconfig acs_bridge 'acs_bridge'\n option enabled '1'\n option management_gateway '1'\nconfig acs_redirect 'r1'\n option scope 'lan'\n option target_ip '10.1.2.3/8'\n option target_port '9090'\n option path '*'\n option device 'H3CT1234ABCD'\nconfig acs_redirect 'r2'\n option scope 'management'\n option target_ip '10.20.30.40'\n option path '/tr069'\n"
+        ))
+        .unwrap();
+        assert!(on.acs_bridge.enabled);
+        assert!(on.acs_bridge.management_gateway);
+        assert_eq!(
+            on.management_network.as_ref().unwrap().management_gateway,
+            cfg!(feature = "acs-bridge")
+        );
+        assert_eq!(on.acs_bridge.rules.len(), 2);
+        assert_eq!(on.acs_bridge.rules[0].target_ip.to_string(), "10.0.0.0");
+        assert_eq!(on.acs_bridge.rules[0].target_prefix, 8);
+        assert_eq!(on.acs_bridge.rules[0].target_port, 9090);
+        assert_eq!(
+            on.acs_bridge.rules[0].path,
+            crate::provisioning::model::AcsPathMatch::Wildcard
+        );
+        assert_eq!(
+            on.acs_bridge.rules[1].path,
+            crate::provisioning::model::AcsPathMatch::Exact("/tr069".into())
+        );
+        assert_eq!(off.business_revision(), on.business_revision());
+        assert_ne!(off.revision, on.revision);
+
+        for bad in [
+            "config acs_bridge 'other'\n option enabled '1'\n",
+            "config acs_bridge 'acs_bridge'\n option enabled 'yes'\n",
+            "config acs_redirect 'bad'\n option target_ip '0.0.0.0/0'\n option path '*'\n",
+            "config acs_redirect 'bad'\n option target_ip '10.0.0.1'\n option target_port '0'\n option path '*'\n",
+            "config acs_redirect 'bad'\n option target_ip '10.0.0.1'\n",
+            "config acs_redirect 'bad'\n option target_ip '10.0.0.1'\n option path 'tr069'\n",
+            "config acs_redirect 'bad'\n option target_ip '10.0.0.1'\n option path '/bad/../path'\n",
+            "config acs_redirect 'bad'\n option target_ip '10.0.0.1'\n option path '*'\n option scope 'wan'\n",
+            "config acs_redirect 'bad'\n option target_ip '10.0.0.1'\n option path '*'\n option device 'missing'\n",
+            "config device 'dup'\n option optical_sn 'H3CT1234ABCD'\n option omci_adapter 'hl202'\n option bootstrap_adapter 'none'\n option provisioning_adapter 'hl202-cu'\n option group 'g'\nconfig acs_redirect 'bad'\n option target_ip '10.0.0.1'\n option path '*'\n option device 'H3CT1234ABCD'\n",
         ] {
             assert!(super::compile(&format!("{base}{bad}")).is_err(), "{bad}");
         }

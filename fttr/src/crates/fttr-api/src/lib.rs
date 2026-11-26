@@ -54,6 +54,8 @@ pub struct Capabilities {
 #[cfg_attr(feature = "codegen", derive(ts_rs::TS))]
 pub struct CapabilityFeatures {
     pub acs: bool,
+    #[serde(rename = "acs-bridge")]
+    pub acs_bridge: bool,
     pub mqtt: bool,
     #[serde(rename = "mqtt-bridge")]
     pub mqtt_bridge: bool,

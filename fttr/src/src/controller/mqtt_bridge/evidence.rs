@@ -12,12 +12,7 @@ const REQUEST_WINDOW: Duration = Duration::from_secs(30);
 const MAX_PACKET: usize = 4096;
 const COOKIE: [u8; 4] = [99, 130, 83, 99];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Origin {
-    Local,
-    Upstream,
-    Unknown,
-}
+pub(crate) use super::super::redirect_net::lan::LanOrigin as Origin;
 
 /// Independently established DHCP server origins. Missing addresses are unknown;
 /// absence from a local-server list is not evidence of an upstream server.

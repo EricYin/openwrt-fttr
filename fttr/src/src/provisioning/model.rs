@@ -225,6 +225,72 @@ impl Device {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcsRedirectScope {
+    Lan,
+    Management,
+    Both,
+}
+
+impl AcsRedirectScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::Management => "management",
+            Self::Both => "both",
+        }
+    }
+
+    pub fn includes_lan(self) -> bool {
+        matches!(self, Self::Lan | Self::Both)
+    }
+
+    pub fn includes_management(self) -> bool {
+        matches!(self, Self::Management | Self::Both)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AcsPathMatch {
+    Wildcard,
+    Exact(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcsRedirectRuleConfig {
+    pub id: String,
+    pub name: Option<String>,
+    pub enabled: bool,
+    pub scope: AcsRedirectScope,
+    pub target_ip: std::net::Ipv4Addr,
+    pub target_prefix: u8,
+    pub target_port: u16,
+    pub path: AcsPathMatch,
+    pub device: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AcsBridgeConfig {
+    pub enabled: bool,
+    pub management_gateway: bool,
+    pub rules: Vec<AcsRedirectRuleConfig>,
+}
+
+pub(crate) fn resolve_configured_device<'a>(
+    devices: &'a [Device],
+    target: &str,
+) -> Result<&'a Device, String> {
+    let matches: Vec<&Device> = devices
+        .iter()
+        .filter(|d| d.id == target || d.optical_sn.eq_ignore_ascii_case(target))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(format!("unknown device {target}")),
+        [dev] => Ok(*dev),
+        _ => Err(format!("ambiguous device target {target}")),
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Config {
     pub omci_auth: crate::omci_auth::Config,
@@ -244,6 +310,7 @@ pub struct Config {
     pub management: Option<Management>,
     pub management_network: Option<super::management_network::Desired>,
     pub mqtt_bridge_enabled: bool,
+    pub acs_bridge: AcsBridgeConfig,
     pub allow_unsupported_as_bridge: bool,
     pub labels: BTreeMap<String, String>,
 }

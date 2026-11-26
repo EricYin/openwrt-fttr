@@ -1,9 +1,10 @@
-use std::io::Write;
+use super::super::redirect_net::nft as net_nft;
 use std::net::Ipv4Addr;
-use std::process::{Command, Stdio};
 
 pub(super) const BRIDGE_TABLE: &str = "fttr_mqtt_redirect";
 pub(super) const IP_TABLE: &str = "fttr_mqtt_redirect";
+
+pub(super) use net_nft::format_mac;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct RedirectRule {
@@ -35,129 +36,38 @@ impl RedirectRule {
     }
 }
 
-pub(super) fn format_mac(mac: [u8; 6]) -> String {
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    )
-}
-
-fn valid_interface(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 15
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-}
-
 pub(super) fn render_apply_script(rules: &[RedirectRule]) -> Result<String, String> {
     if rules.is_empty() {
-        return Ok(render_delete_script());
+        return Ok(net_nft::render_delete_script(Some(BRIDGE_TABLE), IP_TABLE));
     }
-    let mut bridge_rules = String::new();
-    let mut ip_rules = String::new();
+    let mut bridge_rules = Vec::with_capacity(rules.len());
+    let mut ip_rules = Vec::with_capacity(rules.len());
     for rule in rules {
-        if !valid_interface(&rule.interface) {
+        if !net_nft::valid_interface(&rule.interface) {
             return Err(format!("invalid ONU interface name: {}", rule.interface));
         }
-        bridge_rules.push_str(&format!("        {}\n", rule.bridge_rule_expr()));
-        ip_rules.push_str(&format!("        {}\n", rule.ip_rule_expr()));
+        bridge_rules.push(rule.bridge_rule_expr());
+        ip_rules.push(rule.ip_rule_expr());
     }
-    Ok(format!(
-        "table bridge {BRIDGE_TABLE}\n\
-delete table bridge {BRIDGE_TABLE}\n\
-table bridge {BRIDGE_TABLE} {{\n\
-    chain prerouting {{\n\
-        type filter hook prerouting priority -300; policy accept;\n\
-{bridge_rules}\
-    }}\n\
-}}\n\
-table ip {IP_TABLE}\n\
-delete table ip {IP_TABLE}\n\
-table ip {IP_TABLE} {{\n\
-    chain prerouting {{\n\
-        type nat hook prerouting priority -100; policy accept;\n\
-{ip_rules}\
-    }}\n\
-}}\n"
+    Ok(net_nft::render_prerouting_script(
+        Some(BRIDGE_TABLE),
+        IP_TABLE,
+        &bridge_rules,
+        &ip_rules,
     ))
-}
-
-pub(super) fn render_delete_script() -> String {
-    format!(
-        "table bridge {BRIDGE_TABLE}\n\
-delete table bridge {BRIDGE_TABLE}\n\
-table ip {IP_TABLE}\n\
-delete table ip {IP_TABLE}\n"
-    )
-}
-
-fn run_nft_batch(script: &str) -> Result<(), String> {
-    let mut child = Command::new("nft")
-        .args(["-f", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot start nft: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(script.as_bytes())
-            .map_err(|e| format!("write nft script: {e}"))?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("wait nft: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(if stderr.is_empty() {
-            format!("nft exited with {}", output.status)
-        } else {
-            format!("nft failed: {stderr}")
-        });
-    }
-    Ok(())
 }
 
 pub(super) fn apply(rules: &[RedirectRule]) -> Result<(), String> {
     let script = render_apply_script(rules)?;
-    run_nft_batch(&script)
+    net_nft::run_nft_batch(&script)
 }
 
 pub(super) fn remove() -> Result<(), String> {
-    run_nft_batch(&render_delete_script())
+    net_nft::run_nft_batch(&net_nft::render_delete_script(Some(BRIDGE_TABLE), IP_TABLE))
 }
 
 pub(super) fn tables_present() -> Result<(bool, bool), String> {
-    let output = Command::new("nft")
-        .args(["-j", "list", "tables"])
-        .output()
-        .map_err(|e| format!("cannot list nft tables: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(format!("nft list tables failed: {stderr}"));
-    }
-    let parsed: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|e| format!("parse nft tables: {e}"))?;
-    Ok(parse_tables_present(&parsed))
-}
-
-fn parse_tables_present(value: &serde_json::Value) -> (bool, bool) {
-    let Some(entries) = value["nftables"].as_array() else {
-        return (false, false);
-    };
-    let mut bridge = false;
-    let mut ip = false;
-    for entry in entries {
-        let table = &entry["table"];
-        if table["family"] == "bridge" && table["name"] == BRIDGE_TABLE {
-            bridge = true;
-        }
-        if table["family"] == "ip" && table["name"] == IP_TABLE {
-            ip = true;
-        }
-    }
-    (bridge, ip)
+    net_nft::tables_present(Some(BRIDGE_TABLE), IP_TABLE)
 }
 
 #[cfg(test)]
@@ -201,6 +111,9 @@ mod tests {
                 {"table": {"family": "ip", "name": "fttr_mqtt_redirect"}}
             ]
         });
-        assert_eq!(parse_tables_present(&parsed), (true, true));
+        assert_eq!(
+            net_nft::parse_tables_present(&parsed, Some(BRIDGE_TABLE), IP_TABLE),
+            (true, true)
+        );
     }
 }

@@ -102,13 +102,20 @@ async fn request(req: hyper::Request<Incoming>, server: &Server) -> Result<Reque
         }
     }
     let authorized = |s: &Server| {
-        path == s.path
+        super::path_allowed(s, &path)
             && s.auth
                 .as_ref()
                 .is_none_or(|auth| headers.get("authorization") == Some(auth))
     };
     if !authorized(server) && !server.legacy.lock().unwrap().iter().any(|s| authorized(s)) {
-        return Err(Reply::empty(401));
+        let path_ok = super::path_allowed(server, &path)
+            || server
+                .legacy
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| super::path_allowed(s, &path));
+        return Err(Reply::empty(if path_ok { 401 } else { 404 }));
     }
     static PARSERS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let slots = PARSERS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(8)));

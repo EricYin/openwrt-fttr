@@ -1,5 +1,5 @@
+use super::super::redirect_net::conntrack;
 use super::capture::{ensure_capture, stop_capture, CaptureControl, SynObservation};
-use super::conntrack;
 use super::evidence::{Lease, MqttSyn, Origin, Transactions};
 use super::lan::{
     inspect_lan_context, origin_str, parse_mac_hex12, same_subnet, server_origins, LanContext,
@@ -196,7 +196,14 @@ fn cleanup_rules_and_conntrack(c: &mut Coordinator) -> Result<(), String> {
         errors.push(err);
     }
     let matchers: Vec<_> = c.tracked_matchers.values().copied().collect();
-    match conntrack::cleanup_redirected_flows(&matchers, c.broker_ip) {
+    let fallback = c.broker_ip.map(|ip| conntrack::FallbackSweep {
+        reply_ip: ip,
+        reply_port: 1883,
+        allowed_orig_ports: &[1883],
+    });
+    let fallback_slice: &[conntrack::FallbackSweep<'_>] =
+        fallback.as_ref().map(std::slice::from_ref).unwrap_or(&[]);
+    match conntrack::cleanup_redirected_flows(&matchers, fallback_slice) {
         Ok(_) => c.tracked_matchers.clear(),
         Err(err) => errors.push(err),
     }
@@ -684,9 +691,11 @@ pub(crate) fn tick(
         c.tracked_matchers.insert(
             (client_ip, target_gw),
             conntrack::FlowMatcher {
-                client_ip,
-                target_gw,
-                broker_ip,
+                orig_src: Some(client_ip),
+                orig_dst: target_gw,
+                orig_dst_prefix: 32,
+                orig_port: 1883,
+                reply_target: (broker_ip, 1883),
             },
         );
         next_devices.insert(
@@ -760,7 +769,7 @@ pub(crate) fn tick(
                     c.rule_error = None;
                     if !removed_matchers.is_empty() {
                         if let Err(err) =
-                            conntrack::cleanup_redirected_flows(&removed_matchers, None)
+                            conntrack::cleanup_redirected_flows(&removed_matchers, &[])
                         {
                             c.rule_error = Some(err);
                         } else {
