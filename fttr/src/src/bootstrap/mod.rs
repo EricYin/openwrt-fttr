@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const STATE_FILE: &str = "/var/lib/fttr/acs-bootstrap.json";
+const STATE_FILE: &str = "/etc/fttr/acs-bootstrap.json";
+const LEGACY_STATE_FILE: &str = "/var/lib/fttr/acs-bootstrap.json";
+const MAX_ATTEMPTS: u32 = 5;
 
 use fttr_api::BootstrapPhase as Phase;
 
@@ -28,6 +30,9 @@ struct Record {
     state: Phase,
     reason: String,
     attempts: u32,
+    // A durable write intent is not remote cancellation or terminal evidence.
+    // Preserve it across invalidation/restart and never automatically replay it.
+    write_pending: Option<u64>,
     next_retry_at: u64,
     updated_at: u64,
     settings_verified_at: Option<u64>,
@@ -57,23 +62,54 @@ struct Coordinator {
     records: BTreeMap<String, Record>,
     saved: Vec<u8>,
     persistence_error: Option<String>,
+    load_blocked: bool,
 }
 
 static COORDINATOR: OnceLock<Mutex<Coordinator>> = OnceLock::new();
 fn coordinator() -> &'static Mutex<Coordinator> {
     COORDINATOR.get_or_init(|| {
         let mut c = Coordinator::default();
-        match std::fs::read(STATE_FILE) {
-            Ok(bytes) => match serde_json::from_slice::<BTreeMap<String, Record>>(&bytes) {
+        let bytes = std::fs::read(STATE_FILE).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                std::fs::read(LEGACY_STATE_FILE)
+            } else {
+                Err(error)
+            }
+        });
+        match bytes {
+            Ok(bytes) => match decode_records(&bytes) {
                 Ok(records) => c.records = records,
-                Err(e) => c.persistence_error = Some(format!("bootstrap state decode: {e}")),
+                Err(e) => {
+                    c.load_blocked = true;
+                    c.persistence_error = Some(format!("bootstrap state decode: {e}"));
+                }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-            Err(e) => c.persistence_error = Some(format!("bootstrap state read: {e}")),
+            Err(e) => {
+                c.load_blocked = true;
+                c.persistence_error = Some(format!("bootstrap state read: {e}"));
+            }
         }
         c.restart(now());
         Mutex::new(c)
     })
+}
+
+fn decode_records(bytes: &[u8]) -> Result<BTreeMap<String, Record>, serde_json::Error> {
+    let fields: BTreeMap<String, Value> = serde_json::from_slice(bytes)?;
+    let mut records: BTreeMap<String, Record> = serde_json::from_slice(bytes)?;
+    for (id, record) in &mut records {
+        // Preserve uncertainty when importing a pre-intent journal. Its generic
+        // error cannot distinguish an initial-read failure from a lost write reply.
+        if fields[id].get("write_pending").is_none()
+            && record.method == "hl202-mqtt-acs"
+            && record.attempts != 0
+            && record.last_error.is_some()
+        {
+            record.write_pending = Some(record.generation);
+        }
+    }
+    Ok(records)
 }
 
 fn now() -> u64 {
@@ -115,7 +151,6 @@ impl Record {
         self.settings_verified_at = None;
         self.selected_vlan = None;
         self.require_inform_after = time;
-        self.attempts = 0;
         self.next_retry_at = 0;
         self.last_error = None;
         self.set_phase(Phase::WaitingTransport, time, reason);
@@ -147,6 +182,9 @@ impl Record {
         }
         match result {
             Ok(true) => {
+                if self.write_pending == Some(generation) {
+                    self.write_pending = None;
+                }
                 self.settings_verified_at = Some(time);
                 self.last_error = None;
                 self.next_retry_at = time.saturating_add(60);
@@ -200,7 +238,7 @@ pub(super) fn retain_devices(ids: &std::collections::BTreeSet<String>) {
         }
     }
     c.records
-        .retain(|id, r| ids.contains(id) || r.worker.is_some());
+        .retain(|id, r| ids.contains(id) || r.worker.is_some() || r.write_pending.is_some());
     c.persist();
 }
 
@@ -222,7 +260,7 @@ pub(super) fn tick(observation: Observation<'_>) {
     let mut c = coordinator().lock().unwrap();
     let job = c.schedule(observation, &sources);
     drop(sources);
-    c.persist();
+    let job = c.durable_job(job, |bytes| storage::write_atomic(STATE_FILE, bytes, true));
     drop(c);
     if let Some(job) = job {
         crate::runtime::spawn_service("CWMP bootstrap", async move {
@@ -260,11 +298,23 @@ impl Coordinator {
                 r.removed = true;
             }
         }
-        self.records.retain(|_, r| !r.removed || r.worker.is_some());
+        self.records
+            .retain(|_, r| !r.removed || r.worker.is_some() || r.write_pending.is_some());
     }
 
     fn restart(&mut self, time: u64) {
         for record in self.records.values_mut() {
+            // Older records may predate the explicit intent field. An interrupted
+            // write/verification phase cannot be converted to a fresh write grant.
+            if matches!(
+                record.state,
+                Phase::Configuring
+                    | Phase::ConfiguringManagementWan
+                    | Phase::Verifying
+                    | Phase::VerifyingManagementWan
+            ) {
+                record.write_pending.get_or_insert(record.generation);
+            }
             record.invalidate(
                 time,
                 "daemon restarted; fresh transport and Inform required",
@@ -376,7 +426,9 @@ impl Coordinator {
             );
         // Transport freshness is a separate observation, not a configuration change.
         // Keep readback evidence when only the Inform expires.
-        if fresh {
+        if r.write_pending.is_some() && r.worker.is_none() {
+            r.set_phase(Phase::AwaitingApply, time, "unresolved bootstrap write; terminal execution evidence and transaction-aware recovery required");
+        } else if fresh && r.write_pending.is_none() {
             if let Some((epoch, _)) = authorization {
                 r.completed_authorization = epoch;
             }
@@ -387,6 +439,7 @@ impl Coordinator {
             );
             r.next_retry_at = 0;
             r.last_error = None;
+            r.attempts = 0;
         } else if r.worker.is_some() {
             // Keep the slot until an obsolete worker exits; never overlap per-device commands.
         } else if management.is_none() {
@@ -434,6 +487,14 @@ impl Coordinator {
                 "waiting for optical online and fresh MQTT telemetry from the associated device",
             );
         } else if let (Some(target), Some(management)) = (target, management) {
+            if r.attempts >= MAX_ATTEMPTS {
+                r.set_phase(
+                    Phase::AwaitingApply,
+                    time,
+                    "bootstrap attempt budget exhausted; explicit recovery required",
+                );
+                return None;
+            }
             if time >= r.next_retry_at {
                 r.attempts = r.attempts.saturating_add(1);
                 r.worker = Some(r.generation);
@@ -466,19 +527,92 @@ impl Coordinator {
 }
 
 impl Coordinator {
-    fn persist(&mut self) {
-        let bytes = serde_json::to_vec(&self.records).unwrap_or_default();
+    fn persist(&mut self) -> bool {
+        self.persist_with(|bytes| storage::write_atomic(STATE_FILE, bytes, true))
+    }
+
+    fn persist_with(&mut self, write: impl FnOnce(&[u8]) -> std::io::Result<()>) -> bool {
+        if self.load_blocked {
+            return false;
+        }
+        let bytes = match serde_json::to_vec(&self.records) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.persistence_error = Some(format!("bootstrap state encode: {error}"));
+                return false;
+            }
+        };
         if bytes != self.saved {
-            match storage::write_atomic(STATE_FILE, &bytes, true) {
+            match write(&bytes) {
                 Ok(()) => {
                     self.saved = bytes;
                     self.persistence_error = None;
                 }
                 Err(e) => {
-                    self.persistence_error = Some(format!("bootstrap state persistence: {e}"))
+                    // A failed rename/directory barrier may already have changed
+                    // the visible file. Even reverting to the old bytes must fsync.
+                    self.saved.clear();
+                    self.persistence_error = Some(format!("bootstrap state persistence: {e}"));
+                    return false;
                 }
             }
         }
+        true
+    }
+
+    fn durable_job(
+        &mut self,
+        job: Option<Job>,
+        write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+    ) -> Option<Job> {
+        if self.persist_with(write) {
+            return job;
+        }
+        if let Some(job) = &job {
+            if let Some(record) = self.records.get_mut(&job.id) {
+                if record.worker == Some(job.generation) {
+                    record.worker = None;
+                    record.next_retry_at = record
+                        .updated_at
+                        .saturating_add(retry_delay(record.attempts));
+                    record.set_phase(
+                        Phase::RetryWait,
+                        record.updated_at,
+                        "bootstrap persistence barrier failed; no worker dispatched",
+                    );
+                }
+            }
+        }
+        None
+    }
+
+    fn advance(
+        &mut self,
+        id: &str,
+        generation: u64,
+        state: Phase,
+        time: u64,
+        reason: &str,
+        write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+    ) -> bool {
+        let Some(record) = self.records.get_mut(id) else {
+            return false;
+        };
+        if record.generation != generation
+            || record.worker != Some(generation)
+            || record.state == Phase::Ready
+        {
+            return false;
+        }
+        if matches!(state, Phase::Configuring | Phase::ConfiguringManagementWan) {
+            if record.write_pending.is_some_and(|old| old != generation) {
+                return false;
+            }
+            record.write_pending = Some(generation);
+            record.settings_verified_at = None;
+        }
+        record.set_phase(state, time, reason);
+        self.persist_with(write)
     }
 }
 
@@ -490,15 +624,9 @@ fn progress(id: &str, generation: u64, auth_epoch: u64, state: Phase, reason: &s
     if crate::omci_auth::serial_epoch(&r.optical_sn) != Some(auth_epoch) {
         return false;
     }
-    if r.generation != generation || r.worker != Some(generation) || r.state == Phase::Ready {
-        return false;
-    }
-    if matches!(state, Phase::Configuring | Phase::ConfiguringManagementWan) {
-        r.settings_verified_at = None;
-    }
-    r.set_phase(state, now(), reason);
-    c.persist();
-    true
+    c.advance(id, generation, state, now(), reason, |bytes| {
+        storage::write_atomic(STATE_FILE, bytes, true)
+    })
 }
 
 async fn progress_async(
@@ -584,8 +712,7 @@ async fn run(
                 return false;
             }
             r.selected_vlan = Some(selected);
-            c.persist();
-            true
+            c.persist()
         })
         .await
         .map_err(|_| "bootstrap persistence worker failed")?
@@ -673,13 +800,12 @@ fn public_url(url: &str) -> String {
 }
 
 pub(super) fn is_ready_for_management(id: &str, sn: &str, url: &str, epoch: u64) -> bool {
-    coordinator()
-        .lock()
-        .unwrap()
-        .records
-        .get(id)
-        .is_some_and(|r| {
+    let c = coordinator().lock().unwrap();
+    c.persistence_error.is_none()
+        && !c.load_blocked
+        && c.records.get(id).is_some_and(|r| {
             r.state == Phase::Ready
+                && r.write_pending.is_none()
                 && r.optical_sn == sn
                 && r.expected_acs_url == url
                 && r.completed_authorization == epoch
@@ -687,9 +813,13 @@ pub(super) fn is_ready_for_management(id: &str, sn: &str, url: &str, epoch: u64)
 }
 pub(super) fn omci_write_allowed(id: &str, epoch: u64, automatic: bool) -> bool {
     let c = coordinator().lock().unwrap();
-    c.records.get(id).is_none_or(|r| {
-        r.state != Phase::Ready && (automatic || (epoch != 0 && r.completed_authorization != epoch))
-    })
+    !c.load_blocked
+        && c.persistence_error.is_none()
+        && c.records.get(id).is_none_or(|r| {
+            r.write_pending.is_none()
+                && r.state != Phase::Ready
+                && (automatic || (epoch != 0 && r.completed_authorization != epoch))
+        })
 }
 
 pub(super) fn view(device: &Device, management: Option<&Management>, acs: &Value) -> Value {
@@ -757,6 +887,240 @@ mod interval_tests;
 mod tests {
     use super::*;
     use crate::mqtt_identity::normalize_target;
+
+    fn active_record() -> Coordinator {
+        Coordinator {
+            records: BTreeMap::from([(
+                "test-device".into(),
+                Record {
+                    generation: 7,
+                    worker: Some(7),
+                    state: Phase::Reading,
+                    attempts: 1,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn failed_durable_admission_never_dispatches_and_does_not_cache_an_acknowledgement() {
+        let mut c = active_record();
+        let job = Job {
+            id: "test-device".into(),
+            generation: 7,
+            target: "020000000001".into(),
+            url: "http://192.0.2.1/cwmp".into(),
+            persist_matching: false,
+            vlans: vec![46],
+            priority: 0,
+            authorization_epoch: 1,
+        };
+        assert!(c
+            .durable_job(Some(job), |_| Err(std::io::Error::other("fault")))
+            .is_none());
+        assert!(c.records["test-device"].worker.is_none());
+        assert_eq!(c.records["test-device"].state, Phase::RetryWait);
+        assert!(c.saved.is_empty());
+        assert!(c.persistence_error.is_some());
+        let mut retried = false;
+        assert!(c.persist_with(|_| {
+            retried = true;
+            Ok(())
+        }));
+        assert!(retried);
+        assert!(c.persistence_error.is_none());
+        assert!(
+            c.persist_with(|_| panic!("successfully durable unchanged content needs no new write"))
+        );
+    }
+
+    #[test]
+    fn write_phase_requires_all_real_durability_barriers_even_after_identical_rename() {
+        use storage::test_io::{self, Point};
+        for fault in [Point::FileSync, Point::Rename, Point::DirectorySync] {
+            let mut c = active_record();
+            let directory = test_io::registry_directory("/etc/fttr/bootstrap-test");
+            let path = format!("{directory}/{fault:?}.json");
+            test_io::fail_next(fault);
+            assert!(!c.advance(
+                "test-device",
+                7,
+                Phase::Configuring,
+                100,
+                "intent",
+                |bytes| storage::write_atomic(&path, bytes, true)
+            ));
+            assert!(c.saved.is_empty());
+            assert_eq!(c.records["test-device"].write_pending, Some(7));
+            test_io::events();
+            test_io::fail_next(fault);
+            assert!(!c.advance(
+                "test-device",
+                7,
+                Phase::Configuring,
+                100,
+                "intent",
+                |bytes| storage::write_atomic(&path, bytes, true)
+            ));
+            assert!(test_io::events().contains(&fault));
+            assert!(c.advance(
+                "test-device",
+                7,
+                Phase::Configuring,
+                100,
+                "intent",
+                |bytes| storage::write_atomic(&path, bytes, true)
+            ));
+            assert!(!c.saved.is_empty());
+        }
+    }
+
+    #[test]
+    fn unresolved_write_survives_restart_removal_and_obsolete_completion() {
+        for completion in [Ok(true), Err("timeout".into())] {
+            let mut c = active_record();
+            assert!(c.advance(
+                "test-device",
+                7,
+                Phase::ConfiguringManagementWan,
+                100,
+                "intent",
+                |_| Ok(())
+            ));
+            c.records
+                .get_mut("test-device")
+                .unwrap()
+                .invalidate(101, "identity changed");
+            c.records
+                .get_mut("test-device")
+                .unwrap()
+                .finish(7, completion, 102);
+            assert_eq!(c.records["test-device"].write_pending, Some(7));
+            assert!(c.records["test-device"].settings_verified_at.is_none());
+            let bytes = serde_json::to_vec(&c.records).unwrap();
+            c.records = serde_json::from_slice(&bytes).unwrap();
+            c.restart(103);
+            c.configure(&[], 104);
+            assert_eq!(c.records["test-device"].write_pending, Some(7));
+            assert!(c.records["test-device"].worker.is_none());
+        }
+        let mut c = active_record();
+        c.records.get_mut("test-device").unwrap().state = Phase::Verifying;
+        c.restart(100);
+        assert_eq!(c.records["test-device"].write_pending, Some(7));
+    }
+
+    #[test]
+    fn successful_current_completion_clears_only_its_own_intent() {
+        let mut c = active_record();
+        assert!(
+            c.advance("test-device", 7, Phase::Configuring, 100, "intent", |_| Ok(
+                ()
+            ))
+        );
+        c.records
+            .get_mut("test-device")
+            .unwrap()
+            .finish(7, Ok(true), 101);
+        assert!(c.records["test-device"].write_pending.is_none());
+        assert_eq!(c.records["test-device"].settings_verified_at, Some(101));
+        assert!(c.persist_with(|_| Ok(())));
+    }
+
+    #[test]
+    fn unreadable_or_corrupt_state_is_not_overwritten_by_new_observations() {
+        let mut c = active_record();
+        c.load_blocked = true;
+        c.persistence_error = Some("decode failed".into());
+        assert!(!c.advance(
+            "test-device",
+            7,
+            Phase::Configuring,
+            100,
+            "intent",
+            |_| panic!("must preserve unreadable state")
+        ));
+        assert_eq!(c.persistence_error.as_deref(), Some("decode failed"));
+    }
+
+    #[test]
+    fn failed_changed_snapshot_invalidates_ack_even_when_reverting_to_old_content() {
+        let mut c = active_record();
+        assert!(c.persist_with(|_| Ok(())));
+        c.records.get_mut("test-device").unwrap().attempts = 2;
+        assert!(
+            !c.persist_with(|_| Err(std::io::Error::other("directory sync failed after rename")))
+        );
+        c.records.get_mut("test-device").unwrap().attempts = 1;
+        let mut wrote = false;
+        assert!(c.persist_with(|_| {
+            wrote = true;
+            Ok(())
+        }));
+        assert!(
+            wrote,
+            "a failed barrier invalidates the last acknowledged content cache"
+        );
+    }
+
+    #[test]
+    fn legacy_unknown_bootstrap_is_imported_as_unresolved_but_new_read_failure_is_not() {
+        let mut c = active_record();
+        let record = c.records.get_mut("test-device").unwrap();
+        record.method = "hl202-mqtt-acs".into();
+        record.last_error = Some("unknown timeout".into());
+        let mut value = serde_json::to_value(&c.records).unwrap();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(decode_records(&bytes).unwrap()["test-device"]
+            .write_pending
+            .is_none());
+        value["test-device"]
+            .as_object_mut()
+            .unwrap()
+            .remove("write_pending");
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert_eq!(
+            decode_records(&bytes).unwrap()["test-device"].write_pending,
+            Some(7)
+        );
+        assert!(decode_records(b"not-json").is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "device-hl202")]
+    fn attempt_budget_and_unknown_write_cannot_be_reset_by_transport_or_desired_changes() {
+        let mut c = TestCoordinator::default();
+        let d = device("bounded", "hl202");
+        let mut m = Management {
+            vlans: vec![46],
+            vlan: 46,
+            priority: 0,
+            acs_url: "http://192.0.2.1/cwmp".into(),
+        };
+        let mac = "020000000001";
+        c.sources.observe(mac, 100);
+        let job = schedule(&mut c, &d, &m, Some(mac), 100, None).unwrap();
+        c.records.get_mut(&d.id).unwrap().finish(
+            job.generation,
+            Err("initial read timeout".into()),
+            101,
+        );
+        c.records.get_mut(&d.id).unwrap().attempts = MAX_ATTEMPTS;
+        m.acs_url = "http://192.0.2.2/cwmp".into();
+        c.restart(102);
+        c.sources.observe(mac, 170);
+        assert!(schedule(&mut c, &d, &m, Some(mac), 170, None).is_none());
+        assert_eq!(c.records[&d.id].attempts, MAX_ATTEMPTS);
+        assert!(c.records[&d.id].reason.contains("budget exhausted"));
+        c.records.get_mut(&d.id).unwrap().write_pending = Some(job.generation);
+        assert!(schedule(&mut c, &d, &m, Some(mac), 171, Some(171)).is_none());
+        assert_eq!(c.records[&d.id].state, Phase::AwaitingApply);
+        assert!(c.records[&d.id]
+            .reason
+            .contains("unresolved bootstrap write"));
+    }
 
     struct TestCoordinator {
         coordinator: Coordinator,

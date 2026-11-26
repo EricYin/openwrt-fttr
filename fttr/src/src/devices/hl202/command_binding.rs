@@ -60,6 +60,21 @@ pub async fn execute_async(
             "command must not be empty",
         ));
     }
+    let target = crate::mqtt_identity::shared()
+        .lock()
+        .map_err(|_| io::Error::other("MQTT identity state unavailable"))?
+        .resolve(selection, now())
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    let transaction = command::Transaction::acquire(&target.mqtt_mac)?;
+    execute_transaction_async(&transaction, selection, script, timeout).await
+}
+
+pub(super) async fn execute_transaction_async(
+    transaction: &command::Transaction,
+    selection: &Selection,
+    script: &str,
+    timeout: Duration,
+) -> io::Result<SelectedResult> {
     execute_at_async(
         "127.0.0.1:1883".parse().unwrap(),
         crate::mqtt_identity::shared(),
@@ -67,6 +82,7 @@ pub async fn execute_async(
         script,
         timeout,
         now,
+        Some(transaction),
     )
     .await
 }
@@ -81,7 +97,7 @@ fn execute_at(
     clock: impl Fn() -> u64,
 ) -> io::Result<SelectedResult> {
     crate::runtime::block_on(execute_at_async(
-        address, registry, selection, script, timeout, clock,
+        address, registry, selection, script, timeout, clock, None,
     ))
 }
 
@@ -92,12 +108,27 @@ async fn execute_at_async(
     script: &str,
     timeout: Duration,
     clock: impl Fn() -> u64,
+    transaction: Option<&command::Transaction>,
 ) -> io::Result<SelectedResult> {
     let target = registry
         .lock()
         .map_err(|_| io::Error::other("MQTT identity state unavailable"))?
         .resolve(selection, clock())
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    let owned_transaction;
+    let transaction = match transaction {
+        Some(transaction) => transaction,
+        None => {
+            owned_transaction = command::Transaction::acquire(&target.mqtt_mac)?;
+            &owned_transaction
+        }
+    };
+    if transaction.target() != target.mqtt_mac {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "transaction target changed",
+        ));
+    }
     let _target_lock = command::lock_target(&target.mqtt_mac)?;
     let id = command::request_id();
     let result = command_transport::run(
@@ -162,6 +193,18 @@ mod tests {
                 .binding_generation
                 .clone(),
         };
+        let transaction = command::Transaction::acquire("02AABBCCDDEF").unwrap();
+        let blocked = execute_at(
+            "127.0.0.1:1".parse().unwrap(),
+            &registry,
+            &selection,
+            "fixture",
+            Duration::from_secs(1),
+            || 100,
+        )
+        .unwrap_err();
+        assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
+        drop(transaction);
         let peer_registry = registry.clone();
         let (address, worker) = test_peer::spawn(move |mut stream| {
             let Packet::Subscribe(subscription) = read(&mut stream).unwrap() else {

@@ -98,7 +98,7 @@ pub(crate) fn write_atomic(path: &str, data: &[u8], sync_directory: bool) -> io:
 // Tests run the production save/rename/fsync path in a per-test-thread sandbox.
 // Only the directory and fault injection points differ; no save is stubbed out.
 #[cfg(test)]
-pub(super) mod test_io {
+pub(crate) mod test_io {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::path::PathBuf;

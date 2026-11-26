@@ -14,8 +14,9 @@ struct Connection {
     isp: String,
     settings_verified: bool,
 }
-async fn execute(target: &str, script: &str) -> Result<String, String> {
-    let result = command::execute_async(target, script, Duration::from_secs(60))
+async fn execute(transaction: &command::Transaction, script: &str) -> Result<String, String> {
+    let result = transaction
+        .execute(script, Duration::from_secs(60))
         .await
         .map_err(|_| "management WAN command transport failed")?;
     if !result.success() {
@@ -131,9 +132,9 @@ pub async fn ensure_async<F: std::future::Future<Output = bool>>(
         return Err("invalid management VLAN/priority".into());
     }
     let target = mqtt_target(target).ok_or("invalid MQTT management target")?;
-    let _transaction = command::lock_target(&format!("transaction-{target}"))
-        .map_err(|_| "device command transaction active")?;
-    let (parents, connections) = parse(execute(&target, INVENTORY).await?.trim())?;
+    let transaction =
+        command::Transaction::acquire(&target).map_err(|_| "device command transaction active")?;
+    let (parents, connections) = parse(execute(&transaction, INVENTORY).await?.trim())?;
     let tr069: Vec<_> = connections
         .iter()
         .filter(|c| c.service.to_uppercase().contains("TR069"))
@@ -212,7 +213,7 @@ pub async fn ensure_async<F: std::future::Future<Output = bool>>(
         ));
     }
     commands.push("printf 'FTTR_MANAGEMENT_WAN_WRITTEN\\n'".into());
-    if !execute(&target, &commands.join("; "))
+    if !execute(&transaction, &commands.join("; "))
         .await?
         .lines()
         .any(|l| l == "FTTR_MANAGEMENT_WAN_WRITTEN")
@@ -222,7 +223,7 @@ pub async fn ensure_async<F: std::future::Future<Output = bool>>(
     if !progress(super::super::ManagementWanStage::Verifying).await {
         return Err("management WAN authorization changed before verification".into());
     }
-    let (_, connections) = parse(execute(&target, INVENTORY).await?.trim())?;
+    let (_, connections) = parse(execute(&transaction, INVENTORY).await?.trim())?;
     if !connections
         .iter()
         .any(|x| x.parent == p && x.child == c && matches(x, vlan, priority))

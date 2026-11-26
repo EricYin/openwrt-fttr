@@ -55,21 +55,34 @@ fn now() -> u64 {
         .as_secs()
 }
 
-async fn execute(selection: &Selection, script: &str) -> Result<String, String> {
-    execute_once(selection, script)
+async fn execute(
+    transaction: &super::command::Transaction,
+    selection: &Selection,
+    script: &str,
+) -> Result<String, String> {
+    execute_once(transaction, selection, script)
         .await
         .map_err(|(reason, _)| reason)
 }
 
-async fn execute_once(selection: &Selection, script: &str) -> Result<String, (String, bool)> {
-    let reply = command_binding::execute_async(selection, script, Duration::from_secs(90))
-        .await
-        .map_err(|_| {
-            (
-                "command transport failed; rediscovery required".into(),
-                false,
-            )
-        })?;
+async fn execute_once(
+    transaction: &super::command::Transaction,
+    selection: &Selection,
+    script: &str,
+) -> Result<String, (String, bool)> {
+    let reply = command_binding::execute_transaction_async(
+        transaction,
+        selection,
+        script,
+        Duration::from_secs(90),
+    )
+    .await
+    .map_err(|_| {
+        (
+            "command transport failed; rediscovery required".into(),
+            false,
+        )
+    })?;
     if !reply.binding_current {
         return Err((
             "command identity changed; rediscovery required".into(),
@@ -653,7 +666,7 @@ pub async fn run(
         )
     };
     // Separate from per-publication transport locks; held for the complete transaction.
-    let _transaction = super::command::lock_target(&format!("transaction-{target_mac}"))
+    let transaction = super::command::Transaction::acquire(&target_mac)
         .map_err(|_| "device transaction already active")?;
     let path = format!("/etc/fttr/command-owned/{}.json", device.optical_sn);
     let owned: Ownership = match std::fs::read(&path) {
@@ -673,7 +686,7 @@ pub async fn run(
     // Inventory is read-only. A timeout does not cancel the remote shell, so
     // only retry this initial read, never a write or its uncertain readback.
     let inventory_text = initial_inventory_with_retry(
-        || execute_once(&selection, INVENTORY),
+        || execute_once(&transaction, &selection, INVENTORY),
         check_auth,
         Duration::from_secs(2),
     )
@@ -694,7 +707,8 @@ pub async fn run(
         owned,
         |script| {
             let selection = &selection;
-            async move { execute(selection, &script).await }
+            let transaction = &transaction;
+            async move { execute(transaction, selection, &script).await }
         },
         |owned| {
             storage::write_atomic(

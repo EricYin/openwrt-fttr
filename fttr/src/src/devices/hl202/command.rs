@@ -192,6 +192,33 @@ mod tests {
         std::fs::remove_file(format!("/tmp/fttr-command-{first_target}.lock")).unwrap();
         std::fs::remove_file(format!("/tmp/fttr-command-{second_target}.lock")).unwrap();
     }
+
+    #[test]
+    #[cfg(feature = "mqtt")]
+    fn transaction_excludes_raw_exec_dispatch_and_broadcast_between_publications() {
+        let target = "0200000000F1";
+        let transaction = Transaction::acquire(target).unwrap();
+        // No publication lock is held: these must fail at transaction admission,
+        // before connecting or enqueueing anything to the broker.
+        assert_eq!(
+            execute(target, "fixture", Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            dispatch(target, "fixture").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            dispatch("all", "fixture").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let other = Transaction::acquire("0200000000F2").unwrap();
+        assert!(Transaction::acquire("02:00:00:00:00:f1").is_err());
+        drop((transaction, other));
+        Transaction::acquire(target).unwrap();
+    }
 }
 
 // Explicit unlock also releases descriptors briefly inherited by concurrent fork/exec.
@@ -215,6 +242,11 @@ impl Drop for CommandLock {
 // Do not unlink the lock file: doing so would let clients lock different inodes.
 #[cfg(any(feature = "mqtt", test))]
 pub(super) fn lock_target(target: &str) -> io::Result<CommandLock> {
+    lock_named(target, 2)
+}
+
+#[cfg(any(feature = "mqtt", test))]
+fn lock_named(target: &str, mode: i32) -> io::Result<CommandLock> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -224,13 +256,61 @@ pub(super) fn lock_target(target: &str) -> io::Result<CommandLock> {
     extern "C" {
         fn flock(fd: i32, operation: i32) -> i32;
     }
-    if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
+    if unsafe { flock(file.as_raw_fd(), mode | 4) } != 0 {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!("another fttrctl command is active for {target}"),
         ));
     }
     Ok(CommandLock(file))
+}
+
+/// A complete read/plan/write/readback transaction, shared by native sync,
+/// bootstrap, account commands and standalone exec. Publication locks alone
+/// would leave gaps between inventory and its dependent write.
+#[cfg(any(feature = "mqtt", test))]
+pub(super) struct Transaction {
+    target: String,
+    _global: CommandLock,
+    _device: CommandLock,
+}
+
+#[cfg(any(feature = "mqtt", test))]
+impl Transaction {
+    pub(super) fn acquire(target: &str) -> io::Result<Self> {
+        let target = normalize_mac(target)?;
+        let global = lock_named("transactions", 1)?;
+        let device = lock_target(&format!("transaction-{target}"))?;
+        Ok(Self {
+            target,
+            _global: global,
+            _device: device,
+        })
+    }
+
+    pub(super) fn target(&self) -> &str {
+        &self.target
+    }
+
+    #[cfg(feature = "mqtt")]
+    pub(super) async fn execute(
+        &self,
+        script: &str,
+        timeout: Duration,
+    ) -> io::Result<CommandResult> {
+        let _publication = lock_target(&self.target)?;
+        super::command_transport::run(
+            "127.0.0.1:1883".parse().unwrap(),
+            super::command_transport::Request {
+                target: self.target.clone(),
+                script,
+                id: request_id(),
+                timeout,
+            },
+            super::command_transport::enqueue,
+        )
+        .await
+    }
 }
 
 /// QoS 0 dispatch only. Success reports a socket write, not device execution.
@@ -246,6 +326,17 @@ pub fn dispatch(target: &str, command: &str) -> io::Result<CommandResult> {
             io::ErrorKind::InvalidInput,
             "command must not be empty",
         ));
+    }
+    // A broadcast conflicts with every per-device transaction. Unicast takes
+    // the same transaction gate as exec, not merely its publication lock.
+    let _broadcast;
+    let _transaction;
+    if target == "all" {
+        _broadcast = Some(lock_named("transactions", 2)?);
+        _transaction = None;
+    } else {
+        _broadcast = None;
+        _transaction = Some(Transaction::acquire(&target)?);
     }
     let _lock = lock_target(&target)?;
     super::command_transport::blocking(async {
@@ -292,19 +383,9 @@ pub async fn execute_async(
             "command must not be empty",
         ));
     }
-    let _lock = lock_target(&target)?;
-    let id = request_id();
-    super::command_transport::run(
-        "127.0.0.1:1883".parse().unwrap(),
-        super::command_transport::Request {
-            target,
-            script: command,
-            id,
-            timeout,
-        },
-        super::command_transport::enqueue,
-    )
-    .await
+    Transaction::acquire(&target)?
+        .execute(command, timeout)
+        .await
 }
 
 #[cfg(not(feature = "mqtt"))]

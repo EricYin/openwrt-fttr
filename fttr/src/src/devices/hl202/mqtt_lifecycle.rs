@@ -31,13 +31,14 @@ pub async fn read_authenticated_settings_async(
     credentials: &crate::devices::CwmpCredentials,
 ) -> Result<bool, String> {
     let target = mqtt_target(device_id).ok_or("invalid MQTT command target")?;
-    let _transaction = command::lock_target(&format!("transaction-{target}"))
-        .map_err(|_| "device command transaction active")?;
+    let transaction =
+        command::Transaction::acquire(&target).map_err(|_| "device command transaction active")?;
     let script = format!(
         "if {}; then printf 'FTTR_CWMP_MATCH\\n'; else printf 'FTTR_CWMP_DIFF\\n'; fi",
         authenticated_tests(Some(acs_url), credentials).join(" && ")
     );
-    let result = command::execute_async(&target, &script, Duration::from_secs(30))
+    let result = transaction
+        .execute(&script, Duration::from_secs(30))
         .await
         .map_err(|_| "CWMP settings read transport failed")?;
     if !result.success() {
@@ -65,10 +66,11 @@ pub async fn configure_settings_async(
     credentials: &crate::devices::CwmpCredentials,
 ) -> Result<(), String> {
     let target = mqtt_target(device_id).ok_or("invalid MQTT command target")?;
-    let _transaction = command::lock_target(&format!("transaction-{target}"))
-        .map_err(|_| "device command transaction active")?;
+    let transaction =
+        command::Transaction::acquire(&target).map_err(|_| "device command transaction active")?;
     let script = authenticated_script(Some(acs_url), credentials);
-    let result = command::execute_async(&target, &script, Duration::from_secs(90))
+    let result = transaction
+        .execute(&script, Duration::from_secs(90))
         .await
         .map_err(|_| "CWMP configuration transport failed")?;
     if !result.success()
