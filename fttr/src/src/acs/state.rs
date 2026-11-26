@@ -180,8 +180,29 @@ impl State {
                 id: task.id,
                 sent: task.sent,
             };
-            task.state = TaskState::Sent;
-            task.sent = Some(now());
+            let write = matches!(
+                task.method.as_str(),
+                "SetParameterValues" | "AddObject" | "DeleteObject"
+            );
+            let epoch = task.args["_omci_auth_epoch"].as_u64();
+            let mut admit = || {
+                task.state = TaskState::Sent;
+                task.sent = Some(now());
+                Ok(())
+            };
+            let admitted = if write {
+                crate::omci_auth::enqueue_cwmp(device, epoch, admit)
+            } else {
+                admit()
+            };
+            if let Err(error) = admitted {
+                let id = task.id;
+                task.state = TaskState::Fault;
+                task.result = Some(error_result(&error.to_string()));
+                self.mark_completed(id);
+                self.release_dispatch(id);
+                return Ok(None);
+            }
             return Ok(Some(transaction::PreparedRpc { xml, undo }));
         }
         Ok(None)

@@ -63,6 +63,70 @@ struct Coordinator {
     saved: Vec<u8>,
     persistence_error: Option<String>,
     load_blocked: bool,
+    tasks: BTreeMap<(String, u64), Worker>,
+}
+
+struct Worker(tokio::task::JoinHandle<Result<bool, String>>);
+impl Worker {
+    fn start(
+        work: impl std::future::Future<Output = Result<bool, String>> + Send + 'static,
+        deadline: std::time::Duration,
+    ) -> Self {
+        Self(crate::runtime::spawn(async move {
+            struct Wake;
+            impl Drop for Wake {
+                fn drop(&mut self) {
+                    crate::provisioning::controller::wake();
+                }
+            }
+            let _wake = Wake;
+            tokio::time::timeout(deadline, work)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(
+                        "bootstrap effect deadline exceeded; remote execution is not cancelled"
+                            .into(),
+                    )
+                })
+        }))
+    }
+    fn take(&mut self) -> Option<Result<bool, String>> {
+        use std::{
+            future::Future,
+            pin::Pin,
+            task::{Context, Poll, Waker},
+        };
+        match Pin::new(&mut self.0).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Pending => None,
+            Poll::Ready(result) => Some(result.unwrap_or_else(|_| {
+                Err("bootstrap executor terminated; execution outcome not established".into())
+            })),
+        }
+    }
+}
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+// Harvest even after removal, authorization loss or loss of both transports.
+// Completions always route to their original generation, never a new grant.
+pub(super) fn collect() {
+    let mut c = coordinator().lock().unwrap();
+    if c.collect_workers(now()) {
+        c.persist();
+    }
+}
+
+pub(crate) fn external_command_allowed(serial: &str) -> bool {
+    let c = coordinator().lock().unwrap();
+    !c.load_blocked
+        && c.persistence_error.is_none()
+        && !c
+            .records
+            .values()
+            .any(|r| r.optical_sn == serial && (r.write_pending.is_some() || r.worker.is_some()))
 }
 
 static COORDINATOR: OnceLock<Mutex<Coordinator>> = OnceLock::new();
@@ -261,26 +325,52 @@ pub(super) fn tick(observation: Observation<'_>) {
     let job = c.schedule(observation, &sources);
     drop(sources);
     let job = c.durable_job(job, |bytes| storage::write_atomic(STATE_FILE, bytes, true));
-    drop(c);
     if let Some(job) = job {
-        crate::runtime::spawn_service("CWMP bootstrap", async move {
-            run(
-                job.id,
-                job.generation,
-                job.target,
-                job.url,
-                job.persist_matching,
-                job.vlans,
-                job.priority,
-                job.authorization_epoch,
-                auth_epoch,
-            )
-            .await
-        });
+        let key = (job.id.clone(), job.generation);
+        let serial = c.records[&job.id].optical_sn.clone();
+        c.tasks.insert(
+            key,
+            Worker::start(
+                async move {
+                    crate::omci_auth::execution_scope(
+                        serial,
+                        auth_epoch,
+                        run(
+                            job.id,
+                            job.generation,
+                            job.target,
+                            job.url,
+                            job.persist_matching,
+                            job.vlans,
+                            job.priority,
+                            job.authorization_epoch,
+                            auth_epoch,
+                        ),
+                    )
+                    .await
+                },
+                std::time::Duration::from_secs(8 * 60),
+            ),
+        );
     }
 }
 
 impl Coordinator {
+    fn collect_workers(&mut self, time: u64) -> bool {
+        let terminal: Vec<_> = self
+            .tasks
+            .iter_mut()
+            .filter_map(|(key, worker)| worker.take().map(|result| (key.clone(), result)))
+            .collect();
+        let changed = !terminal.is_empty();
+        for ((id, generation), result) in terminal {
+            self.tasks.remove(&(id.clone(), generation));
+            if let Some(record) = self.records.get_mut(&id) {
+                record.finish(generation, result, time);
+            }
+        }
+        changed
+    }
     fn configure(&mut self, devices: &[Device], time: u64) {
         for (id, r) in &mut self.records {
             let selected = devices
@@ -323,6 +413,8 @@ impl Coordinator {
     }
 
     fn schedule(&mut self, observation: Observation<'_>, sources: &Registry) -> Option<Job> {
+        let capacity = !crate::runtime::is_stopping()
+            && self.records.values().filter(|r| r.worker.is_some()).count() < 2;
         let Observation {
             device,
             management,
@@ -495,7 +587,7 @@ impl Coordinator {
                 );
                 return None;
             }
-            if time >= r.next_retry_at {
+            if capacity && time >= r.next_retry_at {
                 r.attempts = r.attempts.saturating_add(1);
                 r.worker = Some(r.generation);
                 r.set_phase(
@@ -652,8 +744,8 @@ async fn run(
     priority: u32,
     authorization_epoch: u64,
     auth_epoch: u64,
-) {
-    let result = async {
+) -> Result<bool, String> {
+    async {
         let credentials = management_network::credentials(authorization_epoch)
             .ok_or("management authorization changed before execution")?;
         if !progress_async(
@@ -773,17 +865,7 @@ async fn run(
         }
         Ok(true)
     }
-    .await;
-    let _ = crate::runtime::spawn_blocking(move || {
-        let mut c = coordinator().lock().unwrap();
-        if let Some(r) = c.records.get_mut(&id) {
-            r.finish(generation, result, now());
-        }
-        c.persist();
-        drop(c);
-        crate::provisioning::controller::wake();
-    })
-    .await;
+    .await
 }
 
 fn public_url(url: &str) -> String {
@@ -887,6 +969,46 @@ mod interval_tests;
 mod tests {
     use super::*;
     use crate::mqtt_identity::normalize_target;
+
+    #[tokio::test]
+    async fn supervised_workers_settle_once_and_preserve_obsolete_write_intent() {
+        use std::time::Duration;
+        for mode in 0..4 {
+            let mut c = active_record();
+            c.records.get_mut("test-device").unwrap().write_pending = Some(7);
+            let worker = Worker::start(
+                async move {
+                    match mode {
+                        0 => Ok(true),
+                        1 => panic!("injected bootstrap executor panic"),
+                        _ => std::future::pending().await,
+                    }
+                },
+                Duration::from_millis(20),
+            );
+            if mode == 2 {
+                worker.0.abort();
+            }
+            c.tasks.insert(("test-device".into(), 7), worker);
+            if mode == 0 {
+                c.records
+                    .get_mut("test-device")
+                    .unwrap()
+                    .invalidate(100, "replaced");
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !c.collect_workers(101) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(c.tasks.is_empty());
+            assert!(!c.collect_workers(102));
+            assert_eq!(c.records["test-device"].write_pending, Some(7));
+            assert!(c.records["test-device"].worker.is_none());
+        }
+    }
 
     fn active_record() -> Coordinator {
         Coordinator {
@@ -1126,6 +1248,35 @@ mod tests {
         coordinator: Coordinator,
         sources: Registry,
         links: BTreeMap<String, String>,
+    }
+
+    #[test]
+    #[cfg(feature = "device-hl202")]
+    fn bootstrap_capacity_defers_without_spending_attempts_or_allocating_a_worker() {
+        let mut c = TestCoordinator::default();
+        for id in ["busy-a", "busy-b"] {
+            c.records.insert(
+                id.into(),
+                Record {
+                    worker: Some(7),
+                    ..Default::default()
+                },
+            );
+        }
+        let d = device("waiting", "hl202");
+        let m = Management {
+            vlans: vec![46],
+            vlan: 46,
+            priority: 0,
+            acs_url: "http://192.0.2.1/cwmp".into(),
+        };
+        c.sources.observe("020000000003", 100);
+        assert!(schedule(&mut c, &d, &m, Some("020000000003"), 100, None).is_none());
+        assert_eq!(c.records[&d.id].attempts, 0);
+        assert!(c.records[&d.id].worker.is_none());
+        c.records.get_mut("busy-a").unwrap().worker = None;
+        assert!(schedule(&mut c, &d, &m, Some("020000000003"), 101, None).is_some());
+        assert_eq!(c.records.values().filter(|r| r.worker.is_some()).count(), 2);
     }
     impl Default for TestCoordinator {
         fn default() -> Self {

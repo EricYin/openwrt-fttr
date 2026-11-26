@@ -270,11 +270,7 @@ impl Controller {
         // Never wait for an offline device's old, entirely unstarted plan.
         // Once discovery or a transport job starts, its owner must drain it.
         for op in self.operations.values_mut().filter(|op| {
-            !op.work_started
-                && op.index == 0
-                && op.task.is_none()
-                && op.submission.is_none()
-                && op.command_job.is_none()
+            op.unstarted()
                 && matches!(
                     op.stage,
                     OperationPhase::Waiting | OperationPhase::WanReconciling

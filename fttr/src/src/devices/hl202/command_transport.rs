@@ -18,20 +18,20 @@ pub(super) async fn run(
     request: Request<'_>,
     enqueue: impl FnOnce(&mut CommandSession, &str, &[u8]) -> io::Result<()>,
 ) -> io::Result<CommandResult> {
+    // One end-to-end deadline, including connection, SUBACK and socket flush.
+    // An expired deadline never means a remote shell was cancelled.
+    let deadline = Instant::now() + request.timeout;
     let topic = format!("/fttr/subdev/exec/{}", request.target);
     let reply_topic = format!("{topic}/resp");
     let mut session = CommandSession::connect(
         address,
         &format!("fttr-exec-{}", request.id),
-        Instant::now() + Duration::from_secs(5),
+        deadline.min(Instant::now() + Duration::from_secs(5)),
     )
     .await
     .map_err(io::Error::other)?;
     session
-        .subscribe(
-            &reply_topic,
-            Instant::now() + request.timeout.max(Duration::from_secs(1)),
-        )
+        .subscribe(&reply_topic, deadline)
         .await
         .map_err(|error| {
             let kind = if error.contains("SUBACK") {
@@ -46,11 +46,7 @@ pub(super) async fn run(
         &topic,
         framed_script(request.script, &request.id).as_bytes(),
     )?;
-    session
-        .flushed(Instant::now() + Duration::from_secs(5))
-        .await
-        .map_err(io::Error::other)?;
-    let deadline = Instant::now() + request.timeout;
+    session.flushed(deadline).await.map_err(io::Error::other)?;
     while Instant::now() < deadline {
         match session.next(deadline).await {
             Ok(Event::Incoming(Packet::Publish(message)))

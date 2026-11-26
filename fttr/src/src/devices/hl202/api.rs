@@ -147,6 +147,15 @@ pub fn control_query(query: Query, devices: &[Device]) -> Value {
                     Ok(request) => request,
                     Err(_) => return error("invalid_request", "invalid HL202 action parameters"),
                 };
+                if !crate::provisioning::controller::external_write_allowed(
+                    &request.target.optical_sn,
+                ) || !crate::bootstrap::external_command_allowed(&request.target.optical_sn)
+                {
+                    return error(
+                        "unresolved_transaction",
+                        "device has an unresolved transaction or reset; command admission refused",
+                    );
+                }
                 match request.action {
                     super::request::Action::Exec {
                         script,

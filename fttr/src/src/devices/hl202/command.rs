@@ -273,6 +273,14 @@ pub(super) struct Transaction {
     target: String,
     _global: CommandLock,
     _device: CommandLock,
+    _effect: crate::effects::Permit,
+    publication: Option<Publication>,
+}
+
+#[cfg(any(feature = "mqtt", test))]
+struct Publication {
+    selection: crate::mqtt_identity::Selection,
+    epoch: u64,
 }
 
 #[cfg(any(feature = "mqtt", test))]
@@ -281,15 +289,114 @@ impl Transaction {
         let target = normalize_mac(target)?;
         let global = lock_named("transactions", 1)?;
         let device = lock_target(&format!("transaction-{target}"))?;
+        let effect = crate::effects::Permit::acquire(crate::effects::Kind::Command)?;
+        let publication = if crate::omci_auth::managed() {
+            let time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let snapshot = crate::mqtt_identity::shared()
+                .lock()
+                .map_err(|_| io::Error::other("identity unavailable"))?
+                .snapshots(time)
+                .into_iter()
+                .find(|s| s.mqtt_mac == target && s.reason == "ready")
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "fresh unique optical binding required",
+                    )
+                })?;
+            let serial = snapshot
+                .optical_sn
+                .ok_or_else(|| io::Error::other("optical identity unavailable"))?;
+            #[cfg(feature = "mqtt")]
+            super::command_binding::ensure_no_pending(&serial)?;
+            let epoch = crate::omci_auth::serial_epoch(&serial).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "OMCI authorization required",
+                )
+            })?;
+            if crate::omci_auth::execution_grant()
+                .is_some_and(|grant| grant != (serial.clone(), epoch))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "execution authorization changed",
+                ));
+            }
+            Some(Publication {
+                selection: crate::mqtt_identity::Selection {
+                    optical_sn: serial,
+                    onu_id: snapshot
+                        .onu_id
+                        .ok_or_else(|| io::Error::other("ONU identity unavailable"))?,
+                    binding_generation: snapshot.binding_generation,
+                },
+                epoch,
+            })
+        } else {
+            #[cfg(not(test))]
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "commands must execute through the fttrd authority",
+            ));
+            #[cfg(test)]
+            None
+        };
         Ok(Self {
             target,
             _global: global,
             _device: device,
+            _effect: effect,
+            publication,
         })
     }
 
     pub(super) fn target(&self) -> &str {
         &self.target
+    }
+
+    #[cfg(feature = "mqtt")]
+    pub(super) fn enqueue(
+        &self,
+        session: &mut CommandSession,
+        topic: &str,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let Some(publication) = &self.publication else {
+            return super::command_transport::enqueue(session, topic, payload);
+        };
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let registry = crate::mqtt_identity::shared()
+            .lock()
+            .map_err(|_| io::Error::other("identity unavailable"))?;
+        let target = registry
+            .resolve(&publication.selection, time)
+            .map_err(io::Error::other)?;
+        if target.mqtt_mac != self.target {
+            return Err(io::Error::other("transaction binding changed"));
+        }
+        self.enqueue_authorized(session, topic, payload)
+    }
+    #[cfg(feature = "mqtt")]
+    pub(super) fn enqueue_authorized(
+        &self,
+        session: &mut CommandSession,
+        topic: &str,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let mut action = || super::command_transport::enqueue(session, topic, payload);
+        match &self.publication {
+            Some(grant) => {
+                crate::omci_auth::enqueue_serial(&grant.selection.optical_sn, grant.epoch, action)
+            }
+            None => action(),
+        }
     }
 
     #[cfg(feature = "mqtt")]
@@ -307,7 +414,7 @@ impl Transaction {
                 id: request_id(),
                 timeout,
             },
-            super::command_transport::enqueue,
+            |session, topic, payload| self.enqueue(session, topic, payload),
         )
         .await
     }
@@ -316,52 +423,70 @@ impl Transaction {
 /// QoS 0 dispatch only. Success reports a socket write, not device execution.
 #[cfg(feature = "mqtt")]
 pub fn dispatch(target: &str, command: &str) -> io::Result<CommandResult> {
-    let target = if target == "all" {
-        "all".to_string()
-    } else {
-        normalize_mac(target)?
-    };
-    if command.trim().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "command must not be empty",
-        ));
-    }
-    // A broadcast conflicts with every per-device transaction. Unicast takes
-    // the same transaction gate as exec, not merely its publication lock.
-    let _broadcast;
-    let _transaction;
-    if target == "all" {
-        _broadcast = Some(lock_named("transactions", 2)?);
-        _transaction = None;
-    } else {
-        _broadcast = None;
-        _transaction = Some(Transaction::acquire(&target)?);
-    }
-    let _lock = lock_target(&target)?;
-    super::command_transport::blocking(async {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut session = CommandSession::connect(
-            "127.0.0.1:1883".parse().unwrap(),
-            &format!("fttr-cmd-{}", request_id()),
-            deadline,
-        )
-        .await
-        .map_err(io::Error::other)?;
-        session
-            .enqueue_publish(&format!("/fttr/subdev/cmd/{target}"), command.as_bytes())
+    // Unconfirmed dispatch has no transaction completion contract. Managed
+    // callers use per-device framed exec; a broadcast cannot be authorized by
+    // one device's identity or epoch.
+    #[cfg(not(test))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "unconfirmed dispatch disabled; use daemon-authorized exec",
+    ));
+    #[cfg(test)]
+    {
+        let target = if target == "all" {
+            "all".to_string()
+        } else {
+            normalize_mac(target)?
+        };
+        if command.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "command must not be empty",
+            ));
+        }
+        // A broadcast conflicts with every per-device transaction. Unicast takes
+        // the same transaction gate as exec, not merely its publication lock.
+        let _broadcast;
+        let _transaction;
+        if target == "all" {
+            _broadcast = Some(lock_named("transactions", 2)?);
+            _transaction = None;
+        } else {
+            _broadcast = None;
+            _transaction = Some(Transaction::acquire(&target)?);
+        }
+        let _lock = lock_target(&target)?;
+        let _effect = if target == "all" {
+            Some(crate::effects::Permit::acquire(
+                crate::effects::Kind::Command,
+            )?)
+        } else {
+            None
+        };
+        super::command_transport::blocking(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut session = CommandSession::connect(
+                "127.0.0.1:1883".parse().unwrap(),
+                &format!("fttr-cmd-{}", request_id()),
+                deadline,
+            )
+            .await
             .map_err(io::Error::other)?;
-        session.flushed(deadline).await.map_err(io::Error::other)
-    })?;
-    Ok(CommandResult {
-        target,
-        status: CommandStatus::Dispatched,
-        request_id: None,
-        exit_code: None,
-        output: None,
-        output_truncated: false,
-        error: None,
-    })
+            session
+                .enqueue_publish(&format!("/fttr/subdev/cmd/{target}"), command.as_bytes())
+                .map_err(io::Error::other)?;
+            session.flushed(deadline).await.map_err(io::Error::other)
+        })?;
+        Ok(CommandResult {
+            target,
+            status: CommandStatus::Dispatched,
+            request_id: None,
+            exit_code: None,
+            output: None,
+            output_truncated: false,
+            error: None,
+        })
+    }
 }
 
 /// Wait for a fresh, matching response frame containing combined output and exit code.

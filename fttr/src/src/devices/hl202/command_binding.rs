@@ -16,6 +16,7 @@ fn enqueue_guarded(
     topic: &str,
     payload: &[u8],
     now: u64,
+    transaction: &command::Transaction,
 ) -> io::Result<()> {
     let state = registry
         .lock()
@@ -31,7 +32,7 @@ fn enqueue_guarded(
     }
     // Resolve and nonblocking enqueue are atomic against rebinding. No await
     // occurs with this lock held; a full queue is a terminal local error.
-    command_transport::enqueue(session, topic, payload)
+    transaction.enqueue_authorized(session, topic, payload)
 }
 
 fn now() -> u64 {
@@ -66,7 +67,53 @@ pub async fn execute_async(
         .resolve(selection, now())
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let transaction = command::Transaction::acquire(&target.mqtt_mac)?;
-    execute_transaction_async(&transaction, selection, script, timeout).await
+    // Opaque external scripts have no idempotent replay contract. Persist only
+    // identity and intent metadata; never persist the script or its secrets.
+    let path = crate::provisioning::storage::registry_path(
+        "/etc/fttr/command-external",
+        &selection.optical_sn,
+    );
+    let mut intent = serde_json::json!({"schema_version":1,"pending":true,
+        "binding_generation":selection.binding_generation,"onu_id":selection.onu_id,
+        "created_at":now()});
+    let save = |value: &serde_json::Value| -> io::Result<()> {
+        crate::provisioning::storage::write_atomic(
+            &path,
+            &serde_json::to_vec(value).map_err(io::Error::other)?,
+            true,
+        )
+    };
+    save(&intent)?;
+    let result = execute_transaction_async(&transaction, selection, script, timeout).await?;
+    if result.binding_current
+        && result.result.status == command::CommandStatus::Executed
+        && result.result.exit_code == Some(0)
+    {
+        intent["pending"] = false.into();
+        save(&intent)?;
+    }
+    Ok(result)
+}
+
+pub(super) fn ensure_no_pending(serial: &str) -> io::Result<()> {
+    for directory in ["/etc/fttr/command-external", "/etc/fttr/command-owned"] {
+        let path = crate::provisioning::storage::registry_path(directory, serial);
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                if value["pending"].as_bool() != Some(false) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "unresolved command intent; transaction-aware recovery required",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn execute_transaction_async(
@@ -148,6 +195,7 @@ async fn execute_at_async(
                 topic,
                 payload,
                 clock(),
+                transaction,
             )
         },
     )
@@ -170,6 +218,21 @@ mod tests {
     use crate::mqtt::test_peer::{self, read, write};
     use rumqttc::{Packet, QoS, SubAck, SubscribeReasonCode};
     use std::{collections::BTreeMap, io::Read, sync::Arc};
+
+    #[test]
+    fn external_and_native_pending_or_corrupt_intents_block_every_transaction() {
+        let serial = "TEST00000017";
+        for directory in ["/etc/fttr/command-external", "/etc/fttr/command-owned"] {
+            let path = crate::provisioning::storage::registry_path(directory, serial);
+            for bytes in [b"{\"pending\":true}".as_slice(), b"{", b"{}"] {
+                crate::provisioning::storage::write_atomic(&path, bytes, true).unwrap();
+                assert!(ensure_no_pending(serial).is_err());
+            }
+            crate::provisioning::storage::write_atomic(&path, b"{\"pending\":false}", true)
+                .unwrap();
+            ensure_no_pending(serial).unwrap();
+        }
+    }
 
     #[test]
     fn command_binding_reply_reports_rebound_without_retargeting() {

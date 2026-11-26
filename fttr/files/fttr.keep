@@ -2,6 +2,7 @@
 /etc/fttr/wan-owned/
 /etc/fttr/wifi-owned/
 /etc/fttr/command-owned/
+/etc/fttr/command-external/
 /etc/fttr/acs-bootstrap.json
 /etc/fttr/reset-pending/
 /etc/fttr/management-applied.json

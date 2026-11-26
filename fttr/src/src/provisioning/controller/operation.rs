@@ -45,41 +45,43 @@ impl Operation {
             }
         }
         device.items.extend(activations);
-        let wan = wan::Reconciler::new(&device, BTreeMap::new(), false);
-        let wifi = wifi::Reconciler::new(&device, wifi::Registry::default(), false);
+        let execution = match device.backend_kind() {
+            Backend::Command => Execution::Command(CommandExecution::default()),
+            Backend::Disabled => Execution::Disabled,
+            Backend::Acs => Execution::Acs(Box::new(AcsExecution {
+                verify_after: 0,
+                compiled: false,
+                capabilities: crate::cwmp::runtime::Discovery::new(
+                    crate::adapters::provisioning::lookup(&device.provisioning_adapter)
+                        .ok()
+                        .and_then(|a| a.contract)
+                        .map_or("none", |c| c.id),
+                ),
+                index: 0,
+                task: None,
+                submission: None,
+                wan: wan::Reconciler::new(&device, BTreeMap::new(), false),
+                wifi: wifi::Reconciler::new(&device, wifi::Registry::default(), false),
+                roots: Vec::new(),
+                writable: BTreeSet::new(),
+                changes: Vec::new(),
+                uncertain: false,
+                pending: false,
+                written: false,
+                credential_write: None,
+                passphrase_fallback: false,
+            })),
+        };
         Self {
+            execution,
             work_started: false,
-            command_job: None,
-            command_reservation: 0,
-            command_result: None,
             full_sync: true,
-            verify_after: 0,
-            compiled: false,
-            capabilities: crate::cwmp::runtime::Discovery::new(
-                crate::adapters::provisioning::lookup(&device.provisioning_adapter)
-                    .ok()
-                    .and_then(|a| a.contract)
-                    .map_or("none", |c| c.id),
-            ),
             id,
             device,
             revision,
             apply,
             management,
-            index: 0,
             stage: OperationPhase::Waiting,
-            task: None,
-            submission: None,
-            wan,
-            wifi,
-            roots: Vec::new(),
-            writable: BTreeSet::new(),
-            changes: Vec::new(),
-            uncertain: false,
-            pending: false,
-            written: false,
-            credential_write: None,
-            passphrase_fallback: false,
             results: BTreeMap::new(),
             started: now(),
             completed_at: None,
@@ -130,25 +132,34 @@ impl Operation {
     }
 
     pub(super) fn complete(&mut self, time: u64) {
-        self.submission = None;
+        if let Execution::Acs(state) = &mut self.execution {
+            state.submission = None;
+        }
         self.stage = OperationPhase::Completed;
         self.completed_at.get_or_insert(time);
     }
 
     pub(super) fn supersede_remaining(&mut self) {
-        if self.device.backend() == "command" && self.command_result.is_none() {
-            self.command_result = Some(json!({"items":[]}));
+        if let Some(state) = self.command_mut() {
+            state.result.get_or_insert_with(|| json!({"items":[]}));
         }
-        for item in self.device.items.iter().skip(self.index) {
+        let index = match &self.execution {
+            Execution::Acs(state) => state.index,
+            _ => 0,
+        };
+        for item in self.device.items.iter().skip(index) {
             self.results.insert(item.id.clone(), json!({"id":item.id,"kind":item.kind,"service_type":item.service_type,"state":"blocked","reason":"superseded at a safe boundary by a newer configuration","revision":self.revision}));
         }
-        self.index = self.device.items.len();
+        let len = self.device.items.len();
+        if let Execution::Acs(state) = &mut self.execution {
+            state.index = len;
+        }
         self.complete(now());
     }
 
     pub(super) fn view(&self) -> Value {
-        if self.device.backend() == "command" {
-            let mut result = self.command_result.clone().unwrap_or_else(|| json!({"items":self.device.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":self.stage,"revision":self.revision})).collect::<Vec<_>>()}));
+        if let Some(state) = self.command() {
+            let mut result = state.result.clone().unwrap_or_else(|| json!({"items":self.device.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":self.stage,"revision":self.revision})).collect::<Vec<_>>()}));
             result["operation_id"] = json!(self.id);
             result["device"] = json!(self.device.id);
             result["optical_sn"] = json!(self.device.optical_sn);
@@ -175,6 +186,9 @@ impl Operation {
                 }
             }
             return result;
+        }
+        if matches!(self.execution, Execution::Disabled) {
+            return json!({"state":"disabled","items":[],"operation_id":self.id});
         }
         let mut items: Vec<Value> = self.results.values().cloned().collect();
         for i in self.device.items.iter().skip(self.index) {

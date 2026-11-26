@@ -83,6 +83,7 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     let mut command_ready = BTreeSet::new();
     c.begin_history_tick();
     c.collect_commands(time);
+    bootstrap::collect();
     let mut history_changed = false;
     for d in &config.devices {
         if !crate::omci_auth::allowed(&d.optical_sn) {
@@ -297,7 +298,10 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     let deadline = c
         .operations
         .values()
-        .flat_map(|op| [op.verify_after, op.capabilities.deadline()])
+        .flat_map(|op| match &op.execution {
+            Execution::Acs(state) => [state.verify_after, state.capabilities.deadline()],
+            _ => [0, 0],
+        })
         .chain(c.next_retry_at.values().copied())
         .filter(|at| *at > time)
         .min();
@@ -656,7 +660,11 @@ fn reconcile(
     reachable: bool,
     reload_pending: bool,
 ) -> bool {
-    op.capabilities
+    let Execution::Acs(state) = &mut op.execution else {
+        return false;
+    };
+    state
+        .capabilities
         .tick(&op.device.cwmp_id, identity, epoch, reachable, acs);
     if op.capabilities.blocked() {
         let reason = op.capabilities.view()["reason"]
@@ -695,8 +703,11 @@ fn reconcile(
                     op.wan.full_sync(),
                 );
                 op.device = prepared.device;
-                op.wan = prepared.wan;
-                op.wifi = prepared.wifi;
+                let Execution::Acs(state) = prepared.execution else {
+                    unreachable!()
+                };
+                op.wan = state.wan;
+                op.wifi = state.wifi;
                 op.compiled = true;
             }
             Err(reason) => {
@@ -707,7 +718,10 @@ fn reconcile(
     }
     op.wan.protected_roots = op.capabilities.protected_wan();
     op.wan.evidence_paths = op.capabilities.wan_fields();
-    let ready = op
+    let Execution::Acs(state) = &mut op.execution else {
+        unreachable!()
+    };
+    let ready = state
         .wan
         .tick(&mut op.device, op.apply, op.management, reachable);
     if let Err(error) = op.wan.save(&op.device.cwmp_id) {
@@ -717,7 +731,10 @@ fn reconcile(
         );
         op.complete(now());
     } else if ready {
-        op.wan.block_unresolved(&mut op.device);
+        let Execution::Acs(state) = &op.execution else {
+            unreachable!()
+        };
+        state.wan.block_unresolved(&mut op.device);
         let finish = op.index >= op.device.items.len();
         if finish
             && op
@@ -744,16 +761,22 @@ fn reconcile(
                     .get(&i.id)
                     .is_some_and(|r| ItemOutcome::from_result(r) == Some(ItemOutcome::Verified))
             });
-        if finish && op.wan.begin_final_verification(op.apply) {
+        let Execution::Acs(state) = &mut op.execution else {
+            unreachable!()
+        };
+        if finish && state.wan.begin_final_verification(op.apply) {
             op.stage = OperationPhase::WanVerifying;
-        } else if op
+        } else if state
             .wifi
             .tick(&op.device, op.apply, reachable, finish, verified)
         {
             if finish {
                 op.complete(now());
             } else {
-                op.wifi.block_unresolved(&mut op.device);
+                let Execution::Acs(state) = &op.execution else {
+                    unreachable!()
+                };
+                state.wifi.block_unresolved(&mut op.device);
                 if matches!(
                     op.stage,
                     OperationPhase::WanReconciling | OperationPhase::WifiReconciling
@@ -765,12 +788,15 @@ fn reconcile(
         } else {
             op.stage = OperationPhase::WifiReconciling;
         }
+        let Execution::Acs(state) = &mut op.execution else {
+            unreachable!()
+        };
         for item in &op.device.items {
             if op.results.get(&item.id).is_some_and(|r| {
                 ItemOutcome::from_result(r) == Some(ItemOutcome::Verified)
                     && r["revision"] == op.revision
             }) {
-                if let Some(owned) = op.wan.owned.get_mut(&item.id) {
+                if let Some(owned) = state.wan.owned.get_mut(&item.id) {
                     if let Some(p) = item.parameters.iter().find(|p| {
                         p.name.ends_with("ServiceList") || p.name.ends_with("SERVICELIST")
                     }) {

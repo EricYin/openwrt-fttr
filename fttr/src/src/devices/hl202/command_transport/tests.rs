@@ -80,10 +80,28 @@ fn mqtt_command_transport_timeout_does_not_republish() {
         publication(&mut stream);
         assert_eq!(stream.read(&mut [0]).unwrap(), 0); // Exactly one publication, then closed.
     });
-    let result = blocking(run(address, request(Duration::ZERO), enqueue)).unwrap();
+    let result = blocking(run(address, request(Duration::from_millis(250)), enqueue)).unwrap();
     assert_eq!(result.status, CommandStatus::Timeout);
     assert!(!result.success());
     assert!(result.error.unwrap().contains("outcome is unknown"));
+    worker.join().unwrap();
+}
+
+#[test]
+fn suback_wait_consumes_the_same_deadline_and_never_enqueues_after_expiry() {
+    let (address, worker) = test_peer::spawn(|mut stream| {
+        assert!(matches!(read(&mut stream).unwrap(), Packet::Subscribe(_)));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+    });
+    let started = std::time::Instant::now();
+    assert!(blocking(run(
+        address,
+        request(Duration::from_millis(100)),
+        |_, _, _| { panic!("expired subscription must not publish") }
+    ))
+    .is_err());
+    assert!(started.elapsed() < Duration::from_millis(500));
     worker.join().unwrap();
 }
 

@@ -424,6 +424,80 @@ pub(crate) fn serial_epoch(serial: &str) -> Option<u64> {
         .map(|g| g.epoch)
 }
 
+tokio::task_local! { static EXECUTION_GRANT: (String, u64); }
+pub(crate) async fn execution_scope<T>(
+    serial: String,
+    epoch: u64,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    EXECUTION_GRANT.scope((serial, epoch), work).await
+}
+pub(crate) fn execution_grant() -> Option<(String, u64)> {
+    EXECUTION_GRANT.try_with(Clone::clone).ok()
+}
+pub(crate) fn managed() -> bool {
+    registry().lock().unwrap().managed
+}
+
+pub(crate) fn enqueue_cwmp<T>(
+    device: &str,
+    epoch: Option<u64>,
+    action: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let r = registry().lock().unwrap();
+    if !r.managed {
+        return action();
+    }
+    let serial = r.bindings.get(device).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "CWMP identity is not authorized",
+        )
+    })?;
+    enqueue_serial_in(
+        &r,
+        serial,
+        epoch.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "CWMP authorization missing",
+            )
+        })?,
+        action,
+    )
+}
+
+/// The final nonblocking enqueue and authorization revocation share this lock.
+/// No network wait, file persistence or controller lock is allowed in action.
+pub(crate) fn enqueue_serial<T>(
+    serial: &str,
+    epoch: u64,
+    action: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    enqueue_serial_in(&registry().lock().unwrap(), serial, epoch, action)
+}
+fn enqueue_serial_in<T>(
+    r: &Registry,
+    serial: &str,
+    epoch: u64,
+    action: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    if r.config.as_ref().is_none_or(|config| {
+        !r.grants.values().any(|g| {
+            g.serial == serial
+                && g.epoch == epoch
+                && &g.policy == config.effective(serial)
+                && permitted(g)
+        })
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "authorization generation changed before publication",
+        ));
+    }
+    action()
+}
+
 #[cfg(test)]
 thread_local! { static TEST_AUTHORIZED: std::cell::RefCell<std::collections::BTreeSet<String>> = Default::default(); }
 #[cfg(test)]
@@ -462,6 +536,46 @@ mod tests {
             reported: Some(("test-onu".into(), "test-pass".into())),
             epoch: 1,
         }
+    }
+
+    #[test]
+    fn final_enqueue_rejects_revoked_and_replaced_authorization_generations() {
+        let mut r = Registry {
+            config: Some(Config {
+                global: Policy::Disabled,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        r.grants.insert(1, grant("TEST00000001", Policy::Disabled));
+        let publishes = std::cell::Cell::new(0);
+        enqueue_serial_in(&r, "TEST00000001", 1, || {
+            publishes.set(publishes.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        r.grants
+            .get_mut(&1)
+            .unwrap()
+            .token
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            enqueue_serial_in::<()>(&r, "TEST00000001", 1, || panic!("revoked publication"))
+                .is_err()
+        );
+        let mut replacement = grant("TEST00000001", Policy::Disabled);
+        replacement.epoch = 2;
+        r.grants.insert(1, replacement);
+        assert!(
+            enqueue_serial_in::<()>(&r, "TEST00000001", 1, || panic!("obsolete publication"))
+                .is_err()
+        );
+        enqueue_serial_in(&r, "TEST00000001", 2, || {
+            publishes.set(publishes.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(publishes.get(), 2);
     }
 
     #[test]

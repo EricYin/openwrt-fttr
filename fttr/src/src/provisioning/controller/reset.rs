@@ -112,7 +112,7 @@ impl Controller {
         if self
             .operations
             .get(&device.id)
-            .is_some_and(|op| op.command_job.is_some())
+            .is_some_and(Operation::command_running)
         {
             return Err(
                 "command transaction active; wait for completion before resetting state".into(),

@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-pub(super) fn registry_path(directory: &str, id: &str) -> String {
+pub(crate) fn registry_path(directory: &str, id: &str) -> String {
     let hash = id.bytes().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });

@@ -109,13 +109,17 @@ impl Job {
             let outcome = if auth_epoch.is_none() {
                 Err("OMCI authentication pending".into())
             } else if device.provisioning_adapter == "hl202-mqtt" {
-                crate::devices::hl202::provisioning::run(
-                    device,
-                    apply,
-                    full,
-                    revision,
-                    operation_id,
+                crate::omci_auth::execution_scope(
+                    device.optical_sn.clone(),
                     auth_epoch.unwrap(),
+                    crate::devices::hl202::provisioning::run(
+                        device,
+                        apply,
+                        full,
+                        revision,
+                        operation_id,
+                        auth_epoch.unwrap(),
+                    ),
                 )
                 .await
             } else {

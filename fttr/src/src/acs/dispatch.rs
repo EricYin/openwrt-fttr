@@ -12,6 +12,7 @@ use std::{
 pub(super) struct Dispatcher {
     ready: VecDeque<(String, Instant)>,
     grants: BTreeMap<u64, (Permit, Instant)>,
+    effects: BTreeMap<u64, crate::effects::Permit>,
     demand: BTreeMap<String, Instant>,
     pub parsing: std::collections::BTreeSet<u64>,
 }
@@ -36,6 +37,28 @@ mod tests {
                 result: None,
             },
         );
+    }
+
+    #[test]
+    fn saturated_command_lanes_preserve_rpc_dispatch_and_release_global_capacity() {
+        let a = crate::effects::Permit::acquire(crate::effects::Kind::Command).unwrap();
+        let b = crate::effects::Permit::acquire(crate::effects::Kind::Command).unwrap();
+        let mut state = State::default();
+        for id in 1..=3 {
+            let device = format!("fixture-{id}");
+            queued(&mut state, id, &device, "GetParameterValues");
+            state.dispatch_demand(&device);
+        }
+        state.schedule_device("fixture-1");
+        assert_eq!(state.dispatch.effects.len(), 2);
+        assert!(state.dispatch.grants.contains_key(&1));
+        assert!(state.dispatch.grants.contains_key(&2));
+        state.tasks.get_mut(&1).unwrap().state = TaskState::Completed;
+        state.release_dispatch(1);
+        assert!(state.schedule_device("fixture-3"));
+        assert!(state.dispatch.grants.contains_key(&3));
+        drop((a, b, state));
+        crate::effects::Permit::acquire(crate::effects::Kind::Command).unwrap();
     }
 
     #[test]
@@ -136,6 +159,10 @@ impl State {
             .map(|r| r.bytes())
             .sum();
         serde_json::json!({
+            "protocol_effect_limit": crate::effects::SLOTS,
+            "protocol_effect_working_bytes": crate::effects::SLOTS * crate::effects::SLOT_BYTES,
+            "rpc_effects":self.dispatch.effects.len(),
+            "rpc_effect_reserved_bytes":self.dispatch.effects.values().map(crate::effects::Permit::bytes).sum::<usize>(),
             "used_bytes": self.budget.used(), "limit_bytes": resources::RESULT_BYTES,
             "dispatch_bytes": reserved, "retained_bytes": retained,
             "consumer_or_parser_bytes": self.budget.used().saturating_sub(reserved + retained),
@@ -166,6 +193,9 @@ impl State {
                     || t.state == TaskState::Queued && since.elapsed() < Duration::from_secs(10)
             })
         });
+        self.dispatch
+            .effects
+            .retain(|id, _| self.dispatch.grants.contains_key(id));
         // Register all accepted heads in durable ID order, rather than letting
         // HTTP arrival order or configuration iteration choose the winner.
         for task in self.tasks.values().filter(|t| {
@@ -215,6 +245,11 @@ impl State {
                 resources::RESULT_BYTES
             };
             if let Some(permit) = self.budget.reserve(bytes, ceiling) {
+                let Ok(effect) = crate::effects::Permit::acquire(crate::effects::Kind::Rpc) else {
+                    self.dispatch.ready.push_back((candidate, since));
+                    continue;
+                };
+                self.dispatch.effects.insert(task.id, effect);
                 self.dispatch.grants.insert(task.id, (permit, at));
             } else {
                 // Once aged, let in-flight work drain rather than continually
@@ -236,12 +271,14 @@ impl State {
             .is_some_and(|t| self.dispatch.grants.contains_key(&t.id))
     }
     pub(super) fn take_permit(&mut self, id: u64) -> Option<Permit> {
+        self.dispatch.effects.remove(&id);
         self.dispatch.grants.remove(&id).map(|(p, _)| p)
     }
     pub(super) fn parsing_permit(&self, id: u64) -> Option<Permit> {
         self.dispatch.grants.get(&id).map(|(p, _)| p.clone())
     }
     pub(super) fn release_dispatch(&mut self, id: u64) {
+        self.dispatch.effects.remove(&id);
         self.dispatch.grants.remove(&id);
     }
     pub(super) fn waiting_capacity(&self, id: u64) -> bool {

@@ -85,24 +85,21 @@ pub(crate) fn wake_device(device: &str) {
     }
     WAKE.notify_one();
 }
+pub(crate) fn external_write_allowed(serial: &str) -> bool {
+    let c = controller().lock().unwrap();
+    c.config
+        .devices
+        .iter()
+        .find(|d| d.optical_sn == serial)
+        .is_some_and(|d| !c.unresolved_owner(d) && !c.resets.blocks(serial))
+}
 
-struct Operation {
-    work_started: bool,
-    command_job: Option<crate::provisioning::command::Job>,
-    command_reservation: usize,
-    command_result: Option<Value>,
-    full_sync: bool,
+struct AcsExecution {
     submission: Option<crate::cwmp::transport::Pending<OperationPhase>>,
     verify_after: u64,
     compiled: bool,
     capabilities: crate::cwmp::runtime::Discovery,
-    id: u64,
-    device: Device,
-    revision: String,
-    apply: bool,
-    management: bool,
     index: usize,
-    stage: OperationPhase,
     task: Option<u64>,
     roots: Vec<String>,
     writable: BTreeSet<String>,
@@ -112,11 +109,79 @@ struct Operation {
     written: bool,
     credential_write: Option<TaskOutcome>,
     passphrase_fallback: bool,
+    wan: wan::Reconciler,
+    wifi: wifi::Reconciler,
+}
+#[derive(Default)]
+struct CommandExecution {
+    job: Option<crate::provisioning::command::Job>,
+    reservation: usize,
+    result: Option<Value>,
+}
+enum Execution {
+    Acs(Box<AcsExecution>),
+    Command(CommandExecution),
+    Disabled,
+}
+struct Operation {
+    execution: Execution,
+    work_started: bool,
+    full_sync: bool,
+    id: u64,
+    device: Device,
+    revision: String,
+    apply: bool,
+    management: bool,
+    stage: OperationPhase,
     results: BTreeMap<String, Value>,
     started: u64,
     completed_at: Option<u64>,
-    wan: wan::Reconciler,
-    wifi: wifi::Reconciler,
+}
+// CWMP transitions use the ACS payload only after backend dispatch. Native
+// operations never allocate discovery/reconcilers or carry a second executor.
+impl std::ops::Deref for Operation {
+    type Target = AcsExecution;
+    fn deref(&self) -> &AcsExecution {
+        match &self.execution {
+            Execution::Acs(state) => state,
+            _ => panic!("CWMP transition on a non-ACS operation"),
+        }
+    }
+}
+impl std::ops::DerefMut for Operation {
+    fn deref_mut(&mut self) -> &mut AcsExecution {
+        match &mut self.execution {
+            Execution::Acs(state) => state,
+            _ => panic!("CWMP transition on a non-ACS operation"),
+        }
+    }
+}
+impl Operation {
+    fn command(&self) -> Option<&CommandExecution> {
+        match &self.execution {
+            Execution::Command(state) => Some(state),
+            _ => None,
+        }
+    }
+    fn command_mut(&mut self) -> Option<&mut CommandExecution> {
+        match &mut self.execution {
+            Execution::Command(state) => Some(state),
+            _ => None,
+        }
+    }
+    fn command_running(&self) -> bool {
+        self.command().is_some_and(|state| state.job.is_some())
+    }
+    fn unstarted(&self) -> bool {
+        !self.work_started
+            && match &self.execution {
+                Execution::Acs(state) => {
+                    state.index == 0 && state.task.is_none() && state.submission.is_none()
+                }
+                Execution::Command(state) => state.job.is_none(),
+                Execution::Disabled => true,
+            }
+    }
 }
 #[derive(Default)]
 struct Controller {

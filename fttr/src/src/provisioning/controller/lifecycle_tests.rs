@@ -483,7 +483,7 @@ fn unstarted_command_job_is_superseded_without_duplicate_item_results() {
     let view = c.operations["child"].view();
     assert_eq!(view["items"].as_array().unwrap().len(), 1);
     assert_eq!(view["items"][0]["state"], "blocked");
-    assert!(c.operations["child"].command_job.is_none());
+    assert!(!c.operations["child"].command_running());
 }
 
 #[test]

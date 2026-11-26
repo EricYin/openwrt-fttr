@@ -69,9 +69,13 @@ impl Operation {
         outcome: Result<Value, crate::provisioning::command::Failure>,
         time: u64,
     ) {
-        self.command_result = Some(outcome.unwrap_or_else(|failure| json!({"items":self.device.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":if failure.uncertain {ItemOutcome::Unknown} else {ItemOutcome::Blocked},"reason":failure.reason})).collect::<Vec<_>>(),"readback_verified":false,"effect_uncertain":failure.uncertain})));
-        self.command_job = None;
-        self.command_reservation = 0;
+        let result = outcome.unwrap_or_else(|failure| json!({"items":self.device.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":if failure.uncertain {ItemOutcome::Unknown} else {ItemOutcome::Blocked},"reason":failure.reason})).collect::<Vec<_>>(),"readback_verified":false,"effect_uncertain":failure.uncertain}));
+        let state = self
+            .command_mut()
+            .expect("command completion belongs to command owner");
+        state.result = Some(result);
+        state.job = None;
+        state.reservation = 0;
         self.complete(time);
     }
 }
@@ -81,7 +85,11 @@ impl Controller {
     // still belongs to this operation after revocation; it must not be forgotten.
     pub(super) fn collect_commands(&mut self, time: u64) {
         for op in self.operations.values_mut() {
-            if let Some(outcome) = op.command_job.as_mut().and_then(Job::take) {
+            if let Some(outcome) = op
+                .command_mut()
+                .and_then(|state| state.job.as_mut())
+                .and_then(Job::take)
+            {
                 op.finish_command(outcome, time);
                 self.dirty = true;
             }
@@ -100,12 +108,12 @@ impl Controller {
         let mut active = self
             .operations
             .values()
-            .filter(|op| op.command_job.is_some())
+            .filter(|op| op.command_running())
             .count();
         let mut bytes: usize = self
             .operations
             .values()
-            .map(|op| op.command_reservation)
+            .map(|op| op.command().map_or(0, |state| state.reservation))
             .sum();
         let ids: Vec<_> = self.operations.keys().cloned().collect();
         let first = self
@@ -118,7 +126,7 @@ impl Controller {
             }
             let op = self.operations.get_mut(id).unwrap();
             if op.device.backend_kind() != Backend::Command
-                || op.command_job.is_some()
+                || op.command_running()
                 || matches!(
                     op.stage,
                     OperationPhase::Completed | OperationPhase::Interrupted
@@ -141,8 +149,12 @@ impl Controller {
             if bytes.saturating_add(required) > COMMAND_WORKING_BYTES {
                 continue;
             }
-            op.command_job = Some(launch(op));
-            op.command_reservation = required;
+            let job = launch(op);
+            let state = op
+                .command_mut()
+                .expect("command backend owns command state");
+            state.job = Some(job);
+            state.reservation = required;
             op.work_started = true;
             op.stage = OperationPhase::Reading;
             self.command_cursor = Some(id.clone());
@@ -156,7 +168,7 @@ impl Controller {
         let ids: Vec<_> = self
             .operations
             .iter()
-            .filter(|(_, op)| op.stage == OperationPhase::Completed && op.command_job.is_none())
+            .filter(|(_, op)| op.stage == OperationPhase::Completed && !op.command_running())
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
@@ -200,6 +212,7 @@ mod tests {
             op.device.id = format!("child{n}");
             op.device.optical_sn = format!("H3CT000000{n:02}");
             op.device.provisioning_adapter = "hl202-mqtt".into();
+            op.execution = Execution::Command(CommandExecution::default());
             crate::omci_auth::test_authorize(&op.device.optical_sn);
             reachable.insert(op.device.id.clone());
             c.operations.insert(op.device.id.clone(), op);
@@ -214,7 +227,7 @@ mod tests {
         assert_eq!(
             c.operations
                 .values()
-                .filter(|o| o.command_job.is_some())
+                .filter(|o| o.command_running())
                 .count(),
             2
         );
@@ -235,7 +248,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 c.collect_commands(101);
-                if c.operations.values().all(|o| o.command_job.is_none()) {
+                if c.operations.values().all(|o| !o.command_running()) {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -258,6 +271,7 @@ mod tests {
         let mut op = super::super::tests::operation(OperationPhase::Waiting, false);
         op.device.provisioning_adapter = "hl202-mqtt".into();
         op.device.items[0].parameters[0].value = "x".repeat(COMMAND_WORKING_BYTES / 4);
+        op.execution = super::super::Execution::Command(Default::default());
         crate::omci_auth::test_authorize(&op.device.optical_sn);
         c.operations.insert("child".into(), op);
         c.admit_commands(&BTreeSet::from(["child".into()]), 100, |_| {
@@ -276,6 +290,7 @@ mod tests {
             op.device.id = format!("child{n}");
             op.device.provisioning_adapter = "hl202-mqtt".into();
             op.device.items[0].parameters[0].value = "x".repeat(1536 * 1024);
+            op.execution = super::super::Execution::Command(Default::default());
             crate::omci_auth::test_authorize(&op.device.optical_sn);
             reachable.insert(op.device.id.clone());
             c.operations.insert(op.device.id.clone(), op);
@@ -289,7 +304,7 @@ mod tests {
         assert!(
             c.operations
                 .values()
-                .map(|op| op.command_reservation)
+                .map(|op| op.command().map_or(0, |state| state.reservation))
                 .sum::<usize>()
                 <= COMMAND_WORKING_BYTES
         );

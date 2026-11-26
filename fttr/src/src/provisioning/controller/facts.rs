@@ -92,7 +92,9 @@ impl Facts {
 
 impl Operation {
     pub(super) fn facts(&self) -> Facts {
-        if let Some(result) = &self.command_result {
+        if let Some(command) = self.command() {
+            let empty = json!({"items":[]});
+            let result = command.result.as_ref().unwrap_or(&empty);
             let mut facts = Facts::collect(
                 Some(self.stage),
                 self.apply,
@@ -111,7 +113,7 @@ impl Operation {
             );
             facts.verified &= result["readback_verified"] == true;
             facts
-        } else {
+        } else if let super::Execution::Acs(state) = &self.execution {
             let mut facts = Facts::collect(
                 Some(self.stage),
                 self.apply,
@@ -120,7 +122,11 @@ impl Operation {
                 false,
                 false,
                 self.results.values(),
-                self.wan.results.values().chain(self.wifi.results.values()),
+                state
+                    .wan
+                    .results
+                    .values()
+                    .chain(state.wifi.results.values()),
             );
             facts.verified &= self.device.items.iter().all(|i| {
                 self.results
@@ -128,6 +134,17 @@ impl Operation {
                     .is_some_and(|r| ItemOutcome::from_result(r) == Some(ItemOutcome::Verified))
             });
             facts
+        } else {
+            Facts::collect(
+                Some(self.stage),
+                self.apply,
+                self.revision.clone(),
+                self.completed_at,
+                false,
+                false,
+                self.results.values(),
+                std::iter::empty(),
+            )
         }
     }
 }
@@ -178,9 +195,12 @@ mod tests {
         op.device.provisioning_adapter = "hl202-mqtt".into();
         for complete in [false, true] {
             for unresolved in [false, true] {
-                op.command_result = Some(
-                    json!({"items":[{"state":"verified"}],"readback_verified":complete,"unresolved_operation":if unresolved {json!({"operation_id":9})} else {Value::Null}}),
-                );
+                op.execution = Execution::Command(CommandExecution {
+                    result: Some(
+                        json!({"items":[{"state":"verified"}],"readback_verified":complete,"unresolved_operation":if unresolved {json!({"operation_id":9})} else {Value::Null}}),
+                    ),
+                    ..Default::default()
+                });
                 assert_eq!(op.facts().verified, complete && !unresolved);
                 assert_eq!(
                     Facts::recovered(&op.view()).verified,
