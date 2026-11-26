@@ -181,10 +181,14 @@ mod tests {
         );
         c.operations.insert("child".into(), op);
         let history = c.history();
+        let id = c.operations["child"].id;
+        let by_id = c.operation_view(id).unwrap();
         c.compact_completed();
         assert!(c.operations.is_empty());
         assert!(c.previous_facts("child").unwrap().unresolved);
         assert_eq!(c.history(), history);
+        assert_eq!(c.operation_view(id), Some(by_id));
+        assert!(c.operation_view(id + 1).is_none());
     }
 
     #[tokio::test]

@@ -547,6 +547,21 @@ impl Controller {
         policy
     }
 }
+impl Controller {
+    fn operation_view(&self, id: u64) -> Option<Value> {
+        self.operations
+            .values()
+            .find(|op| op.id == id)
+            .map(Operation::view)
+            .or_else(|| {
+                self.recovered
+                    .values()
+                    .find(|op| op["operation_id"].as_u64() == Some(id))
+                    .cloned()
+            })
+    }
+}
+
 pub fn control(request: &str) -> String {
     let mut changed = false;
     let reply = (|| -> Result<Value, String> {
@@ -602,10 +617,9 @@ pub fn control(request: &str) -> String {
             }
             "operation" => {
                 let c = controller().lock().unwrap();
-                Ok(c.operations
-                    .values()
-                    .find(|o| Some(o.id) == v["id"].as_u64())
-                    .map(Operation::view)
+                Ok(v["id"]
+                    .as_u64()
+                    .and_then(|id| c.operation_view(id))
                     .unwrap_or_else(|| error("unknown operation")))
             }
             "plan" | "apply" => {
