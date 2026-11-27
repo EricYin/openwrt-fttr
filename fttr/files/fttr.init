@@ -19,7 +19,9 @@ start_service() {
 	# Set before exec: mimalloc may allocate before Rust main. Keep the native
 	# allocator's thread heaps, but avoid eager commit and long-lived spare pages.
 	# A nonzero purge delay batches reclamation instead of purging every free.
-	procd_set_param env MIMALLOC_ARENA_EAGER_COMMIT=0 MIMALLOC_PAGE_COMMIT_ON_DEMAND=1 MIMALLOC_PAGE_FULL_RETAIN=0 MIMALLOC_PURGE_DELAY=100 MIMALLOC_ARENA_PURGE_MULT=1 MIMALLOC_PURGE_DECOMMITS=1 MIMALLOC_ALLOW_THP=0
+	# Visit thread heaps every 1000 slow-path allocations; reclaiming a page
+	# still follows mimalloc's deferred-free and non-forced collection rules.
+	procd_set_param env MIMALLOC_ARENA_EAGER_COMMIT=0 MIMALLOC_PAGE_COMMIT_ON_DEMAND=1 MIMALLOC_PAGE_FULL_RETAIN=0 MIMALLOC_PURGE_DELAY=100 MIMALLOC_ARENA_PURGE_MULT=1 MIMALLOC_PURGE_DECOMMITS=1 MIMALLOC_ALLOW_THP=0 MIMALLOC_GENERIC_COLLECT=1000
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1

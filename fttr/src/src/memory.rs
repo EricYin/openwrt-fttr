@@ -72,7 +72,7 @@ fn startup_options() -> serde_json::Value {
     if !cfg!(feature = "allocator-mimalloc") {
         return serde_json::Value::Null;
     }
-    const KEYS: [&str; 7] = [
+    const KEYS: [&str; 8] = [
         "MIMALLOC_ARENA_EAGER_COMMIT",
         "MIMALLOC_PAGE_COMMIT_ON_DEMAND",
         "MIMALLOC_PAGE_FULL_RETAIN",
@@ -80,6 +80,7 @@ fn startup_options() -> serde_json::Value {
         "MIMALLOC_ARENA_PURGE_MULT",
         "MIMALLOC_PURGE_DECOMMITS",
         "MIMALLOC_ALLOW_THP",
+        "MIMALLOC_GENERIC_COLLECT",
     ];
     KEYS.into_iter()
         .filter_map(|key| std::env::var(key).ok().map(|v| (key.into(), v.into())))
