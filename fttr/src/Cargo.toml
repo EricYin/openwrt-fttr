@@ -13,7 +13,7 @@ default-members = ["."]
 resolver = "2"
 
 [features]
-default = ["device-hl202", "mqtt", "mqtt-bridge", "npu", "platform-h3c-hm2004-du"]
+default = ["device-hl202", "mqtt", "mqtt-bridge", "npu", "platform-h3c-hm2004-du", "allocator-mimalloc"]
 npu = ["tokio/process"]
 platform-h3c-hm2004-du = []
 platform-fiberhome-an4475-g2 = []

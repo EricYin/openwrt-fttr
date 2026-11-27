@@ -91,13 +91,13 @@ define Package/openwrt-fttr/config
       redirect verified HL202 sub-gateways to the local MQTT broker in
       upstream-DHCP bridge mode.
   config FTTR_MIMALLOC
-    bool "Use mimalloc for fttrd Rust allocations (experimental)"
+    bool "Use mimalloc for fttrd Rust allocations"
     depends on PACKAGE_openwrt-fttr
-    default n
+    default y
     help
       Select mimalloc 3.5.3 for the daemon only, without explicit THP advice.
-      The system allocator is the footprint-oriented default on musl targets.
-      Compare target RSS, swap and service behavior before enabling in production.
+      The service uses on-demand commit and a bounded-delay low-retention policy.
+      Compare target RSS, CPU and long-running service behavior when tuning.
   config FTTR_NPU
     bool "Compile fttrd NPU offload coordination (runtime UCI switch)"
     depends on PACKAGE_openwrt-fttr && (FTTR_PLATFORM_H3C_HM2004_DU || FTTR_PLATFORM_FIBERHOME_AN4475_G2)

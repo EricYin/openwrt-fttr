@@ -68,7 +68,7 @@ impl Facts {
     // History decoding is a boundary operation. It does not render an Operation
     // or infer a successful write from phase=completed.
     pub fn recovered(snapshot: &Value) -> Self {
-        let phase = serde_json::from_value(snapshot["state"].clone()).ok();
+        let phase = serde::Deserialize::deserialize(&snapshot["state"]).ok();
         let mut facts = Self::collect(
             phase,
             snapshot["mode"] != "plan",
@@ -96,8 +96,7 @@ impl Facts {
 impl Operation {
     pub(super) fn facts(&self) -> Facts {
         if let Some(command) = self.command() {
-            let empty = json!({"items":[]});
-            let result = command.result.as_ref().unwrap_or(&empty);
+            let result = command.result.as_ref().unwrap_or(&Value::Null);
             let mut facts = Facts::collect(
                 Some(self.stage),
                 self.apply,

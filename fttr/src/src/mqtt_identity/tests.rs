@@ -62,17 +62,34 @@ fn mqtt_identity_refuses_ambiguity_expiry_and_clock_regression() {
     let mut registry = Registry::new("daemon-a".into());
     registry.observe("02AABBCCDDEE", 100);
     registry.update_topology(online(), Ok(links()), 100);
+    let assert_readiness = |registry: &Registry, time| {
+        let rendered = registry
+            .snapshots(time)
+            .iter()
+            .any(|s| s.optical_sn.as_deref() == Some("H3CT12345678") && s.reason == "ready");
+        let borrowed = registry
+            .automatic_source("H3CT12345678", time)
+            .ok()
+            .flatten()
+            .is_some();
+        assert_eq!(borrowed, rendered);
+    };
+    assert_readiness(&registry, 100);
+    assert_readiness(&registry, 160);
+    assert_readiness(&registry, 161);
     assert_eq!(registry.snapshots(160)[0].reason, "ready");
     assert_ne!(registry.snapshots(161)[0].reason, "ready");
     registry.observe("02AABBCCDDEF", 100);
     let mut conflicting = links();
     conflicting.insert("02AABBCCDDEF".into(), "H3CT12345678".into());
     registry.update_topology(online(), Ok(conflicting), 100);
+    assert_readiness(&registry, 100);
     assert!(registry
         .snapshots(100)
         .iter()
         .all(|s| s.reason == "ambiguous"));
     registry.observe("02AABBCCDDEE", 99);
+    assert_readiness(&registry, 99);
     assert!(registry.snapshots(99).iter().all(|s| s.reason != "ready"));
 }
 

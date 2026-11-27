@@ -154,7 +154,7 @@ impl Snapshot {
                 || op["optical_sn"] != self.serial
                 || op["operation_id"].as_u64().is_none()
                 || !matches!(op["mode"].as_str(), Some("plan" | "apply"))
-                || serde_json::from_value::<OperationPhase>(op["state"].clone()).is_err()
+                || OperationPhase::deserialize(&op["state"]).is_err()
                 || !op["items"].is_array()
             {
                 return Err(invalid());
@@ -165,7 +165,7 @@ impl Snapshot {
                 // owner just because the history decoder ignores that state.
                 if item["state"] != "pending"
                     && ItemOutcome::from_result(item).is_none()
-                    && serde_json::from_value::<OperationPhase>(item["state"].clone()).is_err()
+                    && OperationPhase::deserialize(&item["state"]).is_err()
                 {
                     return Err(invalid());
                 }
@@ -429,38 +429,69 @@ impl Controller {
         let Some(mut store) = self.snapshots.take() else {
             return true;
         };
-        let mut identities: BTreeMap<&str, (&str, &str)> = self
+        // Iterate the union without allocating a temporary identity tree on
+        // every barrier. Preserve the original live > recovered > config
+        // precedence, including owners removed from the current configuration.
+        let configured = |id: &str| self.config.devices.iter().any(|d| d.id == id);
+        let ids = self
             .config
             .devices
             .iter()
-            .map(|d| (d.id.as_str(), (d.optical_sn.as_str(), d.cwmp_id.as_str())))
-            .collect();
-        for (id, view) in &self.recovered {
-            if let (Some(sn), Some(cwmp)) = (view["optical_sn"].as_str(), view["cwmp_id"].as_str())
-            {
-                identities.insert(id, (sn, cwmp));
-            }
-        }
-        for (id, op) in &self.operations {
-            identities.insert(id, (&op.device.optical_sn, &op.device.cwmp_id));
-        }
-        for (id, (serial, cwmp_id)) in identities {
+            .map(|d| d.id.as_str())
+            .chain(
+                self.recovered
+                    .keys()
+                    .filter(|id| !configured(id))
+                    .map(String::as_str),
+            )
+            .chain(
+                self.operations
+                    .keys()
+                    .filter(|id| !configured(id) && !self.recovered.contains_key(*id))
+                    .map(String::as_str),
+            );
+        for id in ids {
+            let identity = self
+                .operations
+                .get(id)
+                .map(|op| (op.device.optical_sn.as_str(), op.device.cwmp_id.as_str()))
+                .or_else(|| {
+                    self.recovered
+                        .get(id)
+                        .and_then(|v| Some((v["optical_sn"].as_str()?, v["cwmp_id"].as_str()?)))
+                })
+                .or_else(|| {
+                    self.config
+                        .devices
+                        .iter()
+                        .find(|d| d.id == id)
+                        .map(|d| (d.optical_sn.as_str(), d.cwmp_id.as_str()))
+                });
+            let Some((serial, cwmp_id)) = identity else {
+                continue;
+            };
             let active = self.operations.get(id).map(Operation::view);
             let operation = active.as_ref().or_else(|| self.recovered.get(id));
             let empty_owned = BTreeMap::new();
             let owned = self.owned.get(cwmp_id).unwrap_or(&empty_owned);
-            let frame = store.frames.entry(id.into()).or_insert_with(|| Snapshot {
-                schema: 1,
-                serial: serial.into(),
-                cwmp_id: cwmp_id.into(),
-                operation: None,
-                owned: BTreeMap::new(),
-                attempts: 0,
-                retry_at: 0,
-                reasons: scheduler::Reasons::default(),
-                read: ReadRecovery::default(),
-                device: id.into(),
-            });
+            if !store.frames.contains_key(id) {
+                store.frames.insert(
+                    id.into(),
+                    Snapshot {
+                        schema: 1,
+                        serial: serial.into(),
+                        cwmp_id: cwmp_id.into(),
+                        operation: None,
+                        owned: BTreeMap::new(),
+                        attempts: 0,
+                        retry_at: 0,
+                        reasons: scheduler::Reasons::default(),
+                        read: ReadRecovery::default(),
+                        device: id.into(),
+                    },
+                );
+            }
+            let frame = store.frames.get_mut(id).unwrap();
             if frame.serial != serial {
                 frame.serial = serial.into();
             }
@@ -470,7 +501,9 @@ impl Controller {
             // Completed histories dominate idle ticks. Compare borrowed state
             // before cloning it, instead of rebuilding every JSON tree/map.
             if frame.operation.as_ref() != operation {
-                frame.operation = operation.cloned();
+                // Active views are already owned temporaries. Move them into
+                // the checkpoint instead of cloning a second full JSON tree.
+                frame.operation = active.or_else(|| self.recovered.get(id).cloned());
             }
             if &frame.owned != owned {
                 frame.owned.clone_from(owned);

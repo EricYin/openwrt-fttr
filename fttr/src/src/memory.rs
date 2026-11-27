@@ -60,8 +60,31 @@ pub(crate) fn view() -> serde_json::Value {
         "rust_requested_live_bytes":LIVE.load(Relaxed),
         "rust_requested_peak_bytes":PEAK.load(Relaxed),
         "rust_allocated_bytes_total":ALLOCATED.load(Relaxed),
+        "startup_options":startup_options(),
         "scope":"Rust requested sizes; excludes allocator slack, C allocations and thread stacks",
     })
+}
+
+// These are startup requests, not a claim that every page can be reclaimed.
+// procd supplies them before exec, when mimalloc first reads its environment.
+// Do not set environment variables from main after allocator initialization.
+fn startup_options() -> serde_json::Value {
+    if !cfg!(feature = "allocator-mimalloc") {
+        return serde_json::Value::Null;
+    }
+    const KEYS: [&str; 7] = [
+        "MIMALLOC_ARENA_EAGER_COMMIT",
+        "MIMALLOC_PAGE_COMMIT_ON_DEMAND",
+        "MIMALLOC_PAGE_FULL_RETAIN",
+        "MIMALLOC_PURGE_DELAY",
+        "MIMALLOC_ARENA_PURGE_MULT",
+        "MIMALLOC_PURGE_DECOMMITS",
+        "MIMALLOC_ALLOW_THP",
+    ];
+    KEYS.into_iter()
+        .filter_map(|key| std::env::var(key).ok().map(|v| (key.into(), v.into())))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }
 
 #[cfg(test)]

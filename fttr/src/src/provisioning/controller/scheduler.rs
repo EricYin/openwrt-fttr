@@ -119,9 +119,10 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
             && crate::mqtt_identity::shared()
                 .lock()
                 .unwrap()
-                .snapshots(time)
-                .iter()
-                .any(|s| s.optical_sn.as_deref() == Some(&d.optical_sn) && s.reason == "ready");
+                .automatic_source(&d.optical_sn, time)
+                .ok()
+                .flatten()
+                .is_some();
         c.mqtt.insert(d.id.clone(), json!({"state":if mqtt_reachable {"online"} else {"waiting_transport"},"optical_online":online.contains(&d.optical_sn)}));
         let boot = observed["inform"]["events"].as_array().is_some_and(|a| {
             a.iter()

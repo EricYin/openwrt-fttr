@@ -24,6 +24,32 @@ macro_rules! wire_enum {
     };
 }
 
+/// Scheduler observations share immutable desired data. Mutating a reload or
+/// resolving an identity detaches it, so an older observer keeps its generation.
+#[derive(Clone, Default)]
+pub(super) struct SharedConfig(std::sync::Arc<Config>);
+impl std::ops::Deref for SharedConfig {
+    type Target = Config;
+    fn deref(&self) -> &Config {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for SharedConfig {
+    fn deref_mut(&mut self) -> &mut Config {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+impl From<Config> for SharedConfig {
+    fn from(config: Config) -> Self {
+        Self(std::sync::Arc::new(config))
+    }
+}
+impl From<SharedConfig> for Config {
+    fn from(config: SharedConfig) -> Self {
+        std::sync::Arc::unwrap_or_clone(config.0)
+    }
+}
+
 wire_enum!(TaskOutcome {
     Queued => "queued",
     Sent => "sent",
@@ -43,7 +69,7 @@ wire_enum!(Backend {
 
 impl TaskOutcome {
     pub(super) fn from_task(task: &serde_json::Value) -> Self {
-        serde_json::from_value(task["state"].clone()).unwrap_or(Self::Missing)
+        Self::deserialize(&task["state"]).unwrap_or(Self::Missing)
     }
 }
 
@@ -63,7 +89,7 @@ wire_enum!(ItemOutcome {
 
 impl ItemOutcome {
     pub(super) fn from_result(result: &serde_json::Value) -> Option<Self> {
-        serde_json::from_value(result["state"].clone()).ok()
+        Self::deserialize(&result["state"]).ok()
     }
 }
 
@@ -343,6 +369,31 @@ impl Config {
 #[cfg(test)]
 mod backend_tests {
     use super::*;
+
+    #[test]
+    fn scheduler_configuration_is_shared_until_a_reload_or_identity_mutation() {
+        let original: SharedConfig = Config {
+            revision: "before".into(),
+            labels: BTreeMap::from([("device".into(), "unchanged".into())]),
+            ..Default::default()
+        }
+        .into();
+        let observer = original.clone();
+        let mut next = original.clone();
+        assert!(std::sync::Arc::ptr_eq(&observer.0, &next.0));
+        assert_eq!(
+            observer.labels["device"].as_ptr(),
+            next.labels["device"].as_ptr()
+        );
+        next.revision = "after".into();
+        next.labels.insert("device".into(), "changed".into());
+        assert!(!std::sync::Arc::ptr_eq(&observer.0, &next.0));
+        assert_eq!(observer.revision, "before");
+        assert_eq!(observer.labels["device"], "unchanged");
+        let owned: Config = next.into();
+        assert_eq!(owned.revision, "after");
+        assert_eq!(original.revision, "before");
+    }
 
     #[test]
     fn optical_adapter_does_not_select_provisioning_transport() {

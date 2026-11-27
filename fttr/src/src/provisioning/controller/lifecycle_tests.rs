@@ -611,7 +611,7 @@ fn startup_preserves_template_safety_and_ownership_until_binding_is_discovered()
         history["operations"][0]["state"] = json!(state);
         history["operations"][0]["items"] = json!([{"id":"wifi","state":"unknown"}]);
         let mut c = Controller::default();
-        c.config = template_config();
+        c.config = template_config().into();
         assert_eq!(c.config.devices[0].cwmp_id, "pending:H3CT12345678");
         c.recover(history.to_string().as_bytes());
 
@@ -641,7 +641,7 @@ fn startup_preserves_template_safety_and_ownership_until_binding_is_discovered()
 )]
 fn unchanged_template_reload_preserves_resolved_binding_and_unknown_outcomes() {
     let mut c = configured();
-    c.config = template_config();
+    c.config = template_config().into();
     c.config.devices[0].cwmp_id = "id".into();
     let mut op = operation(OperationPhase::Completed, false);
     op.results
@@ -667,7 +667,7 @@ fn unchanged_template_reload_preserves_resolved_binding_and_unknown_outcomes() {
 fn discovered_template_replacement_prunes_previous_resolved_history_and_ownership() {
     let previous = configured();
     let mut c = Controller::default();
-    c.config = template_config();
+    c.config = template_config().into();
     c.recover(previous.history().as_bytes());
     c.retain_configured_state();
     assert!(c.recovered.contains_key("child"));

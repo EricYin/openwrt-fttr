@@ -241,7 +241,8 @@ impl Controller {
                 .any(|d| self.resets.blocks(&d.optical_sn))
     }
 
-    pub(super) fn request_config(&mut self, config: Config) {
+    pub(super) fn request_config(&mut self, config: impl Into<Config>) {
+        let config = config.into();
         if let Some(resources) = self.resources {
             if let Err(error) = validate_desired_pins(resources, &config) {
                 self.config_error = Some(error);
@@ -340,7 +341,8 @@ impl Controller {
             "reset_pending":self.config.devices.iter().any(|d| self.resets.blocks(&d.optical_sn))})
     }
 
-    pub(super) fn replace_config(&mut self, mut config: Config) -> Result<(), String> {
+    pub(super) fn replace_config(&mut self, config: impl Into<Config>) -> Result<(), String> {
+        let mut config = config.into();
         if let Some(resources) = self.resources {
             validate_desired_pins(resources, &config)?;
         }
@@ -418,7 +420,7 @@ impl Controller {
         crate::omci_auth::bind(&config.devices);
         crate::controller::mqtt_bridge::configure(config.mqtt_bridge_enabled);
         crate::controller::acs_bridge::configure(&config.acs_bridge);
-        self.config = config;
+        self.config = config.into();
         super::super::bootstrap::configure(&self.config.devices);
         super::super::health_watch::config(
             self.config

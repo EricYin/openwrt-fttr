@@ -1,5 +1,7 @@
 //! Desired-state controller. CWMP traffic runs independently of optical workers.
-use super::model::{Backend, ItemKind, ItemOutcome, OperationPhase, ParameterKind, TaskOutcome};
+use super::model::{
+    Backend, ItemKind, ItemOutcome, OperationPhase, ParameterKind, SharedConfig, TaskOutcome,
+};
 use super::{config, wan, wifi};
 #[path = "controller/admission.rs"]
 mod admission;
@@ -191,7 +193,7 @@ struct Controller {
     resources: Option<&'static crate::platform::resources::Resources>,
     pub(super) dirty: bool,
     resets: reset::Resets,
-    config: Config,
+    config: SharedConfig,
     pending_config: Option<(Config, u64)>,
     failure: Option<String>,
     config_error: Option<String>,
