@@ -57,6 +57,22 @@ mod allocation_tests {
     }
 }
 
+/// Failure classification for strictly single-shot OMCI operations.
+#[derive(Debug)]
+pub enum SingleShotError {
+    NotSent(io::Error),
+    Rejected(io::Error),
+    UncertainAfterSend(io::Error),
+}
+
+impl SingleShotError {
+    pub fn into_io_error(self) -> io::Error {
+        match self {
+            Self::NotSent(e) | Self::Rejected(e) | Self::UncertainAfterSend(e) => e,
+        }
+    }
+}
+
 /// OMCI-001/002/003/008 message semantics; retries/guards are project orchestration.
 /// No socket, FPGA register or device topology is owned by this object.
 pub struct OmciSession {
@@ -207,18 +223,33 @@ impl OmciSession {
         }
         Ok(())
     }
-    /// Raw vendor requests remain explicit at the device adapter boundary.
-    pub fn transact(
+    fn transact_attempts(
         &mut self,
         message_type: u8,
         class_id: u16,
         entity_id: u16,
         payload: [u8; 32],
-    ) -> io::Result<BaselineFrame> {
-        let request = request_frame(message_type, class_id, entity_id, payload)?;
-        for _ in 0..3 {
-            self.check_active()?;
-            self.transport.send(&request)?;
+        max_attempts: u8,
+    ) -> Result<BaselineFrame, SingleShotError> {
+        let request = request_frame(message_type, class_id, entity_id, payload)
+            .map_err(SingleShotError::NotSent)?;
+        let mut sent = false;
+        let fail = |sent: bool, error: io::Error| {
+            if sent {
+                SingleShotError::UncertainAfterSend(error)
+            } else {
+                SingleShotError::NotSent(error)
+            }
+        };
+        for _ in 0..max_attempts {
+            self.check_active().map_err(|e| fail(sent, e))?;
+            // Mark attempted before calling transport.send so ambiguous lower-layer
+            // errors (such as a post-submit completion timeout) are never misreported
+            // as "not sent".
+            sent = true;
+            self.transport
+                .send(&request)
+                .map_err(SingleShotError::UncertainAfterSend)?;
             // Building a MIB snapshot can take much longer than an ordinary
             // attribute operation. Keep the same TCI while awaiting that reply;
             // rapidly starting another upload can restart the ONU's snapshot.
@@ -229,8 +260,13 @@ impl OmciSession {
             };
             let end = Instant::now() + timeout;
             while Instant::now() < end {
-                self.check_active()?;
-                match self.transport.receive()? {
+                self.check_active()
+                    .map_err(SingleShotError::UncertainAfterSend)?;
+                match self
+                    .transport
+                    .receive()
+                    .map_err(SingleShotError::UncertainAfterSend)?
+                {
                     Some(frame) if frame.answers(&request) => {
                         std::thread::sleep(Duration::from_millis(25));
                         return Ok(frame);
@@ -240,13 +276,34 @@ impl OmciSession {
                 }
             }
         }
-        Err(io::Error::new(
+        Err(SingleShotError::UncertainAfterSend(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
                 "OMCI TCI={:04x} class={class_id} entity={entity_id:04x}",
                 request.transaction_id
             ),
-        ))
+        )))
+    }
+    /// Raw vendor requests remain explicit at the device adapter boundary.
+    pub fn transact(
+        &mut self,
+        message_type: u8,
+        class_id: u16,
+        entity_id: u16,
+        payload: [u8; 32],
+    ) -> io::Result<BaselineFrame> {
+        self.transact_attempts(message_type, class_id, entity_id, payload, 3)
+            .map_err(SingleShotError::into_io_error)
+    }
+    /// Sends at most one OMCI request frame without retrying on timeout.
+    pub fn transact_once(
+        &mut self,
+        message_type: u8,
+        class_id: u16,
+        entity_id: u16,
+        payload: [u8; 32],
+    ) -> Result<BaselineFrame, SingleShotError> {
+        self.transact_attempts(message_type, class_id, entity_id, payload, 1)
     }
     fn request(
         &mut self,
@@ -362,6 +419,32 @@ impl OmciSession {
             RequestBody::Set { mask, data },
         )?;
         check_result(&frame)
+    }
+    pub fn set_once(
+        &mut self,
+        class_id: u16,
+        entity_id: u16,
+        mask: u16,
+        data: &[u8],
+    ) -> Result<(), SingleShotError> {
+        let payload = RequestBody::Set { mask, data }
+            .encode()
+            .map_err(SingleShotError::NotSent)?;
+        let frame = self.transact_once(Action::Set.request_type(), class_id, entity_id, payload)?;
+        check_result(&frame).map_err(SingleShotError::Rejected)
+    }
+    pub fn set_attributes_once(
+        &mut self,
+        class_id: u16,
+        entity_id: u16,
+        values: &[(u8, AttributeValue)],
+    ) -> Result<(), SingleShotError> {
+        let def = MeRegistry::get(class_id)
+            .filter(|d| d.layout_supported)
+            .ok_or_else(|| SingleShotError::NotSent(invalid("no complete ME layout")))?;
+        let (mask, data) = AttributeCodec::encode(def, values, AttributeContext::SetRequest)
+            .map_err(SingleShotError::NotSent)?;
+        self.set_once(class_id, entity_id, mask, &data)
     }
     pub fn create(&mut self, class_id: u16, entity_id: u16, data: &[u8]) -> io::Result<()> {
         let frame = self.request(

@@ -120,7 +120,7 @@ fn business_data_alloc_config_scales_best_effort_and_floor_modes() {
 
     let be_2p5g = GdbaAllocConfig::business_data(130, 2, 64, true, Some(0)).unwrap();
     assert_eq!(be_2p5g.fixed_bw, 0);
-    assert_eq!(be_2p5g.max_bw, 312_500);
+    assert_eq!(be_2p5g.max_bw, 156_250);
     assert_eq!(be_2p5g.alloc_type, 2);
     assert!(be_2p5g.ds_tail_flag);
 

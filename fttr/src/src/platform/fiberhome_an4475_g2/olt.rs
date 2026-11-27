@@ -360,6 +360,13 @@ impl<B: Bus> FslOltSession<B> {
         self.onus.get(&onu_id)
     }
 
+    pub fn alarm_counts(&self, onu_id: u8) -> (u8, u8) {
+        (
+            self.losi_counts.get(&onu_id).copied().unwrap_or(0),
+            self.lofi_counts.get(&onu_id).copied().unwrap_or(0),
+        )
+    }
+
     pub fn find_onu_by_sn(&self, serial_number: &[u8; 8]) -> Option<ManagedOnu> {
         self.onus
             .values()
@@ -426,6 +433,10 @@ impl<B: Bus> FslOltSession<B> {
                 if alarm_bitmap_contains(&bitmap, onu_index) {
                     let count = self.losi_counts.entry(onu_id).or_insert(0);
                     *count = count.saturating_add(1);
+                    println!(
+                        "[*] FSL alarm bitmap match: kind=losi onu={onu_id} index={onu_index} count={count} word0={:#010x}",
+                        bitmap[0]
+                    );
                     if *count > 5 && !offline.iter().any(|&(id, _)| id == onu_id) {
                         offline.push((onu_id, "losi"));
                     }
@@ -438,6 +449,10 @@ impl<B: Bus> FslOltSession<B> {
                 if alarm_bitmap_contains(&bitmap, onu_index) {
                     let count = self.lofi_counts.entry(onu_id).or_insert(0);
                     *count = count.saturating_add(1);
+                    println!(
+                        "[*] FSL alarm bitmap match: kind=lofi onu={onu_id} index={onu_index} count={count} word0={:#010x}",
+                        bitmap[0]
+                    );
                     if *count > 2 && !offline.iter().any(|&(id, _)| id == onu_id) {
                         offline.push((onu_id, "lofi"));
                     }

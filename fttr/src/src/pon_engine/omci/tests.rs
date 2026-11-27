@@ -9,6 +9,7 @@ use super::{
     messages::GetResponse,
     mib::{MibAssembler, MibRecord},
     schema::MeRegistry,
+    session::SingleShotError,
     session::{OmciSession, OmciTransport},
     tables::{TableAssembler, VlanRule},
     wire::{unhex, BaselineFrame},
@@ -537,4 +538,99 @@ fn optional_operation_cannot_extend_outer_deadline_or_bypass_registration() {
             .kind(),
         io::ErrorKind::NotConnected
     );
+}
+
+struct CountingTransport {
+    sent: usize,
+    reply: Option<BaselineFrame>,
+}
+
+impl OmciTransport for CountingTransport {
+    fn send(&mut self, _request: &BaselineFrame) -> io::Result<()> {
+        self.sent += 1;
+        Ok(())
+    }
+    fn receive(&mut self) -> io::Result<Option<BaselineFrame>> {
+        Ok(self.reply.take())
+    }
+}
+
+#[test]
+fn single_shot_set_never_retries_and_distinguishes_not_sent_rejected_and_uncertain() {
+    let mut not_sent = OmciSession::new(CountingTransport {
+        sent: 0,
+        reply: None,
+    });
+    not_sent.guard_registration(|| false);
+    assert!(matches!(
+        not_sent.set_once(171, 0x0201, 0x0400, &[0; 16]),
+        Err(SingleShotError::NotSent(_))
+    ));
+
+    struct FixedReply {
+        sent: usize,
+        result: u8,
+        pending: Option<BaselineFrame>,
+    }
+    impl OmciTransport for FixedReply {
+        fn send(&mut self, request: &BaselineFrame) -> io::Result<()> {
+            self.sent += 1;
+            let mut reply = *request;
+            reply.message_type = (request.message_type & 0x1f) | 0x20;
+            reply.payload = [0; 32];
+            reply.payload[0] = self.result;
+            self.pending = Some(reply);
+            Ok(())
+        }
+        fn receive(&mut self) -> io::Result<Option<BaselineFrame>> {
+            Ok(self.pending.take())
+        }
+    }
+    let mut rejected = OmciSession::new(FixedReply {
+        sent: 0,
+        result: 3,
+        pending: None,
+    });
+    assert!(matches!(
+        rejected.set_once(171, 0x0201, 0x0400, &[0; 16]),
+        Err(SingleShotError::Rejected(_))
+    ));
+
+    struct ErrorOnReceive;
+    impl OmciTransport for ErrorOnReceive {
+        fn send(&mut self, _request: &BaselineFrame) -> io::Result<()> {
+            Ok(())
+        }
+        fn receive(&mut self) -> io::Result<Option<BaselineFrame>> {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "rx failed"))
+        }
+    }
+    let mut uncertain = OmciSession::new(ErrorOnReceive);
+    let err = uncertain
+        .set_once(171, 0x0201, 0x0400, &[0; 16])
+        .unwrap_err();
+    assert!(matches!(err, SingleShotError::UncertainAfterSend(_)));
+}
+
+#[test]
+fn single_shot_transact_once_sends_only_once_on_timeout() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct SharedCount(Arc<AtomicUsize>);
+    impl OmciTransport for SharedCount {
+        fn send(&mut self, _request: &BaselineFrame) -> io::Result<()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn receive(&mut self) -> io::Result<Option<BaselineFrame>> {
+            Ok(None)
+        }
+    }
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut session = OmciSession::new(SharedCount(count.clone()));
+    let err = session.set_once(171, 0x0201, 0x0400, &[0; 16]).unwrap_err();
+    assert!(matches!(err, SingleShotError::UncertainAfterSend(_)));
+    assert_eq!(count.load(Ordering::Relaxed), 1);
 }

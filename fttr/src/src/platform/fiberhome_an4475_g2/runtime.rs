@@ -446,7 +446,6 @@ fn configure_business_datapath(onu_id: u8, floor_bytes: Option<u16>) -> io::Resu
             .onu(onu_id)
             .copied()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ONU not active in FSL"))?;
-        configure_gem_port(session.fsl_mut(), onu.onu_index, 0, res.gem_id, true)?;
         let max_onus = session.config().init.max_onu_id.min(128) as u8;
         let tcont = alloc_to_tcont(res.alloc_id, 0, max_onus, 0)?;
         let alloc = GdbaAllocConfig::business_data(
@@ -456,7 +455,8 @@ fn configure_business_datapath(onu_id: u8, floor_bytes: Option<u16>) -> io::Resu
             onu.rate == OnuUpstreamRate::Rate2p5G,
             floor_bytes.map(u32::from),
         )?;
-        session.configure_tcont_alloc(&alloc)?;
+        // Match fslstack_gpon_config_alloc_id: send Assign_Alloc-ID PLOAM and allow
+        // 5 ms before enabling GDBA grants; granting an unassigned Alloc-ID causes LOSi/LOFi.
         let frame = assign_alloc_id_ploam(onu_id, res.alloc_id, true, 0)?;
         for _ in 0..session.config().ploam_repeat {
             session.send_ploam(&frame, &mut |delay| {
@@ -464,6 +464,9 @@ fn configure_business_datapath(onu_id: u8, floor_bytes: Option<u16>) -> io::Resu
                 Ok(())
             })?;
         }
+        thread::sleep(Duration::from_millis(5));
+        session.configure_tcont_alloc(&alloc)?;
+        configure_gem_port(session.fsl_mut(), onu.onu_index, 0, res.gem_id, true)?;
         println!(
             "[+] FSL business datapath enabled for ONU {onu_id}: gem={:#x} alloc={:#x} tcont={tcont} fixed_bw={} max_bw={} alloc_type={}",
             res.gem_id, res.alloc_id, alloc.fixed_bw, alloc.max_bw, alloc.alloc_type
@@ -513,6 +516,214 @@ pub(crate) fn send_ploam(frame: &PloamFrame) -> io::Result<()> {
             thread::sleep(delay);
             Ok(())
         })
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DatapathStage {
+    Status,
+    GemEnable,
+    GemDisable,
+    AssignAllocPloamEnable,
+    AssignAllocPloamDisable,
+    GdbaEnable,
+    GdbaDisable,
+    Revoke,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatapathStageCommand {
+    onu_id: u8,
+    serial: String,
+    generation: u64,
+    stage: DatapathStage,
+    #[serde(default)]
+    fixed_bw: Option<u32>,
+    #[serde(default)]
+    max_bw: Option<u32>,
+    #[serde(default)]
+    ds_period: Option<u8>,
+    #[serde(default)]
+    ds_flag: Option<bool>,
+    #[serde(default)]
+    ds_tail_flag: Option<bool>,
+    #[serde(default)]
+    sequence: Option<u16>,
+}
+
+fn datapath_stage(
+    cmd: DatapathStageCommand,
+    states: &service::States,
+) -> io::Result<serde_json::Value> {
+    if !crate::controller::attribute_probe::identity_current(
+        states,
+        cmd.onu_id,
+        &cmd.serial,
+        cmd.generation,
+    ) {
+        return Err(io::Error::other(
+            "ONU identity/registration generation mismatch",
+        ));
+    }
+    let res = super::active_resources().onu(cmd.onu_id)?;
+    with_session(|session| {
+        let onu = session
+            .onu(cmd.onu_id)
+            .copied()
+            .filter(|onu| onu.state == FslOnuState::Active)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ONU not active in FSL"))?;
+        let max_onus = session.config().init.max_onu_id.min(128) as u8;
+        let tcont = alloc_to_tcont(res.alloc_id, 0, max_onus, 0)?;
+        let (losi_count, lofi_count) = session.alarm_counts(cmd.onu_id);
+        match cmd.stage {
+            DatapathStage::Status => Ok(serde_json::json!({
+                "status": "success",
+                "stage": "status",
+                "onu_id": cmd.onu_id,
+                "onu_index": onu.onu_index,
+                "rate": format!("{:?}", onu.rate),
+                "gem_id": res.gem_id,
+                "alloc_id": res.alloc_id,
+                "tcont": tcont,
+                "dba_granularity_8x": session.dba_granularity_8x(),
+                "losi_count": losi_count,
+                "lofi_count": lofi_count,
+            })),
+            DatapathStage::GemEnable | DatapathStage::GemDisable => {
+                let enable = cmd.stage == DatapathStage::GemEnable;
+                configure_gem_port(session.fsl_mut(), onu.onu_index, 0, res.gem_id, enable)?;
+                println!(
+                    "[*] FSL staged gem_port: onu={} gem={:#x} enable={enable}",
+                    cmd.onu_id, res.gem_id
+                );
+                Ok(serde_json::json!({
+                    "status": "success",
+                    "stage": if enable { "gem_enable" } else { "gem_disable" },
+                    "onu_id": cmd.onu_id,
+                    "gem_id": res.gem_id,
+                }))
+            }
+            DatapathStage::AssignAllocPloamEnable | DatapathStage::AssignAllocPloamDisable => {
+                let enable = cmd.stage == DatapathStage::AssignAllocPloamEnable;
+                let seq = cmd.sequence.unwrap_or(1);
+                let frame = assign_alloc_id_ploam(cmd.onu_id, res.alloc_id, enable, seq)?;
+                for _ in 0..session.config().ploam_repeat {
+                    session.send_ploam(&frame, &mut |delay| {
+                        thread::sleep(delay);
+                        Ok(())
+                    })?;
+                }
+                println!(
+                    "[*] FSL staged Assign_Alloc-ID PLOAM: onu={} alloc={:#x} enable={enable} seq={seq}",
+                    cmd.onu_id, res.alloc_id
+                );
+                Ok(serde_json::json!({
+                    "status": "success",
+                    "stage": if enable { "assign_alloc_ploam_enable" } else { "assign_alloc_ploam_disable" },
+                    "onu_id": cmd.onu_id,
+                    "alloc_id": res.alloc_id,
+                    "sequence": seq,
+                }))
+            }
+            DatapathStage::GdbaEnable => {
+                let mut alloc = GdbaAllocConfig::business_data(
+                    tcont,
+                    onu.onu_index,
+                    session.dba_granularity_8x(),
+                    onu.rate == OnuUpstreamRate::Rate2p5G,
+                    cmd.fixed_bw,
+                )?;
+                if let Some(max_bw) = cmd.max_bw {
+                    alloc.max_bw = max_bw;
+                }
+                if let Some(period) = cmd.ds_period {
+                    alloc.ds_period = period;
+                }
+                if let Some(flag) = cmd.ds_flag {
+                    alloc.ds_flag = flag;
+                }
+                if let Some(tail) = cmd.ds_tail_flag {
+                    alloc.ds_tail_flag = tail;
+                }
+                session.configure_tcont_alloc(&alloc)?;
+                println!(
+                    "[*] FSL staged GDBA enable: onu={} tcont={tcont} fixed_bw={} max_bw={} alloc_type={} ds_period={} ds_flag={} ds_tail={}",
+                    cmd.onu_id, alloc.fixed_bw, alloc.max_bw, alloc.alloc_type, alloc.ds_period, alloc.ds_flag, alloc.ds_tail_flag
+                );
+                Ok(serde_json::json!({
+                    "status": "success",
+                    "stage": "gdba_enable",
+                    "onu_id": cmd.onu_id,
+                    "tcont": tcont,
+                    "fixed_bw": alloc.fixed_bw,
+                    "max_bw": alloc.max_bw,
+                    "alloc_type": alloc.alloc_type,
+                    "ds_period": alloc.ds_period,
+                    "ds_flag": alloc.ds_flag,
+                    "ds_tail_flag": alloc.ds_tail_flag,
+                }))
+            }
+            DatapathStage::GdbaDisable => {
+                let disable_alloc = GdbaAllocConfig {
+                    tcont,
+                    onu_index: onu.onu_index,
+                    enable: false,
+                    fixed_bw: 0,
+                    assured_bw: 0,
+                    max_bw: 0,
+                    alloc_type: 0,
+                    priority: 0,
+                    weight: 0,
+                    ds_period: 0,
+                    ds_flag: false,
+                    ds_bw_flag: false,
+                    ds_tail_flag: false,
+                };
+                session.configure_tcont_alloc(&disable_alloc)?;
+                println!(
+                    "[*] FSL staged GDBA disable: onu={} tcont={tcont}",
+                    cmd.onu_id
+                );
+                Ok(serde_json::json!({
+                    "status": "success",
+                    "stage": "gdba_disable",
+                    "onu_id": cmd.onu_id,
+                    "tcont": tcont,
+                }))
+            }
+            DatapathStage::Revoke => {
+                configure_gem_port(session.fsl_mut(), onu.onu_index, 0, res.gem_id, false)?;
+                let disable_alloc = GdbaAllocConfig {
+                    tcont,
+                    onu_index: onu.onu_index,
+                    enable: false,
+                    fixed_bw: 0,
+                    assured_bw: 0,
+                    max_bw: 0,
+                    alloc_type: 0,
+                    priority: 0,
+                    weight: 0,
+                    ds_period: 0,
+                    ds_flag: false,
+                    ds_bw_flag: false,
+                    ds_tail_flag: false,
+                };
+                let _ = session.configure_tcont_alloc(&disable_alloc);
+                println!(
+                    "[*] FSL staged revoke: onu={} gem={:#x} tcont={tcont}",
+                    cmd.onu_id, res.gem_id
+                );
+                Ok(serde_json::json!({
+                    "status": "success",
+                    "stage": "revoke",
+                    "onu_id": cmd.onu_id,
+                    "gem_id": res.gem_id,
+                    "tcont": tcont,
+                }))
+            }
+        }
     })
 }
 
@@ -1312,6 +1523,64 @@ fn ipc_handler(
             };
             let _ = serde_json::to_writer(&mut stream, &response);
             let _ = stream.write_all(b"\n");
+        } else if let Some(request) = line.strip_prefix("OMCI_SNAPSHOT ") {
+            let result =
+                serde_json::from_str::<crate::controller::attribute_probe::Command>(request)
+                    .map_err(std::io::Error::other)
+                    .and_then(|command| {
+                        crate::controller::attribute_probe::snapshot(
+                            optics.platform,
+                            command,
+                            &services,
+                            &stream,
+                        )
+                    });
+            let response =
+                result.unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+            let _ = serde_json::to_writer(&mut stream, &response);
+            let _ = stream.write_all(b"\n");
+        } else if let Some(request) = line.strip_prefix("OMCI_SET_ONCE ") {
+            let result =
+                serde_json::from_str::<crate::controller::attribute_probe::Command>(request)
+                    .map_err(std::io::Error::other)
+                    .and_then(|command| {
+                        crate::controller::attribute_probe::set_once(
+                            optics.platform,
+                            command,
+                            &services,
+                            &stream,
+                        )
+                    });
+            let response =
+                result.unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+            let _ = serde_json::to_writer(&mut stream, &response);
+            let _ = stream.write_all(b"\n");
+        } else if let Some(request) = line.strip_prefix("OMCI_EVTO_RULE ") {
+            let result =
+                serde_json::from_str::<crate::controller::attribute_probe::EvtoRuleCommand>(
+                    request,
+                )
+                .map_err(std::io::Error::other)
+                .and_then(|command| {
+                    crate::controller::attribute_probe::evto_rule(
+                        optics.platform,
+                        command,
+                        &services,
+                        &stream,
+                    )
+                });
+            let response =
+                result.unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+            let _ = serde_json::to_writer(&mut stream, &response);
+            let _ = stream.write_all(b"\n");
+        } else if let Some(request) = line.strip_prefix("DATAPATH_STAGE ") {
+            let result = serde_json::from_str::<DatapathStageCommand>(request)
+                .map_err(std::io::Error::other)
+                .and_then(|command| datapath_stage(command, &services));
+            let response =
+                result.unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+            let _ = serde_json::to_writer(&mut stream, &response);
+            let _ = stream.write_all(b"\n");
         } else if let Some(request) = line.strip_prefix("OMCI_ATTRIBUTE ") {
             let result =
                 serde_json::from_str::<crate::controller::attribute_probe::Command>(request)
@@ -1455,6 +1724,10 @@ mod ipc_tests {
             "ACS invalid",
             "PROVISIONING invalid",
             "FEC_PM invalid",
+            "OMCI_SNAPSHOT invalid",
+            "OMCI_SET_ONCE invalid",
+            "OMCI_EVTO_RULE invalid",
+            "DATAPATH_STAGE invalid",
             "OMCI_ATTRIBUTE invalid",
             "MIB invalid",
         ] {
@@ -1875,10 +2148,15 @@ async fn run_async(platform: PlatformContext) {
                                     );
                                     newly_active.push(active);
                                 }
-                                Ok(None)
-                                    if record.frame[2] != PLOAM_MSG_BER_INTERVAL
-                                        && record.frame[2] != PLOAM_MSG_ASSIGN_ALLOC_ID =>
-                                {
+                                Ok(None) if record.frame[2] == PLOAM_MSG_ASSIGN_ALLOC_ID => {
+                                    println!(
+                                        "[*] FSL Assign_Alloc-ID ACK onu_id={:?} enable={} seq={}",
+                                        record.onu_id(),
+                                        record.frame[5],
+                                        u16::from_be_bytes([record.frame[8], record.frame[9]])
+                                    );
+                                }
+                                Ok(None) if record.frame[2] != PLOAM_MSG_BER_INTERVAL => {
                                     println!(
                                         "[*] Ignoring unmatched PLOAM ACK onu_id={:?} acked_msg={:#x} enable={} seq={}",
                                         record.onu_id(),

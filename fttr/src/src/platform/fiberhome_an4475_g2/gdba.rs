@@ -183,7 +183,10 @@ impl GdbaAllocConfig {
         }
         let gran = u64::from(granularity_8x);
         let (scale, max_kbps) = if is_2p5g {
-            (8u64, 2_500_000u64)
+            // Live GSPON (2.488G) testing on AN4121-AM showed GDBA max_bw >= 215_000
+            // triggers immediate LOSi/LOFi deactivations and 213_125 is marginal,
+            // whereas 156_250 (1.25 Gbps cap at 8x granularity=64) stays alarm-free.
+            (8u64, 1_250_000u64)
         } else {
             (16u64, 1_250_000u64)
         };
