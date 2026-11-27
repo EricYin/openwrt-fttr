@@ -1,7 +1,6 @@
 use super::*;
 use crate::provisioning::storage;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -26,8 +25,8 @@ impl Default for Resets {
         Self {
             pending: BTreeMap::new(),
             blocked: BTreeMap::new(),
-            directory: "/etc/fttr/reset-pending".into(),
-            history: "/var/lib/fttr/provisioning-state.json".into(),
+            directory: "/tmp/fttr/state/reset-pending".into(),
+            history: crate::provisioning::runtime_store::LEGACY_HISTORY.into(),
             #[cfg(test)]
             wan: "/etc/fttr/wan-owned".into(),
             #[cfg(test)]
@@ -47,6 +46,9 @@ impl Resets {
         self.blocked.get(serial).map(String::as_str)
     }
     fn path(&self, serial: &str) -> String {
+        #[cfg(not(test))]
+        return crate::provisioning::runtime_store::Record::Reset.path(serial);
+        #[cfg(test)]
         storage::registry_path(&self.directory, serial)
     }
 }
@@ -55,15 +57,11 @@ impl Controller {
     pub(super) fn load_reset_intents(&mut self) {
         for device in &self.config.devices {
             let result = (|| -> Result<Option<Intent>, String> {
-                let file = match std::fs::File::open(self.resets.path(&device.optical_sn)) {
+                let data = match storage::read(self.resets.path(&device.optical_sn)) {
                     Ok(file) => file,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                     Err(e) => return Err(format!("read reset intent: {e}")),
                 };
-                let mut data = Vec::new();
-                file.take(4097)
-                    .read_to_end(&mut data)
-                    .map_err(|e| format!("read reset intent: {e}"))?;
                 if data.len() > 4096 {
                     return Err("oversized reset intent".into());
                 }
@@ -177,7 +175,7 @@ impl Controller {
         }
         self.forget_device(serial, &intent.cwmp_id);
         #[cfg(not(test))]
-        storage::remove_registry(&format!("/etc/fttr/command-owned/{serial}.json"))?;
+        storage::remove_registry(&crate::provisioning::runtime_store::Record::Native.path(serial))?;
         if self.snapshots.is_none() {
             let saved = self.history();
             storage::write_atomic(&self.resets.history, saved.as_bytes(), true)

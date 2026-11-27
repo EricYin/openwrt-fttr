@@ -69,11 +69,8 @@ pub async fn execute_async(
     let transaction = command::Transaction::acquire(&target.mqtt_mac)?;
     // Opaque external scripts have no idempotent replay contract. Persist only
     // identity and intent metadata; never persist the script or its secrets.
-    let path = crate::provisioning::storage::registry_path(
-        "/etc/fttr/command-external",
-        &selection.optical_sn,
-    );
-    let mut intent = serde_json::json!({"schema_version":1,"pending":true,
+    let path = crate::provisioning::runtime_store::Record::External.path(&selection.optical_sn);
+    let intent = serde_json::json!({"schema_version":1,"pending":true,
         "binding_generation":selection.binding_generation,"onu_id":selection.onu_id,
         "created_at":now()});
     let save = |value: &serde_json::Value| -> io::Result<()> {
@@ -89,18 +86,17 @@ pub async fn execute_async(
         && result.result.status == command::CommandStatus::Executed
         && result.result.exit_code == Some(0)
     {
-        intent["pending"] = false.into();
-        save(&intent)?;
+        crate::provisioning::storage::remove_registry(&path).map_err(io::Error::other)?;
     }
     Ok(result)
 }
 
 pub(super) fn ensure_no_pending(serial: &str) -> io::Result<()> {
     for path in [
-        crate::provisioning::storage::registry_path("/etc/fttr/command-external", serial),
+        crate::provisioning::runtime_store::Record::External.path(serial),
         super::provisioning::ownership_path(serial),
     ] {
-        match std::fs::read(path) {
+        match crate::provisioning::storage::read(path) {
             Ok(bytes) => {
                 let value: serde_json::Value =
                     serde_json::from_slice(&bytes).map_err(io::Error::other)?;
@@ -227,7 +223,7 @@ mod tests {
         let native = super::super::provisioning::ownership_path(serial);
         assert!(native.ends_with("/TEST00000017.json"));
         for path in [
-            crate::provisioning::storage::registry_path("/etc/fttr/command-external", serial),
+            crate::provisioning::runtime_store::Record::External.path(serial),
             native,
         ] {
             for bytes in [b"{\"pending\":true}".as_slice(), b"{", b"{}"] {

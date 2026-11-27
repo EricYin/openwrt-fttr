@@ -14,6 +14,9 @@ pub(crate) fn registry_path(directory: &str, id: &str) -> String {
 }
 
 pub(crate) fn remove_registry(path: &str) -> Result<(), String> {
+    if let Some(key) = path.strip_prefix(super::runtime_store::PREFIX) {
+        return super::runtime_store::remove(key).map_err(|e| e.to_string());
+    }
     match fs::remove_file(path) {
         Ok(()) => fs::File::open(
             Path::new(path)
@@ -59,6 +62,9 @@ fn sync_file(file: &fs::File) -> io::Result<()> {
 /// identical-content path: a previous attempt may have renamed successfully but
 /// failed to sync the directory. Retrying must finish that commit, not assume it.
 pub(crate) fn write_atomic(path: &str, data: &[u8], sync_directory: bool) -> io::Result<()> {
+    if let Some(key) = path.strip_prefix(super::runtime_store::PREFIX) {
+        return super::runtime_store::write(key, data);
+    }
     let directory = Path::new(path).parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "state path has no directory")
     })?;
@@ -123,7 +129,7 @@ pub(crate) mod test_io {
         static EVENTS: RefCell<Vec<Point>> = const { RefCell::new(Vec::new()) };
     }
     pub fn registry_directory(directory: &str) -> String {
-        if !directory.starts_with("/etc/fttr/") {
+        if !directory.starts_with("/etc/fttr/") && !directory.starts_with("/tmp/fttr/") {
             return directory.to_owned();
         }
         DIRECTORY.with(|root| {
@@ -150,6 +156,21 @@ pub(crate) mod test_io {
             }
         })
     }
+}
+
+pub(crate) fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    let path = path.as_ref();
+    if let Some(key) = path
+        .to_str()
+        .and_then(|s| s.strip_prefix(super::runtime_store::PREFIX))
+    {
+        return super::runtime_store::read(key);
+    }
+    fs::read(path)
+}
+
+pub(crate) fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
+    String::from_utf8(read(path)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 #[cfg(test)]

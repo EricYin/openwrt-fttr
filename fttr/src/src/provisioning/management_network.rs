@@ -19,7 +19,9 @@ mod verification;
 use verification::dhcp_range_matches;
 use verification::{verify_bridge, verify_dhcp, verify_firewall, verify_network};
 
-const JOURNAL: &str = "/etc/fttr/management-applied.json";
+fn journal_path() -> String {
+    super::runtime_store::Record::Management.path("")
+}
 type Sections = BTreeMap<String, Section>;
 use fttr_api::NetworkPhase as Phase;
 
@@ -225,13 +227,13 @@ struct Coordinator {
 static COORDINATOR: OnceLock<Mutex<Coordinator>> = OnceLock::new();
 fn coordinator() -> &'static Mutex<Coordinator> {
     COORDINATOR.get_or_init(|| {
-        let (journal, error) = match std::fs::read(JOURNAL) { Ok(bytes) => match serde_json::from_slice(&bytes) { Ok(j) => (j, None), Err(_) => (Journal::default(), Some("management journal is invalid or uses the old scalar VLAN format; explicitly apply the VLAN list configuration".into())) }, Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Journal::default(), None), Err(_) => (Journal::default(), Some("management journal cannot be read".into())) };
+        let (journal, error) = match storage::read(journal_path()) { Ok(bytes) => match serde_json::from_slice(&bytes) { Ok(j) => (j, None), Err(_) => (Journal::default(), Some("management journal is invalid or uses the old scalar VLAN format; explicitly apply the VLAN list configuration".into())) }, Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Journal::default(), None), Err(_) => (Journal::default(), Some("management journal cannot be read".into())) };
         Mutex::new(Coordinator { journal, saved:None, requires_apply:error.is_some(), busy:false, state:Phase::Discovering, error, plan:json!([]), next_retry:0, attempts:0, ready:false, last_discovery:0 })
     })
 }
 fn persist(c: &mut Coordinator) -> Result<(), String> {
     persist_journal(&c.journal, &mut c.saved, |bytes| {
-        storage::write_atomic(JOURNAL, bytes, true)
+        storage::write_atomic(&journal_path(), bytes, true)
     })
 }
 fn persist_journal(

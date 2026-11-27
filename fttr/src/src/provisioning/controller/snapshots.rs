@@ -2,9 +2,9 @@
 use super::*;
 use crate::provisioning::storage;
 use serde::{Deserialize, Serialize};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
-const DIRECTORY: &str = "/etc/fttr/provisioning-snapshots";
+const DIRECTORY: &str = "/tmp/fttr/state/recovery";
 const MAX_DEVICES: usize = 256; // Includes retained orphan transactions.
 const MAX_BYTES: usize = 128 * 1024;
 const LEGACY_BYTES: usize = 4 * 1024 * 1024;
@@ -25,11 +25,19 @@ struct Snapshot {
     serial: String,
     cwmp_id: String,
     operation: Option<Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     owned: BTreeMap<String, wan::Owned>,
+    #[serde(default, skip_serializing_if = "is_default")]
     attempts: u32,
+    #[serde(default, skip_serializing_if = "is_default")]
     retry_at: u64,
+    #[serde(default, skip_serializing_if = "is_default")]
     reasons: scheduler::Reasons,
+    #[serde(default, skip_serializing_if = "is_default")]
     read: ReadRecovery,
+}
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,9 +135,14 @@ pub(super) struct Store {
 
 fn read_bounded(path: &str, max: usize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take((max + 1) as u64)
-        .read_to_end(&mut bytes)?;
+    if path.starts_with(crate::provisioning::runtime_store::PREFIX) {
+        bytes = storage::read(path)?;
+    } else {
+        use std::io::Read;
+        std::fs::File::open(path)?
+            .take((max + 1) as u64)
+            .read_to_end(&mut bytes)?;
+    }
     if bytes.len() > max {
         return Err(io::Error::other("recovery state exceeds size limit"));
     }
@@ -137,6 +150,44 @@ fn read_bounded(path: &str, max: usize) -> io::Result<Vec<u8>> {
 }
 fn invalid() -> io::Error {
     io::Error::other("invalid recovery schema, identity, or budget")
+}
+fn intent_view(view: &Value) -> Value {
+    let mut intent = serde_json::Map::new();
+    for key in [
+        "device",
+        "optical_sn",
+        "cwmp_id",
+        "operation_id",
+        "mode",
+        "state",
+        "revision",
+        "unresolved_operation",
+    ] {
+        if let Some(value) = view.get(key) {
+            intent.insert(key.into(), value.clone());
+        }
+    }
+    intent.insert("effect_uncertain".into(), Value::Bool(true));
+    intent.insert(
+        "items".into(),
+        Value::Array(
+            view["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|item| {
+                    let mut minimal = serde_json::Map::new();
+                    for key in ["id", "kind", "state", "reason"] {
+                        if let Some(value) = item.get(key) {
+                            minimal.insert(key.into(), value.clone());
+                        }
+                    }
+                    Value::Object(minimal)
+                })
+                .collect(),
+        ),
+    );
+    Value::Object(intent)
 }
 impl Snapshot {
     fn validate(&self) -> io::Result<()> {
@@ -193,6 +244,9 @@ impl Store {
         json!({"schema":2,"state":if self.blocked() {"blocked"} else {"durable"},"error":self.error,"devices":self.frames.len(),"files":1,"per_device_limit":MAX_BYTES,"total_limit":MAX_TOTAL_BYTES,"durable_bytes":self.acknowledged.len()})
     }
     fn file_path(&self) -> String {
+        if self.directory == DIRECTORY {
+            return crate::provisioning::runtime_store::Record::Recovery.path("");
+        }
         format!("{}.json", self.directory)
     }
     fn index_path(&self) -> String {
@@ -378,33 +432,32 @@ impl Controller {
                 self.restore_frames(&store);
             }
             Ok(false) => {
-                let result =
-                    match read_bounded("/var/lib/fttr/provisioning-state.json", LEGACY_BYTES) {
-                        Ok(bytes) => {
-                            // Validate before using the legacy decoder, which historically
-                            // ignored malformed input. Do not silently migrate empty state.
-                            serde_json::from_slice::<Value>(&bytes)
-                                .map_err(|_| invalid())
-                                .and_then(|v| {
-                                    let ops = v["operations"].as_array().ok_or_else(invalid)?;
-                                    if ops.len() > MAX_DEVICES || !v["owned"].is_object() {
+                let result = match read_bounded("/tmp/fttr/provisioning-state.json", LEGACY_BYTES) {
+                    Ok(bytes) => {
+                        // Validate before using the legacy decoder, which historically
+                        // ignored malformed input. Do not silently migrate empty state.
+                        serde_json::from_slice::<Value>(&bytes)
+                            .map_err(|_| invalid())
+                            .and_then(|v| {
+                                let ops = v["operations"].as_array().ok_or_else(invalid)?;
+                                if ops.len() > MAX_DEVICES || !v["owned"].is_object() {
+                                    return Err(invalid());
+                                }
+                                for op in ops {
+                                    if !op["device"].is_string()
+                                        || !op["optical_sn"].is_string()
+                                        || !op["items"].is_array()
+                                    {
                                         return Err(invalid());
                                     }
-                                    for op in ops {
-                                        if !op["device"].is_string()
-                                            || !op["optical_sn"].is_string()
-                                            || !op["items"].is_array()
-                                        {
-                                            return Err(invalid());
-                                        }
-                                    }
-                                    self.recover(&bytes);
-                                    Ok(())
-                                })
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                        Err(e) => Err(e),
-                    };
+                                }
+                                self.recover(&bytes);
+                                Ok(())
+                            })
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                };
                 if let Err(e) = result {
                     store.error = Some(e.to_string());
                     store.load_error = true;
@@ -419,7 +472,7 @@ impl Controller {
         if self.persist_snapshots() {
             // Migration is durable before program_start.
             #[cfg(not(test))]
-            if let Err(e) = storage::remove_registry("/var/lib/fttr/provisioning-state.json") {
+            if let Err(e) = storage::remove_registry("/tmp/fttr/provisioning-state.json") {
                 eprintln!("[provisioning] retire obsolete UI cache: {e}");
             }
         }
@@ -470,10 +523,22 @@ impl Controller {
             let Some((serial, cwmp_id)) = identity else {
                 continue;
             };
+            let retain = self.operations.get(id).is_some_and(|op| {
+                op.facts().unresolved || (op.apply && op.stage != OperationPhase::Completed)
+            }) || self
+                .recovered
+                .get(id)
+                .is_some_and(|op| facts::Facts::recovered(op).unresolved);
+            if !retain {
+                store.frames.remove(id);
+                continue;
+            }
             let active = self.operations.get(id).map(Operation::view);
-            let operation = active.as_ref().or_else(|| self.recovered.get(id));
-            let empty_owned = BTreeMap::new();
-            let owned = self.owned.get(cwmp_id).unwrap_or(&empty_owned);
+            let minimal = active
+                .as_ref()
+                .or_else(|| self.recovered.get(id))
+                .map(intent_view);
+            let operation = minimal.as_ref();
             if !store.frames.contains_key(id) {
                 store.frames.insert(
                     id.into(),
@@ -503,15 +568,15 @@ impl Controller {
             if frame.operation.as_ref() != operation {
                 // Active views are already owned temporaries. Move them into
                 // the checkpoint instead of cloning a second full JSON tree.
-                frame.operation = active.or_else(|| self.recovered.get(id).cloned());
+                frame.operation = minimal;
             }
-            if &frame.owned != owned {
-                frame.owned.clone_from(owned);
-            }
-            frame.attempts = self.attempts.get(id).copied().unwrap_or(0);
-            frame.retry_at = self.next_retry_at.get(id).copied().unwrap_or(0);
-            frame.reasons = self.automatic_ready.get(id).copied().unwrap_or_default();
-            frame.read = self.read_recovery.get(id).cloned().unwrap_or_default();
+            // Only unresolved intent is a restart checkpoint. Derived histories,
+            // duplicate ownership, timers and retry episodes stay in memory.
+            frame.owned.clear();
+            frame.attempts = 0;
+            frame.retry_at = 0;
+            frame.reasons = scheduler::Reasons::default();
+            frame.read = ReadRecovery::default();
         }
         let success = match store.save(|path, bytes| storage::write_atomic(path, bytes, true)) {
             Ok(()) => {
@@ -536,6 +601,41 @@ impl Controller {
 mod tests {
     use super::*;
     use storage::test_io::{self, Point};
+
+    #[test]
+    fn completed_history_and_retry_timers_are_not_restart_records() {
+        let mut c = Controller::default();
+        let op = super::super::tests::operation(OperationPhase::Completed, false);
+        let id = op.device.id.clone();
+        c.config.devices.push(op.device.clone());
+        c.operations.insert(id.clone(), op);
+        c.attempts.insert(id.clone(), 5);
+        c.read_recovery.insert(
+            id.clone(),
+            ReadRecovery {
+                attempts: 3,
+                retry_at: 999,
+            },
+        );
+        c.snapshots = Some(store("minimal"));
+        assert!(c.persist_snapshots());
+        assert!(c.snapshots.as_ref().unwrap().frames.is_empty());
+        let mut op = super::super::tests::operation(OperationPhase::Writing, true);
+        op.results.insert(
+            "example".into(),
+            json!({"state":"unknown", "actual":"discard-me"}),
+        );
+        c.operations.insert(id.clone(), op);
+        assert!(c.persist_snapshots());
+        let frame = &c.snapshots.as_ref().unwrap().frames[&id];
+        assert_eq!(frame.attempts, 0);
+        assert_eq!(frame.read.attempts, 0);
+        assert!(frame.owned.is_empty());
+        assert!(!serde_json::to_string(&frame.operation)
+            .unwrap()
+            .contains("discard-me"));
+        assert!(facts::Facts::recovered(frame.operation.as_ref().unwrap()).unresolved);
+    }
 
     fn store(name: &str) -> Store {
         Store::new(test_io::registry_directory(&format!("{DIRECTORY}/{name}")))

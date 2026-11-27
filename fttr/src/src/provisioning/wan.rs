@@ -7,11 +7,11 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 const ROOT: &str = "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.";
 fn registry_path(id: &str) -> String {
-    super::storage::registry_path("/etc/fttr/wan-owned", id)
+    super::runtime_store::Record::Wan.path(id)
 }
 pub fn load(id: &str) -> Result<Option<BTreeMap<String, Owned>>, String> {
     let path = registry_path(id);
-    let text = match std::fs::read_to_string(path) {
+    let text = match super::storage::read_to_string(path) {
         Ok(v) => v,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("read WAN ownership: {e}")),
@@ -31,7 +31,7 @@ pub fn reset(id: &str) -> Result<(), String> {
 }
 #[cfg(feature = "acs")]
 pub fn parent_protected(id: &str, parent: u32) -> bool {
-    std::fs::read_to_string(registry_path(id))
+    super::storage::read_to_string(registry_path(id))
         .ok()
         .and_then(|v| serde_json::from_str::<Value>(&v).ok())
         .is_none_or(|v| {

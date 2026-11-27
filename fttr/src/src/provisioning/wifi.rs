@@ -13,7 +13,7 @@ pub struct Registry {
     pub pending_instance: Option<u32>,
 }
 fn path(id: &str) -> String {
-    super::storage::registry_path("/etc/fttr/wifi-owned", id)
+    super::runtime_store::Record::Wifi.path(id)
 }
 
 #[cfg(test)]
@@ -284,7 +284,7 @@ mod tests {
     }
 }
 pub fn load(id: &str) -> Result<Registry, String> {
-    let text = match std::fs::read_to_string(path(id)) {
+    let text = match super::storage::read_to_string(path(id)) {
         Ok(v) => v,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Registry::default()),
         Err(e) => return Err(format!("read Wi-Fi ownership: {e}")),

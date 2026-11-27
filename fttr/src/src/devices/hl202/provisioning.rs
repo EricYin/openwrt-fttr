@@ -631,10 +631,7 @@ fn write_script(diff: &Fields, removed: &BTreeSet<(u32, u32)>) -> String {
 }
 
 pub(super) fn ownership_path(serial: &str) -> String {
-    let directory = "/etc/fttr/command-owned";
-    #[cfg(test)]
-    let directory = crate::provisioning::storage::test_io::registry_directory(directory);
-    format!("{directory}/{serial}.json")
+    crate::provisioning::runtime_store::Record::Native.path(serial)
 }
 
 pub async fn run(
@@ -676,7 +673,7 @@ pub async fn run(
     let transaction = super::command::Transaction::acquire(&target_mac)
         .map_err(|e| format!("device transaction admission rejected: {e}"))?;
     let path = ownership_path(&device.optical_sn);
-    let owned: Ownership = match std::fs::read(&path) {
+    let owned: Ownership = match crate::provisioning::storage::read(&path) {
         Ok(bytes) => {
             serde_json::from_slice(&bytes).map_err(|_| "invalid command ownership journal")?
         }

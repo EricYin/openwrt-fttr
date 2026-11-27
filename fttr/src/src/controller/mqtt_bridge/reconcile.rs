@@ -13,7 +13,6 @@ use std::net::Ipv4Addr;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const IDENTITIES_PATH: &str = "/var/lib/fttr/mqtt-identities.json";
 const SUBDEV_DIR: &str = "/tmp/fttr_subdev";
 pub(super) const SYN_FRESHNESS: Duration = Duration::from_secs(120);
 const TRIAL_DURATION: Duration = Duration::from_secs(15);
@@ -146,15 +145,6 @@ fn seed_identities_once(c: &mut Coordinator) {
         return;
     }
     c.seeded_identities = true;
-    if let Ok(bytes) = std::fs::read(IDENTITIES_PATH) {
-        if let Ok(map) = serde_json::from_slice::<BTreeMap<String, String>>(&bytes) {
-            if let Ok(mut reg) = crate::mqtt_identity::shared().lock() {
-                for (sn, mac) in map {
-                    reg.seed_verified_report(&sn, &mac);
-                }
-            }
-        }
-    }
     #[cfg(feature = "device-hl202")]
     if let Ok(entries) = std::fs::read_dir(SUBDEV_DIR) {
         let mut count = 0usize;

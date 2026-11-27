@@ -9,6 +9,23 @@ pub(super) fn protect_management(
     args: &Value,
 ) -> Result<(), String> {
     const ROOT: &str = "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.";
+    if matches!(
+        method,
+        "SetParameterValues"
+            | "AddObject"
+            | "DeleteObject"
+            | "Reboot"
+            | "FactoryReset"
+            | "Download"
+    ) && state
+        .tasks
+        .values()
+        .any(|task| task.device == device && task.args["_restart_unresolved"] == true)
+    {
+        return Err(
+            "unresolved write from a prior process; transaction-aware recovery required".into(),
+        );
+    }
     let paths: Vec<&str> = match method {
         "SetParameterValues" => args["parameters"]
             .as_array()

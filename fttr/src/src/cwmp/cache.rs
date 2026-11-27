@@ -2,37 +2,36 @@
 //! registration/bootstrap epoch and a schema fingerprint from readonly discovery.
 use super::{contract::Contract, identity::Identity, registry};
 
-fn record_path(serial: &str) -> Option<std::path::PathBuf> {
+fn valid_serial(serial: &str) -> bool {
     if serial.len() != 12 || !serial.bytes().all(|b| b.is_ascii_alphanumeric()) {
-        return None;
+        return false;
     }
-    #[cfg(not(test))]
-    let root = std::path::PathBuf::from("/var/lib/fttr/cwmp-contracts");
-    #[cfg(test)]
-    let root = std::env::temp_dir().join(format!("fttr-contract-test-{}", std::process::id()));
-    Some(root.join(format!("{serial}.json")))
+    true
+}
+fn records() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 pub fn load_record(serial: &str) -> Option<serde_json::Value> {
-    let path = record_path(serial)?;
-    if std::fs::metadata(&path).ok()?.len() > 32768 {
-        return None;
-    }
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    records().lock().ok()?.get(serial).cloned()
 }
 pub fn save_record(serial: &str, value: &serde_json::Value) -> Result<(), String> {
-    let path = record_path(serial).ok_or("invalid cache identity")?;
-    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-    let temporary = path.with_extension("next");
-    std::fs::write(
-        &temporary,
-        serde_json::to_vec(value).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    std::fs::rename(temporary, path).map_err(|e| e.to_string())
+    if !valid_serial(serial) || serde_json::to_vec(value).map_err(|e| e.to_string())?.len() > 32768
+    {
+        return Err("invalid or oversized cache record".into());
+    }
+    let mut cache = records().lock().map_err(|_| "cache unavailable")?;
+    if cache.len() >= 128 && !cache.contains_key(serial) {
+        return Err("contract cache capacity reached".into());
+    }
+    cache.insert(serial.into(), value.clone());
+    Ok(())
 }
 pub fn invalidate_record(serial: &str) {
-    if let Some(path) = record_path(serial) {
-        let _ = std::fs::remove_file(path);
+    if let Ok(mut cache) = records().lock() {
+        cache.remove(serial);
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]

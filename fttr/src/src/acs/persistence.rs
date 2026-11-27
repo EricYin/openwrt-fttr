@@ -28,6 +28,33 @@ impl<W: Write> Write for LimitedWriter<W> {
 
 impl State {
     pub(super) fn load(path: &str) -> io::Result<Self> {
+        if path.starts_with(crate::provisioning::runtime_store::PREFIX) {
+            let bytes = match crate::provisioning::storage::read(path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+                Err(e) => return Err(e),
+            };
+            let mut state: Self = serde_json::from_slice(&bytes)?;
+            for task in state.tasks.values_mut() {
+                if !is_write(&task.method)
+                    || !matches!(
+                        task.state,
+                        TaskState::Sent | TaskState::Unknown | TaskState::AcceptedPendingApply
+                    )
+                {
+                    return Err(io::Error::other("invalid unresolved RPC checkpoint"));
+                }
+                task.state = TaskState::Unknown;
+                task.args = serde_json::json!({"_restart_unresolved":true});
+                task.result = Some(error_result(
+                    "unresolved write before process restart; fresh observation does not settle it",
+                ));
+                state
+                    .results
+                    .insert(task.id, super::retention::ResultInfo::protected());
+            }
+            return Ok(state);
+        }
         let file = match File::open(path) {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
@@ -105,6 +132,21 @@ impl Server {
             if let Some(reason) = &state.load_failure {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, reason.clone()));
             }
+            if self
+                .state_file
+                .starts_with(crate::provisioning::runtime_store::PREFIX)
+            {
+                let restart = restart_state(state);
+                if restart.tasks.is_empty() {
+                    return crate::provisioning::storage::remove_registry(&self.state_file)
+                        .map_err(io::Error::other);
+                }
+                return crate::provisioning::storage::write_atomic(
+                    &self.state_file,
+                    &serde_json::to_vec(&restart)?,
+                    true,
+                );
+            }
             let path = std::path::Path::new(&self.state_file);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
@@ -128,5 +170,78 @@ impl Server {
             *self.failure.lock().unwrap() = Some(format!("state persistence: {err}"));
         }
         result
+    }
+}
+
+fn is_write(method: &str) -> bool {
+    matches!(
+        method,
+        "SetParameterValues"
+            | "AddObject"
+            | "DeleteObject"
+            | "Reboot"
+            | "FactoryReset"
+            | "Download"
+    )
+}
+fn restart_state(state: &State) -> State {
+    let mut restart = State::default();
+    for task in state.tasks.values().filter(|t| {
+        is_write(&t.method)
+            && matches!(
+                t.state,
+                TaskState::Sent | TaskState::Unknown | TaskState::AcceptedPendingApply
+            )
+    }) {
+        restart.next_id = restart.next_id.max(task.id);
+        restart.tasks.insert(
+            task.id,
+            super::Task {
+                id: task.id,
+                device: task.device.clone(),
+                method: task.method.clone(),
+                args: serde_json::json!({"_restart_unresolved":true}),
+                state: task.state,
+                created: task.created,
+                sent: task.sent,
+                result: None,
+            },
+        );
+    }
+    restart
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    #[test]
+    fn restart_records_exclude_readbacks_credentials_queued_work_and_completed_history() {
+        let mut state = State::default();
+        for (id, method, phase) in [
+            (1, "SetParameterValues", TaskState::Sent),
+            (2, "GetParameterValues", TaskState::Sent),
+            (3, "AddObject", TaskState::Queued),
+            (4, "SetParameterValues", TaskState::Completed),
+        ] {
+            state.tasks.insert(
+                id,
+                super::super::Task {
+                    id,
+                    device: "TEST00000084".into(),
+                    method: method.into(),
+                    args: serde_json::json!({"password":"do-not-checkpoint"}),
+                    state: phase,
+                    created: 1,
+                    sent: Some(2),
+                    result: Some(error_result("do-not-checkpoint")),
+                },
+            );
+        }
+        let saved = restart_state(&state);
+        assert_eq!(saved.tasks.len(), 1);
+        assert_eq!(saved.tasks[&1].state, TaskState::Sent);
+        assert!(!String::from_utf8(serde_json::to_vec(&saved).unwrap())
+            .unwrap()
+            .contains("do-not-checkpoint"));
     }
 }

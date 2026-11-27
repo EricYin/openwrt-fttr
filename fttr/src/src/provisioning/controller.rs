@@ -408,6 +408,12 @@ impl Controller {
         if devices.iter().any(|d| self.unresolved_owner(d)) {
             return Err("unresolved prior write; transaction-aware recovery required before a new plan or apply".into());
         }
+        if apply && self.snapshots.is_some() {
+            for device in &devices {
+                super::runtime_store::approve(&device.optical_sn)
+                    .map_err(|e| format!("record explicit write admission: {e}"))?;
+            }
+        }
         let mut ids = Vec::new();
         for d in devices {
             self.next_id += 1;
@@ -482,6 +488,7 @@ impl Controller {
                 operation["next_retry_at"] = json!(next_retry);
             }
             operation["read_recovery"] = json!(self.read_recovery.get(&d.id));
+            operation["automatic_write_admission"] = json!(if self.snapshots.is_none() || super::runtime_store::approved(&d.optical_sn) { "approved" } else { "explicit_apply_required" });
             if !management_fresh && matches!(operation["state"].as_str(), Some("waiting" | "recovering")) {
                 operation["state"] = json!("waiting_management");
             }

@@ -11,7 +11,7 @@ pub(crate) struct StartupConfig {
 impl Default for StartupConfig {
     fn default() -> Self {
         Self {
-            acs_state_file: "/var/lib/fttr/acs-state.json".into(),
+            acs_state_file: String::new(),
             acs_username: String::new(),
             acs_password: String::new(),
             rx_snapshot: false,
@@ -66,7 +66,10 @@ fn from_view(view: &crate::config::View) -> Result<StartupConfig, &'static str> 
                 return Err("startup settings require unique scalar options");
             }
             match (section, key) {
-                ("acs", "state_file") => config.acs_state_file = option.value.clone(),
+                ("acs", "state_file") => {
+                    // Historical dump paths no longer select another writer.
+                    // Only unresolved RPC metadata uses the shared tmp store.
+                }
                 ("acs", "username") => config.acs_username = option.value.clone(),
                 ("acs", "password") => config.acs_password = option.value.clone(),
                 ("fiberhome", "rx_snapshot") => {
@@ -80,6 +83,7 @@ fn from_view(view: &crate::config::View) -> Result<StartupConfig, &'static str> 
             }
         }
     }
+    config.acs_state_file = crate::provisioning::runtime_store::Record::Acs.path("");
     Ok(config)
 }
 
@@ -90,7 +94,10 @@ mod tests {
     #[test]
     fn packaged_configuration_is_accepted() {
         let config = parse(include_str!("../../files/fttr.config")).unwrap();
-        assert_eq!(config.acs_state_file, "/var/lib/fttr/acs-state.json");
+        assert_eq!(
+            config.acs_state_file,
+            crate::provisioning::runtime_store::Record::Acs.path("")
+        );
         assert!(config.acs_username.is_empty());
         assert!(!config.rx_snapshot);
     }
@@ -98,11 +105,17 @@ mod tests {
     #[test]
     fn defaults_and_explicit_empty_values() {
         let defaults = parse("").unwrap();
-        assert_eq!(defaults.acs_state_file, "/var/lib/fttr/acs-state.json");
+        assert_eq!(
+            defaults.acs_state_file,
+            crate::provisioning::runtime_store::Record::Acs.path("")
+        );
         assert!(defaults.acs_username.is_empty());
         assert!(!defaults.rx_snapshot);
         let config = parse("config acs 'acs'\n option state_file ''\n option username ''\n option password 'a'\\''b'\n").unwrap();
-        assert_eq!(config.acs_state_file, "");
+        assert_eq!(
+            config.acs_state_file,
+            crate::provisioning::runtime_store::Record::Acs.path("")
+        );
         assert_eq!(config.acs_password, "a'b");
     }
 

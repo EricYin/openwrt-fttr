@@ -304,7 +304,11 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     c.last_online = fresh;
     c.dirty |= history_changed;
     c.persist_history(|data| {
-        storage::write_atomic("/var/lib/fttr/provisioning-state.json", data, false)
+        storage::write_atomic(
+            crate::provisioning::runtime_store::LEGACY_HISTORY,
+            data,
+            false,
+        )
     });
     if c.activate_pending_config() {
         // Do not wait for the periodic sweep after the final old operation finishes.
@@ -432,7 +436,7 @@ fn bootstrap_free_acs_consumers_require_current_listener_evidence_before_network
     ));
 }
 
-#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct Reasons(pub(super) u8);
 impl Reasons {
     fn add(&mut self, bit: u8, present: bool) {
@@ -448,6 +452,17 @@ fn retry_delay(attempts: u32) -> u64 {
 fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, time: u64) {
     if c.pending_config.is_some() {
         return;
+    }
+    // A tmpfs checkpoint missing after reboot cannot establish the fate of old
+    // remote writes. Discover afresh, but require explicit apply to rearm writes.
+    let write_admitted =
+        c.snapshots.is_none() || crate::provisioning::runtime_store::approved(&d.optical_sn);
+    if !write_admitted {
+        let previous = c.previous_facts(&d.id);
+        if reachable && previous.is_none() && c.config.enabled && c.config.automatic {
+            let _ = c.start_selected(&d.id, false, false, None);
+            return;
+        }
     }
     let previous = c.previous_facts(&d.id);
     let needs_reconcile = previous
@@ -543,7 +558,7 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
             && attempts < 5
             && time >= c.next_retry_at.get(&d.id).copied().unwrap_or(0)
         {
-            if c.start(&d.id, true, false).is_ok() {
+            if write_admitted && c.start(&d.id, true, false).is_ok() {
                 let next_attempts = attempts + 1;
                 c.attempts.insert(d.id.clone(), next_attempts);
                 c.next_retry_at.insert(
@@ -627,6 +642,33 @@ mod config_change_tests {
         c.config.devices.push(device.clone());
         c.operations.insert(device.id.clone(), op);
         (c, device)
+    }
+
+    #[test]
+    fn missing_volatile_approval_allows_only_reads_and_respects_automatic_policy() {
+        let (mut c, device) = fixture();
+        c.operations.clear();
+        c.load_snapshots();
+        c.startup_pending.insert(device.id.clone());
+        c.config.triggers.insert("startup".into());
+        c.config.automatic = false;
+        schedule(&mut c, &device, true, false, 100);
+        assert!(c.operations.is_empty());
+        c.config.automatic = true;
+        schedule(&mut c, &device, true, false, 101);
+        assert!(!c.operations[&device.id].apply);
+        let read_id = c.operations[&device.id].id;
+        c.operations.get_mut(&device.id).unwrap().complete(102);
+        schedule(&mut c, &device, true, true, 103);
+        assert_eq!(c.operations[&device.id].id, read_id);
+        assert!(!crate::provisioning::runtime_store::approved(
+            &device.optical_sn
+        ));
+        c.start_selected(&device.id, true, false, None).unwrap();
+        assert!(crate::provisioning::runtime_store::approved(
+            &device.optical_sn
+        ));
+        assert!(c.operations[&device.id].apply);
     }
 
     #[test]

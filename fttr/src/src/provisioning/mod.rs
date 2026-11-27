@@ -15,6 +15,7 @@ pub(crate) mod link_identity;
 pub(crate) mod management_network;
 pub mod model;
 mod policy;
+pub(crate) mod runtime_store;
 pub(crate) mod storage;
 mod templates;
 mod wan;

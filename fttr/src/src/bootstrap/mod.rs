@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const STATE_FILE: &str = "/etc/fttr/acs-bootstrap.json";
-const LEGACY_STATE_FILE: &str = "/var/lib/fttr/acs-bootstrap.json";
+fn state_path() -> String {
+    crate::provisioning::runtime_store::Record::Bootstrap.path("")
+}
 const MAX_ATTEMPTS: u32 = 5;
 
 use fttr_api::BootstrapPhase as Phase;
@@ -133,13 +134,7 @@ static COORDINATOR: OnceLock<Mutex<Coordinator>> = OnceLock::new();
 fn coordinator() -> &'static Mutex<Coordinator> {
     COORDINATOR.get_or_init(|| {
         let mut c = Coordinator::default();
-        let bytes = std::fs::read(STATE_FILE).or_else(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                std::fs::read(LEGACY_STATE_FILE)
-            } else {
-                Err(error)
-            }
-        });
+        let bytes = storage::read(state_path());
         match bytes {
             Ok(bytes) => match decode_records(&bytes) {
                 Ok(records) => c.records = records,
@@ -324,7 +319,9 @@ pub(super) fn tick(observation: Observation<'_>) {
     let mut c = coordinator().lock().unwrap();
     let job = c.schedule(observation, &sources);
     drop(sources);
-    let job = c.durable_job(job, |bytes| storage::write_atomic(STATE_FILE, bytes, true));
+    let job = c.durable_job(job, |bytes| {
+        storage::write_atomic(&state_path(), bytes, true)
+    });
     if let Some(job) = job {
         let key = (job.id.clone(), job.generation);
         let serial = c.records[&job.id].optical_sn.clone();
@@ -620,14 +617,42 @@ impl Coordinator {
 
 impl Coordinator {
     fn persist(&mut self) -> bool {
-        self.persist_with(|bytes| storage::write_atomic(STATE_FILE, bytes, true))
+        self.persist_with(|bytes| storage::write_atomic(&state_path(), bytes, true))
     }
 
     fn persist_with(&mut self, write: impl FnOnce(&[u8]) -> std::io::Result<()>) -> bool {
         if self.load_blocked {
             return false;
         }
-        let bytes = match serde_json::to_vec(&self.records) {
+        #[derive(Serialize)]
+        struct Intent<'a> {
+            optical_sn: &'a str,
+            cwmp_id: &'a str,
+            method: &'a str,
+            generation: u64,
+            write_pending: u64,
+            state: Phase,
+        }
+        let restart: BTreeMap<_, _> = self
+            .records
+            .iter()
+            .filter_map(|(id, record)| {
+                record.write_pending.map(|pending| {
+                    (
+                        id,
+                        Intent {
+                            optical_sn: &record.optical_sn,
+                            cwmp_id: &record.cwmp_id,
+                            method: &record.method,
+                            generation: record.generation,
+                            write_pending: pending,
+                            state: Phase::AwaitingApply,
+                        },
+                    )
+                })
+            })
+            .collect();
+        let bytes = match serde_json::to_vec(&restart) {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.persistence_error = Some(format!("bootstrap state encode: {error}"));
@@ -716,8 +741,13 @@ fn progress(id: &str, generation: u64, auth_epoch: u64, state: Phase, reason: &s
     if crate::omci_auth::serial_epoch(&r.optical_sn) != Some(auth_epoch) {
         return false;
     }
+    if matches!(state, Phase::Configuring | Phase::ConfiguringManagementWan)
+        && !crate::provisioning::runtime_store::approved(&r.optical_sn)
+    {
+        return false;
+    }
     c.advance(id, generation, state, now(), reason, |bytes| {
-        storage::write_atomic(STATE_FILE, bytes, true)
+        storage::write_atomic(&state_path(), bytes, true)
     })
 }
 
@@ -1170,12 +1200,13 @@ mod tests {
     #[test]
     fn failed_changed_snapshot_invalidates_ack_even_when_reverting_to_old_content() {
         let mut c = active_record();
+        c.records.get_mut("test-device").unwrap().write_pending = Some(7);
         assert!(c.persist_with(|_| Ok(())));
-        c.records.get_mut("test-device").unwrap().attempts = 2;
+        c.records.get_mut("test-device").unwrap().write_pending = Some(8);
         assert!(
             !c.persist_with(|_| Err(std::io::Error::other("directory sync failed after rename")))
         );
-        c.records.get_mut("test-device").unwrap().attempts = 1;
+        c.records.get_mut("test-device").unwrap().write_pending = Some(7);
         let mut wrote = false;
         assert!(c.persist_with(|_| {
             wrote = true;
@@ -1185,6 +1216,18 @@ mod tests {
             wrote,
             "a failed barrier invalidates the last acknowledged content cache"
         );
+    }
+
+    #[test]
+    fn derived_bootstrap_observations_do_not_rewrite_restart_state() {
+        let mut c = active_record();
+        assert!(c.persist_with(|bytes| {
+            assert_eq!(bytes, b"{}");
+            Ok(())
+        }));
+        c.records.get_mut("test-device").unwrap().attempts = 4;
+        c.records.get_mut("test-device").unwrap().last_inform = Some(999);
+        assert!(c.persist_with(|_| panic!("derived observations stay in memory")));
     }
 
     #[test]
