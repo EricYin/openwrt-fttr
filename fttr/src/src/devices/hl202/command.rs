@@ -311,6 +311,29 @@ impl Transaction {
         .await
     }
 
+    #[cfg(feature = "mqtt")]
+    pub(super) async fn probe_recovery(
+        &self,
+        selection: &crate::mqtt_identity::Selection,
+        request_id: &str,
+        expected_boot_id: &str,
+    ) -> Result<String, (String, bool)> {
+        let probe = super::provisioning::remote_status_probe(request_id, expected_boot_id)
+            .map_err(|reason| (reason, false))?;
+        let script = format!(
+            "{}\n{}\n{}",
+            super::provisioning::BOOT_PROBE,
+            probe,
+            super::provisioning::INVENTORY
+        );
+        super::provisioning::execute_once(self, selection, &script).await
+    }
+
+    #[cfg(feature = "mqtt")]
+    pub(super) fn acquire_for_recovery(target: &str) -> io::Result<Self> {
+        Self::acquire_inner(target, false)
+    }
+
     #[cfg(all(feature = "mqtt", feature = "diagnostics"))]
     pub(super) async fn restart_for_recovery(
         target: &str,

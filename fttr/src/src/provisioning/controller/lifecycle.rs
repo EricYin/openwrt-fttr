@@ -445,7 +445,7 @@ impl Controller {
         for (id, view) in self
             .operations
             .iter()
-            .filter(|(_, op)| op.observes().is_none())
+            .filter(|(_, op)| op.observes().is_none() && op.recovers().is_none())
             .map(|(id, op)| (id, op.view()))
             .chain(self.recovered.iter().map(|(id, op)| (id, op.clone())))
         {
@@ -482,7 +482,7 @@ impl Controller {
             !self
                 .operations
                 .get(id)
-                .is_some_and(|active| active.observes().is_none())
+                .is_some_and(|active| active.observes().is_none() && active.recovers().is_none())
                 && (facts::Facts::recovered(op).unresolved
                     || devices.iter().any(|d| {
                         &d.id == id

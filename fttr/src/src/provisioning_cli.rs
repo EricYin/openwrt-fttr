@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::io;
 use std::time::{Duration, Instant};
 pub fn run(command: &str, args: &[String]) -> io::Result<i32> {
-    let usage="fttrctl config check|reload\nfttrctl sync plan|apply|reconcile|retry [DEVICE|all] [--item SECTION] [--wait SECONDS] [--management]\nfttrctl sync observe DEVICE [--wait SECONDS]\nfttrctl sync reset_state DEVICE\nfttrctl sync management_plan|management_apply\nfttrctl sync status|operation ID";
+    let usage="fttrctl config check|reload\nfttrctl sync plan|apply|reconcile|recover|retry [DEVICE|all] [--item SECTION] [--wait SECONDS] [--management]\nfttrctl sync observe DEVICE [--wait SECONDS]\nfttrctl sync reset_state DEVICE\nfttrctl sync management_plan|management_apply\nfttrctl sync status|operation ID";
     let mut values = Vec::new();
     let mut wait = 0u64;
     let mut management = false;
@@ -48,6 +48,9 @@ pub fn run(command: &str, args: &[String]) -> io::Result<i32> {
         ("config", "check" | "reload", 1) | ("sync", "status", 1) => json!({"op":op}),
         ("sync", "plan" | "apply" | "reconcile" | "retry", 1..=2) => {
             json!({"op":op,"target":values.get(1).map(String::as_str).unwrap_or("all"),"management":management,"item":item})
+        }
+        ("sync", "recover", 1..=2) if !management && item.is_none() => {
+            json!({"op":op,"target":values.get(1).map(String::as_str).unwrap_or("all")})
         }
         ("sync", "observe" | "recover_reboot", 2) if !management && item.is_none() => {
             json!({"op":op,"target":values[1]})

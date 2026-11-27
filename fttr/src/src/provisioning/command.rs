@@ -135,6 +135,29 @@ impl Job {
         )
     }
 
+    pub(super) fn recover(device: Device, apply: bool, operation_id: u64) -> Self {
+        let auth_epoch = crate::omci_auth::serial_epoch(&device.optical_sn);
+        Self::spawn(apply, Duration::from_secs(8 * 60), async move {
+            #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
+            if let Some(epoch) = auth_epoch.filter(|_| device.provisioning_adapter == "hl202-mqtt")
+            {
+                return crate::omci_auth::execution_scope(
+                    device.optical_sn.clone(),
+                    epoch,
+                    crate::devices::hl202::provisioning::recover_pending(
+                        device,
+                        apply,
+                        operation_id,
+                        epoch,
+                    ),
+                )
+                .await;
+            }
+            let _ = (device, apply, operation_id, auth_epoch);
+            Err("HL202 transaction recovery unavailable or unauthorized".into())
+        })
+    }
+
     pub fn start(
         device: Device,
         apply: bool,

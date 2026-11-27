@@ -291,6 +291,13 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
         },
         time,
         |op| {
+            if op.recovers().is_some() {
+                return crate::provisioning::command::Job::recover(
+                    op.device.clone(),
+                    op.apply,
+                    op.id,
+                );
+            }
             if op.observes().is_some() {
                 return crate::provisioning::command::Job::observe(
                     op.device.clone(),

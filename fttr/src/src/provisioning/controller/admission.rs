@@ -69,6 +69,35 @@ impl Operation {
         outcome: Result<Value, crate::provisioning::command::Failure>,
         time: u64,
     ) {
+        if self.recovers().is_some() {
+            let result = match outcome {
+                Ok(recovery) => recovery,
+                Err(failure) => json!({
+                    "settled": false,
+                    "recovery_outcome": "retryable_failure",
+                    "recovery_state": "retry_scheduled",
+                    "observation_error": failure.reason,
+                    "write_performed": false,
+                    "readback_verified": false,
+                    "write_attempted": false,
+                    "terminal_received": false,
+                    "write_verified": false,
+                    "items": self.device.items.iter().map(|i| json!({
+                        "id": i.id,
+                        "kind": i.kind,
+                        "service_type": i.service_type,
+                        "state": "unknown",
+                        "reason": failure.reason,
+                    })).collect::<Vec<_>>(),
+                }),
+            };
+            let state = self.command_mut().unwrap();
+            state.result = Some(result);
+            state.job = None;
+            state.reservation = 0;
+            self.complete(time);
+            return;
+        }
         if self.observes().is_some() {
             let key = if self.command().unwrap().reboot_from.is_some() {
                 "restart"
@@ -200,7 +229,44 @@ impl Controller {
             .collect();
         for id in ids {
             let op = self.operations.remove(&id).unwrap();
-            if op.observes().is_some() {
+            if op.recovers().is_some() {
+                let view = op.view();
+                self.observations.insert(id.clone(), view.clone());
+                if view["settled"] == true {
+                    let mut settled = view;
+                    let matches_current = settled["settled_matches_current"] == true;
+                    settled["mode"] =
+                        json!(if settled["write_performed"] == true || matches_current {
+                            "apply"
+                        } else {
+                            "plan"
+                        });
+                    if !matches_current {
+                        settled["revision"] = settled["settled_revision"].clone();
+                    }
+                    let rev = settled["revision"].clone();
+                    let settled_op_id = settled["operation_id"].clone();
+                    if let Some(items) = settled["items"].as_array_mut() {
+                        for item in items {
+                            item["revision"] = rev.clone();
+                            item.as_object_mut().map(|m| {
+                                m.entry("operation_id")
+                                    .or_insert_with(|| settled_op_id.clone())
+                            });
+                        }
+                    }
+                    settled["unresolved_operation"] = Value::Null;
+                    settled["effect_uncertain"] = json!(false);
+                    settled["wifi_stage"] = json!("done");
+                    self.read_recovery.remove(&id);
+                    self.attempts.remove(&id);
+                    self.next_retry_at.remove(&id);
+                    self.recovered.insert(id.clone(), settled);
+                    if !matches_current {
+                        wake_device(&id);
+                    }
+                }
+            } else if op.observes().is_some() {
                 self.observations.insert(id, op.view());
             } else {
                 self.recovered.insert(id, op.view());

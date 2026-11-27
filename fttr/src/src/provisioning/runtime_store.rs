@@ -23,6 +23,7 @@ pub(crate) enum Record {
     Reset,
     Admission,
     Acs,
+    SecretKey,
 }
 impl Record {
     pub(crate) fn path(self, id: &str) -> String {
@@ -37,6 +38,7 @@ impl Record {
             Self::Reset => "reset-pending",
             Self::Admission => "admission",
             Self::Acs => "acs",
+            Self::SecretKey => "secret-key",
         };
         let directory = format!("{PREFIX}{name}");
         if id.is_empty() {
@@ -66,6 +68,60 @@ pub(crate) fn approve(serial: &str) -> io::Result<()> {
             .map_err(io::Error::other)?,
         true,
     )
+}
+pub(crate) fn secret_mac(node: &str, value: &str) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let path = Record::SecretKey.path("");
+    let key = match storage::read(&path) {
+        Ok(bytes) => {
+            let v: Value =
+                serde_json::from_slice(&bytes).map_err(|_| "invalid runtime secret key")?;
+            let hex = v["key"].as_str().ok_or("missing runtime secret key")?;
+            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("corrupt runtime secret key".into());
+            }
+            (0..32)
+                .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|_| "corrupt runtime secret key".to_string())?
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut key = [0u8; 32];
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| f.read_exact(&mut key))
+                .map_err(|err| format!("generate runtime secret key: {err}"))?;
+            let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+            storage::write_atomic(
+                &path,
+                &serde_json::to_vec(&serde_json::json!({"schema":1,"key":hex}))
+                    .map_err(|err| format!("serialize runtime secret key: {err}"))?,
+                true,
+            )
+            .map_err(|err| format!("persist runtime secret key: {err}"))?;
+            key.to_vec()
+        }
+        Err(e) => return Err(format!("read runtime secret key: {e}")),
+    };
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for (i, b) in key.iter().copied().enumerate() {
+        ipad[i] ^= b;
+        opad[i] ^= b;
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(node.as_bytes());
+    inner.update([0]);
+    inner.update(value.as_bytes());
+    let inner_hash = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_hash);
+    Ok(outer
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 const LIMIT: usize = 8 * 1024 * 1024;
 const RECORDS: usize = 2048;

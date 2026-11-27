@@ -1,8 +1,8 @@
 //! HL202 native tcapi contract. No CWMP paths or instance numbers cross this boundary.
-use super::{command::CommandStatus, command_binding};
+use super::{command::CommandStatus, command_binding, command_transport::PublicationState};
 use crate::{
     mqtt_identity::Selection,
-    provisioning::{model::*, storage},
+    provisioning::{model::*, runtime_store, storage},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -20,6 +20,8 @@ struct Inventory {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Ownership {
+    #[serde(default = "legacy_schema")]
+    schema_version: u32,
     #[serde(default)]
     revision: String,
     #[serde(default)]
@@ -30,6 +32,31 @@ struct Ownership {
     wan: BTreeMap<String, Owned>,
     #[serde(default)]
     pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_tx: Option<PendingTransaction>,
+}
+fn legacy_schema() -> u32 {
+    1
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingTransaction {
+    request_id: String,
+    boot_id: String,
+    dispatched_at: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    expected_fields: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    expected_secret_macs: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed_wans: Vec<(u32, u32)>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    item_fields: BTreeMap<String, Vec<(String, String)>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    item_meta: BTreeMap<String, (ItemKind, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_state: Option<String>,
+    #[serde(default)]
+    resume_attempts: u32,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Owned {
@@ -65,7 +92,7 @@ async fn execute(
         .map_err(|(reason, _)| reason)
 }
 
-async fn execute_once(
+pub(super) async fn execute_once(
     transaction: &super::command::Transaction,
     selection: &Selection,
     script: &str,
@@ -74,7 +101,7 @@ async fn execute_once(
         transaction,
         selection,
         script,
-        Duration::from_secs(90),
+        Duration::from_secs(15),
     )
     .await
     .map_err(|_| {
@@ -149,6 +176,204 @@ pub(super) fn valid_boot_id(id: &str) -> bool {
             }
         })
         && id.bytes().any(|b| !matches!(b, b'0' | b'-'))
+}
+
+pub(super) fn valid_request_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+pub(super) fn wrapped_write_script(
+    inner_script: &str,
+    request_id: &str,
+    expected_boot_id: &str,
+    operation_id: u64,
+) -> Result<String, String> {
+    if !valid_request_id(request_id) {
+        return Err("invalid execution request ID".into());
+    }
+    if !valid_boot_id(expected_boot_id) {
+        return Err("invalid expected ONU boot ID".into());
+    }
+    let inner = inner_script.trim_end();
+    Ok(format!(
+        r#"fttr_exec_dir=/tmp/.fttr-exec
+fttr_rec_dir="$fttr_exec_dir/receipts"
+fttr_lock_dir="$fttr_exec_dir/writer.lock.d"
+fttr_active="$fttr_exec_dir/active"
+fttr_req='{request_id}'
+fttr_exp_boot='{expected_boot_id}'
+fttr_op='{operation_id}'
+mkdir -p "$fttr_rec_dir" || exit 70
+if ! mkdir "$fttr_lock_dir" 2>/dev/null; then
+ printf 'FTTR_EXEC_BUSY\n'
+ exit 75
+fi
+fttr_boot=; read -r fttr_boot </proc/sys/kernel/random/boot_id 2>/dev/null || fttr_boot=
+if [ "$fttr_boot" != "$fttr_exp_boot" ]; then
+ rmdir "$fttr_lock_dir" 2>/dev/null || true
+ printf 'FTTR_EXEC_BOOT_MISMATCH|%s\n' "$fttr_boot"
+ exit 76
+fi
+fttr_rec="$fttr_rec_dir/$fttr_req"
+if [ -f "$fttr_rec" ]; then
+ IFS= read -r fttr_prev <"$fttr_rec" || fttr_prev=
+ case "$fttr_prev" in
+  'terminal|rc='*'|boot='*)
+   fttr_rc=${{fttr_prev#terminal|rc=}}
+   fttr_rc=${{fttr_rc%%|*}}
+   fttr_prev_boot=${{fttr_prev#*|boot=}}
+   fttr_prev_boot=${{fttr_prev_boot%%|*}}
+   if [ "$fttr_prev_boot" = "$fttr_boot" ]; then
+    rmdir "$fttr_lock_dir" 2>/dev/null || true
+    printf 'FTTR_EXEC_DEDUP|%s\n' "$fttr_rc"
+    [ "$fttr_rc" = "0" ] && printf 'FTTR_WRITE_COMPLETE\n'
+    exit "$fttr_rc"
+   fi
+   ;;
+ esac
+fi
+if ! (printf 'running|boot=%s|op=%s|pid=%s\n' "$fttr_boot" "$fttr_op" "$$" >"${{fttr_rec}}.tmp" && mv -f "${{fttr_rec}}.tmp" "$fttr_rec"); then
+ rmdir "$fttr_lock_dir" 2>/dev/null || true
+ exit 72
+fi
+printf '%s|%s|%s|%s\n' "$fttr_req" "$fttr_op" "$fttr_boot" "$$" >"${{fttr_active}}.tmp" && mv -f "${{fttr_active}}.tmp" "$fttr_active" || true
+(
+{inner}
+)
+fttr_rc=$?
+printf 'terminal|rc=%s|boot=%s|op=%s\n' "$fttr_rc" "$fttr_boot" "$fttr_op" >"${{fttr_rec}}.tmp" && mv -f "${{fttr_rec}}.tmp" "$fttr_rec"
+rm -f "$fttr_active"
+rmdir "$fttr_lock_dir" 2>/dev/null || true
+fttr_keep=0
+for fttr_old in $(ls -1t "$fttr_rec_dir" 2>/dev/null); do
+ case "$fttr_old" in
+  *.tmp|"$fttr_req") continue ;;
+ esac
+ fttr_keep=$((fttr_keep + 1))
+ if [ "$fttr_keep" -gt 16 ]; then
+  rm -f "$fttr_rec_dir/$fttr_old"
+ fi
+done
+if [ "$fttr_rc" -eq 0 ]; then
+ printf 'FTTR_WRITE_COMPLETE\n'
+else
+ printf 'FTTR_WRITE_FAILED|%s\n' "$fttr_rc"
+fi
+exit "$fttr_rc""#
+    ))
+}
+
+pub(super) fn remote_status_probe(
+    request_id: &str,
+    expected_boot_id: &str,
+) -> Result<String, String> {
+    if !valid_request_id(request_id) {
+        return Err("invalid execution request ID".into());
+    }
+    if !valid_boot_id(expected_boot_id) {
+        return Err("invalid expected ONU boot ID".into());
+    }
+    Ok(format!(
+        r#"fttr_exec_dir=/tmp/.fttr-exec
+fttr_rec="$fttr_exec_dir/receipts/{request_id}"
+fttr_lock_dir="$fttr_exec_dir/writer.lock.d"
+fttr_active="$fttr_exec_dir/active"
+fttr_exp_boot='{expected_boot_id}'
+fttr_boot=; read -r fttr_boot </proc/sys/kernel/random/boot_id 2>/dev/null || fttr_boot=
+if [ "$fttr_boot" != "$fttr_exp_boot" ]; then
+ printf 'EXEC_STATUS|rebooted||%s\n' "$fttr_boot"
+elif [ -f "$fttr_rec" ]; then
+ IFS= read -r fttr_line <"$fttr_rec" || fttr_line=
+ case "$fttr_line" in
+  'terminal|rc='*'|boot='*)
+   fttr_rc=${{fttr_line#terminal|rc=}}
+   fttr_rc=${{fttr_rc%%|*}}
+   fttr_rboot=${{fttr_line#*|boot=}}
+   fttr_rboot=${{fttr_rboot%%|*}}
+   if [ "$fttr_rboot" = "$fttr_boot" ]; then
+    printf 'EXEC_STATUS|finished|%s|%s\n' "$fttr_rc" "$fttr_boot"
+   else
+    printf 'EXEC_STATUS|unknown||%s\n' "$fttr_boot"
+   fi
+   ;;
+  'running|boot='*'|pid='*)
+   fttr_rboot=${{fttr_line#*|boot=}}
+   fttr_rboot=${{fttr_rboot%%|*}}
+   fttr_rpid=${{fttr_line##*|pid=}}
+   if [ "$fttr_rboot" = "$fttr_boot" ] && [ -d "$fttr_lock_dir" ] && [ -n "$fttr_rpid" ] && [ -d "/proc/$fttr_rpid" ] && tr '\0' ' ' <"/proc/$fttr_rpid/cmdline" 2>/dev/null | grep -q 'sh'; then
+    printf 'EXEC_STATUS|running|%s|%s\n' "$fttr_rpid" "$fttr_boot"
+   else
+    printf 'EXEC_STATUS|aborted||%s\n' "$fttr_boot"
+   fi
+   ;;
+  *)
+   printf 'EXEC_STATUS|unknown||%s\n' "$fttr_boot"
+   ;;
+ esac
+elif [ -d "$fttr_lock_dir" ]; then
+ fttr_act=
+ [ -f "$fttr_active" ] && IFS= read -r fttr_act <"$fttr_active" || fttr_act=
+ printf 'EXEC_STATUS|running|%s|%s\n' "$fttr_act" "$fttr_boot"
+else
+ printf 'EXEC_STATUS|missing||%s\n' "$fttr_boot"
+fi"#
+    ))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RemoteExecutionState {
+    Running,
+    Finished(i32),
+    Rebooted(String),
+    Aborted,
+    Missing,
+    Unknown,
+}
+
+impl RemoteExecutionState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Finished(_) => "finished",
+            Self::Rebooted(_) => "rebooted",
+            Self::Aborted => "aborted",
+            Self::Missing => "missing",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn confirmed_ended(&self) -> bool {
+        matches!(self, Self::Finished(_) | Self::Rebooted(_))
+    }
+
+    fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::Finished(rc) => Some(*rc),
+            _ => None,
+        }
+    }
+}
+
+fn parse_exec_status(line: &str) -> Result<RemoteExecutionState, String> {
+    let parts: Vec<_> = line.split('|').collect();
+    match parts.as_slice() {
+        ["EXEC_STATUS", "running", _, _] => Ok(RemoteExecutionState::Running),
+        ["EXEC_STATUS", "rebooted", _, boot] => {
+            if valid_boot_id(boot) {
+                Ok(RemoteExecutionState::Rebooted((*boot).to_ascii_lowercase()))
+            } else {
+                Ok(RemoteExecutionState::Unknown)
+            }
+        }
+        ["EXEC_STATUS", "finished", rc, _] => match rc.parse::<i32>() {
+            Ok(code) => Ok(RemoteExecutionState::Finished(code)),
+            Err(_) => Ok(RemoteExecutionState::Unknown),
+        },
+        ["EXEC_STATUS", "aborted", _, _] => Ok(RemoteExecutionState::Aborted),
+        ["EXEC_STATUS", "missing", _, _] => Ok(RemoteExecutionState::Missing),
+        ["EXEC_STATUS", "unknown", _, _] => Ok(RemoteExecutionState::Unknown),
+        _ => Err("invalid remote execution status frame".into()),
+    }
 }
 
 pub(super) const INVENTORY: &str = r#"read_fields() {
@@ -587,7 +812,7 @@ fn differences(desired: &Desired, actual: &Inventory) -> Fields {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
-fn write_script(diff: &Fields, removed: &BTreeSet<(u32, u32)>) -> String {
+fn write_script_body(diff: &Fields, removed: &BTreeSet<(u32, u32)>) -> String {
     let mut script = String::from("set -e\n");
     let mut roots = BTreeSet::new();
     let wan_nodes: BTreeSet<_> = diff
@@ -646,7 +871,14 @@ fn write_script(diff: &Fields, removed: &BTreeSet<(u32, u32)>) -> String {
         }
         script.push_str(&format!("tcapi commit {} >/dev/null\n", quote(&root)));
     }
-    script.push_str("tcapi save >/dev/null\nprintf 'FTTR_WRITE_COMPLETE\\n'\n");
+    script.push_str("tcapi save >/dev/null\n");
+    script
+}
+
+#[cfg(test)]
+fn write_script(diff: &Fields, removed: &BTreeSet<(u32, u32)>) -> String {
+    let mut script = write_script_body(diff, removed);
+    script.push_str("printf 'FTTR_WRITE_COMPLETE\\n'\n");
     script
 }
 
@@ -684,6 +916,130 @@ fn load_ownership(serial: &str) -> Result<Ownership, String> {
     }
 }
 
+pub(crate) fn has_recoverable_tx(serial: &str) -> bool {
+    load_ownership(serial).is_ok_and(|o| o.pending && o.pending_tx.is_some())
+}
+
+fn parse_boot_and_inventory(text: &str) -> Result<(Option<String>, bool, Inventory), String> {
+    let (boot, rest) = text.split_once('\n').ok_or("missing boot probe frame")?;
+    let (boot_id, restart) = boot
+        .strip_prefix("BOOT|")
+        .and_then(|v| v.split_once('|'))
+        .ok_or("invalid boot probe frame")?;
+    let inventory = parse(rest)?;
+    let boot_id = valid_boot_id(boot_id).then(|| boot_id.to_ascii_lowercase());
+    Ok((boot_id, restart == "1", inventory))
+}
+
+fn parse_probe_recovery_output(
+    text: &str,
+) -> Result<(Option<String>, RemoteExecutionState, Inventory), String> {
+    let (boot, rest) = text.split_once('\n').ok_or("missing boot probe frame")?;
+    let (boot_id, _) = boot
+        .strip_prefix("BOOT|")
+        .and_then(|v| v.split_once('|'))
+        .ok_or("invalid boot probe frame")?;
+    let (exec_line, inv_text) = rest
+        .split_once('\n')
+        .ok_or("missing remote execution status frame")?;
+    let remote = parse_exec_status(exec_line)?;
+    let inventory = parse(inv_text)?;
+    let boot_id = valid_boot_id(boot_id).then(|| boot_id.to_ascii_lowercase());
+    Ok((boot_id, remote, inventory))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WriteReply {
+    Complete,
+    RemoteBusy,
+    BootMismatch(String),
+    RemoteFailed,
+    Uncertain,
+}
+
+fn parse_write_reply(reply: &command_binding::SelectedResult) -> WriteReply {
+    if !reply.binding_current {
+        return WriteReply::Uncertain;
+    }
+    if reply.result.output_truncated {
+        return WriteReply::Uncertain;
+    }
+    if reply.result.status == CommandStatus::Timeout {
+        return WriteReply::Uncertain;
+    }
+    let output = reply.result.output.as_deref().unwrap_or("");
+    if output.lines().any(|line| line == "FTTR_EXEC_BUSY") {
+        return WriteReply::RemoteBusy;
+    }
+    if let Some(boot) = output
+        .lines()
+        .find_map(|line| line.strip_prefix("FTTR_EXEC_BOOT_MISMATCH|"))
+    {
+        return WriteReply::BootMismatch(boot.to_string());
+    }
+    if reply.result.status == CommandStatus::Executed
+        && reply.result.exit_code == Some(0)
+        && output.lines().any(|line| line == "FTTR_WRITE_COMPLETE")
+    {
+        return WriteReply::Complete;
+    }
+    if reply.result.status == CommandStatus::Executed && reply.result.exit_code.is_some() {
+        return WriteReply::RemoteFailed;
+    }
+    WriteReply::Uncertain
+}
+
+fn build_pending_tx(
+    device: &Device,
+    desired: &Desired,
+    request_id: String,
+    boot_id: String,
+) -> Result<PendingTransaction, String> {
+    let mut expected_fields: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut expected_secret_macs = BTreeMap::new();
+    for ((node, key), value) in &desired.fields {
+        if key == "WPAPSK" {
+            expected_secret_macs.insert(node.clone(), runtime_store::secret_mac(node, value)?);
+        } else {
+            expected_fields
+                .entry(node.clone())
+                .or_default()
+                .insert(key.clone(), value.clone());
+        }
+    }
+    let item_fields = desired
+        .items
+        .iter()
+        .map(|(id, fields)| (id.clone(), fields.iter().cloned().collect()))
+        .collect();
+    let item_meta = device
+        .items
+        .iter()
+        .map(|item| (item.id.clone(), (item.kind, item.service_type.clone())))
+        .collect();
+    Ok(PendingTransaction {
+        request_id,
+        boot_id,
+        dispatched_at: now(),
+        expected_fields,
+        expected_secret_macs,
+        removed_wans: desired.removed.iter().copied().collect(),
+        item_fields,
+        item_meta,
+        remote_state: None,
+        resume_attempts: 0,
+    })
+}
+
+fn persist_ownership(path: &str, owned: &Ownership) -> Result<(), String> {
+    storage::write_atomic(
+        path,
+        &serde_json::to_vec(owned).map_err(|_| "serialize command journal")?,
+        true,
+    )
+    .map_err(|_| "persist command journal".to_string())
+}
+
 /// Observe current intent without asserting anything about the old writer.
 /// No write callback, ownership update, or raw inventory leaves this path.
 pub async fn observe(
@@ -695,20 +1051,15 @@ pub async fn observe(
         .await
         .map_err(|e| format!("inventory command failed: {e}"))?;
     let text = inventory_reply(reply).map_err(|(reason, _)| reason)?;
-    let (boot, text) = text.split_once('\n').ok_or("missing boot probe frame")?;
-    let (boot_id, restart) = boot
-        .strip_prefix("BOOT|")
-        .and_then(|v| v.split_once('|'))
-        .ok_or("invalid boot probe frame")?;
-    let inventory = parse(text)?;
+    let (boot_id, restart, inventory) = parse_boot_and_inventory(&text)?;
     if crate::omci_auth::serial_epoch(&device.optical_sn) != Some(auth_epoch) {
         return Err("OMCI authentication generation changed".into());
     }
     let owned = load_ownership(&device.optical_sn)?;
     let mut result = observation(device, &inventory, owned);
-    if valid_boot_id(boot_id) {
-        result["boot_id"] = json!(boot_id.to_ascii_lowercase());
-        result["restart_available"] = json!(restart == "1");
+    if let Some(boot_id) = boot_id {
+        result["boot_id"] = json!(boot_id);
+        result["restart_available"] = json!(restart);
     }
     Ok(result)
 }
@@ -795,17 +1146,20 @@ pub async fn run(
             reason.into()
         }
     };
+    let probe_script = format!("{BOOT_PROBE}\n{INVENTORY}");
     // Inventory is read-only. A timeout does not cancel the remote shell, so
     // only retry this initial read, never a write or its uncertain readback.
     let inventory_text = initial_inventory_with_retry(
-        || execute_once(&transaction, &selection, INVENTORY),
+        || execute_once(&transaction, &selection, &probe_script),
         check_auth,
         Duration::from_secs(2),
     )
     .await
     .map_err(read_failure)?;
-    let inventory = parse(&inventory_text).map_err(read_failure)?;
+    let (boot_id, _, inventory) =
+        parse_boot_and_inventory(&inventory_text).map_err(read_failure)?;
     check_auth().map_err(read_failure)?;
+    let request_id = super::command::request_id();
     reconcile(
         Transaction {
             device: &device,
@@ -814,22 +1168,37 @@ pub async fn run(
             revision: &revision,
             operation_id,
             binding_generation: &selection.binding_generation,
+            request_id: &request_id,
+            boot_id: boot_id.as_deref(),
         },
         inventory,
         owned,
-        |script| {
+        |req_id, script| {
             let selection = &selection;
             let transaction = &transaction;
-            async move { execute(transaction, selection, &script).await }
+            async move {
+                match command_binding::execute_request_async(
+                    transaction,
+                    selection,
+                    req_id,
+                    &script,
+                    Duration::from_secs(90),
+                )
+                .await
+                {
+                    Ok((reply, publication)) => Ok((parse_write_reply(&reply), publication)),
+                    Err((error, publication)) => {
+                        Err((format!("command transport failed: {error}"), publication))
+                    }
+                }
+            }
         },
-        |owned| {
-            storage::write_atomic(
-                &path,
-                &serde_json::to_vec(owned).map_err(|_| "serialize command journal")?,
-                true,
-            )
-            .map_err(|_| "persist command journal".to_string())
+        || {
+            let selection = &selection;
+            let transaction = &transaction;
+            async move { execute(transaction, selection, INVENTORY).await }
         },
+        |owned| persist_ownership(&path, owned),
         check_auth,
     )
     .await
@@ -842,6 +1211,8 @@ struct Transaction<'a> {
     revision: &'a str,
     operation_id: u64,
     binding_generation: &'a str,
+    request_id: &'a str,
+    boot_id: Option<&'a str>,
 }
 
 fn runtime_matches(
@@ -859,17 +1230,22 @@ fn runtime_matches(
     })
 }
 
-async fn reconcile<F, Fut, P, C>(
+async fn reconcile<FW, FutW, FR, FutR, P, C>(
     transaction: Transaction<'_>,
     inventory: Inventory,
     owned: Ownership,
-    mut execute: F,
+    mut execute_write: FW,
+    mut execute_read: FR,
     mut persist: P,
     check_auth: C,
 ) -> Result<Value, crate::provisioning::command::Failure>
 where
-    F: FnMut(String) -> Fut,
-    Fut: std::future::Future<Output = Result<String, String>>,
+    FW: FnMut(String, String) -> FutW,
+    FutW: std::future::Future<
+        Output = Result<(WriteReply, PublicationState), (String, PublicationState)>,
+    >,
+    FR: FnMut() -> FutR,
+    FutR: std::future::Future<Output = Result<String, String>>,
     P: FnMut(&Ownership) -> Result<(), String>,
     C: Fn() -> Result<(), String>,
 {
@@ -880,6 +1256,8 @@ where
         revision,
         operation_id,
         binding_generation,
+        request_id,
+        boot_id,
     } = transaction;
     let unresolved = owned.pending;
     let unresolved_operation = unresolved.then(|| json!({"revision":owned.revision,"operation_id":owned.operation_id,"binding_generation":owned.binding_generation}));
@@ -926,17 +1304,72 @@ where
     // Even a no-diff snapshot (or a plan) cannot settle that old transaction.
     let mut uncertain = unresolved;
     let mut write_dispatched = false;
+    let mut terminal_received = false;
+    let mut publication_state = None;
+    let mut remote_execution_state = None;
+    let mut dispatched_request_id = None;
     if apply && changed && !unresolved {
+        let boot_id = boot_id
+            .filter(|id| valid_boot_id(id))
+            .ok_or("valid ONU boot ID required before native write")?;
+        let pre_write_wan = desired.owned.wan.clone();
+        let pre_write_schema = desired.owned.schema_version;
+        let inner = write_script_body(&diff, &desired.removed);
+        let wrapped = wrapped_write_script(&inner, request_id, boot_id, operation_id)?;
+        let tx = build_pending_tx(device, &desired, request_id.into(), boot_id.into())?;
+        desired.owned.schema_version = 2;
         desired.owned.pending = true;
+        desired.owned.pending_tx = Some(tx);
         persist(&desired.owned)?;
-        let script = write_script(&diff, &desired.removed);
         check_auth()?;
-        write_dispatched = true;
-        uncertain = execute(script)
-            .await
-            .map_or(true, |s| s.trim() != "FTTR_WRITE_COMPLETE");
+        dispatched_request_id = Some(request_id.to_string());
+        match execute_write(request_id.to_string(), wrapped).await {
+            Ok((reply, publication)) => {
+                write_dispatched = true;
+                publication_state = Some(publication.as_str());
+                match reply {
+                    WriteReply::Complete => {
+                        terminal_received = true;
+                        remote_execution_state = Some("finished");
+                        uncertain = false;
+                    }
+                    WriteReply::RemoteFailed => {
+                        terminal_received = true;
+                        remote_execution_state = Some("finished");
+                        uncertain = true;
+                    }
+                    WriteReply::RemoteBusy => {
+                        remote_execution_state = Some("running");
+                        uncertain = true;
+                    }
+                    WriteReply::BootMismatch(_) => {
+                        remote_execution_state = Some("rebooted");
+                        uncertain = true;
+                    }
+                    WriteReply::Uncertain => {
+                        remote_execution_state = Some("unknown");
+                        uncertain = true;
+                    }
+                }
+            }
+            Err((reason, PublicationState::NotEnqueued)) => {
+                desired.owned.pending = false;
+                desired.owned.pending_tx = None;
+                desired.owned.wan = pre_write_wan;
+                desired.owned.schema_version = pre_write_schema;
+                persist(&desired.owned)
+                    .map_err(crate::provisioning::command::Failure::uncertain)?;
+                return Err(reason.into());
+            }
+            Err((_, publication)) => {
+                write_dispatched = true;
+                publication_state = Some(publication.as_str());
+                remote_execution_state = Some("unknown");
+                uncertain = true;
+            }
+        }
         check_auth().map_err(crate::provisioning::command::Failure::uncertain)?;
-        match execute(INVENTORY.into()).await.and_then(|s| parse(&s)) {
+        match execute_read().await.and_then(|s| parse(&s)) {
             Ok(readback) => actual = readback,
             Err(_) => uncertain = true,
         }
@@ -959,6 +1392,7 @@ where
             .wan
             .retain(|_, owned| !desired.removed.contains(&(owned.parent, owned.child)));
         desired.owned.pending = false;
+        desired.owned.pending_tx = None;
         persist(&desired.owned).map_err(|reason| {
             if write_dispatched {
                 crate::provisioning::command::Failure::uncertain(reason)
@@ -996,8 +1430,634 @@ where
         .get("wifi_cleanup")
         .map(|fields| result_for("wifi_cleanup", fields));
     Ok(
-        json!({"items":items,"wifi_lifecycle":cleanup.map(|v|json!({"native_cleanup":v})).unwrap_or(json!({})),"wan_lifecycle":{"final_inventory":{"state":if uncertain {"unknown"} else if verified {"verified"} else {"drift"},"reason":"native inventory; management/shared parents protected"}},"native_ownership":desired.owned.wan,"write_performed":write_dispatched,"readback_verified":verified,"unresolved_operation":unresolved_operation}),
+        json!({"items":items,"wifi_lifecycle":cleanup.map(|v|json!({"native_cleanup":v})).unwrap_or(json!({})),"wan_lifecycle":{"final_inventory":{"state":if uncertain {"unknown"} else if verified {"verified"} else {"drift"},"reason":"native inventory; management/shared parents protected"}},"native_ownership":desired.owned.wan,"write_performed":write_dispatched,"readback_verified":verified,"write_attempted":write_dispatched,"terminal_received":terminal_received,"write_verified":verified && write_dispatched,"publication_state":publication_state,"remote_execution_state":remote_execution_state,"request_id":dispatched_request_id,"unresolved_operation":unresolved_operation}),
     )
+}
+
+struct IntentComparison {
+    remaining_diff: Fields,
+    remaining_removed: BTreeSet<(u32, u32)>,
+    drifted_secrets: BTreeSet<String>,
+}
+
+fn verify_against_intent(
+    tx: &PendingTransaction,
+    owned_wan: &BTreeMap<String, Owned>,
+    actual: &Inventory,
+) -> Result<IntentComparison, String> {
+    let mut remaining_diff = Fields::new();
+    for (node, keys) in &tx.expected_fields {
+        for (key, value) in keys {
+            if actual.fields.get(&(node.clone(), key.clone())) != Some(value) {
+                remaining_diff.insert((node.clone(), key.clone()), value.clone());
+            }
+        }
+    }
+    let removed_set: BTreeSet<_> = tx.removed_wans.iter().copied().collect();
+    for owned in owned_wan.values() {
+        if removed_set.contains(&(owned.parent, owned.child)) {
+            continue;
+        }
+        let node = format!("Wan_PVC{}_Entry{}", owned.parent, owned.child);
+        if tx
+            .expected_fields
+            .get(&node)
+            .and_then(|fields| fields.get("Active"))
+            .is_some_and(|v| v == "Yes")
+            && get(actual, &node, "__runtime_present") != "1"
+        {
+            remaining_diff.insert((node, "Active".into()), "Yes".into());
+        }
+    }
+    let remaining_removed: BTreeSet<_> = removed_set
+        .into_iter()
+        .filter(|pair| actual.children.contains(pair))
+        .collect();
+    let mut drifted_secrets = BTreeSet::new();
+    for (node, expected_mac) in &tx.expected_secret_macs {
+        let actual_secret = get(actual, node, "WPAPSK");
+        let actual_mac = runtime_store::secret_mac(node, actual_secret)?;
+        if &actual_mac != expected_mac {
+            drifted_secrets.insert(node.clone());
+        }
+    }
+    Ok(IntentComparison {
+        remaining_diff,
+        remaining_removed,
+        drifted_secrets,
+    })
+}
+
+fn resolve_remaining_diff(
+    device: &Device,
+    tx: &PendingTransaction,
+    owned_wan: &BTreeMap<String, Owned>,
+    actual: &Inventory,
+    comparison: IntentComparison,
+) -> Result<(Fields, BTreeSet<(u32, u32)>), String> {
+    let mut diff = comparison.remaining_diff;
+    let removed = comparison.remaining_removed;
+    for node in comparison.drifted_secrets {
+        let expected_mac = &tx.expected_secret_macs[&node];
+        let mut matched_key = None;
+        for item in &device.items {
+            if let Some(wlan_intent) = &item.wlan_intent {
+                if wlan(&wlan_intent.endpoint).ok().as_deref() == Some(node.as_str()) {
+                    if let Some(key) = &wlan_intent.key {
+                        if runtime_store::secret_mac(&node, key)? == *expected_mac {
+                            matched_key = Some(key.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let Some(key) = matched_key else {
+            return Err("original Wi-Fi credential unavailable in current configuration; manual intervention required".into());
+        };
+        diff.insert((node, "WPAPSK".into()), key);
+    }
+    let tx_removed: BTreeSet<_> = tx.removed_wans.iter().copied().collect();
+    for owned in owned_wan.values() {
+        if tx_removed.contains(&(owned.parent, owned.child)) {
+            continue;
+        }
+        let parent_node = format!("Wan_PVC{}", owned.parent);
+        let node = format!("{parent_node}_Entry{}", owned.child);
+        if actual.children.contains(&(owned.parent, owned.child)) {
+            if protected(get(actual, &node, "ServiceList"))
+                || get(actual, &node, "ServiceList") != owned.service
+                || get(actual, &parent_node, "VLANID") != owned.vlan
+                || actual
+                    .children
+                    .iter()
+                    .any(|(p, c)| *p == owned.parent && *c != owned.child)
+            {
+                return Err(
+                    "owned WAN identity changed or shares a parent; manual intervention required"
+                        .into(),
+                );
+            }
+        } else if actual.parents.contains(&owned.parent) {
+            return Err("target WAN parent is no longer free; manual intervention required".into());
+        }
+    }
+    for (p, c) in &removed {
+        let parent_node = format!("Wan_PVC{p}");
+        let node = format!("{parent_node}_Entry{c}");
+        if protected(get(actual, &node, "ServiceList"))
+            || !owned_wan.values().any(|o| {
+                o.parent == *p
+                    && o.child == *c
+                    && get(actual, &node, "ServiceList") == o.service
+                    && get(actual, &parent_node, "VLANID") == o.vlan
+            })
+            || actual
+                .children
+                .iter()
+                .any(|(other_p, other_c)| other_p == p && other_c != c)
+        {
+            return Err(
+                "stale owned WAN changed or shares a parent; manual removal refused".into(),
+            );
+        }
+    }
+    for (node, keys) in &tx.expected_fields {
+        if let Some(active) = keys.get("Active") {
+            let parent = node.split("_Entry").next().unwrap_or(node);
+            if diff
+                .keys()
+                .any(|(changed, _)| changed == node || changed == parent)
+            {
+                diff.insert((node.clone(), "Active".into()), active.clone());
+            }
+        }
+    }
+    Ok((diff, removed))
+}
+
+fn evaluate_current_config(
+    device: &Device,
+    actual: &Inventory,
+    owned: &Ownership,
+) -> (bool, Vec<Value>, Value) {
+    match compile(device, actual, owned.clone(), true) {
+        Ok(desired) => {
+            let diff = differences(&desired, actual);
+            let items: Vec<_> = device
+                .items
+                .iter()
+                .map(|item| {
+                    let fields = &desired.items[&item.id];
+                    let matches = fields.iter().all(|k| desired.fields.get(k) == actual.fields.get(k))
+                        && runtime_matches(&desired, actual, fields);
+                    json!({
+                        "id": item.id,
+                        "kind": item.kind,
+                        "service_type": item.service_type,
+                        "state": if matches { "verified" } else { "drift" },
+                        "updated_at": now(),
+                        "reason": if matches { "native tcapi readback matches desired state" } else { "settled prior write; configuration drift remains for latest revision" },
+                        "changes": fields.iter().filter(|k| diff.contains_key(*k)).map(|(node, key)| {
+                            json!({"name": format!("{node}.{key}"), "desired": if key == "WPAPSK" { "<redacted>" } else { desired.fields.get(&(node.clone(), key.clone())).map(String::as_str).unwrap_or("") }})
+                        }).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            let cleanup = desired.items.get("wifi_cleanup").map(|fields| {
+                let matches = fields.iter().all(|k| desired.fields.get(k) == actual.fields.get(k))
+                    && runtime_matches(&desired, actual, fields);
+                json!({"native_cleanup": {"id": "wifi_cleanup", "state": if matches { "verified" } else { "drift" }, "updated_at": now(), "reason": if matches { "native tcapi readback matches desired state" } else { "configuration drift remains" }}})
+            }).unwrap_or_else(|| json!({}));
+            let all_match = diff.is_empty()
+                && desired
+                    .removed
+                    .iter()
+                    .all(|pair| !actual.children.contains(pair))
+                && desired
+                    .items
+                    .values()
+                    .all(|fields| runtime_matches(&desired, actual, fields));
+            (all_match, items, cleanup)
+        }
+        Err(reason) => {
+            let items = device
+                .items
+                .iter()
+                .map(|item| {
+                    json!({
+                        "id": item.id,
+                        "kind": item.kind,
+                        "service_type": item.service_type,
+                        "state": "blocked",
+                        "updated_at": now(),
+                        "reason": reason,
+                    })
+                })
+                .collect();
+            (false, items, json!({}))
+        }
+    }
+}
+
+fn unresolved_intent_items(tx: &PendingTransaction, state: &str, reason: &str) -> Vec<Value> {
+    tx.item_meta
+        .iter()
+        .map(|(id, (kind, service_type))| {
+            json!({
+                "id": id,
+                "kind": kind,
+                "service_type": service_type,
+                "state": state,
+                "updated_at": now(),
+                "reason": reason,
+            })
+        })
+        .collect()
+}
+
+pub async fn recover_pending(
+    device: Device,
+    apply: bool,
+    operation_id: u64,
+    auth_epoch: u64,
+) -> Result<Value, crate::provisioning::command::Failure> {
+    let check_auth = || {
+        if crate::omci_auth::serial_epoch(&device.optical_sn) == Some(auth_epoch) {
+            Ok(())
+        } else {
+            Err("OMCI authentication generation changed".to_string())
+        }
+    };
+    check_auth()?;
+    let (selection, target_mac) = selection(&device.optical_sn)?;
+    let transaction = super::command::Transaction::acquire_for_recovery(&target_mac)
+        .map_err(|e| format!("device transaction admission rejected: {e}"))?;
+    let path = ownership_path(&device.optical_sn);
+    let owned = load_ownership(&device.optical_sn)?;
+    let read_failure = |reason: String| {
+        if owned.pending {
+            crate::provisioning::command::Failure::uncertain(reason)
+        } else {
+            reason.into()
+        }
+    };
+    let probe_text = initial_inventory_with_retry(
+        || async {
+            match &owned.pending_tx {
+                Some(tx) => {
+                    transaction
+                        .probe_recovery(&selection, &tx.request_id, &tx.boot_id)
+                        .await
+                }
+                None => {
+                    let probe = format!("{BOOT_PROBE}\nEXEC_STATUS|unknown||\n{INVENTORY}");
+                    execute_once(&transaction, &selection, &probe).await
+                }
+            }
+        },
+        check_auth,
+        Duration::from_secs(2),
+    )
+    .await
+    .map_err(read_failure)?;
+    let (current_boot_id, remote, inventory) =
+        parse_probe_recovery_output(&probe_text).map_err(read_failure)?;
+    check_auth().map_err(read_failure)?;
+    let next_req = super::command::request_id();
+    recover_pending_core(
+        &device,
+        apply,
+        operation_id,
+        owned,
+        current_boot_id,
+        remote,
+        inventory,
+        &next_req,
+        |req_id, script| {
+            let selection = &selection;
+            let transaction = &transaction;
+            async move {
+                match command_binding::execute_request_async(
+                    transaction,
+                    selection,
+                    req_id,
+                    &script,
+                    Duration::from_secs(90),
+                )
+                .await
+                {
+                    Ok((reply, publication)) => Ok((parse_write_reply(&reply), publication)),
+                    Err((error, publication)) => {
+                        Err((format!("command transport failed: {error}"), publication))
+                    }
+                }
+            }
+        },
+        || {
+            let selection = &selection;
+            let transaction = &transaction;
+            async move { execute(transaction, selection, INVENTORY).await }
+        },
+        |owned| persist_ownership(&path, owned),
+        check_auth,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_pending_core<FW, FutW, FR, FutR, P, C>(
+    device: &Device,
+    apply: bool,
+    operation_id: u64,
+    mut owned: Ownership,
+    current_boot_id: Option<String>,
+    remote: RemoteExecutionState,
+    inventory: Inventory,
+    next_request_id: &str,
+    mut execute_write: FW,
+    mut execute_read: FR,
+    mut persist: P,
+    check_auth: C,
+) -> Result<Value, crate::provisioning::command::Failure>
+where
+    FW: FnMut(String, String) -> FutW,
+    FutW: std::future::Future<
+        Output = Result<(WriteReply, PublicationState), (String, PublicationState)>,
+    >,
+    FR: FnMut() -> FutR,
+    FutR: std::future::Future<Output = Result<String, String>>,
+    P: FnMut(&Ownership) -> Result<(), String>,
+    C: Fn() -> Result<(), String>,
+{
+    if !owned.pending {
+        let (all_match, items, cleanup) = evaluate_current_config(device, &inventory, &owned);
+        return Ok(json!({
+            "settled": true,
+            "settled_operation_id": owned.operation_id,
+            "settled_matches_current": all_match,
+            "recovery_outcome": "already_settled",
+            "recovery_state": "none",
+            "remote_execution_state": "finished",
+            "boot_id": current_boot_id,
+            "write_performed": false,
+            "readback_verified": all_match,
+            "write_attempted": false,
+            "terminal_received": true,
+            "write_verified": false,
+            "items": items,
+            "wifi_lifecycle": cleanup,
+            "native_ownership": owned.wan,
+        }));
+    }
+    let old_operation_id = owned.operation_id;
+    let Some(mut tx) = owned.pending_tx.clone() else {
+        let mut obs = observation(device, &inventory, owned);
+        obs["settled"] = json!(false);
+        obs["recovery_outcome"] = json!("legacy_pending");
+        obs["recovery_state"] = json!("manual_required");
+        obs["remote_execution_state"] = json!("legacy");
+        obs["boot_id"] = json!(current_boot_id);
+        obs["write_performed"] = json!(false);
+        obs["readback_verified"] = json!(false);
+        obs["manual_action"] = json!("legacy pending record lacks original intent and remote receipt; confirm old writer termination independently");
+        return Ok(obs);
+    };
+    if !remote.confirmed_ended() {
+        let is_running = remote == RemoteExecutionState::Running;
+        let recovery_state = if is_running {
+            "checking_execution"
+        } else {
+            "manual_required"
+        };
+        let recovery_outcome = if is_running {
+            "still_running"
+        } else {
+            "manual_required"
+        };
+        let manual_action = if is_running {
+            "remote writer is still running on the ONU; waiting before verification"
+        } else {
+            "remote execution termination could not be proven on the current ONU boot"
+        };
+        let items = unresolved_intent_items(&tx, "unknown", manual_action);
+        return Ok(json!({
+            "settled": false,
+            "recovery_outcome": recovery_outcome,
+            "recovery_state": recovery_state,
+            "remote_execution_state": remote.as_str(),
+            "boot_id": current_boot_id,
+            "write_performed": false,
+            "readback_verified": false,
+            "write_attempted": false,
+            "terminal_received": false,
+            "write_verified": false,
+            "manual_action": manual_action,
+            "items": items,
+            "native_ownership": owned.wan,
+        }));
+    }
+
+    let comparison = verify_against_intent(&tx, &owned.wan, &inventory)?;
+    if comparison.remaining_diff.is_empty()
+        && comparison.remaining_removed.is_empty()
+        && comparison.drifted_secrets.is_empty()
+    {
+        owned
+            .wan
+            .retain(|_, w| !tx.removed_wans.contains(&(w.parent, w.child)));
+        owned.pending = false;
+        owned.pending_tx = None;
+        persist(&owned).map_err(crate::provisioning::command::Failure::uncertain)?;
+        let (all_match, items, cleanup) = evaluate_current_config(device, &inventory, &owned);
+        return Ok(json!({
+            "settled": true,
+            "settled_operation_id": old_operation_id,
+            "settled_revision": owned.revision,
+            "settled_matches_current": all_match,
+            "recovery_outcome": "settled",
+            "recovery_state": "none",
+            "remote_execution_state": remote.as_str(),
+            "remote_exit_code": remote.exit_code(),
+            "boot_id": current_boot_id,
+            "write_performed": false,
+            "readback_verified": true,
+            "write_attempted": false,
+            "terminal_received": true,
+            "write_verified": false,
+            "items": items,
+            "wifi_lifecycle": cleanup,
+            "native_ownership": owned.wan,
+        }));
+    }
+
+    let (remaining_diff, remaining_removed) =
+        match resolve_remaining_diff(device, &tx, &owned.wan, &inventory, comparison) {
+            Ok(resolved) => resolved,
+            Err(conflict) => {
+                let items = unresolved_intent_items(&tx, "unknown", &conflict);
+                return Ok(json!({
+                    "settled": false,
+                    "recovery_outcome": "manual_required",
+                    "recovery_state": "manual_required",
+                    "remote_execution_state": remote.as_str(),
+                    "remote_exit_code": remote.exit_code(),
+                    "boot_id": current_boot_id,
+                    "write_performed": false,
+                    "readback_verified": false,
+                    "manual_action": conflict,
+                    "items": items,
+                    "native_ownership": owned.wan,
+                }));
+            }
+        };
+
+    if !apply {
+        let msg = "old execution ended with remaining drift; explicit apply or recover required";
+        let items = unresolved_intent_items(&tx, "unknown", msg);
+        return Ok(json!({
+            "settled": false,
+            "recovery_outcome": "drift_awaiting_apply",
+            "recovery_state": "manual_required",
+            "remote_execution_state": remote.as_str(),
+            "remote_exit_code": remote.exit_code(),
+            "boot_id": current_boot_id,
+            "write_performed": false,
+            "readback_verified": false,
+            "manual_action": msg,
+            "items": items,
+            "native_ownership": owned.wan,
+        }));
+    }
+
+    if tx.resume_attempts >= 2 {
+        let msg = "recovery write budget exhausted; manual inspection required";
+        let items = unresolved_intent_items(&tx, "unknown", msg);
+        return Ok(json!({
+            "settled": false,
+            "recovery_outcome": "manual_required",
+            "recovery_state": "manual_required",
+            "remote_execution_state": remote.as_str(),
+            "remote_exit_code": remote.exit_code(),
+            "boot_id": current_boot_id,
+            "write_performed": false,
+            "readback_verified": false,
+            "manual_action": msg,
+            "items": items,
+            "native_ownership": owned.wan,
+        }));
+    }
+
+    let cur_boot = current_boot_id
+        .clone()
+        .filter(|id| valid_boot_id(id))
+        .ok_or("valid ONU boot ID required before recovery write")?;
+    let prev_request_id = tx.request_id.clone();
+    let prev_boot_id = tx.boot_id.clone();
+    let wrapped = wrapped_write_script(
+        &write_script_body(&remaining_diff, &remaining_removed),
+        next_request_id,
+        &cur_boot,
+        operation_id,
+    )?;
+    tx.request_id = next_request_id.to_string();
+    tx.boot_id = cur_boot;
+    tx.resume_attempts += 1;
+    tx.remote_state = Some(remote.as_str().to_string());
+    owned.operation_id = operation_id;
+    owned.pending_tx = Some(tx.clone());
+    persist(&owned).map_err(crate::provisioning::command::Failure::uncertain)?;
+    check_auth().map_err(crate::provisioning::command::Failure::uncertain)?;
+
+    let mut terminal_received = false;
+    let publication_state;
+    let mut write_ok = false;
+    match execute_write(next_request_id.to_string(), wrapped).await {
+        Ok((reply, publication)) => {
+            publication_state = Some(publication.as_str());
+            match reply {
+                WriteReply::Complete => {
+                    terminal_received = true;
+                    write_ok = true;
+                }
+                WriteReply::RemoteFailed => {
+                    terminal_received = true;
+                }
+                WriteReply::RemoteBusy | WriteReply::BootMismatch(_) | WriteReply::Uncertain => {}
+            }
+        }
+        Err((reason, PublicationState::NotEnqueued)) => {
+            tx.request_id = prev_request_id;
+            tx.boot_id = prev_boot_id;
+            owned.operation_id = old_operation_id;
+            owned.pending_tx = Some(tx);
+            persist(&owned).map_err(crate::provisioning::command::Failure::uncertain)?;
+            return Err(crate::provisioning::command::Failure::uncertain(reason));
+        }
+        Err((_, publication)) => {
+            publication_state = Some(publication.as_str());
+        }
+    }
+
+    check_auth().map_err(crate::provisioning::command::Failure::uncertain)?;
+    let readback = match execute_read().await.and_then(|s| parse(&s)) {
+        Ok(readback) => readback,
+        Err(_) => {
+            let msg = "recovery write readback unavailable; retaining unresolved intent";
+            let items = unresolved_intent_items(&tx, "unknown", msg);
+            return Ok(json!({
+                "settled": false,
+                "recovery_outcome": "still_uncertain",
+                "recovery_state": "retry_scheduled",
+                "remote_execution_state": if write_ok { "finished" } else { "unknown" },
+                "boot_id": current_boot_id,
+                "write_performed": true,
+                "readback_verified": false,
+                "write_attempted": true,
+                "terminal_received": terminal_received,
+                "write_verified": false,
+                "publication_state": publication_state,
+                "request_id": next_request_id,
+                "items": items,
+                "native_ownership": owned.wan,
+            }));
+        }
+    };
+
+    let post_check = verify_against_intent(&tx, &owned.wan, &readback)?;
+    if write_ok
+        && post_check.remaining_diff.is_empty()
+        && post_check.remaining_removed.is_empty()
+        && post_check.drifted_secrets.is_empty()
+    {
+        owned
+            .wan
+            .retain(|_, w| !tx.removed_wans.contains(&(w.parent, w.child)));
+        owned.pending = false;
+        owned.pending_tx = None;
+        persist(&owned).map_err(crate::provisioning::command::Failure::uncertain)?;
+        let (all_match, items, cleanup) = evaluate_current_config(device, &readback, &owned);
+        return Ok(json!({
+            "settled": true,
+            "settled_operation_id": old_operation_id,
+            "settled_revision": owned.revision,
+            "settled_matches_current": all_match,
+            "recovery_outcome": "resumed_settled",
+            "recovery_state": "none",
+            "remote_execution_state": "finished",
+            "remote_exit_code": 0,
+            "boot_id": current_boot_id,
+            "write_performed": true,
+            "readback_verified": true,
+            "write_attempted": true,
+            "terminal_received": true,
+            "write_verified": true,
+            "publication_state": publication_state,
+            "request_id": next_request_id,
+            "items": items,
+            "wifi_lifecycle": cleanup,
+            "native_ownership": owned.wan,
+        }));
+    }
+
+    let msg = "remaining differences persist after recovery write";
+    let items = unresolved_intent_items(&tx, "unknown", msg);
+    Ok(json!({
+        "settled": false,
+        "recovery_outcome": "still_uncertain",
+        "recovery_state": "retry_scheduled",
+        "remote_execution_state": if write_ok { "finished" } else { "unknown" },
+        "boot_id": current_boot_id,
+        "write_performed": true,
+        "readback_verified": false,
+        "write_attempted": true,
+        "terminal_received": terminal_received,
+        "write_verified": false,
+        "publication_state": publication_state,
+        "request_id": next_request_id,
+        "items": items,
+        "native_ownership": owned.wan,
+    }))
 }
 
 #[cfg(test)]
@@ -1130,10 +2190,13 @@ mod tests {
                         revision: "new-revision",
                         operation_id: 42,
                         binding_generation: "new-binding",
+                        request_id: "req_legacy",
+                        boot_id: Some("73d5ff2a-4f34-409a-9577-166c32c0a83b"),
                     },
                     actual,
                     owned.clone(),
-                    |_| async { panic!("pending must not dispatch") },
+                    |_, _| async { panic!("pending must not dispatch") },
+                    || async { panic!("pending must not readback") },
                     |_| panic!("pending journal must remain byte-for-byte unchanged"),
                     || Ok(()),
                 )
@@ -1164,6 +2227,7 @@ mod tests {
             security: None,
             key: None,
         });
+        let boot_id = "73d5ff2a-4f34-409a-9577-166c32c0a83b";
         let transaction = || Transaction {
             device: &device,
             apply: true,
@@ -1171,12 +2235,15 @@ mod tests {
             revision: "new",
             operation_id: 42,
             binding_generation: "binding",
+            request_id: "req_42",
+            boot_id: Some(boot_id),
         };
         let result = reconcile(
             transaction(),
             parse(&complete_wifi_text("old")).unwrap(),
             Ownership::default(),
-            |_| async { panic!("failed intent must not dispatch") },
+            |_, _| async { panic!("failed intent must not dispatch") },
+            || async { panic!("failed intent must not readback") },
             |_| Err("injected save failure".into()),
             || Ok(()),
         )
@@ -1184,28 +2251,30 @@ mod tests {
         assert!(result.is_err());
         for terminal in [true, false] {
             let saves = RefCell::new(Vec::new());
-            let calls = RefCell::new(0);
+            let writes = RefCell::new(0);
+            let reads = RefCell::new(0);
             let result = reconcile(
                 transaction(),
                 parse(&complete_wifi_text("old")).unwrap(),
                 Ownership::default(),
-                |_| {
-                    *calls.borrow_mut() += 1;
-                    let n = *calls.borrow();
+                |_, _| {
+                    *writes.borrow_mut() += 1;
                     async move {
-                        if n == 1 {
-                            if terminal {
-                                Ok("FTTR_WRITE_COMPLETE".into())
-                            } else {
-                                Err("timeout".into())
-                            }
+                        if terminal {
+                            Ok((WriteReply::Complete, PublicationState::FlushConfirmed))
                         } else {
-                            Ok(complete_wifi_text("wanted"))
+                            Err(("timeout".into(), PublicationState::FlushConfirmed))
                         }
                     }
                 },
+                || {
+                    *reads.borrow_mut() += 1;
+                    async move { Ok(complete_wifi_text("wanted")) }
+                },
                 |owned| {
-                    saves.borrow_mut().push(owned.pending);
+                    saves
+                        .borrow_mut()
+                        .push((owned.pending, owned.pending_tx.is_some()));
                     Ok(())
                 },
                 || Ok(()),
@@ -1217,9 +2286,9 @@ mod tests {
             assert_eq!(
                 *saves.borrow(),
                 if terminal {
-                    vec![true, false]
+                    vec![(true, true), (false, false)]
                 } else {
-                    vec![true]
+                    vec![(true, true)]
                 }
             );
             assert_eq!(
@@ -1237,16 +2306,13 @@ mod tests {
                 transaction(),
                 parse(&complete_wifi_text("old")).unwrap(),
                 Ownership::default(),
-                |_| {
+                |_, _| {
                     *calls.borrow_mut() += 1;
-                    let n = *calls.borrow();
-                    async move {
-                        Ok(if n == 1 {
-                            "FTTR_WRITE_COMPLETE".into()
-                        } else {
-                            complete_wifi_text("wanted")
-                        })
-                    }
+                    async { Ok((WriteReply::Complete, PublicationState::FlushConfirmed)) }
+                },
+                || {
+                    *calls.borrow_mut() += 1;
+                    async { Ok(complete_wifi_text("wanted")) }
                 },
                 |_| {
                     *saves.borrow_mut() += 1;
@@ -1535,5 +2601,260 @@ mod tests {
         let script = write_script(&diff, &BTreeSet::new());
         assert!(script.contains("'a'\\''$(touch /tmp/unwanted)'"));
         assert!(script.find("tcapi commit").unwrap() < script.find("tcapi save").unwrap());
+    }
+
+    #[tokio::test]
+    async fn not_enqueued_write_rolls_back_pending_while_flushed_timeout_retains_verifiable_intent()
+    {
+        use std::cell::RefCell;
+        let (mut device, _) = fixture();
+        device.items[0].wan_intent = None;
+        device.items[0].wlan_intent = Some(WlanIntent {
+            endpoint: EndpointRef::Ssid { radio: 2, slot: 1 },
+            ssid: "wanted".into(),
+            enabled: Some(true),
+            broadcast: None,
+            security: None,
+            key: Some("secret-pass".into()),
+        });
+        let boot_id = "73d5ff2a-4f34-409a-9577-166c32c0a83b";
+        let persisted = RefCell::new(None::<Ownership>);
+        let err = reconcile(
+            Transaction {
+                device: &device,
+                apply: true,
+                full: true,
+                revision: "rev1",
+                operation_id: 10,
+                binding_generation: "b1",
+                request_id: "req_10",
+                boot_id: Some(boot_id),
+            },
+            parse(&complete_wifi_text("old")).unwrap(),
+            Ownership::default(),
+            |_, _| async { Err(("connect refused".into(), PublicationState::NotEnqueued)) },
+            || async { panic!("not_enqueued must not read back") },
+            |owned| {
+                *persisted.borrow_mut() = Some(owned.clone());
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.uncertain);
+        let rolled_back = persisted.borrow().clone().unwrap();
+        assert!(!rolled_back.pending);
+        assert!(rolled_back.pending_tx.is_none());
+
+        // Now simulate FlushConfirmed timeout: pending_tx is preserved without plaintext WPAPSK.
+        let reply = reconcile(
+            Transaction {
+                device: &device,
+                apply: true,
+                full: true,
+                revision: "rev1",
+                operation_id: 11,
+                binding_generation: "b1",
+                request_id: "req_11",
+                boot_id: Some(boot_id),
+            },
+            parse(&complete_wifi_text("old")).unwrap(),
+            Ownership::default(),
+            |_, _| async { Err(("timeout".into(), PublicationState::FlushConfirmed)) },
+            || async { Ok(complete_wifi_text("old")) },
+            |owned| {
+                *persisted.borrow_mut() = Some(owned.clone());
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["items"][0]["state"], "unknown");
+        assert_eq!(reply["publication_state"], "flush_confirmed");
+        let saved = persisted.borrow().clone().unwrap();
+        assert!(saved.pending);
+        let tx = saved.pending_tx.unwrap();
+        assert_eq!(tx.request_id, "req_11");
+        assert_eq!(tx.boot_id, boot_id);
+        assert!(tx.expected_secret_macs.contains_key("WLan_Entry0"));
+        assert!(!serde_json::to_string(&tx).unwrap().contains("secret-pass"));
+    }
+
+    #[tokio::test]
+    async fn recovery_handles_running_finished_partial_and_missing_receipts_without_blind_replay() {
+        use std::cell::RefCell;
+        let (mut device, _) = fixture();
+        device.items[0].wan_intent = None;
+        device.items[0].wlan_intent = Some(WlanIntent {
+            endpoint: EndpointRef::Ssid { radio: 2, slot: 1 },
+            ssid: "wanted".into(),
+            enabled: Some(true),
+            broadcast: None,
+            security: None,
+            key: Some("secret-pass".into()),
+        });
+        let boot_id = "73d5ff2a-4f34-409a-9577-166c32c0a83b";
+        let desired = compile(&device, &Inventory::default(), Ownership::default(), true).unwrap();
+        let tx = build_pending_tx(&device, &desired, "req_20".into(), boot_id.into()).unwrap();
+        let mut pending_owned = desired.owned.clone();
+        pending_owned.schema_version = 2;
+        pending_owned.pending = true;
+        pending_owned.operation_id = 20;
+        pending_owned.revision = "rev1".into();
+        pending_owned.pending_tx = Some(tx);
+
+        // 1. Still running: blocks writes, stays unresolved.
+        let running = recover_pending_core(
+            &device,
+            true,
+            21,
+            pending_owned.clone(),
+            Some(boot_id.into()),
+            RemoteExecutionState::Running,
+            parse(&complete_wifi_text("wanted")).unwrap(),
+            "req_21",
+            |_, _| async { panic!("running remote writer must block new writes") },
+            || async { panic!("no readback when not writing") },
+            |_| panic!("must not settle while running"),
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(running["settled"], false);
+        assert_eq!(running["recovery_outcome"], "still_running");
+        assert_eq!(running["recovery_state"], "checking_execution");
+
+        // 2. Missing receipt on same boot: stays manual_required, never assumes never-ran.
+        let missing = recover_pending_core(
+            &device,
+            true,
+            22,
+            pending_owned.clone(),
+            Some(boot_id.into()),
+            RemoteExecutionState::Missing,
+            parse(&complete_wifi_text("old")).unwrap(),
+            "req_22",
+            |_, _| async { panic!("missing receipt must not replay") },
+            || async { panic!("no readback") },
+            |_| panic!("must not clear pending"),
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing["settled"], false);
+        assert_eq!(missing["recovery_outcome"], "manual_required");
+
+        // 3. Finished(0) and matching inventory (including secret MAC): settles with 0 writes even when apply=false!
+        let mut matched_inv = parse(&complete_wifi_text("wanted")).unwrap();
+        matched_inv.fields.insert(
+            ("WLan_Entry0".into(), "WPAPSK".into()),
+            "secret-pass".into(),
+        );
+        let saved = RefCell::new(None::<Ownership>);
+        let settled = recover_pending_core(
+            &device,
+            false,
+            23,
+            pending_owned.clone(),
+            Some(boot_id.into()),
+            RemoteExecutionState::Finished(0),
+            matched_inv,
+            "req_23",
+            |_, _| async { panic!("matched intent must perform 0 writes") },
+            || async { panic!("no second readback needed") },
+            |owned| {
+                *saved.borrow_mut() = Some(owned.clone());
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(settled["settled"], true);
+        assert_eq!(settled["recovery_outcome"], "settled");
+        assert_eq!(settled["write_performed"], false);
+        assert_eq!(settled["readback_verified"], true);
+        assert!(!saved.borrow().as_ref().unwrap().pending);
+
+        // 4. Partial write (SSID written, WPAPSK still old) after Finished(1):
+        // resumes ONLY WPAPSK with a new request_id and settles!
+        let partial_inv = parse(&complete_wifi_text("wanted")).unwrap();
+        let dispatched_script = RefCell::new(String::new());
+        let saves = RefCell::new(Vec::new());
+        let mut updated_inv = partial_inv.clone();
+        updated_inv.fields.insert(
+            ("WLan_Entry0".into(), "WPAPSK".into()),
+            "secret-pass".into(),
+        );
+        let resumed = recover_pending_core(
+            &device,
+            true,
+            24,
+            pending_owned,
+            Some(boot_id.into()),
+            RemoteExecutionState::Finished(1),
+            partial_inv,
+            "req_24",
+            |req_id, script| {
+                assert_eq!(req_id, "req_24");
+                *dispatched_script.borrow_mut() = script;
+                async { Ok((WriteReply::Complete, PublicationState::FlushConfirmed)) }
+            },
+            || async { Ok(complete_wifi_text_with_secret("wanted", "secret-pass")) },
+            |owned| {
+                saves.borrow_mut().push((
+                    owned.pending,
+                    owned.pending_tx.as_ref().map(|t| t.request_id.clone()),
+                ));
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed["settled"], true);
+        assert_eq!(resumed["recovery_outcome"], "resumed_settled");
+        assert_eq!(resumed["write_performed"], true);
+        assert_eq!(resumed["readback_verified"], true);
+        assert!(dispatched_script.borrow().contains("WPAPSK"));
+        assert!(!dispatched_script.borrow().contains("'SSID'"));
+        assert_eq!(
+            *saves.borrow(),
+            vec![(true, Some("req_24".into())), (false, None)]
+        );
+    }
+
+    fn complete_wifi_text_with_secret(ssid: &str, secret: &str) -> String {
+        let mut text = String::new();
+        for radio in ["WLan", "WLan11ac"] {
+            for (node, keys) in std::iter::once((format!("{radio}_Common"), "APOn BssidNum")).chain(
+                (0..4).map(|slot| {
+                    (
+                    format!("{radio}_Entry{slot}"),
+                    "SSID EnableSSID HideSSID AuthMode EncrypType WPAPSK PMFMFPC PMFMFPR PMFSHA256",
+                )
+                }),
+            ) {
+                for key in keys.split_whitespace() {
+                    let value = match key {
+                        "BssidNum" => "4",
+                        "SSID" => ssid,
+                        "WPAPSK" if node == "WLan_Entry0" => secret,
+                        _ => "1",
+                    };
+                    text.push_str(&format!(
+                        "V|{node}|{key}|{}\n",
+                        value
+                            .bytes()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    ));
+                }
+            }
+        }
+        text.push_str("FTTR_INVENTORY_COMPLETE\n");
+        text
     }
 }

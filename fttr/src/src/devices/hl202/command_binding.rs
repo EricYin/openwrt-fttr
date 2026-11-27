@@ -124,12 +124,39 @@ pub(super) async fn execute_transaction_async(
         "127.0.0.1:1883".parse().unwrap(),
         crate::mqtt_identity::shared(),
         selection,
+        command::request_id(),
         script,
         timeout,
         now,
         Some(transaction),
     )
     .await
+    .map(|(result, _)| result)
+    .map_err(|failure| failure.error)
+}
+
+pub(super) async fn execute_request_async(
+    transaction: &command::Transaction,
+    selection: &Selection,
+    request_id: String,
+    script: &str,
+    timeout: Duration,
+) -> Result<
+    (SelectedResult, command_transport::PublicationState),
+    (io::Error, command_transport::PublicationState),
+> {
+    execute_at_async(
+        "127.0.0.1:1883".parse().unwrap(),
+        crate::mqtt_identity::shared(),
+        selection,
+        request_id,
+        script,
+        timeout,
+        now,
+        Some(transaction),
+    )
+    .await
+    .map_err(|failure| (failure.error, failure.publication))
 }
 
 #[cfg(test)]
@@ -142,46 +169,61 @@ fn execute_at(
     clock: impl Fn() -> u64,
 ) -> io::Result<SelectedResult> {
     crate::runtime::block_on(execute_at_async(
-        address, registry, selection, script, timeout, clock, None,
+        address,
+        registry,
+        selection,
+        command::request_id(),
+        script,
+        timeout,
+        clock,
+        None,
     ))
+    .map(|(result, _)| result)
+    .map_err(|failure| failure.error)
 }
 
 async fn execute_at_async(
     address: std::net::SocketAddr,
     registry: &Mutex<Registry>,
     selection: &Selection,
+    request_id: String,
     script: &str,
     timeout: Duration,
     clock: impl Fn() -> u64,
     transaction: Option<&command::Transaction>,
-) -> io::Result<SelectedResult> {
+) -> Result<(SelectedResult, command_transport::PublicationState), command_transport::TransportError>
+{
+    let not_enqueued = |error| command_transport::TransportError {
+        error,
+        publication: command_transport::PublicationState::NotEnqueued,
+    };
     let target = registry
         .lock()
-        .map_err(|_| io::Error::other("MQTT identity state unavailable"))?
+        .map_err(|_| not_enqueued(io::Error::other("MQTT identity state unavailable")))?
         .resolve(selection, clock())
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        .map_err(|message| not_enqueued(io::Error::new(io::ErrorKind::InvalidInput, message)))?;
     let owned_transaction;
     let transaction = match transaction {
         Some(transaction) => transaction,
         None => {
-            owned_transaction = command::Transaction::acquire(&target.mqtt_mac)?;
+            owned_transaction =
+                command::Transaction::acquire(&target.mqtt_mac).map_err(not_enqueued)?;
             &owned_transaction
         }
     };
     if transaction.target() != target.mqtt_mac || !transaction.matches_selection(selection) {
-        return Err(io::Error::new(
+        return Err(not_enqueued(io::Error::new(
             io::ErrorKind::InvalidInput,
             "transaction target changed",
-        ));
+        )));
     }
-    let _target_lock = command::lock_target(&target.mqtt_mac)?;
-    let id = command::request_id();
-    let result = command_transport::run(
+    let _target_lock = command::lock_target(&target.mqtt_mac).map_err(not_enqueued)?;
+    let (result, publication) = command_transport::run_tracked(
         address,
         command_transport::Request {
             target: target.mqtt_mac.clone(),
             script,
-            id,
+            id: request_id,
             timeout,
         },
         |session, topic, payload| {
@@ -200,14 +242,20 @@ async fn execute_at_async(
     .await?;
     let binding_current = registry
         .lock()
-        .map_err(|_| io::Error::other("MQTT identity state unavailable"))?
+        .map_err(|_| command_transport::TransportError {
+            error: io::Error::other("MQTT identity state unavailable"),
+            publication,
+        })?
         .resolve(selection, clock())
         .is_ok();
-    Ok(SelectedResult {
-        target,
-        result,
-        binding_current,
-    })
+    Ok((
+        SelectedResult {
+            target,
+            result,
+            binding_current,
+        },
+        publication,
+    ))
 }
 
 #[cfg(test)]

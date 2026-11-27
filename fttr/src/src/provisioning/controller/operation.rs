@@ -140,7 +140,7 @@ impl Operation {
     }
 
     pub(super) fn supersede_remaining(&mut self) {
-        if self.observes().is_some() {
+        if self.observes().is_some() || self.recovers().is_some() {
             self.finish_command(Err("superseded by a newer configuration".into()), now());
             return;
         }
@@ -163,6 +163,27 @@ impl Operation {
 
     pub(super) fn view(&self) -> Value {
         if let Some(state) = self.command() {
+            if let Some(old_id) = state.recovers {
+                let mut result = state.result.clone().unwrap_or_else(|| json!({"items":[]}));
+                result["operation_id"] = json!(self.id);
+                result["device"] = json!(self.device.id);
+                result["optical_sn"] = json!(self.device.optical_sn);
+                result["cwmp_id"] = json!(self.device.cwmp_id);
+                result["backend"] = self.device.backend_view();
+                result["omci_adapter"] = json!(self.device.omci_adapter);
+                result["bootstrap_adapter"] = json!(self.device.bootstrap_adapter);
+                result["provisioning_adapter"] = json!(self.device.provisioning_adapter);
+                result["mode"] = json!("recover");
+                result["state"] = json!(self.stage);
+                result["revision"] = json!(self.revision);
+                result["started_at"] = json!(self.started);
+                result["completed_at"] = json!(self.completed_at);
+                result["recovers_operation_id"] = json!(old_id);
+                if result.get("recovery_state").is_none() {
+                    result["recovery_state"] = json!("checking_execution");
+                }
+                return result;
+            }
             if let Some(old_id) = state.observes {
                 let mut result = state.result.clone().unwrap_or_else(|| json!({}));
                 result["operation_id"] = json!(self.id);

@@ -125,6 +125,7 @@ struct CommandExecution {
     result: Option<Value>,
     observes: Option<u64>,
     reboot_from: Option<String>,
+    recovers: Option<u64>,
 }
 enum Execution {
     Acs(Box<AcsExecution>),
@@ -182,6 +183,9 @@ impl Operation {
     }
     fn observes(&self) -> Option<u64> {
         self.command().and_then(|state| state.observes)
+    }
+    fn recovers(&self) -> Option<u64> {
+        self.command().and_then(|state| state.recovers)
     }
     fn unstarted(&self) -> bool {
         !self.work_started
@@ -533,7 +537,99 @@ impl Controller {
             } else {
                 aggregate(&ssids)
             };
-            let assignment=self.config.assignments.get(&d.id);
+            let device_facts = self
+                .business_operation(&d.id)
+                .map(Operation::facts)
+                .or_else(|| {
+                    self.recovered
+                        .get(&d.id)
+                        .or_else(|| self.recovery_owner(d))
+                        .map(facts::Facts::recovered)
+                });
+            if d.backend() != "disabled" {
+                let phase = match operation["state"].as_str() {
+                    Some("discovering" | "reading" | "disabling_read") => "inventory",
+                    Some("wan_reconciling" | "wifi_reconciling") => "planning",
+                    Some("writing" | "disabling") => "writing",
+                    Some("settling") => "settling",
+                    Some("verifying" | "wan_verifying" | "recovering") => "verifying",
+                    Some("completed" | "interrupted" | "disabled") => "finished",
+                    _ => "queued",
+                };
+                operation["phase"] = json!(phase);
+                if let Some(facts) = device_facts.as_ref() {
+                    let outcome = if facts.unresolved {
+                        "unknown"
+                    } else if facts.failed {
+                        "blocked"
+                    } else if facts.drift {
+                        "drift"
+                    } else if facts.verified {
+                        "verified"
+                    } else if facts.reconcile {
+                        "retryable_failure"
+                    } else {
+                        "pending"
+                    };
+                    operation["outcome"] = json!(outcome);
+                    let rec_state = operation
+                        .get("recovery_observation")
+                        .and_then(|o| o["recovery_state"].as_str())
+                        .unwrap_or_else(|| {
+                            if facts.unresolved {
+                                "manual_required"
+                            } else if !management_fresh && operation["state"] != "completed" {
+                                "waiting_transport"
+                            } else if self.next_retry_at.get(&d.id).is_some_and(|&t| t > 0)
+                                || self
+                                    .read_recovery
+                                    .get(&d.id)
+                                    .is_some_and(|r| r.attempts > 0)
+                            {
+                                "retry_scheduled"
+                            } else {
+                                "none"
+                            }
+                        });
+                    operation["recovery_state"] = json!(rec_state);
+                    if let Some(action) = operation
+                        .get("recovery_observation")
+                        .and_then(|o| o["manual_action"].as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        operation["manual_action"] = json!(action);
+                    }
+                    if facts.verified {
+                        if let Some(at) = operation["completed_at"].as_u64() {
+                            operation["last_verified_at"] = json!(at);
+                        }
+                        if let Some(rev) = operation["revision"].as_str().filter(|s| !s.is_empty())
+                        {
+                            operation["verified_revision"] = json!(rev);
+                        }
+                    }
+                    let affected: Vec<_> = items
+                        .iter()
+                        .filter(|i| {
+                            matches!(
+                                i["state"].as_str(),
+                                Some(
+                                    "unknown"
+                                        | "blocked"
+                                        | "failed"
+                                        | "drift"
+                                        | "reconcile_required"
+                                )
+                            )
+                        })
+                        .filter_map(|i| i["id"].as_str().map(str::to_owned))
+                        .collect();
+                    if !affected.is_empty() {
+                        operation["affected_items"] = json!(affected);
+                    }
+                }
+            }
+            let assignment = self.config.assignments.get(&d.id);
             json!({"device":d.id,"name":self.config.labels.get(&d.id),"group":assignment.map(|a|&a.0),"group_name":assignment.and_then(|a|self.config.labels.get(&a.0)),"template":assignment.map(|a|&a.1),"template_name":assignment.and_then(|a|self.config.labels.get(&a.1)),"optical_sn":d.optical_sn,"omci_adapter":d.omci_adapter,"bootstrap_adapter":d.bootstrap_adapter,"provisioning_adapter":d.provisioning_adapter,"omci_auth":crate::omci_auth::view(&d.optical_sn),"omci_management":self.omci_management_view(d),"management":self.management.get(&d.id),"mqtt":self.mqtt.get(&d.id),"mqtt_bridge":crate::controller::mqtt_bridge::device_view(&d.optical_sn),"acs_bootstrap":super::bootstrap::view(d,self.config.management.as_ref(),&self.acs_status),"provisioning":operation,"services":services,"ssids":ssids,"wifi_sync":wifi_sync})
         }).collect();
         json!({"enabled":self.config.enabled,"mode":if self.config.automatic {"auto"} else {"manual"},"method":"diff","revision":self.config.revision,"triggers":self.config.triggers,"interval_minutes":self.config.interval_seconds / 60,"omci_management":{"desired":self.config.management,"state":"not_verified"},"management_network":super::management_network::view(self.config.management_network.as_ref()),"mqtt_bridge":crate::controller::mqtt_bridge::global_view(),"acs_bridge":crate::controller::acs_bridge::global_view(),"groups":self.config.groups.iter().map(|(id,t)|json!({"id":id,"name":self.config.labels.get(id),"template":t})).collect::<Vec<_>>(),"error":self.failure,"devices":devices,"pending_devices":devices.iter().filter(|d| !matches!(d["provisioning"]["state"].as_str(),Some("completed" | "disabled"))).map(|d| d["device"].clone()).collect::<Vec<_>>()})
@@ -676,6 +772,7 @@ pub fn control(request: &str) -> String {
                     | "apply"
                     | "reconcile"
                     | "observe"
+                    | "recover"
                     | "recover_reboot"
                     | "retry"
             )
@@ -743,6 +840,12 @@ pub fn control(request: &str) -> String {
                 let mut c = controller().lock().unwrap();
                 let id = c.observe_selected(v["target"].as_str().unwrap_or(""))?;
                 Ok(json!({"operation_ids":[id],"mode":"observe"}))
+            }
+            "recover" => {
+                let target = v["target"].as_str().unwrap_or("all");
+                let mut c = controller().lock().unwrap();
+                let ids = c.recover_explicit(target)?;
+                Ok(json!({"operation_ids":ids,"mode":"recover"}))
             }
             "recover_reboot" => {
                 let mut c = controller().lock().unwrap();
