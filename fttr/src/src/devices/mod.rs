@@ -2,7 +2,7 @@
 use crate::cwmp;
 use crate::model::BusinessPhase;
 
-pub fn observe_mqtt_report(source: &str, payload: Vec<u8>, received: u64) -> bool {
+pub fn observe_mqtt_report(source: &str, payload: &[u8], received: u64) -> bool {
     #[cfg(all(feature = "device-hl202", feature = "mqtt"))]
     {
         hl202::telemetry::store::observe(source, payload, received)
@@ -861,4 +861,14 @@ mod tests {
 }
 pub fn supports_command_provisioning(adapter: &str) -> bool {
     cfg!(all(feature = "device-hl202", feature = "mqtt")) && adapter == "hl202"
+}
+pub(crate) fn mqtt_report_resources() -> serde_json::Value {
+    #[cfg(feature = "device-hl202")]
+    {
+        hl202::telemetry::store::usage()
+    }
+    #[cfg(not(feature = "device-hl202"))]
+    {
+        serde_json::Value::Null
+    }
 }

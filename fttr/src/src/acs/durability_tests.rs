@@ -111,6 +111,57 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn unresolved_writes_are_not_evicted_under_history_pressure() {
+    let fixture = Fixture::new();
+    let mut state = fixture.0.state.lock().unwrap();
+    for id in 1..=256 {
+        let mut task = record(id);
+        task.state = if id % 2 == 0 {
+            TaskState::Unknown
+        } else {
+            TaskState::AcceptedPendingApply
+        };
+        task.sent = Some(now());
+        task.release_request();
+        state.tasks.insert(id, task);
+    }
+    state.next_id = 256;
+
+    let reply = fixture.0.enqueue(&mut state, record(257));
+
+    assert_eq!(reply["code"], "backpressure");
+    assert_eq!(state.tasks.len(), 256);
+    assert!(state.tasks.values().all(Task::unresolved_write));
+}
+
+#[test]
+fn clean_and_dispatch_preserve_unresolved_write_while_reads_progress() {
+    let fixture = Fixture::new();
+    {
+        let mut state = fixture.0.state.lock().unwrap();
+        let mut unresolved = record(1);
+        unresolved.state = TaskState::AcceptedPendingApply;
+        unresolved.sent = Some(now());
+        unresolved.release_request();
+        state.tasks.insert(1, unresolved);
+        state.tasks.insert(2, record(2));
+        let mut read = record(3);
+        read.method = "GetParameterValues".into();
+        read.args = json!({"names":["InternetGatewayDevice.DeviceInfo.ModelName"]});
+        state.tasks.insert(3, read);
+    }
+    let cleaned: Value = serde_json::from_str(&fixture.0.execute(json!({"op":"clean"}))).unwrap();
+    assert_eq!(cleaned["tasks"], 3);
+
+    let mut state = fixture.0.state.lock().unwrap();
+    assert!(state.next(DEVICE, NS).unwrap().is_none());
+    assert_eq!(state.tasks[&2].state, TaskState::Fault);
+    let read = state.next(DEVICE, NS).unwrap().expect("read can proceed");
+    assert!(read.xml.contains("<cwmp:GetParameterValues>"));
+    assert!(state.tasks[&1].unresolved_write());
+}
+
+#[test]
 fn queue_rejects_failed_save_without_losing_history_or_consuming_id() {
     let fixture = Fixture::new();
     {
@@ -226,9 +277,8 @@ fn response_plus_next_save_failure_never_requeues_the_already_emitted_write() {
     drop(state);
     let mut restarted = State::load(&fixture.0.state_file).unwrap();
     assert_eq!(restarted.tasks[&1].state, TaskState::Unknown);
-    let next = restarted.next(DEVICE, NS).unwrap().unwrap();
-    assert_eq!(soap::parse(&next.xml).unwrap().id, "fttr-2");
     assert!(restarted.next(DEVICE, NS).unwrap().is_none());
+    assert_eq!(restarted.tasks[&2].state, TaskState::Fault);
     fixture.repair_save();
     let (_, next) = fixture.exchange("");
     assert_eq!(soap::parse(&next).unwrap().id, "fttr-2");

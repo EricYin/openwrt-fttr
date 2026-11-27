@@ -141,17 +141,20 @@ impl Controller {
         }
     }
 
-    pub(super) fn resolve_pending_identities(&mut self, devices: &Value) {
-        let mut resolved = false;
-        for d in &mut self.config.devices {
+    pub(super) fn resolve_pending_identities(&mut self, devices: &DeviceObservations) {
+        let mut resolved = Vec::new();
+        for (index, d) in self.config.devices.iter().enumerate() {
             if d.cwmp_id.starts_with("pending:") && !self.resets.blocks(&d.optical_sn) {
                 if let Some(id) = discovered_identity(devices, &d.optical_sn) {
-                    d.cwmp_id = id;
-                    resolved = true;
+                    resolved.push((index, id));
                 }
             }
         }
-        if resolved {
+        if !resolved.is_empty() {
+            for (index, id) in resolved {
+                self.config.devices[index].cwmp_id = id.into();
+            }
+            crate::omci_auth::bind(&self.config.devices);
             self.retain_configured_state();
         }
     }

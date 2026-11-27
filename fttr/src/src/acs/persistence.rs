@@ -1,3 +1,4 @@
+use super::task::is_write;
 use super::{error_result, Server, State, TaskState};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -45,7 +46,7 @@ impl State {
                     return Err(io::Error::other("invalid unresolved RPC checkpoint"));
                 }
                 task.state = TaskState::Unknown;
-                task.args = serde_json::json!({"_restart_unresolved":true});
+                task.release_request();
                 task.result = Some(error_result(
                     "unresolved write before process restart; fresh observation does not settle it",
                 ));
@@ -173,26 +174,13 @@ impl Server {
     }
 }
 
-fn is_write(method: &str) -> bool {
-    matches!(
-        method,
-        "SetParameterValues"
-            | "AddObject"
-            | "DeleteObject"
-            | "Reboot"
-            | "FactoryReset"
-            | "Download"
-    )
-}
 fn restart_state(state: &State) -> State {
     let mut restart = State::default();
-    for task in state.tasks.values().filter(|t| {
-        is_write(&t.method)
-            && matches!(
-                t.state,
-                TaskState::Sent | TaskState::Unknown | TaskState::AcceptedPendingApply
-            )
-    }) {
+    for task in state
+        .tasks
+        .values()
+        .filter(|t| t.unresolved_write() || (t.state == TaskState::Sent && is_write(&t.method)))
+    {
         restart.next_id = restart.next_id.max(task.id);
         restart.tasks.insert(
             task.id,
@@ -200,7 +188,7 @@ fn restart_state(state: &State) -> State {
                 id: task.id,
                 device: task.device.clone(),
                 method: task.method.clone(),
-                args: serde_json::json!({"_restart_unresolved":true}),
+                args: serde_json::Value::Null,
                 state: task.state,
                 created: task.created,
                 sent: task.sent,

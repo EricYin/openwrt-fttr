@@ -56,14 +56,14 @@ async fn receive(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            ingest(&packet.topic, Vec::from(packet.payload), now, devices)?;
+            ingest(&packet.topic, &packet.payload, now, devices)?;
         }
     }
 }
 
 fn ingest(
     topic: &str,
-    payload: Vec<u8>,
+    payload: &[u8],
     now: u64,
     devices: &Mutex<Vec<SubDevice>>,
 ) -> Result<(), String> {

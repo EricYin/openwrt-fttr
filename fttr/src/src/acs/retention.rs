@@ -46,7 +46,8 @@ impl State {
         let info = self.results.entry(id).or_default();
         info.completed_at.get_or_insert_with(now);
         info.status = "available".into();
-        if let Some(task) = self.tasks.get(&id) {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.release_request();
             crate::provisioning::controller::wake_device(&task.device);
         }
     }

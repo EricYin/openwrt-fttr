@@ -27,8 +27,13 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
     if let Ok(mut registry) = crate::mqtt_identity::shared().lock() {
         registry.update_topology(online_onus.clone(), source_links.clone(), now());
     }
-    let devices = acs(Command::Devices);
-    let acs_status = acs(Command::Status);
+    #[cfg(feature = "acs")]
+    let (devices, acs_status) = crate::acs::observations();
+    #[cfg(not(feature = "acs"))]
+    let (devices, acs_status) = (
+        DeviceObservations::default(),
+        ListenerObservation::default(),
+    );
     controller().lock().unwrap().activate_pending_config();
     let configured = controller().lock().unwrap().config.clone();
     crate::controller::mqtt_bridge::tick(&online_onus, &interfaces, &configured.devices);
@@ -48,9 +53,8 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
         source_links.as_ref().ok(),
     );
     let mut c = controller().lock().unwrap();
-    c.acs_status = acs_status.into_metadata();
+    c.acs_status = acs_status;
     c.resolve_pending_identities(&devices);
-    crate::omci_auth::bind(&c.config.devices);
     let config = c.config.clone();
     bootstrap::retain_devices(
         &config
@@ -98,8 +102,8 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
             continue;
         }
         // Observe both channels and advance bootstrap independently of business transport.
-        let observed = &devices["devices"][&d.cwmp_id];
-        let at = current_inform(observed, &c.acs_status);
+        let observed = devices.get(&d.cwmp_id);
+        let at = observed.and_then(|value| c.acs_status.current_inform(value));
         let cwmp_reachable = online.contains(&d.optical_sn)
             && at.is_some_and(|at| {
                 at <= time
@@ -114,7 +118,7 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
         } else {
             "offline_or_stale"
         };
-        c.management.insert(d.id.clone(), json!({"cwmp_id":d.cwmp_id,"product_class":observed["product_class"],"state":state,"optical_online":online.contains(&d.optical_sn),"last_inform":at,"age_seconds":at.map(|at| time.saturating_sub(at))}));
+        c.management.insert(d.id.clone(), json!({"cwmp_id":d.cwmp_id,"product_class":observed.map(|d| &d.product_class),"state":state,"optical_online":online.contains(&d.optical_sn),"last_inform":at,"age_seconds":at.map(|at| time.saturating_sub(at))}));
         let mqtt_reachable = online.contains(&d.optical_sn)
             && crate::mqtt_identity::shared()
                 .lock()
@@ -124,10 +128,7 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
                 .flatten()
                 .is_some();
         c.mqtt.insert(d.id.clone(), json!({"state":if mqtt_reachable {"online"} else {"waiting_transport"},"optical_online":online.contains(&d.optical_sn)}));
-        let boot = observed["inform"]["events"].as_array().is_some_and(|a| {
-            a.iter()
-                .any(|e| matches!(e.as_str(), Some("0 BOOTSTRAP" | "1 BOOT")))
-        });
+        let boot = observed.is_some_and(|device| device.boot);
         let new_boot = boot && at.is_some() && at != c.last_boot.get(&d.id).copied();
         if boot {
             if let Some(at) = at {
@@ -144,8 +145,8 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
                 freshness: d.connection_request.effective_freshness(config.freshness),
                 time,
                 acs_available: active_management.is_some()
-                    && c.acs_status["enabled"] == true
-                    && c.acs_status["error"].is_null(),
+                    && c.acs_status.enabled
+                    && c.acs_status.error.is_none(),
                 authorization: management_network::grant(&d.id, &d.optical_sn),
             });
         }
@@ -349,8 +350,8 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
 
 fn bootstrap_free_consumers_ready(
     config: &Config,
-    devices: &Value,
-    acs: &Value,
+    devices: &DeviceObservations,
+    acs: &ListenerObservation,
     online: &BTreeSet<String>,
     time: u64,
 ) -> bool {
@@ -359,30 +360,16 @@ fn bootstrap_free_consumers_ready(
         .iter()
         .filter(|d| d.bootstrap_adapter == "none" && d.backend() == "acs")
         .all(|d| {
-            let id =
-                discovered_identity(devices, &d.optical_sn).unwrap_or_else(|| d.cwmp_id.clone());
-            current_inform(&devices["devices"][&id], acs).is_some_and(|at| {
-                online.contains(&d.optical_sn)
-                    && at <= time
-                    && time - at <= d.connection_request.effective_freshness(config.freshness)
-            })
+            let id = discovered_identity(devices, &d.optical_sn).unwrap_or(&d.cwmp_id);
+            devices
+                .get(id)
+                .and_then(|observed| acs.current_inform(observed))
+                .is_some_and(|at| {
+                    online.contains(&d.optical_sn)
+                        && at <= time
+                        && time - at <= d.connection_request.effective_freshness(config.freshness)
+                })
         })
-}
-
-fn current_inform(observed: &Value, acs: &Value) -> Option<u64> {
-    let obs_ep = observed["endpoint_id"]
-        .as_str()
-        .filter(|id| !id.is_empty())?;
-    if acs["enabled"] != true || !acs["error"].is_null() {
-        return None;
-    }
-    let matches_primary = acs["endpoint_id"].as_str() == Some(obs_ep);
-    let matches_active_list = acs["active_endpoint_ids"]
-        .as_array()
-        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(obs_ep)));
-    (matches_primary || matches_active_list)
-        .then(|| observed["last_inform"].as_u64())
-        .flatten()
 }
 
 #[cfg(test)]
@@ -393,9 +380,19 @@ fn bootstrap_free_acs_consumers_require_current_listener_evidence_before_network
     let mut config = Config::default();
     config.devices.push(device.clone());
     let online = BTreeSet::from([device.optical_sn.clone()]);
-    let mut devices = json!({"devices":{}});
-    devices["devices"][&device.cwmp_id] = json!({"endpoint_id":"new-listener","last_inform":100});
-    let acs = json!({"enabled":true,"endpoint_id":"new-listener","error":null});
+    use crate::cwmp::observations::DeviceObservation;
+    let mut devices = DeviceObservations::new();
+    let observation = |endpoint: &str, last_inform| DeviceObservation {
+        endpoint_id: endpoint.into(),
+        last_inform,
+        ..Default::default()
+    };
+    devices.insert(device.cwmp_id.clone(), observation("new-listener", 100));
+    let acs = ListenerObservation {
+        enabled: true,
+        primary: "new-listener".into(),
+        ..Default::default()
+    };
     assert!(bootstrap_free_consumers_ready(
         &config, &devices, &acs, &online, 101
     ));
@@ -404,12 +401,12 @@ fn bootstrap_free_acs_consumers_require_current_listener_evidence_before_network
         ("new-listener", 102, 101),
         ("new-listener", 0, 100000),
     ] {
-        devices["devices"][&device.cwmp_id] = json!({"endpoint_id":endpoint,"last_inform":inform});
+        devices.insert(device.cwmp_id.clone(), observation(endpoint, inform));
         assert!(!bootstrap_free_consumers_ready(
             &config, &devices, &acs, &online, time
         ));
     }
-    devices["devices"][&device.cwmp_id] = json!({"endpoint_id":"new-listener","last_inform":100});
+    devices.insert(device.cwmp_id.clone(), observation("new-listener", 100));
     assert!(!bootstrap_free_consumers_ready(
         &config,
         &devices,
@@ -421,8 +418,8 @@ fn bootstrap_free_acs_consumers_require_current_listener_evidence_before_network
         config.devices[0].provisioning_adapter = adapter.into();
         assert!(bootstrap_free_consumers_ready(
             &config,
-            &json!({}),
-            &json!({}),
+            &Default::default(),
+            &Default::default(),
             &BTreeSet::new(),
             101
         ));
@@ -431,19 +428,22 @@ fn bootstrap_free_acs_consumers_require_current_listener_evidence_before_network
     // Extra LAN listener endpoint IDs are recognized even when primary endpoint_id is empty/different,
     // while retired/stale endpoints are still rejected.
     config.devices[0].provisioning_adapter = "hl202-cu".into();
-    let extra_acs = json!({
-        "enabled": true,
-        "endpoint_id": "",
-        "active_endpoint_ids": ["extra-lan-listener"],
-        "error": null
-    });
-    devices["devices"][&device.cwmp_id] =
-        json!({"endpoint_id": "extra-lan-listener", "last_inform": 100});
+    let extra_acs = ListenerObservation {
+        enabled: true,
+        extra: Some("extra-lan-listener".into()),
+        ..Default::default()
+    };
+    devices.insert(
+        device.cwmp_id.clone(),
+        observation("extra-lan-listener", 100),
+    );
     assert!(bootstrap_free_consumers_ready(
         &config, &devices, &extra_acs, &online, 101
     ));
-    devices["devices"][&device.cwmp_id] =
-        json!({"endpoint_id": "retired-extra-listener", "last_inform": 100});
+    devices.insert(
+        device.cwmp_id.clone(),
+        observation("retired-extra-listener", 100),
+    );
     assert!(!bootstrap_free_consumers_ready(
         &config, &devices, &extra_acs, &online, 101
     ));
@@ -977,25 +977,23 @@ mod config_change_tests {
     }
 }
 
-fn identity(d: &Device, observed: &Value) -> crate::cwmp::identity::Identity {
-    let version = |suffix: &str| {
-        observed["inform"]["parameters"]
-            .as_array()
-            .and_then(|p| {
-                p.iter()
-                    .find(|p| p["name"].as_str().is_some_and(|n| n.ends_with(suffix)))
-            })
-            .and_then(|p| p["value"].as_str())
-            .unwrap_or("")
-            .to_owned()
-    };
+fn identity(
+    d: &Device,
+    observed: Option<&crate::cwmp::observations::DeviceObservation>,
+) -> crate::cwmp::identity::Identity {
     crate::cwmp::identity::Identity {
         optical_vendor: d.optical_sn[..4].into(),
         optical_serial: d.optical_sn.clone(),
-        cwmp_serial: observed["serial"].as_str().unwrap_or("").into(),
-        product_class: observed["product_class"].as_str().unwrap_or("").into(),
-        software_version: version(".SoftwareVersion"),
-        hardware_version: version(".HardwareVersion"),
+        cwmp_serial: observed.map(|d| d.serial.clone()).unwrap_or_default(),
+        product_class: observed
+            .map(|d| d.product_class.clone())
+            .unwrap_or_default(),
+        software_version: observed
+            .map(|d| d.software_version.clone())
+            .unwrap_or_default(),
+        hardware_version: observed
+            .map(|d| d.hardware_version.clone())
+            .unwrap_or_default(),
     }
 }
 

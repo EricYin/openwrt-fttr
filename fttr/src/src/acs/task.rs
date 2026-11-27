@@ -6,6 +6,18 @@ pub(super) fn error_result(message: &str) -> super::resources::Response {
     super::resources::Response::uncharged(super::error(message))
 }
 
+pub(super) fn is_write(method: &str) -> bool {
+    matches!(
+        method,
+        "SetParameterValues"
+            | "AddObject"
+            | "DeleteObject"
+            | "Reboot"
+            | "FactoryReset"
+            | "Download"
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum TaskState {
@@ -35,6 +47,24 @@ pub(super) struct Task {
     pub(super) sent: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) result: Option<super::resources::Response>,
+}
+
+impl Task {
+    pub(super) fn unresolved_write(&self) -> bool {
+        is_write(&self.method)
+            && matches!(
+                self.state,
+                TaskState::Unknown | TaskState::AcceptedPendingApply
+            )
+    }
+
+    pub(super) fn release_request(&mut self) {
+        if !self.state.is_active() {
+            // Raw requests may carry credentials. The result and its lease are
+            // separate and remain available to the original consumer.
+            self.args = Value::Null;
+        }
+    }
 }
 
 #[cfg(test)]

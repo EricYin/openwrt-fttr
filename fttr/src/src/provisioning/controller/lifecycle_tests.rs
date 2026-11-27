@@ -302,7 +302,7 @@ fn cwmp_binding_does_not_depend_on_business_transport_or_candidate_contract_id()
         device.cwmp_id = "pending:SCTY1234ABCD".into();
         device.provisioning_adapter = adapter.into();
         c.config.devices.push(device);
-        c.resolve_pending_identities(&records);
+        c.resolve_pending_identities(&crate::cwmp::observations::from_fixture(&records));
         assert_eq!(c.config.devices[0].cwmp_id, "native", "{adapter}");
     }
 }
@@ -627,7 +627,7 @@ fn startup_preserves_template_safety_and_ownership_until_binding_is_discovered()
         );
         assert_eq!(c.recovered["child"]["items"][0]["state"], "unknown");
         assert_eq!(c.owned["id"]["old-wan"].parent, 4);
-        c.resolve_pending_identities(&discovered("id"));
+        c.resolve_pending_identities(&crate::cwmp::observations::from_fixture(&discovered("id")));
         assert_eq!(c.config.devices[0].cwmp_id, "id");
         assert!(c.recovered.contains_key("child"));
         assert!(c.owned.contains_key("id"));
@@ -673,7 +673,9 @@ fn discovered_template_replacement_prunes_previous_resolved_history_and_ownershi
     assert!(c.recovered.contains_key("child"));
     assert!(c.owned.contains_key("id"));
 
-    c.resolve_pending_identities(&discovered("replacement"));
+    c.resolve_pending_identities(&crate::cwmp::observations::from_fixture(&discovered(
+        "replacement",
+    )));
 
     assert_eq!(c.config.devices[0].cwmp_id, "replacement");
     assert!(c.recovered.is_empty());

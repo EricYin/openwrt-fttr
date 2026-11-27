@@ -13,5 +13,6 @@ pub mod registry;
 pub mod runtime;
 pub mod vendor;
 
+pub(crate) mod observations;
 pub mod response;
 pub mod transport;

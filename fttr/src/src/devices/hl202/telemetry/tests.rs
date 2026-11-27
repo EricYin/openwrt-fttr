@@ -222,9 +222,9 @@ fn hl202_telemetry_json_limit_accepts_exact_size_and_rejects_next_byte() {
         "x".repeat(4 * 1024 * 1024 - overhead - escaped_bytes)
     ));
     assert_eq!(serde_json::to_vec(&report).unwrap().len(), 4 * 1024 * 1024);
-    assert!(super::check_json_limit(&report).is_ok());
+    assert!(super::report_bytes(&report).is_ok());
     report.members[0].text.as_mut().unwrap().push('x');
-    let error = super::check_json_limit(&report).unwrap_err();
+    let error = super::report_bytes(&report).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert_eq!(error.to_string(), "telemetry JSON limit exceeded");
 }

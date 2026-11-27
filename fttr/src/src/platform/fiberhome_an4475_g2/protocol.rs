@@ -87,18 +87,31 @@ impl<B: Bus> Fsl<B> {
         row: u32,
         count: usize,
     ) -> io::Result<Vec<u32>> {
+        validate(space, address, row, count)?;
+        let mut words = [0; MAX_WORDS];
+        self.read_into(space, address, row, &mut words[..count])?;
+        Ok(words[..count].to_vec())
+    }
+
+    pub fn read_into(
+        &mut self,
+        space: RegisterSpace,
+        address: u32,
+        row: u32,
+        words: &mut [u32],
+    ) -> io::Result<()> {
         let mut tx = [0; 6];
-        tx[..5].copy_from_slice(&header(space, address, row, count, false)?);
-        let mut bytes = vec![0; count * 4];
-        self.bus.transfer(&tx, &mut bytes)?;
-        let mut words: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_be_bytes(word.try_into().unwrap()))
-            .collect();
+        tx[..5].copy_from_slice(&header(space, address, row, words.len(), false)?);
+        let mut bytes = [0; MAX_WORDS * 4];
+        let bytes = &mut bytes[..words.len() * 4];
+        self.bus.transfer(&tx, bytes)?;
+        for (out, wire) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+            *out = u32::from_be_bytes(wire.try_into().unwrap());
+        }
         if space == RegisterSpace::Memory {
             words.reverse();
         }
-        Ok(words)
+        Ok(())
     }
 
     pub fn write(
@@ -108,21 +121,24 @@ impl<B: Bus> Fsl<B> {
         row: u32,
         words: &[u32],
     ) -> io::Result<()> {
-        let mut tx = header(space, address, row, words.len(), true)?.to_vec();
-        if space == RegisterSpace::Memory {
-            for word in words.iter().rev() {
-                tx.extend_from_slice(&word.to_be_bytes());
-            }
-        } else {
-            for word in words {
-                tx.extend_from_slice(&word.to_be_bytes());
-            }
+        let mut tx = [0; 5 + MAX_WORDS * 4];
+        tx[..5].copy_from_slice(&header(space, address, row, words.len(), true)?);
+        let tx = &mut tx[..5 + words.len() * 4];
+        for (i, wire) in tx[5..].chunks_exact_mut(4).enumerate() {
+            let index = if space == RegisterSpace::Memory {
+                words.len() - 1 - i
+            } else {
+                i
+            };
+            wire.copy_from_slice(&words[index].to_be_bytes());
         }
-        self.bus.transfer(&tx, &mut [])
+        self.bus.transfer(tx, &mut [])
     }
 
     pub fn read_register(&mut self, address: u32) -> io::Result<u32> {
-        Ok(self.read(RegisterSpace::Register, address, 0, 1)?[0])
+        let mut word = [0];
+        self.read_into(RegisterSpace::Register, address, 0, &mut word)?;
+        Ok(word[0])
     }
 
     /// The caller keeps the same exclusive session across all three messages.

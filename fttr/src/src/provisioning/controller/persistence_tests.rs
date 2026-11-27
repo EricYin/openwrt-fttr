@@ -31,9 +31,11 @@ fn identity_pruning_marks_saved_history_pending() {
     c.owned.insert(op.device.cwmp_id.clone(), BTreeMap::new());
     c.saved = c.history();
 
-    c.resolve_pending_identities(&json!({"devices":{
-        "replacement":{"product_class":"HL202-DU-C","serial":"H3CT12345678"}
-    }}));
+    c.resolve_pending_identities(&crate::cwmp::observations::from_fixture(
+        &json!({"devices":{
+            "replacement":{"product_class":"HL202-DU-C","serial":"H3CT12345678"}
+        }}),
+    ));
 
     assert!(c.dirty);
     c.persist_history(|data| {

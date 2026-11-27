@@ -24,12 +24,10 @@ fn source_report(
         snapshot.mqtt_mac == target.mqtt_mac
             && snapshot.binding_generation == target.binding_generation
     }) {
-        Some(snapshot) => wire(HlReportReply::Source {
-            schema_version: 1,
-            report: super::telemetry::store::snapshot(&snapshot.mqtt_mac),
-            target: snapshot,
-            read_only: true,
-        }),
+        Some(snapshot) => super::telemetry::store::with_snapshot(
+            &snapshot.mqtt_mac,
+            |report| serde_json::json!({"schema_version": 1, "report": report, "target": &snapshot, "read_only": true}),
+        ),
         None => error(
             "stale_source",
             "MQTT source observation changed or is no longer available",
@@ -100,17 +98,13 @@ pub fn control_query(query: Query, devices: &[Device]) -> Value {
         Query::Report { target } => match registry.lock() {
             Ok(state) => match state.resolve(&target, now) {
                 Ok(snapshot) => {
-                    let report = super::telemetry::store::snapshot(&snapshot.mqtt_mac);
-                    let state = if report.is_some() {
-                        HlReportPhase::Received
-                    } else {
-                        HlReportPhase::ReportUnavailable
-                    };
-                    wire(HlReportReply::Report {
-                        schema_version: 1,
-                        target: snapshot,
-                        report,
-                        state,
+                    super::telemetry::store::with_snapshot(&snapshot.mqtt_mac, |report| {
+                        let state = if report.is_some() {
+                            HlReportPhase::Received
+                        } else {
+                            HlReportPhase::ReportUnavailable
+                        };
+                        serde_json::json!({"schema_version": 1, "target": &snapshot, "report": report, "state": state})
                     })
                 }
                 Err(message) => error("stale_target", message),

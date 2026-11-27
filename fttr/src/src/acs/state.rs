@@ -13,6 +13,7 @@ impl State {
         let time = now();
         self.tasks.retain(|_, task| {
             task.state.is_active()
+                || task.unresolved_write()
                 || time.saturating_sub(
                     self.results
                         .get(&task.id)
@@ -104,24 +105,18 @@ impl State {
                 t.result = Some(error_result(
                     "response timeout: device execution is unknown; no automatic write retry",
                 ));
+                t.release_request();
             } else if t.state == TaskState::Queued && time.saturating_sub(t.created) >= 600 {
                 t.state = TaskState::Expired;
                 let info = self.results.entry(t.id).or_default();
                 info.completed_at = Some(time);
                 info.status = "available".into();
                 t.result = Some(error_result("no device session within 600 seconds"));
+                t.release_request();
             }
         }
         self.prune();
-        let terminal: Vec<_> = self
-            .tasks
-            .iter()
-            .filter(|(_, t)| !t.state.is_active())
-            .map(|(id, _)| *id)
-            .collect();
-        for id in terminal {
-            self.release_dispatch(id);
-        }
+        self.release_terminal_dispatches();
     }
 
     pub(super) fn next(
@@ -157,7 +152,7 @@ impl State {
             if let Err(reason) = if !auth_valid {
                 Err("OMCI authentication generation changed; queued write cancelled".into())
             } else if internal_interval {
-                Ok(())
+                super::policy::protect_unresolved(self, device, &task.method)
             } else {
                 protect_management(self, device, &task.method, &task.args)
             } {

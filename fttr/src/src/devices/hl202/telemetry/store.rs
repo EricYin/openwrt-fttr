@@ -2,29 +2,57 @@ use super::Report;
 pub use fttr_api::HlReportState as State;
 use std::{
     collections::BTreeMap,
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering::Relaxed},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 struct Pending {
-    payload: Option<Vec<u8>>,
+    payload: Option<Payload>,
     received: u64,
     budget_evicted: bool,
 }
 
 const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
+
+pub(super) struct Payload {
+    bytes: Box<[u8]>,
+    used: Arc<AtomicUsize>,
+}
+impl std::ops::Deref for Payload {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+impl Drop for Payload {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes.len(), Relaxed);
+    }
+}
 
 #[derive(Default)]
 struct Queue {
     seen: BTreeMap<String, u64>,
     pending: BTreeMap<String, Pending>,
+    used: Arc<AtomicUsize>,
+    peak: usize,
 }
 
 impl Queue {
-    fn put(&mut self, source: &str, payload: Vec<u8>, received: u64, protected: &[String]) -> bool {
+    fn put(
+        &mut self,
+        source: &str,
+        payload: impl AsRef<[u8]>,
+        received: u64,
+        protected: &[String],
+    ) -> bool {
         let Some(mac) = crate::mqtt_identity::normalize_target(source) else {
             return false;
         };
-        let payload = (payload.len() <= super::archive::MAX_COMPRESSED).then_some(payload);
+        let payload = payload.as_ref();
         if !self.seen.contains_key(&mac) && self.seen.len() >= 64 {
             let oldest = self
                 .seen
@@ -39,32 +67,38 @@ impl Queue {
             self.pending.remove(&oldest);
         }
         self.seen.insert(mac.clone(), received);
-        self.pending.insert(
-            mac,
-            Pending {
-                payload,
-                received,
-                budget_evicted: false,
-            },
-        );
-        while self
-            .pending
-            .values()
-            .filter_map(|item| item.payload.as_ref())
-            .map(Vec::len)
-            .sum::<usize>()
-            > MAX_PENDING_BYTES
-        {
-            let oldest = self
-                .pending
-                .values_mut()
-                .filter(|item| item.payload.is_some())
-                .min_by_key(|item| item.received);
-            if let Some(item) = oldest {
-                item.payload = None;
+        self.pending.remove(&mac);
+        let mut item = Pending {
+            payload: None,
+            received,
+            budget_evicted: false,
+        };
+        if payload.len() <= super::archive::MAX_COMPRESSED {
+            while self.used.load(Relaxed) + payload.len() > MAX_PENDING_BYTES {
+                let oldest = self
+                    .pending
+                    .values_mut()
+                    .filter(|item| item.payload.is_some())
+                    .min_by_key(|item| item.received);
+                let Some(oldest) = oldest else { break };
+                oldest.payload = None;
+                oldest.budget_evicted = true;
+            }
+            if self.used.load(Relaxed) + payload.len() <= MAX_PENDING_BYTES {
+                // rumqttc slices its receive slab. Use one exact-size owned
+                // copy here; a small report must not pin the entire slab.
+                let bytes = Box::<[u8]>::from(payload);
+                let current = self.used.fetch_add(bytes.len(), Relaxed) + bytes.len();
+                self.peak = self.peak.max(current);
+                item.payload = Some(Payload {
+                    bytes,
+                    used: self.used.clone(),
+                });
+            } else {
                 item.budget_evicted = true;
             }
         }
+        self.pending.insert(mac, item);
         true
     }
 
@@ -82,10 +116,31 @@ impl Queue {
 struct Store {
     queue: Queue,
     states: BTreeMap<String, State>,
+    report_bytes: BTreeMap<String, usize>,
 }
 static SHARED: OnceLock<(Mutex<Store>, tokio::sync::Notify)> = OnceLock::new();
 
 impl Store {
+    fn complete(&mut self, mac: String, received: u64, result: Result<(Report, usize), String>) {
+        if self
+            .states
+            .get(&mac)
+            .and_then(|s| s.last_processed_receipt)
+            .is_some_and(|last| last > received)
+        {
+            return;
+        }
+        let result = result.and_then(|(report, bytes)| {
+            let total: usize = self.report_bytes.values().sum();
+            let other = total - self.report_bytes.get(&mac).copied().unwrap_or(0);
+            if other.saturating_add(bytes) > MAX_REPORT_BYTES {
+                return Err("retained telemetry report budget exceeded".into());
+            }
+            self.report_bytes.insert(mac.clone(), bytes);
+            Ok(report)
+        });
+        self.states.entry(mac).or_default().apply(received, result);
+    }
     fn take(&mut self) -> Option<(String, Pending)> {
         while let Some((mac, item)) = self.queue.take() {
             if item.budget_evicted {
@@ -108,7 +163,7 @@ fn shared() -> &'static (Mutex<Store>, tokio::sync::Notify) {
     })
 }
 
-pub fn observe(source: &str, payload: Vec<u8>, received: u64) -> bool {
+pub fn observe(source: &str, payload: &[u8], received: u64) -> bool {
     let protected = match crate::mqtt_identity::shared().lock() {
         Ok(registry) => registry
             .snapshots(received)
@@ -125,12 +180,18 @@ pub fn observe(source: &str, payload: Vec<u8>, received: u64) -> bool {
     if !store.queue.put(source, payload, received, &protected) {
         return false;
     }
-    let Store { queue, states } = &mut *store;
+    let Store {
+        queue,
+        states,
+        report_bytes,
+    } = &mut *store;
     states.retain(|key, _| queue.seen.contains_key(key));
+    report_bytes.retain(|key, _| queue.seen.contains_key(key));
     if let Some(mac) = crate::mqtt_identity::normalize_target(source) {
-        let state = store.states.entry(mac).or_default();
+        let state = states.entry(mac.clone()).or_default();
         if received < state.last_received {
             *state = State::default();
+            report_bytes.remove(&mac);
         }
         state.last_received = received;
     }
@@ -139,9 +200,18 @@ pub fn observe(source: &str, payload: Vec<u8>, received: u64) -> bool {
 }
 
 pub fn snapshot(mac: &str) -> Option<State> {
+    with_snapshot(mac, |state| state.cloned())
+}
+
+pub(in crate::devices::hl202) fn with_snapshot<T>(
+    mac: &str,
+    read: impl FnOnce(Option<&State>) -> T,
+) -> T {
     let (mutex, _) = shared();
-    let store = mutex.lock().ok()?;
-    store.states.get(mac).cloned()
+    match mutex.lock() {
+        Ok(store) => read(store.states.get(mac)),
+        Err(_) => read(None),
+    }
 }
 
 pub fn revision(mac: &str) -> Option<u64> {
@@ -150,7 +220,27 @@ pub fn revision(mac: &str) -> Option<u64> {
     Some(store.states.get(mac)?.revision)
 }
 
-pub(super) async fn next() -> Option<(String, Option<Vec<u8>>, u64)> {
+pub(crate) fn usage() -> serde_json::Value {
+    let Some((mutex, _)) = SHARED.get() else {
+        return serde_json::Value::Null;
+    };
+    let Ok(store) = mutex.lock() else {
+        return serde_json::Value::Null;
+    };
+    let (archive_bytes, archive_limit) = super::worker::archive_usage();
+    serde_json::json!({
+        "sources": store.queue.seen.len(),
+        "compressed_bytes": store.queue.used.load(Relaxed),
+        "compressed_peak_bytes": store.queue.peak,
+        "compressed_limit_bytes": MAX_PENDING_BYTES,
+        "retained_report_json_bytes": store.report_bytes.values().sum::<usize>(),
+        "retained_report_json_limit_bytes": MAX_REPORT_BYTES,
+        "warm_seed_file_bytes": archive_bytes,
+        "warm_seed_file_limit_bytes": archive_limit,
+    })
+}
+
+pub(super) async fn next() -> Option<(String, Option<Payload>, u64)> {
     let (mutex, signal) = shared();
     loop {
         let notified = signal.notified();
@@ -164,7 +254,7 @@ pub(super) async fn next() -> Option<(String, Option<Vec<u8>>, u64)> {
     }
 }
 
-pub(super) fn complete(mac: String, received: u64, result: Result<Report, String>) {
+pub(super) fn complete(mac: String, received: u64, result: Result<(Report, usize), String>) {
     if let Ok(mut store) = shared().0.lock() {
         if store
             .queue
@@ -172,7 +262,7 @@ pub(super) fn complete(mac: String, received: u64, result: Result<Report, String
             .get(&mac)
             .is_some_and(|latest| received <= *latest)
         {
-            store.states.entry(mac).or_default().apply(received, result);
+            store.complete(mac, received, result);
         }
     }
 }
@@ -293,6 +383,6 @@ mod tests {
         assert!(queue.put("001122334455", vec![1], 1, &[]));
         assert!(queue.put("001122334455", vec![2], 2, &[]));
         assert_eq!(queue.pending.len(), 1);
-        assert_eq!(queue.take().unwrap().1.payload, Some(vec![2]));
+        assert_eq!(queue.take().unwrap().1.payload.as_deref(), Some(&[2][..]));
     }
 }

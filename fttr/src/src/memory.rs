@@ -14,6 +14,54 @@ static ALLOCATED: AtomicU64 = AtomicU64::new(0);
 /// Installed only by fttrd; standalone tools retain their system allocator.
 pub struct Allocator;
 
+#[cfg(all(test, feature = "platform-fiberhome-an4475-g2"))]
+pub(crate) mod allocation_test {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+    thread_local! { static COUNT: Cell<Option<usize>> = const { Cell::new(None) }; }
+    struct Counter;
+    #[global_allocator]
+    static TEST_ALLOCATOR: Counter = Counter;
+    fn count() {
+        let _ = COUNT.try_with(|c| {
+            if let Some(n) = c.get() {
+                c.set(Some(n + 1));
+            }
+        });
+    }
+    unsafe impl GlobalAlloc for Counter {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            count();
+            System.alloc(layout)
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            count();
+            System.alloc_zeroed(layout)
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            count();
+            System.realloc(ptr, layout, size)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout);
+        }
+    }
+    pub(crate) fn allocations(work: impl FnOnce()) -> usize {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                COUNT.set(None);
+            }
+        }
+        assert!(COUNT.replace(Some(0)).is_none());
+        let _reset = Reset;
+        work();
+        COUNT.get().unwrap()
+    }
+}
+
 fn allocated(bytes: usize) {
     let live = LIVE.fetch_add(bytes, Relaxed) + bytes;
     PEAK.fetch_max(live, Relaxed);

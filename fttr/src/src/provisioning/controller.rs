@@ -29,6 +29,7 @@ mod scheduler;
 mod scheduling_tests;
 #[path = "controller/snapshots.rs"]
 mod snapshots;
+use crate::cwmp::observations::{DeviceObservations, ListenerObservation};
 use crate::cwmp::transport::Command;
 use config::{Config, Device, Item, Parameter};
 use parameters::advance;
@@ -222,7 +223,7 @@ struct Controller {
     owned: BTreeMap<String, BTreeMap<String, wan::Owned>>,
     wifi_owned: BTreeMap<String, wifi::Registry>,
     omci_management: BTreeMap<String, Value>,
-    acs_status: Value,
+    acs_status: ListenerObservation,
     attempts: BTreeMap<String, u32>,
     next_retry_at: BTreeMap<String, u64>,
     automatic_ready: BTreeMap<String, scheduler::Reasons>,
@@ -479,6 +480,7 @@ impl Controller {
         status["config_load"] = self.config_load_view();
         status["recovery_storage"] = self.snapshots.as_ref().map_or(Value::Null, |s| s.view());
         status["process_memory"] = crate::memory::view();
+        status["mqtt_report_resources"] = crate::devices::mqtt_report_resources();
         status
     }
 
@@ -658,22 +660,12 @@ impl Controller {
         }
     }
 }
-fn discovered_identity(devices: &Value, optical_sn: &str) -> Option<String> {
-    let matches: Vec<_> = devices["devices"]
-        .as_object()?
-        .iter()
-        .filter(|(_, d)| {
-            let product_class = d["product_class"].as_str().unwrap_or("");
-            let serial = d["serial"].as_str().unwrap_or("");
-            crate::devices::matches_cwmp_identity(optical_sn, product_class, serial)
-        })
-        .map(|(id, _)| id.clone())
-        .collect();
-    if matches.len() == 1 {
-        matches.into_iter().next()
-    } else {
-        None
-    }
+fn discovered_identity<'a>(devices: &'a DeviceObservations, optical_sn: &str) -> Option<&'a str> {
+    let mut matches = devices.iter().filter(|(_, d)| {
+        crate::devices::matches_cwmp_identity(optical_sn, &d.product_class, &d.serial)
+    });
+    let (id, _) = matches.next()?;
+    matches.next().is_none().then_some(id.as_str())
 }
 fn aggregate(items: &[Value]) -> &str {
     if items.is_empty() {
@@ -971,6 +963,13 @@ pub fn start(engine: Arc<Mutex<crate::pon_engine::PonEngine>>) {
 
 #[cfg(test)]
 mod tests {
+    fn discovered_identity(devices: &serde_json::Value, optical_sn: &str) -> Option<String> {
+        super::discovered_identity(
+            &crate::cwmp::observations::from_fixture(devices),
+            optical_sn,
+        )
+        .map(str::to_owned)
+    }
     use super::*;
     #[test]
     fn device_reset_forgets_live_and_recovered_state_only_for_target() {

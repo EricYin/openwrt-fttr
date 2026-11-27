@@ -54,7 +54,9 @@ impl Server {
                 .tasks
                 .iter()
                 .find(|(id, task)| {
-                    !task.state.is_active() && !state.results.get(id).is_some_and(|i| i.protected)
+                    !task.state.is_active()
+                        && !task.unresolved_write()
+                        && !state.results.get(id).is_some_and(|i| i.protected)
                 })
                 .map(|(id, _)| *id);
             let Some(id) = oldest else {

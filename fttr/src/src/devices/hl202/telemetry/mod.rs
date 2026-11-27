@@ -5,10 +5,14 @@ mod worker;
 pub use fttr_api::{HlTelemetry as Report, HlTelemetryField as Field, HlTelemetryMember as Member};
 
 pub fn parse(input: &[u8]) -> std::io::Result<Report> {
+    parse_measured(input).map(|(report, _)| report)
+}
+
+fn parse_measured(input: &[u8]) -> std::io::Result<(Report, usize)> {
     let (members, decompressed_bytes) = archive::read(input)?;
     let report = decode::report(members, input.len(), decompressed_bytes);
-    check_json_limit(&report)?;
-    Ok(report)
+    let bytes = report_bytes(&report)?;
+    Ok((report, bytes))
 }
 
 /// Identity claims are only candidates until independently correlated with the
@@ -37,7 +41,7 @@ pub(crate) fn identity_claim(report: &Report, topic_mac: &str) -> Option<(String
     Some((serial.to_ascii_uppercase(), mac))
 }
 
-fn check_json_limit(report: &Report) -> std::io::Result<()> {
+fn report_bytes(report: &Report) -> std::io::Result<usize> {
     struct ByteCount(usize);
     impl std::io::Write for ByteCount {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -57,7 +61,7 @@ fn check_json_limit(report: &Report) -> std::io::Result<()> {
             "telemetry JSON limit exceeded",
         ));
     }
-    Ok(())
+    Ok(encoded.0)
 }
 
 #[cfg(test)]

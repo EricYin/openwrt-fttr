@@ -281,6 +281,15 @@ impl State {
         self.dispatch.effects.remove(&id);
         self.dispatch.grants.remove(&id);
     }
+    pub(super) fn release_terminal_dispatches(&mut self) {
+        let active = |id: &u64| {
+            self.tasks
+                .get(id)
+                .is_some_and(|task| task.state.is_active())
+        };
+        self.dispatch.grants.retain(|id, _| active(id));
+        self.dispatch.effects.retain(|id, _| active(id));
+    }
     pub(super) fn waiting_capacity(&self, id: u64) -> bool {
         self.tasks
             .get(&id)

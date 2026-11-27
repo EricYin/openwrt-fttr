@@ -25,7 +25,7 @@ pub(crate) fn tick(
     _configured_devices: &[crate::provisioning::model::Device],
     _management_network: Option<&crate::provisioning::management_network::Desired>,
     _management_active: bool,
-    _acs_devices: &serde_json::Value,
+    _acs_devices: &crate::cwmp::observations::DeviceObservations,
     _source_links: Option<&std::collections::BTreeMap<String, String>>,
 ) {
 }

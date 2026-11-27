@@ -143,3 +143,24 @@ fn alarm_bitmap_reads_four_words_and_checks_onu_index() {
     assert!(read_alarm_bitmap(&mut fsl, GPON_INT).is_err());
     assert!(bus.0.borrow().steps.is_empty());
 }
+#[test]
+fn idle_interrupt_poll_issues_regular_reads_without_heap_allocations() {
+    struct IdleBus(usize);
+    impl super::Bus for IdleBus {
+        fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) -> std::io::Result<()> {
+            assert_eq!(tx.len(), 6);
+            assert_eq!(rx.len(), 4);
+            rx.fill(0);
+            self.0 += 1;
+            Ok(())
+        }
+    }
+    let mut fsl = super::Fsl { bus: IdleBus(0) };
+    let allocations = crate::memory::allocation_test::allocations(|| {
+        for _ in 0..256 {
+            assert!(super::poll_and_clear_pending(&mut fsl).unwrap().is_empty());
+        }
+    });
+    assert_eq!(fsl.bus.0, 256 * 10);
+    assert_eq!(allocations, 0);
+}

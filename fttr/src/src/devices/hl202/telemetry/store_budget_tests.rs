@@ -17,7 +17,7 @@ fn mqtt_telemetry_slow_consumer_pending_budget_and_eventual_drain() {
             .pending
             .values()
             .filter_map(|p| p.payload.as_ref())
-            .map(Vec::len)
+            .map(|p| p.len())
             .sum::<usize>();
         peak = peak.max(bytes);
         assert!(bytes <= MAX_PENDING_BYTES);
@@ -31,7 +31,7 @@ fn mqtt_telemetry_slow_consumer_pending_budget_and_eventual_drain() {
     assert_eq!(count, 64);
     assert!(queue.pending.is_empty());
     assert!(queue.put("020000000001", vec![1], 201, &[]));
-    assert_eq!(queue.take().unwrap().1.payload, Some(vec![1]));
+    assert_eq!(queue.take().unwrap().1.payload.as_deref(), Some(&[1][..]));
     println!(
         "pending_peak_bytes={peak}, after_drain_bytes=0, retained_sources={}",
         queue.seen.len()
@@ -94,7 +94,7 @@ fn oldest_payload_becomes_error_receipt_when_pending_budget_is_exceeded() {
             .pending
             .values()
             .filter_map(|item| item.payload.as_ref())
-            .map(Vec::len)
+            .map(|p| p.len())
             .sum::<usize>(),
         MAX_PENDING_BYTES
     );
@@ -145,7 +145,45 @@ fn processing_payload_is_not_evicted_when_more_pending_payloads_arrive() {
         ));
     }
 
-    assert_eq!(processing.payload.unwrap(), vec![7; size]);
+    assert_eq!(
+        processing.payload.as_deref(),
+        Some(vec![7; size].as_slice())
+    );
+    assert_eq!(
+        queue.used.load(std::sync::atomic::Ordering::Relaxed),
+        MAX_PENDING_BYTES
+    );
+    assert!(queue.pending["020000000003"].budget_evicted);
+    drop(processing);
+    assert_eq!(
+        queue.used.load(std::sync::atomic::Ordering::Relaxed),
+        MAX_PENDING_BYTES - size
+    );
     assert!(queue.pending["020000000002"].budget_evicted);
     assert!(!queue.pending["020000000006"].budget_evicted);
+}
+
+#[test]
+fn retained_budget_rejects_growth_without_discarding_last_good_report() {
+    let mut store = super::Store::default();
+    let parse =
+        || super::super::parse(&super::super::tests::fixture(&[("IP", b"192.0.2.10")])).unwrap();
+    store.complete(
+        "020000000001".into(),
+        1,
+        Ok((parse(), super::MAX_REPORT_BYTES - 1)),
+    );
+    store.complete("020000000002".into(), 1, Ok((parse(), 1)));
+    store.complete("020000000002".into(), 2, Ok((parse(), 2)));
+    let old = &store.states["020000000002"];
+    assert_eq!(old.last_good, Some(1));
+    assert_eq!(old.last_processed_receipt, Some(2));
+    assert_eq!(
+        old.error.as_deref(),
+        Some("retained telemetry report budget exceeded")
+    );
+    assert_eq!(
+        store.report_bytes.values().sum::<usize>(),
+        super::MAX_REPORT_BYTES
+    );
 }

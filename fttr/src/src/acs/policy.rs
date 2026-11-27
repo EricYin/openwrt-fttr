@@ -2,6 +2,18 @@
 use super::{readback, soap, State};
 use serde_json::Value;
 
+pub(super) fn protect_unresolved(state: &State, device: &str, method: &str) -> Result<(), String> {
+    if super::task::is_write(method)
+        && state
+            .tasks
+            .values()
+            .any(|t| t.device == device && t.unresolved_write())
+    {
+        return Err("unresolved CWMP write; transaction-aware recovery required".into());
+    }
+    Ok(())
+}
+
 pub(super) fn protect_management(
     state: &State,
     device: &str,
@@ -9,23 +21,7 @@ pub(super) fn protect_management(
     args: &Value,
 ) -> Result<(), String> {
     const ROOT: &str = "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.";
-    if matches!(
-        method,
-        "SetParameterValues"
-            | "AddObject"
-            | "DeleteObject"
-            | "Reboot"
-            | "FactoryReset"
-            | "Download"
-    ) && state
-        .tasks
-        .values()
-        .any(|task| task.device == device && task.args["_restart_unresolved"] == true)
-    {
-        return Err(
-            "unresolved write from a prior process; transaction-aware recovery required".into(),
-        );
-    }
+    protect_unresolved(state, device, method)?;
     let paths: Vec<&str> = match method {
         "SetParameterValues" => args["parameters"]
             .as_array()

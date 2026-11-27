@@ -101,6 +101,7 @@ pub(super) fn enqueue(server: &Server, state: &mut State, job: (&str, Request)) 
             interval,
             config,
         } => {
+            super::policy::protect_unresolved(state, device, "SetParameterValues").ok()?;
             let proof = state.connection_request_proofs.get(device)?.clone();
             let grant = Authorization {
                 config,

@@ -56,10 +56,21 @@ impl Record {
 }
 pub(crate) const LEGACY_HISTORY: &str = "/tmp/fttr/provisioning-state.json";
 pub(crate) fn approved(serial: &str) -> bool {
-    storage::read(Record::Admission.path(serial))
+    let path = Record::Admission.path(serial);
+    let matches = |value: &Value| value["serial"] == serial && value["approved"] == true;
+    if let Some(key) = path.strip_prefix(PREFIX) {
+        return store().lock().ok().is_some_and(|mut store| {
+            store
+                .current()
+                .ok()
+                .and_then(|state| state.records.get(key))
+                .is_some_and(matches)
+        });
+    }
+    storage::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .is_some_and(|value| value["serial"] == serial && value["approved"] == true)
+        .is_some_and(|value| matches(&value))
 }
 pub(crate) fn approve(serial: &str) -> io::Result<()> {
     storage::write_atomic(

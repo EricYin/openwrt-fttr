@@ -122,6 +122,7 @@ impl Session {
                     for task in state.tasks.values_mut().filter(|t| t.device == device && t.state == TaskState::Sent) {
                         task.state = TaskState::Unknown;
                         task.result = Some(error_result("new Inform before RPC response"));
+                        task.release_request();
                     }
                     state.sessions.retain(|_, (id, _, _)| *id != device);
                     state.sessions.insert(key.clone(), (device.clone(), self.peer.clone(), now()));

@@ -299,8 +299,9 @@ pub fn read_alarm_bitmap<B: Bus>(fsl: &mut Fsl<B>, reg_addr: u32) -> io::Result<
             "unsupported per-ONU alarm bitmap register",
         ));
     }
-    let words = fsl.read(RegisterSpace::Register, reg_addr, 0, 4)?;
-    Ok(words.try_into().unwrap())
+    let mut words = [0; 4];
+    fsl.read_into(RegisterSpace::Register, reg_addr, 0, &mut words)?;
+    Ok(words)
 }
 
 /// Returns whether `onu_index` (`0..128`) is set in a 128-bit alarm bitmap.

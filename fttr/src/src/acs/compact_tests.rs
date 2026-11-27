@@ -563,6 +563,39 @@ fn test_prune_bounds_inactive_tasks_and_preserves_active() {
 }
 
 #[test]
+fn timed_out_write_keeps_its_fence_without_retaining_request_arguments() {
+    let mut state = State::default();
+    let mut unresolved = task(101);
+    unresolved.method = "SetParameterValues".into();
+    unresolved.state = TaskState::Sent;
+    unresolved.created = now().saturating_sub(2000);
+    unresolved.sent = Some(unresolved.created);
+    unresolved.args = json!({"parameters":[{"name":"Example.Password","value":"fixture"}]});
+    state.tasks.insert(unresolved.id, unresolved);
+
+    state.expire();
+    assert_eq!(state.tasks[&101].state, TaskState::Unknown);
+    assert!(state.tasks[&101].args.is_null());
+    state.results.get_mut(&101).unwrap().completed_at = Some(now().saturating_sub(2000));
+    state.prune();
+
+    assert!(state.tasks.contains_key(&101));
+    assert!(super::policy::protect_management(
+        &state,
+        "compact-test",
+        "SetParameterValues",
+        &json!({"parameters": []}),
+    )
+    .is_err());
+    assert!(
+        super::policy::protect_unresolved(&state, "compact-test", "GetParameterValues").is_ok()
+    );
+    assert!(
+        super::policy::protect_unresolved(&state, "another-device", "SetParameterValues").is_ok()
+    );
+}
+
+#[test]
 fn test_prune_bounds_total_result_bytes_dropping_older_inactive_tasks() {
     let mut state = State::default();
     let current_time = now();
@@ -625,4 +658,33 @@ fn test_clean_op_clears_inactive_tasks_and_resets_load_failure() {
     assert!(!state.tasks.contains_key(&1));
     assert!(state.tasks.contains_key(&2));
     let _ = fs::remove_file(&server.state_file);
+}
+#[test]
+fn ordinary_terminal_tasks_release_requests_but_keep_the_existing_response_lease() {
+    let mut state = State::default();
+    let mut row = super::Task {
+        id: 13,
+        device: "fixture-cpe".into(),
+        method: "SetParameterValues".into(),
+        args: serde_json::json!({"parameters":[{"name":"Device.Example.Password","value":"fixture-only"}]}),
+        state: TaskState::Sent,
+        created: now(),
+        sent: Some(now()),
+        result: None,
+    };
+    state.tasks.insert(13, row.clone());
+    state.prune();
+    assert_eq!(state.tasks[&13].args, row.args);
+    row.state = TaskState::Completed;
+    row.result = Some(error_result("fixture-result"));
+    state.tasks.insert(13, row);
+    state
+        .results
+        .insert(13, super::retention::ResultInfo::protected());
+    state.mark_completed(13);
+    state.prune();
+    assert!(state.tasks[&13].args.is_null());
+    assert!(state.tasks[&13].result.is_some());
+    assert!(state.ack_result(13));
+    assert!(state.tasks[&13].result.is_none());
 }

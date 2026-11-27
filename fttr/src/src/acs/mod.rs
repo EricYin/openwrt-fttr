@@ -106,6 +106,19 @@ struct TaskView<'a> {
     #[serde(flatten)]
     result_info: Option<&'a retention::ResultInfo>,
 }
+
+#[derive(Serialize)]
+struct TaskMetadata<'a> {
+    id: u64,
+    device: &'a str,
+    method: &'a str,
+    state: TaskState,
+    created: u64,
+    sent: Option<u64>,
+    #[serde(flatten)]
+    result_info: Option<&'a retention::ResultInfo>,
+    queue_state: &'static str,
+}
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PathPolicy {
     pub allow_any: bool,
@@ -266,7 +279,9 @@ impl Server {
         state.expire();
         match command {
             Command::Clean => {
-                state.tasks.retain(|_, t| t.state.is_active());
+                state
+                    .tasks
+                    .retain(|_, t| t.state.is_active() || t.unresolved_write());
                 let ids: std::collections::BTreeSet<_> = state.tasks.keys().copied().collect();
                 state.results.retain(|id, _| ids.contains(id));
                 state.load_failure = None;
@@ -358,6 +373,50 @@ impl Server {
         }
     }
 }
+pub(crate) fn observations() -> (
+    crate::cwmp::observations::DeviceObservations,
+    crate::cwmp::observations::ListenerObservation,
+) {
+    use crate::cwmp::observations::{DeviceObservation, ListenerObservation};
+    let server = init();
+    let extra = endpoint::extra_endpoint_id().filter(|id| !id.is_empty());
+    let listener = ListenerObservation {
+        enabled: (server.enabled && !server.stopped.load(Ordering::Acquire)) || extra.is_some(),
+        listen: Some(server.listen.clone()),
+        path: Some(server.path.clone()),
+        error: server.failure.lock().unwrap().clone(),
+        primary: server.endpoint_id.clone(),
+        extra,
+    };
+    let mut state = server.state.lock().unwrap();
+    if state.load_failure.is_some() {
+        return (Default::default(), listener);
+    }
+    state.expire();
+    let devices = state
+        .devices
+        .iter()
+        .map(|(id, device)| {
+            let (software_version, hardware_version, boot) =
+                DeviceObservation::inform_metadata(&device.inform);
+            (
+                id.clone(),
+                DeviceObservation {
+                    serial: device.serial.clone(),
+                    product_class: device.product_class.clone(),
+                    peer: device.peer.parse().ok(),
+                    software_version,
+                    hardware_version,
+                    boot,
+                    endpoint_id: device.endpoint_id.clone(),
+                    last_inform: device.last_inform,
+                },
+            )
+        })
+        .collect();
+    (devices, listener)
+}
+
 pub fn transact(command: crate::cwmp::transport::Command) -> crate::cwmp::transport::Reply {
     crate::runtime::block_on(async move {
         actor::call(move || {
@@ -369,20 +428,24 @@ pub fn transact(command: crate::cwmp::transport::Command) -> crate::cwmp::transp
                 }
                 state.expire();
                 if let Some(task) = state.tasks.get(&id) {
-                    let mut snapshot = task.clone();
-                    let response = snapshot.result.take();
-                    let mut metadata = serde_json::to_value(TaskView {
-                        task: &snapshot,
+                    let response = task.result.clone();
+                    let metadata = serde_json::to_value(TaskMetadata {
+                        id: task.id,
+                        device: &task.device,
+                        method: &task.method,
+                        state: task.state,
+                        created: task.created,
+                        sent: task.sent,
                         result_info: state.results.get(&id),
+                        queue_state: if state.waiting_capacity(id) {
+                            "waiting_capacity"
+                        } else if task.state == TaskState::Queued {
+                            "waiting_device"
+                        } else {
+                            "ready"
+                        },
                     })
                     .unwrap_or_else(|e| error(&e.to_string()));
-                    metadata["queue_state"] = json!(if state.waiting_capacity(id) {
-                        "waiting_capacity"
-                    } else if task.state == TaskState::Queued {
-                        "waiting_device"
-                    } else {
-                        "ready"
-                    });
                     if let Some(response) = response {
                         let reply = response.reply(metadata);
                         if state.ack_result(id) {

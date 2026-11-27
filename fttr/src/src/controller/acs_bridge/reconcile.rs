@@ -208,21 +208,20 @@ fn collect_device_mgmt_candidates(
     mgmt_leases: &BTreeMap<[u8; 6], Ipv4Addr>,
     source_links: Option<&BTreeMap<String, String>>,
     fdb_macs_for_serial: &BTreeMap<String, Vec<String>>,
-    acs_devices: &Value,
+    acs_devices: &crate::cwmp::observations::DeviceObservations,
 ) -> BTreeSet<Ipv4Addr> {
     let mut candidates = BTreeSet::new();
-    if let Some(entries) = acs_devices["devices"].as_object() {
-        for entry in entries.values() {
-            let pc = entry["product_class"].as_str().unwrap_or("");
-            let sn = entry["serial"].as_str().unwrap_or("");
-            if crate::devices::matches_cwmp_identity(&dev.optical_sn, pc, sn) {
-                if let Some(peer) = entry["peer"].as_str() {
-                    if let Ok(ip) = peer.parse::<Ipv4Addr>() {
-                        if ip != mgmt_ip && same_subnet(ip, mgmt_ip, mgmt_prefix) {
-                            candidates.insert(ip);
-                        }
-                    }
-                }
+    for entry in acs_devices.values() {
+        if crate::devices::matches_cwmp_identity(
+            &dev.optical_sn,
+            &entry.product_class,
+            &entry.serial,
+        ) {
+            if let Some(ip) = entry
+                .peer
+                .filter(|&ip| ip != mgmt_ip && same_subnet(ip, mgmt_ip, mgmt_prefix))
+            {
+                candidates.insert(ip);
             }
         }
     }
@@ -272,7 +271,7 @@ fn resolve_management_source_ip(
     mgmt_leases: &BTreeMap<[u8; 6], Ipv4Addr>,
     source_links: Option<&BTreeMap<String, String>>,
     fdb_macs_for_serial: &BTreeMap<String, Vec<String>>,
-    acs_devices: &Value,
+    acs_devices: &crate::cwmp::observations::DeviceObservations,
     configured_devices: &[Device],
 ) -> Result<Ipv4Addr, String> {
     let candidates = collect_device_mgmt_candidates(
@@ -331,7 +330,7 @@ fn build_plan(
     mgmt_leases: &BTreeMap<[u8; 6], Ipv4Addr>,
     source_links: Option<&BTreeMap<String, String>>,
     fdb_macs_for_serial: &BTreeMap<String, Vec<String>>,
-    acs_devices: &Value,
+    acs_devices: &crate::cwmp::observations::DeviceObservations,
     listener_error: Option<&str>,
 ) -> Plan {
     let acs_port = management_network
@@ -853,7 +852,7 @@ pub(crate) fn tick(
     configured_devices: &[Device],
     management_network: Option<&Desired>,
     management_active: bool,
-    acs_devices: &Value,
+    acs_devices: &crate::cwmp::observations::DeviceObservations,
     source_links: Option<&BTreeMap<String, String>>,
 ) {
     let config = {
@@ -1177,7 +1176,7 @@ mod tests {
             &mgmt_leases,
             None,
             &BTreeMap::new(),
-            &json!({"devices":{}}),
+            &Default::default(),
             None,
         );
         assert_eq!(unattributed.rules[0].view.state, "waiting");
@@ -1200,7 +1199,7 @@ mod tests {
             &mgmt_leases,
             Some(&source_links),
             &BTreeMap::new(),
-            &json!({"devices":{}}),
+            &Default::default(),
             None,
         );
         assert_eq!(attributed.rules[0].view.state, "active");
@@ -1265,7 +1264,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             &BTreeMap::new(),
-            &json!({"devices":{}}),
+            &Default::default(),
             None,
         );
 

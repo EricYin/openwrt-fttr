@@ -934,7 +934,11 @@ pub(super) fn omci_write_allowed(id: &str, epoch: u64, automatic: bool) -> bool 
         })
 }
 
-pub(super) fn view(device: &Device, management: Option<&Management>, acs: &Value) -> Value {
+pub(super) fn view(
+    device: &Device,
+    management: Option<&Management>,
+    acs: &crate::cwmp::observations::ListenerObservation,
+) -> Value {
     if device.bootstrap_adapter == "none" {
         return json!({"state":"not_required","reason":"management bootstrap is disabled for this device"});
     }
@@ -960,10 +964,10 @@ pub(super) fn view(device: &Device, management: Option<&Management>, acs: &Value
     view["persistence_error"] = json!(c.persistence_error);
     view["link_identity_error"] = json!(sources.as_ref().and_then(|s| s.topology_error()));
     view["listener"] = serde_json::to_value(fttr_api::AcsListener {
-        enabled: acs["enabled"].as_bool().unwrap_or(false),
-        listen: acs["listen"].as_str().map(str::to_owned),
-        path: acs["path"].as_str().map(str::to_owned),
-        error: acs["error"].as_str().map(str::to_owned),
+        enabled: acs.enabled,
+        listen: acs.listen.clone(),
+        path: acs.path.clone(),
+        error: acs.error.clone(),
     })
     .expect("ACS listener serialization");
     view["mqtt_last_seen"] = json!(r
@@ -973,7 +977,7 @@ pub(super) fn view(device: &Device, management: Option<&Management>, acs: &Value
     if let Some(m) = management {
         let url = public_url(&m.acs_url);
         view["desired"] = json!({"vlan":r.selected_vlan.filter(|v|m.vlans.contains(v)).unwrap_or(m.vlan),"vlans":m.vlans,"priority":m.priority,"acs_url":url});
-        if let (Some(listen), Some(path)) = (acs["listen"].as_str(), acs["path"].as_str()) {
+        if let (Some(listen), Some(path)) = (acs.listen.as_deref(), acs.path.as_deref()) {
             let expected = format!("http://{listen}{path}");
             if url != expected {
                 view["endpoint_notice"] = json!(format!("Configured ACS URL {url} differs from the local listener {expected}; confirm routing or forwarding and wait for a fresh Inform."));
