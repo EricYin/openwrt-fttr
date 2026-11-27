@@ -477,6 +477,10 @@ fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, tim
     if all_verified {
         c.attempts.remove(&d.id);
         c.next_retry_at.remove(&d.id);
+        // An explicit successful apply also satisfies causes queued before its
+        // admission; do not immediately replace its result with a startup apply.
+        c.automatic_ready.remove(&d.id);
+        c.startup_pending.remove(&d.id);
     }
     let active_op = c.operations.get(&d.id).is_some_and(|o| {
         o.stage != OperationPhase::Completed && o.stage != OperationPhase::Interrupted
@@ -775,6 +779,24 @@ mod config_change_tests {
             assert_eq!(c.operations[&device.id].id, id);
             assert_eq!(c.attempts[&device.id], 5);
         }
+    }
+
+    #[test]
+    fn verified_explicit_apply_consumes_preexisting_startup_and_ready_causes() {
+        let (mut c, device) = fixture();
+        c.config.triggers = ["startup".into(), "config_change".into()].into();
+        c.startup_pending.insert(device.id.clone());
+        c.automatic_ready.insert(device.id.clone(), Reasons(3));
+        let op = c.operations.get_mut(&device.id).unwrap();
+        op.revision = c.config.device_revision(&device.id).to_owned();
+        op.results
+            .insert("wifi".into(), json!({"state":"verified"}));
+        op.complete(100);
+        let id = op.id;
+        schedule(&mut c, &device, true, false, 101);
+        assert_eq!(c.operations[&device.id].id, id);
+        assert!(!c.startup_pending.contains(&device.id));
+        assert_eq!(c.automatic_ready[&device.id].0, 0);
     }
 
     #[test]
