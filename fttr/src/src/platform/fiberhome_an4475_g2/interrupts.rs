@@ -282,13 +282,13 @@ pub fn poll_and_clear_pending<B: Bus>(fsl: &mut Fsl<B>) -> io::Result<Vec<GponIn
 /// (`GPON_DYING_GASP_ALM`, `GPON_LOSI_ALM`, or `GPON_LOFI_ALM`).
 ///
 /// TODO(bench): the hardware latch/clear semantics of these bitmaps are
-/// unverified — no stock driver fragment in this repository reads or clears
-/// them, and the software deliberately never writes them back. Before changing
-/// that, read the same bitmap twice around one event on real hardware: the
-/// second read still containing the bit means latched (software must diff
-/// snapshots); the second read being clear means read-clears/level semantics.
-/// Until then, consumers must tolerate stale bits (see the DyingGasp edge
-/// detection in `olt.rs`).
+/// unverified. The stock LOFI handler reads its bitmap for deactivation,
+/// reads it again via `fsldrv_gpon_alarm_read_clear`, then clears the W1C
+/// interrupt. The function name alone does not establish read-clear semantics.
+/// This implementation clears the interrupt before reading the bitmap and
+/// never writes the bitmap back. Compare bounded, consecutive reads and
+/// interrupt timing on hardware; repeated or cleared bits alone cannot
+/// distinguish a latched event from a continuing or renewed condition.
 pub fn read_alarm_bitmap<B: Bus>(fsl: &mut Fsl<B>, reg_addr: u32) -> io::Result<[u32; 4]> {
     if !matches!(
         reg_addr,

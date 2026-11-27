@@ -277,6 +277,12 @@ pub struct SubGatewayStatus {
     pub model: String,
     pub serial_number: String,
     pub state: RegistrationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub pon_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub upstream_phy_rate_gbps: Option<f32>,
     pub business_status: BusinessStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "codegen", ts(optional))]

@@ -19,6 +19,7 @@ pub(super) fn snapshot(
                 )
             },
             has_pon_mac_fec: true,
+            onu_us_fec: std::collections::BTreeMap::new(),
             data_path: super::dataplane::data_path,
             fpga_status: super::firmware::get_fpga_status().to_string(),
             pon_mac: Some(super::pon_mac::snapshot()),

@@ -15,8 +15,8 @@ use super::{
     downstream::SendError,
     gdba::{
         configure_alloc, configure_ds_active_pending_slot, read_b_all_set_thd,
-        read_eight_times_dba_granularity, recalculate_b_all_bandwidth, set_na_num, GdbaAllocConfig,
-        GdbaGapConfig,
+        read_eight_times_dba_granularity, read_onu_fec_bitmap, recalculate_b_all_bandwidth,
+        set_na_num, GdbaAllocConfig, GdbaGapConfig,
     },
     initialization::{
         self,
@@ -65,6 +65,20 @@ impl OnuUpstreamRate {
         match self {
             Self::Rate1p25G => 1,
             Self::Rate2p5G => 7,
+        }
+    }
+
+    pub const fn stock_pon_mode(self) -> &'static str {
+        match self {
+            Self::Rate1p25G => "GPON",
+            Self::Rate2p5G => "GPON_SYM",
+        }
+    }
+
+    pub const fn uplink_gbps(self) -> f32 {
+        match self {
+            Self::Rate1p25G => 1.244,
+            Self::Rate2p5G => 2.488,
         }
     }
 }
@@ -203,8 +217,8 @@ pub struct FslOltSession<B: Bus> {
     /// itself is never written (its latch/clear semantics are unverified).
     last_dying_gasp_bitmap: [u32; 4],
     pending_port_id_acks: Vec<PendingPortIdAck>,
-    blacklist: BTreeSet<([u8; 8], OnuUpstreamRate)>,
-    whitelist: BTreeSet<([u8; 8], OnuUpstreamRate)>,
+    blacklist: BTreeSet<[u8; 8]>,
+    whitelist: BTreeMap<[u8; 8], OnuUpstreamRate>,
     auto_whitelist: bool,
     /// Per-session PON sequence matching stock `g_fslstack_ploam_seq`.
     next_port_id_sequence: u16,
@@ -229,7 +243,7 @@ impl<B: Bus> FslOltSession<B> {
             last_dying_gasp_bitmap: [0; 4],
             pending_port_id_acks: Vec::new(),
             blacklist: BTreeSet::new(),
-            whitelist: BTreeSet::new(),
+            whitelist: BTreeMap::new(),
             auto_whitelist: true,
             next_port_id_sequence: 0,
         }
@@ -239,28 +253,32 @@ impl<B: Bus> FslOltSession<B> {
         &self.pending_port_id_acks
     }
 
-    pub fn add_to_blacklist(&mut self, serial_number: [u8; 8], rate: OnuUpstreamRate) {
-        self.blacklist.insert((serial_number, rate));
+    pub fn add_to_blacklist(&mut self, serial_number: [u8; 8]) {
+        self.blacklist.insert(serial_number);
     }
 
-    pub fn remove_from_blacklist(&mut self, serial_number: [u8; 8], rate: OnuUpstreamRate) -> bool {
-        self.blacklist.remove(&(serial_number, rate))
+    pub fn remove_from_blacklist(&mut self, serial_number: [u8; 8]) -> bool {
+        self.blacklist.remove(&serial_number)
     }
 
-    pub fn is_blacklisted(&self, serial_number: [u8; 8], rate: OnuUpstreamRate) -> bool {
-        self.blacklist.contains(&(serial_number, rate))
+    pub fn is_blacklisted(&self, serial_number: [u8; 8]) -> bool {
+        self.blacklist.contains(&serial_number)
     }
 
     pub fn add_to_whitelist(&mut self, serial_number: [u8; 8], rate: OnuUpstreamRate) {
-        self.whitelist.insert((serial_number, rate));
+        self.whitelist.insert(serial_number, rate);
     }
 
-    pub fn remove_from_whitelist(&mut self, serial_number: [u8; 8], rate: OnuUpstreamRate) -> bool {
-        self.whitelist.remove(&(serial_number, rate))
+    pub fn remove_from_whitelist(&mut self, serial_number: [u8; 8]) -> bool {
+        self.whitelist.remove(&serial_number).is_some()
     }
 
-    pub fn is_whitelisted(&self, serial_number: [u8; 8], rate: OnuUpstreamRate) -> bool {
-        self.whitelist.contains(&(serial_number, rate))
+    pub fn is_whitelisted(&self, serial_number: [u8; 8]) -> bool {
+        self.whitelist.contains_key(&serial_number)
+    }
+
+    pub fn whitelisted_rate(&self, serial_number: [u8; 8]) -> Option<OnuUpstreamRate> {
+        self.whitelist.get(&serial_number).copied()
     }
 
     pub fn set_auto_whitelist(&mut self, enabled: bool) {
@@ -617,34 +635,37 @@ impl<B: Bus> FslOltSession<B> {
         checkpoint: &mut impl FnMut(Duration) -> io::Result<()>,
     ) -> io::Result<ManagedOnu> {
         self.require_initialized()?;
-        if self.blacklist.contains(&(serial_number, rate)) {
+        // Stock `fslstack_black_list_find_entry` and `fslstack_white_list_find_entry`
+        // match by `(pon, sn)` regardless of ONU upstream rate; whitelist lookup
+        // also updates the stored ONU type when the ONU re-discovers at a new rate.
+        if self.blacklist.contains(&serial_number) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "ONU serial number and rate are blacklisted",
+                "ONU serial number is blacklisted",
             ));
         }
-        if self
-            .onus
-            .values()
-            .any(|onu| onu.serial_number == serial_number)
-        {
+        let existing = self.find_onu_by_sn(&serial_number);
+        if existing.is_some_and(|onu| onu.state == OnuState::Active) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "duplicate ONU serial number",
             ));
         }
-        if !self.whitelist.contains(&(serial_number, rate)) {
-            if self.auto_whitelist {
-                self.whitelist.insert((serial_number, rate));
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "ONU serial number and rate are not whitelisted",
-                ));
-            }
+        if self.whitelist.contains_key(&serial_number) || self.auto_whitelist {
+            self.whitelist.insert(serial_number, rate);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "ONU serial number is not whitelisted",
+            ));
         }
 
-        let (onu_index, onu_id) = self.allocate_onu_slot(&serial_number)?;
+        // Stock `fslstack_gpon_add_onu_o3_process` updates rate registers and
+        // re-ranges in place if the ONU re-sends O3 SN before reaching Active.
+        let (onu_index, onu_id) = match existing {
+            Some(onu) => (onu.onu_index, onu.onu_id),
+            None => self.allocate_onu_slot(&serial_number)?,
+        };
         set_onu_upstream_rate_2p5g(
             &mut self.mgmt.fsl,
             onu_index,
@@ -667,6 +688,8 @@ impl<B: Bus> FslOltSession<B> {
             checkpoint,
         )?;
 
+        self.pending_port_id_acks
+            .retain(|entry| entry.onu_id != onu_id);
         let entry = ManagedOnu {
             onu_id,
             onu_index,
@@ -724,22 +747,16 @@ impl<B: Bus> FslOltSession<B> {
                 "ranged serial number does not match assigned ONU-ID",
             ));
         }
-        if self
-            .blacklist
-            .contains(&(existing.serial_number, existing.rate))
-        {
+        if self.blacklist.contains(&existing.serial_number) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "ONU serial number and rate are blacklisted",
+                "ONU serial number is blacklisted",
             ));
         }
-        if !self
-            .whitelist
-            .contains(&(existing.serial_number, existing.rate))
-        {
+        if !self.whitelist.contains_key(&existing.serial_number) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "ONU serial number and rate are not whitelisted",
+                "ONU serial number is not whitelisted",
             ));
         }
         if matches!(
@@ -936,6 +953,23 @@ impl<B: Bus> FslOltSession<B> {
             }
         }
         Ok(report)
+    }
+
+    /// Reads per-ONU upstream FEC enable state (`BMP_CFG_ONU_FEC_1G`) keyed by `onu_id`.
+    pub fn read_onu_us_fec_states(&mut self) -> io::Result<BTreeMap<u8, bool>> {
+        self.require_initialized()?;
+        let max_onus = self.config.init.max_onu_id.min(128) as u8;
+        let bitmap = read_onu_fec_bitmap(&mut self.mgmt.fsl, max_onus)?;
+        Ok(self
+            .onus
+            .iter()
+            .filter_map(|(&onu_id, onu)| {
+                bitmap
+                    .get(usize::from(onu.onu_index))
+                    .copied()
+                    .map(|enabled| (onu_id, enabled))
+            })
+            .collect())
     }
 
     /// Toggles an ONU's upstream FEC bitmap bit (`BMP_CFG_ONU_FEC_1G`) and

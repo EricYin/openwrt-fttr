@@ -76,6 +76,9 @@ pub(crate) fn snapshot(
             if !hardware.has_pon_mac_fec {
                 telemetry.fec.downstream_enabled = None;
             }
+            if let Some(&upstream_enabled) = hardware.onu_us_fec.get(&onu.onu_id) {
+                telemetry.fec.upstream_enabled = Some(upstream_enabled);
+            }
             for (field, unit, reason) in [
                 (
                     "fiber_distance_m",
@@ -123,6 +126,8 @@ pub(crate) fn snapshot(
                     .unwrap_or_else(|| onu.model.clone()),
                 serial_number: sn_str.clone(),
                 state: onu.state,
+                pon_mode: onu.pon_mode.clone(),
+                upstream_phy_rate_gbps: onu.upstream_phy_rate_gbps,
                 omci_auth: Some(crate::omci_auth::status(&sn_str)),
                 management: desired.and_then(|d| d.management.clone()),
                 provisioning: desired.map(|d| d.provisioning.clone()),
@@ -241,6 +246,7 @@ pub(crate) struct Hardware {
     pub supports_pinning: bool,
     pub ranging_source: fn(u8) -> String,
     pub has_pon_mac_fec: bool,
+    pub onu_us_fec: std::collections::BTreeMap<u8, bool>,
     pub data_path: fn(u8, &str, Option<fttr_api::OnuOmciInventory>) -> fttr_api::DataPathStatus,
     pub fpga_status: String,
     pub pon_mac: Option<fttr_api::PonMacStatus>,

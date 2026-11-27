@@ -104,6 +104,8 @@ fn onu(sn: &str, id: u8) -> SubGatewayStatus {
         model: "test-onu".into(),
         serial_number: sn.into(),
         state: RegistrationState::O5Operation,
+        pon_mode: None,
+        upstream_phy_rate_gbps: None,
         business_status: BusinessStatus::default(),
         omci_auth: None,
         management: None,

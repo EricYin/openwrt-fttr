@@ -276,13 +276,26 @@ impl PonEngine {
 
     /// Adopt an ID already confirmed by the platform, rather than allocating a
     /// second, potentially different ID in the shared engine.
-    #[cfg(any(feature = "platform-fiberhome-an4475-g2", test))]
+    #[cfg(test)]
     pub(crate) fn confirm_platform_onu(
         &mut self,
         id: u8,
         vendor: [u8; 4],
         sn: [u8; 4],
         eqd: u32,
+    ) -> Result<Vec<u8>, String> {
+        self.confirm_platform_onu_with_rate(id, vendor, sn, eqd, None, None)
+    }
+
+    #[cfg(any(feature = "platform-fiberhome-an4475-g2", test))]
+    pub(crate) fn confirm_platform_onu_with_rate(
+        &mut self,
+        id: u8,
+        vendor: [u8; 4],
+        sn: [u8; 4],
+        eqd: u32,
+        pon_mode: Option<&str>,
+        upstream_phy_rate_gbps: Option<f32>,
     ) -> Result<Vec<u8>, String> {
         if !self.resources.onu_ids.contains(&id) {
             return Err(format!("platform ONU-ID {id} is unavailable"));
@@ -309,6 +322,8 @@ impl PonEngine {
             .find(|onu| onu.onu_id == id)
             .unwrap();
         onu.eq_delay = Some(eqd);
+        onu.pon_mode = pon_mode.map(str::to_owned);
+        onu.upstream_phy_rate_gbps = upstream_phy_rate_gbps;
         onu.state = OnuState::O5Operation;
         Ok(displaced)
     }
@@ -386,6 +401,8 @@ impl PonEngine {
             // Retain identity/slot only, never evidence from the previous activation.
             onu.state = OnuState::O1Initial;
             onu.eq_delay = None;
+            onu.pon_mode = None;
+            onu.upstream_phy_rate_gbps = None;
         }
     }
 

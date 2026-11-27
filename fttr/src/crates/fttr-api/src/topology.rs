@@ -152,6 +152,12 @@ pub struct TopologyOnu {
     pub firmware_version: Option<String>,
     /// None means a binding-only placeholder, not an invented O1 observation.
     pub registration: Option<RegistrationState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub pon_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "codegen", ts(optional))]
+    pub upstream_phy_rate_gbps: Option<f32>,
     pub business: Option<BusinessStatus>,
     pub management: Option<ManagementStatus>,
     pub provisioning: Option<ProvisioningStatus>,

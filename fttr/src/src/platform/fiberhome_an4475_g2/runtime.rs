@@ -871,19 +871,31 @@ pub(crate) fn status_snapshot(
     // status path — a busy fsl-loop transaction (PLOAM/OMCI bursts, deactivate)
     // would otherwise stall the single IPC STATUS worker. An unavailable
     // sample beats blocking; committed state remains visible via pon_mac.
-    let tx_enabled = runtime_state()
+    let (tx_enabled, onu_us_fec) = runtime_state()
         .session
         .try_lock()
         .ok()
         .and_then(|mut guard| {
-            guard
-                .as_mut()
-                .and_then(|session| session.fsl_mut().is_tx_enabled().ok())
-        });
+            guard.as_mut().map(|session| {
+                (
+                    session.fsl_mut().is_tx_enabled().ok(),
+                    session.read_onu_us_fec_states().unwrap_or_default(),
+                )
+            })
+        })
+        .unwrap_or((None, BTreeMap::new()));
     let calibration = super::calibration::info().application;
     let (measurements, measurement_evidence) = super::transceiver::snapshot();
     let devices = devices.lock().map_err(|_| UBUS_ERROR_INTERNAL)?;
     let engine = pon_engine.lock().map_err(|_| UBUS_ERROR_INTERNAL)?;
+    let phy_rate_uplink_gbps = if engine.active_onus.iter().any(|onu| {
+        onu.state == crate::pon_engine::ploam::OnuState::O5Operation
+            && onu.upstream_phy_rate_gbps == Some(2.488)
+    }) {
+        2.488
+    } else {
+        1.244
+    };
     Ok(crate::platform::status::snapshot(
         &engine,
         services,
@@ -897,6 +909,7 @@ pub(crate) fn status_snapshot(
             supports_pinning: true,
             ranging_source: |_| "FSL upstream ranging time / calculated EqD".into(),
             has_pon_mac_fec: true,
+            onu_us_fec,
             data_path,
             fpga_status: if ready { "ready" } else { "not_ready" }.into(),
             pon_mac: Some(crate::controller::pon_mac::snapshot()),
@@ -907,7 +920,7 @@ pub(crate) fn status_snapshot(
                 wavelength_tx_nm: 1490,
                 wavelength_rx_nm: 1310,
                 phy_rate_downlink_gbps: 2.488,
-                phy_rate_uplink_gbps: 1.244,
+                phy_rate_uplink_gbps,
                 tx_power_dbm: measurements[3],
                 laser_bias_current_ma: measurements[2],
                 temperature_celsius: measurements[0],
@@ -1263,6 +1276,40 @@ fn ipc_handler(
                 .and_then(|command| crate::controller::fec::control(command, &services));
             let response =
                 result.unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+            let _ = serde_json::to_writer(&mut stream, &response);
+            let _ = stream.write_all(b"\n");
+        } else if let Some(request) = line.strip_prefix("US_FEC ") {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct UsFecCommand {
+                onu_id: u8,
+                #[serde(default)]
+                enable: Option<bool>,
+            }
+            let response = match serde_json::from_str::<UsFecCommand>(request)
+                .map_err(std::io::Error::other)
+                .and_then(|cmd| {
+                    with_session(|session| {
+                        let b_all_set_thd = if let Some(enable) = cmd.enable {
+                            session.set_onu_us_fec_and_recalc(cmd.onu_id, enable)?
+                        } else {
+                            None
+                        };
+                        let states = session.read_onu_us_fec_states()?;
+                        let enabled = states.get(&cmd.onu_id).copied().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "unknown ONU-ID in OLT session")
+                        })?;
+                        Ok(serde_json::json!({
+                            "status": "success",
+                            "onu_id": cmd.onu_id,
+                            "upstream_fec_enabled": enabled,
+                            "b_all_set_thd": b_all_set_thd,
+                        }))
+                    })
+                }) {
+                Ok(value) => value,
+                Err(error) => serde_json::json!({"status": "error", "error": error.to_string()}),
+            };
             let _ = serde_json::to_writer(&mut stream, &response);
             let _ = stream.write_all(b"\n");
         } else if let Some(request) = line.strip_prefix("OMCI_ATTRIBUTE ") {
@@ -1904,8 +1951,13 @@ async fn run_async(platform: PlatformContext) {
                             let mut sn_tail = [0u8; 4];
                             sn_tail.copy_from_slice(&onu.serial_number[4..8]);
                             let displaced = match pon_engine_loop.lock() {
-                                Ok(mut engine) => match engine.confirm_platform_onu(
-                                    onu.onu_id, vendor, sn_tail, onu.eqd,
+                                Ok(mut engine) => match engine.confirm_platform_onu_with_rate(
+                                    onu.onu_id,
+                                    vendor,
+                                    sn_tail,
+                                    onu.eqd,
+                                    Some(onu.rate.stock_pon_mode()),
+                                    Some(onu.rate.uplink_gbps()),
                                 ) {
                                     Ok(displaced) => displaced,
                                     Err(err) => {

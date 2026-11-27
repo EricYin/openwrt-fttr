@@ -19,8 +19,8 @@ fn stock_upstream_rate_metadata_is_decoded_and_unknown_values_rejected() {
 }
 use crate::platform::fiberhome_an4475_g2::{
     activation::{
-        read_alloc_offset_mode, BMP_CFG_RG_REQ, BMP_PLS_REQ, BMP_STA, BWMAP_CFG_BASIC,
-        PORTID_CFG_TAB, RSM_ALM, RSM_CFG_TCONT_CLR,
+        read_alloc_offset_mode, BMP_CFG_RG_REQ, BMP_CFG_UP_RATE_IND, BMP_PLS_REQ, BMP_STA,
+        BWMAP_CFG_BASIC, GPON_US_RATE_SEL_CFG, PORTID_CFG_TAB, RSM_ALM, RSM_CFG_TCONT_CLR,
     },
     downstream::{OMCI_CONTROL, OMCI_MEMORY, PLOAM_DATA as TX_PLOAM_DATA, PLOAM_INFO},
     gdba::{
@@ -732,18 +732,23 @@ fn blacklist_and_strict_whitelist_gate_discovery() {
     session.initialize(&mut no_sleep).expect("initialize");
 
     let sn = *b"TEST\x00\x00\x00\x33";
-    // Blacklist is keyed on (SN, rate), matching stock fslstack_black_list_find_entry.
-    session.add_to_blacklist(sn, OnuUpstreamRate::Rate1p25G);
-    assert_eq!(
-        session
-            .process_o3_sn_discovery(sn, OnuUpstreamRate::Rate1p25G, &mut no_sleep)
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::PermissionDenied
-    );
+    // Blacklist is keyed on SN regardless of upstream rate, matching stock
+    // `fslstack_black_list_find_entry`.
+    session.add_to_blacklist(sn);
+    for rate in [OnuUpstreamRate::Rate1p25G, OnuUpstreamRate::Rate2p5G] {
+        assert_eq!(
+            session
+                .process_o3_sn_discovery(sn, rate, &mut no_sleep)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
     assert!(session.bus().ploam_tx_frames.is_empty());
+    assert!(session.remove_from_blacklist(sn));
 
-    // Strict whitelist mode rejects non-whitelisted (SN, rate) until explicitly added.
+    // Strict whitelist mode rejects non-whitelisted SN until explicitly added,
+    // and updates the stored whitelist rate when the ONU discovers at another rate.
     session.set_auto_whitelist(false);
     assert_eq!(
         session
@@ -752,11 +757,57 @@ fn blacklist_and_strict_whitelist_gate_discovery() {
             .kind(),
         io::ErrorKind::PermissionDenied
     );
-    session.add_to_whitelist(sn, OnuUpstreamRate::Rate2p5G);
+    session.add_to_whitelist(sn, OnuUpstreamRate::Rate1p25G);
     let onu = session
         .process_o3_sn_discovery(sn, OnuUpstreamRate::Rate2p5G, &mut no_sleep)
-        .expect("whitelisted 2.5G ONU allowed");
+        .expect("whitelisted SN allowed across rate change");
     assert_eq!(onu.state, OnuState::Ranging);
+    assert_eq!(onu.rate, OnuUpstreamRate::Rate2p5G);
+    assert_eq!(
+        session.whitelisted_rate(sn),
+        Some(OnuUpstreamRate::Rate2p5G)
+    );
+}
+
+#[test]
+fn o3_rediscovery_mid_activation_updates_rate_and_reranges() {
+    let mut cfg = OltSessionConfig::default();
+    cfg.init.max_onu_id = 16;
+    let mut session = FslOltSession::new(SimBus::new(), cfg);
+    session.initialize(&mut no_sleep).expect("initialize");
+
+    let sn = *b"TEST\x00\x00\x00\x77";
+    // Start O3 at 1.25G -> advance to AwaitingPortIdAck (O4 sent).
+    let onu = session
+        .process_o3_sn_discovery(sn, OnuUpstreamRate::Rate1p25G, &mut no_sleep)
+        .expect("initial O3 1.25G");
+    assert_eq!(onu.onu_id, 0);
+    assert_eq!(session.bus().regs[&GPON_US_RATE_SEL_CFG][0] & 1, 0);
+    assert_eq!(session.bus().regs[&BMP_CFG_UP_RATE_IND][0] & 1, 0);
+
+    let pending = session
+        .process_o4_o5_activation(onu.onu_id, &sn, 0x200, &mut no_sleep)
+        .expect("O4 1.25G");
+    assert_eq!(pending.state, OnuState::AwaitingPortIdAck);
+    assert_eq!(session.pending_port_id_acks().len(), 1);
+
+    // Before Configure_Port_ID ACK arrives, ONU re-sends O3 SN at 2.5G (GPON_SYM).
+    let rediscovered = session
+        .process_o3_sn_discovery(sn, OnuUpstreamRate::Rate2p5G, &mut no_sleep)
+        .expect("O3 rediscovery mid-activation switching to 2.5G");
+    assert_eq!(rediscovered.onu_id, 0);
+    assert_eq!(rediscovered.state, OnuState::Ranging);
+    assert_eq!(rediscovered.rate, OnuUpstreamRate::Rate2p5G);
+    assert!(session.pending_port_id_acks().is_empty());
+    assert_eq!(session.bus().regs[&GPON_US_RATE_SEL_CFG][0] & 1, 1);
+    assert_eq!(session.bus().regs[&BMP_CFG_UP_RATE_IND][0] & 1, 1);
+
+    // O4 now computes 2.5G EqD and OMCC ds_tail_flag = 1.
+    let pending_2p5 = session
+        .process_o4_o5_activation(0, &sn, 0x200, &mut no_sleep)
+        .expect("O4 2.5G");
+    assert_eq!(pending_2p5.eqd, (0x200 >> 1) + 0x18);
+    assert_eq!(session.pending_port_id_acks().len(), 1);
 }
 
 #[test]

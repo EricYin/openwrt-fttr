@@ -31,6 +31,7 @@ Commands:\n  \
   status [--json|-j]   Display active FTTR optical link and DSA switch ports (table or JSON)\n  \
   mib ONU_ID [--summary|--json] [--tables]  Read structured OMCI inventory (default: JSON)\n  \
   fec ONU_ID [--json] [--create-pm]  Read downstream FEC PM; optionally create missing PM instance\n  \
+  us-fec ONU_ID [on|off|status] [--json]  Read or toggle per-ONU upstream FEC (AN4475-G2)\n  \
   hardware DEVICE COMMAND  Exclusive offline register/memory diagnostics (JSON; hardware help)\n  \
   fpga-read <addr>     Directly read 32-bit FPGA hardware register\n  \
   fpga-diag [ONU_ID|all] [--samples N] [--interval-ms N] [--json] [--offline]\n  \
@@ -298,8 +299,12 @@ fn print_status_table(status: &FttrSystemStatus) {
 
     println!("[*] Optical Transceiver (BOSA {}):", opt.model);
     println!(
-        "    TX enable/readback: {}  |  Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G",
-        tx_enable_str, opt.wavelength_tx_nm, opt.wavelength_rx_nm
+        "    TX enable/readback: {}  |  Wavelength: TX {}nm / RX {}nm  |  Rate: {:.3}G / {:.3}G",
+        tx_enable_str,
+        opt.wavelength_tx_nm,
+        opt.wavelength_rx_nm,
+        opt.phy_rate_downlink_gbps,
+        opt.phy_rate_uplink_gbps
     );
     if opt.temperature_celsius.is_some()
         || opt.vcc_voltage.is_some()
@@ -345,7 +350,16 @@ fn print_status_table(status: &FttrSystemStatus) {
     let mut in_prog_count = 0;
     for p in &status.switch_ports {
         let is_up = p.carrier;
-        let speed = "Unavailable";
+        let sg_for_port = p
+            .onu_id
+            .and_then(|id| status.sub_gateways.iter().find(|sg| sg.onu_id == id));
+        let speed = sg_for_port
+            .and_then(|sg| match sg.upstream_phy_rate_gbps {
+                Some(rate) if rate >= 2.0 => Some("2.5G/2.5G"),
+                Some(_) => Some("2.5G/1.25G"),
+                None => None,
+            })
+            .unwrap_or("Unavailable");
         let onu_id_str = p
             .onu_id
             .map(|id| id.to_string())
@@ -401,6 +415,26 @@ fn print_status_table(status: &FttrSystemStatus) {
                     .unwrap_or_else(|| "unknown".into()),
                 sg.state
             );
+            if sg.pon_mode.is_some() || sg.upstream_phy_rate_gbps.is_some() {
+                let mode = sg.pon_mode.as_deref().unwrap_or("GPON");
+                let rate = sg
+                    .upstream_phy_rate_gbps
+                    .map(|up| format!("2.488G / {up:.3}G"))
+                    .unwrap_or_else(|| "Unavailable".into());
+                println!("    PON Mode:       {} ({})", mode, rate);
+            }
+            if let Some(fec) = &sg.fec {
+                let fmt_bool = |value: Option<bool>| match value {
+                    Some(true) => "ENABLED",
+                    Some(false) => "DISABLED",
+                    None => "UNKNOWN",
+                };
+                println!(
+                    "    FEC:            DS: {} | US: {}",
+                    fmt_bool(fec.downstream_enabled),
+                    fmt_bool(fec.upstream_enabled)
+                );
+            }
             println!("    Business:       {}", sg.business_status);
             if let Some(provisioning) = &sg.provisioning {
                 println!(
@@ -784,8 +818,11 @@ fn main() {
             } else {
                 println!("[*] Optical Transceiver (BOSA {}):", opt.model);
                 println!(
-                    "    Wavelength: TX {}nm / RX {}nm  |  Rate: 2.488G / 1.244G",
-                    opt.wavelength_tx_nm, opt.wavelength_rx_nm
+                    "    Wavelength: TX {}nm / RX {}nm  |  Rate: {:.3}G / {:.3}G",
+                    opt.wavelength_tx_nm,
+                    opt.wavelength_rx_nm,
+                    opt.phy_rate_downlink_gbps,
+                    opt.phy_rate_uplink_gbps
                 );
                 let temp_str = opt
                     .temperature_celsius
@@ -913,6 +950,52 @@ fn main() {
             };
             if let Err(error) = openwrt_fttr::controller::fec::read(id, create_pm) {
                 eprintln!("[-] FEC PM diagnostic failed: {error}");
+                exit(1);
+            }
+        }
+        "us-fec" => {
+            let Some((id, enable, is_json)) = parse_us_fec_args(&args[2..]) else {
+                eprintln!("Usage: fttrctl us-fec ONU_ID [on|off|status] [--json]");
+                exit(1);
+            };
+            let payload = serde_json::json!({"onu_id": id, "enable": enable});
+            let reply = match ipc::send_ipc_command(&format!("US_FEC {payload}")) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    if is_json {
+                        println!("{}", status_ipc_error(&error.to_string()));
+                    } else {
+                        eprintln!("[-] US FEC request failed: {error}");
+                    }
+                    exit(1);
+                }
+            };
+            let value: serde_json::Value = match serde_json::from_str(&reply) {
+                Ok(v) => v,
+                Err(error) => {
+                    eprintln!("[-] Invalid US FEC response: {error}");
+                    exit(1);
+                }
+            };
+            if is_json {
+                println!("{}", serde_json::to_string_pretty(&value).unwrap_or(reply));
+            } else if value.get("status").and_then(|v| v.as_str()) == Some("success") {
+                let state = value
+                    .get("upstream_fec_enabled")
+                    .and_then(|v| v.as_bool())
+                    .map(|b| if b { "ENABLED" } else { "DISABLED" })
+                    .unwrap_or("UNKNOWN");
+                if let Some(thd) = value.get("b_all_set_thd").and_then(|v| v.as_u64()) {
+                    println!("[+] ONU {id} upstream FEC: {state} (B_ALL_SET_THD={thd})");
+                } else {
+                    println!("[+] ONU {id} upstream FEC: {state}");
+                }
+            } else {
+                let err = value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                eprintln!("[-] US FEC failed: {err}");
                 exit(1);
             }
         }
@@ -1079,9 +1162,25 @@ fn parse_fec_args(args: &[String]) -> Option<(u8, bool)> {
         .then(|| (id, args.iter().any(|arg| arg == "--create-pm")))
 }
 
+fn parse_us_fec_args(args: &[String]) -> Option<(u8, Option<bool>, bool)> {
+    let id = parse_onu_id(args.first()?)?;
+    let mut enable = None;
+    let mut is_json = false;
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--json" | "-j" => is_json = true,
+            "on" if enable.is_none() => enable = Some(true),
+            "off" if enable.is_none() => enable = Some(false),
+            "status" if enable.is_none() => {}
+            _ => return None,
+        }
+    }
+    Some((id, enable, is_json))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_fec_args, parse_optical_args, status_ipc_error};
+    use super::{parse_fec_args, parse_optical_args, parse_us_fec_args, status_ipc_error};
 
     #[test]
     fn fec_accepts_protocol_ids_including_sparse_platform_ids_but_not_reserved_addresses() {
@@ -1133,5 +1232,25 @@ mod tests {
 
         // Invalid subcommand
         assert!(parse_optical_args(&to_args(&["fttrctl", "optical", "reboot"])).is_err());
+    }
+
+    #[test]
+    fn parse_us_fec_args_valid_and_invalid() {
+        let to_args = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_us_fec_args(&to_args(&["0"])), Some((0, None, false)));
+        assert_eq!(
+            parse_us_fec_args(&to_args(&["0", "on", "--json"])),
+            Some((0, Some(true), true))
+        );
+        assert_eq!(
+            parse_us_fec_args(&to_args(&["15", "off"])),
+            Some((15, Some(false), false))
+        );
+        assert_eq!(
+            parse_us_fec_args(&to_args(&["1", "status", "-j"])),
+            Some((1, None, true))
+        );
+        assert!(parse_us_fec_args(&to_args(&["0", "on", "off"])).is_none());
+        assert!(parse_us_fec_args(&to_args(&["255", "on"])).is_none());
     }
 }

@@ -619,6 +619,30 @@ pub fn read_active_onu_count<B: Bus>(fsl: &mut Fsl<B>, max_onus: u8) -> io::Resu
     Ok(words.into_iter().map(|w| w.count_ones() as u16).sum())
 }
 
+/// Reads the per-ONU upstream FEC enable bitmap from `BMP_CFG_ONU_FEC_1G` (`0x633`).
+pub fn read_onu_fec_bitmap<B: Bus>(fsl: &mut Fsl<B>, max_onus: u8) -> io::Result<Vec<bool>> {
+    validate_max_onus(max_onus)?;
+    if max_onus == 0 {
+        return Ok(Vec::new());
+    }
+    let fec = fsl.read(
+        RegisterSpace::Register,
+        BMP_CFG_ONU_FEC_1G,
+        0,
+        ACTIVE_REG_WORDS,
+    )?;
+    let mut fec_words: [u32; ACTIVE_REG_WORDS] = fec.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected BMP_CFG_ONU_FEC_1G word count",
+        )
+    })?;
+    mask_bitmap_bits(&mut fec_words, max_onus);
+    Ok((0..usize::from(max_onus))
+        .map(|idx| ((fec_words[idx / 32] >> (idx % 32)) & 1) != 0)
+        .collect())
+}
+
 /// Returns `true` if any active ONU in `0..max_onus` has upstream FEC enabled in `BMP_CFG_ONU_FEC_1G` (`0x633`),
 /// matching `fslstack_gpon_onu_fec_state_get`.
 pub fn any_active_onu_us_fec<B: Bus>(fsl: &mut Fsl<B>, max_onus: u8) -> io::Result<bool> {
