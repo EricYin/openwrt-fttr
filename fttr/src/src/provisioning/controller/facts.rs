@@ -163,8 +163,7 @@ impl Controller {
     }
 
     pub(super) fn previous_facts(&self, device: &str) -> Option<Facts> {
-        self.operations
-            .get(device)
+        self.business_operation(device)
             .map(Operation::facts)
             .or_else(|| self.recovered.get(device).map(Facts::recovered))
     }

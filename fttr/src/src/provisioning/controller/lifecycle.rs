@@ -445,6 +445,7 @@ impl Controller {
         for (id, view) in self
             .operations
             .iter()
+            .filter(|(_, op)| op.observes().is_none())
             .map(|(id, op)| (id, op.view()))
             .chain(self.recovered.iter().map(|(id, op)| (id, op.clone())))
         {
@@ -478,7 +479,10 @@ impl Controller {
                 })
         });
         self.recovered.retain(|id, op| {
-            !self.operations.contains_key(id)
+            !self
+                .operations
+                .get(id)
+                .is_some_and(|active| active.observes().is_none())
                 && (facts::Facts::recovered(op).unresolved
                     || devices.iter().any(|d| {
                         &d.id == id
@@ -488,6 +492,8 @@ impl Controller {
                             && (d.cwmp_id.starts_with("pending:") || op["cwmp_id"] == d.cwmp_id)
                     }))
         });
+        self.observations
+            .retain(|id, _| devices.iter().any(|d| &d.id == id));
         self.management
             .retain(|id, _| devices.iter().any(|d| &d.id == id));
         self.mqtt

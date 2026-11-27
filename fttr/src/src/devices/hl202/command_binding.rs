@@ -168,7 +168,7 @@ async fn execute_at_async(
             &owned_transaction
         }
     };
-    if transaction.target() != target.mqtt_mac {
+    if transaction.target() != target.mqtt_mac || !transaction.matches_selection(selection) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "transaction target changed",

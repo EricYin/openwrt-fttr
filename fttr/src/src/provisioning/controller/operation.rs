@@ -140,6 +140,10 @@ impl Operation {
     }
 
     pub(super) fn supersede_remaining(&mut self) {
+        if self.observes().is_some() {
+            self.finish_command(Err("superseded by a newer configuration".into()), now());
+            return;
+        }
         if let Some(state) = self.command_mut() {
             state.result.get_or_insert_with(|| json!({"items":[]}));
         }
@@ -159,6 +163,22 @@ impl Operation {
 
     pub(super) fn view(&self) -> Value {
         if let Some(state) = self.command() {
+            if let Some(old_id) = state.observes {
+                let mut result = state.result.clone().unwrap_or_else(|| json!({}));
+                result["operation_id"] = json!(self.id);
+                result["mode"] = json!("observe");
+                result["state"] = json!(self.stage);
+                result["revision"] = json!(self.revision);
+                result["completed_at"] = json!(self.completed_at);
+                result["observes_operation_id"] = json!(old_id);
+                result["write_performed"] = json!(false);
+                result["old_execution"] = json!("unconfirmed");
+                result["recovery_state"] = json!("manual_required");
+                result["manual_action"] = json!(
+                    "confirm old writer termination and recover original intent independently"
+                );
+                return result;
+            }
             let mut result = state.result.clone().unwrap_or_else(|| json!({"items":self.device.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":self.stage,"revision":self.revision})).collect::<Vec<_>>()}));
             result["operation_id"] = json!(self.id);
             result["device"] = json!(self.device.id);

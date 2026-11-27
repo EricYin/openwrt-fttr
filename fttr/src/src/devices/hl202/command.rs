@@ -286,6 +286,28 @@ struct Publication {
 #[cfg(any(feature = "mqtt", test))]
 impl Transaction {
     pub(super) fn acquire(target: &str) -> io::Result<Self> {
+        Self::acquire_inner(target, true)
+    }
+
+    // No mutable transaction permit or caller-supplied script is exposed by
+    // the exception for observing an unresolved write.
+    #[cfg(feature = "mqtt")]
+    pub(super) async fn observe_inventory(
+        target: &str,
+        selection: &crate::mqtt_identity::Selection,
+    ) -> io::Result<super::command_binding::SelectedResult> {
+        let tx = Self::acquire_inner(target, false)?;
+        super::command_binding::execute_transaction_async(
+            &tx,
+            selection,
+            super::provisioning::INVENTORY,
+            Duration::from_secs(90),
+        )
+        .await
+    }
+
+    fn acquire_inner(target: &str, require_settled: bool) -> io::Result<Self> {
+        let _ = require_settled;
         let target = normalize_mac(target)?;
         let global = lock_named("transactions", 1)?;
         let device = lock_target(&format!("transaction-{target}"))?;
@@ -311,7 +333,9 @@ impl Transaction {
                 .optical_sn
                 .ok_or_else(|| io::Error::other("optical identity unavailable"))?;
             #[cfg(feature = "mqtt")]
-            super::command_binding::ensure_no_pending(&serial)?;
+            if require_settled {
+                super::command_binding::ensure_no_pending(&serial)?;
+            }
             let epoch = crate::omci_auth::serial_epoch(&serial).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -356,6 +380,15 @@ impl Transaction {
 
     pub(super) fn target(&self) -> &str {
         &self.target
+    }
+
+    #[cfg(feature = "mqtt")]
+    pub(super) fn matches_selection(&self, selection: &crate::mqtt_identity::Selection) -> bool {
+        self.publication.as_ref().is_none_or(|p| {
+            p.selection.optical_sn == selection.optical_sn
+                && p.selection.onu_id == selection.onu_id
+                && p.selection.binding_generation == selection.binding_generation
+        })
     }
 
     #[cfg(feature = "mqtt")]

@@ -291,6 +291,9 @@ pub(super) fn tick(engine: &Arc<Mutex<crate::pon_engine::PonEngine>>, batch: Rea
         },
         time,
         |op| {
+            if op.observes().is_some() {
+                return crate::provisioning::command::Job::observe(op.device.clone());
+            }
             crate::provisioning::command::Job::start(
                 op.device.clone(),
                 op.apply,
@@ -451,6 +454,11 @@ fn retry_delay(attempts: u32) -> u64 {
 
 fn schedule(c: &mut Controller, d: &Device, reachable: bool, new_boot: bool, time: u64) {
     if c.pending_config.is_some() {
+        return;
+    }
+    if c.unresolved_owner(d) {
+        c.automatic_ready.remove(&d.id);
+        c.schedule_observation(d, reachable, time);
         return;
     }
     // A tmpfs checkpoint missing after reboot cannot establish the fate of old

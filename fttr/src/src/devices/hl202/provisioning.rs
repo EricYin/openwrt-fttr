@@ -83,6 +83,10 @@ async fn execute_once(
             false,
         )
     })?;
+    inventory_reply(reply)
+}
+
+fn inventory_reply(reply: command_binding::SelectedResult) -> Result<String, (String, bool)> {
     if !reply.binding_current {
         return Err((
             "command identity changed; rediscovery required".into(),
@@ -131,7 +135,7 @@ where
     }
 }
 
-const INVENTORY: &str = r#"read_fields() {
+pub(super) const INVENTORY: &str = r#"read_fields() {
  n=$1; shift
  for k in "$@"; do
   v=$(tcapi get "$n" "$k") || exit 1
@@ -634,6 +638,85 @@ pub(super) fn ownership_path(serial: &str) -> String {
     crate::provisioning::runtime_store::Record::Native.path(serial)
 }
 
+fn selection(serial: &str) -> Result<(Selection, String), String> {
+    let registry = crate::mqtt_identity::shared().lock().unwrap();
+    let targets: Vec<_> = registry
+        .snapshots(now())
+        .into_iter()
+        .filter(|s| s.optical_sn.as_deref() == Some(serial) && s.reason == "ready")
+        .collect();
+    let [target] = targets.as_slice() else {
+        return Err("fresh unique optical/MQTT identity required".into());
+    };
+    Ok((
+        Selection {
+            optical_sn: serial.into(),
+            onu_id: target.onu_id.ok_or("missing ONU identity")?,
+            binding_generation: target.binding_generation.clone(),
+        },
+        target.mqtt_mac.clone(),
+    ))
+}
+
+fn load_ownership(serial: &str) -> Result<Ownership, String> {
+    match storage::read(ownership_path(serial)) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|_| "invalid command ownership journal".into())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Ownership::default()),
+        Err(_) => Err("cannot read command ownership journal".into()),
+    }
+}
+
+/// Observe current intent without asserting anything about the old writer.
+/// No write callback, ownership update, or raw inventory leaves this path.
+pub async fn observe(
+    device: &Device,
+    auth_epoch: u64,
+) -> Result<Value, crate::provisioning::command::Failure> {
+    let (selection, mac) = selection(&device.optical_sn)?;
+    let reply = super::command::Transaction::observe_inventory(&mac, &selection)
+        .await
+        .map_err(|e| format!("inventory command failed: {e}"))?;
+    let text = inventory_reply(reply).map_err(|(reason, _)| reason)?;
+    let inventory = parse(&text)?;
+    if crate::omci_auth::serial_epoch(&device.optical_sn) != Some(auth_epoch) {
+        return Err("OMCI authentication generation changed".into());
+    }
+    let owned = load_ownership(&device.optical_sn)?;
+    Ok(observation(device, &inventory, owned))
+}
+
+fn observation(device: &Device, inventory: &Inventory, owned: Ownership) -> Value {
+    let native_pending = owned.pending.then_some(owned.operation_id);
+    let mut result =
+        json!({"inventory_complete":true,"native_pending_operation_id":native_pending});
+    match compile(device, inventory, owned, true) {
+        Ok(desired) => {
+            let items: Vec<_> = device.items.iter().map(|item| {
+                let fields = &desired.items[&item.id];
+                let matches = fields.iter().all(|k| desired.fields.get(k) == inventory.fields.get(k))
+                    && runtime_matches(&desired, inventory, fields);
+                // Match/drift are observations, not provisioning item outcomes.
+                json!({"id":item.id,"kind":item.kind,"comparison":if matches {"match"} else {"drift"}})
+            }).collect();
+            let matches = differences(&desired, inventory).is_empty()
+                && desired
+                    .removed
+                    .iter()
+                    .all(|pair| !inventory.children.contains(pair))
+                && desired
+                    .items
+                    .values()
+                    .all(|fields| runtime_matches(&desired, inventory, fields));
+            result["comparison"] = json!(if matches { "match" } else { "drift" });
+            result["items"] = json!(items);
+        }
+        Err(_) => result["comparison"] = json!("unavailable"),
+    }
+    result
+}
+
 pub async fn run(
     device: Device,
     apply: bool,
@@ -650,36 +733,12 @@ pub async fn run(
         }
     };
     check_auth()?;
-    let (selection, target_mac) = {
-        let registry = crate::mqtt_identity::shared().lock().unwrap();
-        let targets: Vec<_> = registry
-            .snapshots(now())
-            .into_iter()
-            .filter(|s| s.optical_sn.as_deref() == Some(&device.optical_sn) && s.reason == "ready")
-            .collect();
-        let [target] = targets.as_slice() else {
-            return Err("fresh unique optical/MQTT identity required".into());
-        };
-        (
-            Selection {
-                optical_sn: device.optical_sn.clone(),
-                onu_id: target.onu_id.ok_or("missing ONU identity")?,
-                binding_generation: target.binding_generation.clone(),
-            },
-            target.mqtt_mac.clone(),
-        )
-    };
+    let (selection, target_mac) = selection(&device.optical_sn)?;
     // Separate from per-publication transport locks; held for the complete transaction.
     let transaction = super::command::Transaction::acquire(&target_mac)
         .map_err(|e| format!("device transaction admission rejected: {e}"))?;
     let path = ownership_path(&device.optical_sn);
-    let owned: Ownership = match crate::provisioning::storage::read(&path) {
-        Ok(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|_| "invalid command ownership journal")?
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ownership::default(),
-        Err(_) => return Err("cannot read command ownership journal".into()),
-    };
+    let owned = load_ownership(&device.optical_sn)?;
     let read_failure = |reason: String| {
         if owned.pending {
             crate::provisioning::command::Failure::uncertain(reason)
@@ -734,6 +793,21 @@ struct Transaction<'a> {
     revision: &'a str,
     operation_id: u64,
     binding_generation: &'a str,
+}
+
+fn runtime_matches(
+    desired: &Desired,
+    actual: &Inventory,
+    fields: &BTreeSet<(String, String)>,
+) -> bool {
+    fields.iter().all(|(node, key)| {
+        key != "Active"
+            || desired
+                .fields
+                .get(&(node.clone(), key.clone()))
+                .is_none_or(|v| v != "Yes")
+            || get(actual, node, "__runtime_present") == "1"
+    })
 }
 
 async fn reconcile<F, Fut, P, C>(
@@ -823,20 +897,13 @@ where
         .removed
         .iter()
         .all(|pair| !actual.children.contains(pair));
-    let runtime_matches = |fields: &BTreeSet<(String, String)>| {
-        fields.iter().all(|(node, key)| {
-            key != "Active"
-                || desired
-                    .fields
-                    .get(&(node.clone(), key.clone()))
-                    .is_none_or(|v| v != "Yes")
-                || get(&actual, node, "__runtime_present") == "1"
-        })
-    };
     let verified = remaining.is_empty()
         && removed_verified
         && !uncertain
-        && desired.items.values().all(runtime_matches);
+        && desired
+            .items
+            .values()
+            .all(|fields| runtime_matches(&desired, &actual, fields));
     if apply && verified {
         desired
             .owned
@@ -855,7 +922,7 @@ where
         let matches = fields
             .iter()
             .all(|k| desired.fields.get(k) == actual.fields.get(k))
-            && runtime_matches(fields);
+            && runtime_matches(&desired, &actual, fields);
         let state = if uncertain {
             "unknown"
         } else if matches {
@@ -941,6 +1008,42 @@ mod tests {
         assert!(parse(&format!("P|0\n{text}")).is_err());
         assert!(parse(&format!("C|0|0\n{text}")).is_err());
         assert!(parse(&format!("V|Wan_PVC7|VLANID|31\n{text}")).is_err());
+    }
+
+    #[test]
+    fn recovery_comparison_does_not_export_inventory_or_clear_pending() {
+        let (mut device, _) = fixture();
+        device.items[0].wan_intent = None;
+        device.items[0].wlan_intent = Some(WlanIntent {
+            endpoint: EndpointRef::Ssid { radio: 2, slot: 1 },
+            ssid: "fixture-network".into(),
+            enabled: None,
+            broadcast: None,
+            security: None,
+            key: Some("fixture-desired-credential".into()),
+        });
+        let mut inventory = parse(&complete_wifi_text("fixture-network")).unwrap();
+        let key = wlan(&device.items[0].wlan_intent.as_ref().unwrap().endpoint).unwrap();
+        let field = (key, "WPAPSK".into());
+        let owned = Ownership {
+            pending: true,
+            operation_id: 9,
+            ..Ownership::default()
+        };
+        for (secret, comparison) in [
+            ("fixture-actual-credential", "drift"),
+            ("fixture-desired-credential", "match"),
+        ] {
+            inventory.fields.insert(field.clone(), secret.into());
+            let result = observation(&device, &inventory, owned.clone());
+            assert_eq!(result["native_pending_operation_id"], 9);
+            assert_eq!(result["comparison"], comparison);
+            assert_eq!(result["items"][0]["comparison"], comparison);
+            let output = result.to_string();
+            for private in ["credential", "fixture-network", "WPAPSK", "verified"] {
+                assert!(!output.contains(private));
+            }
+        }
     }
 
     #[tokio::test]

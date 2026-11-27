@@ -12,6 +12,7 @@ mod lifecycle;
 #[cfg(test)]
 #[path = "controller/lifecycle_tests.rs"]
 mod lifecycle_tests;
+mod observation;
 #[path = "controller/operation.rs"]
 mod operation;
 #[path = "parameters.rs"]
@@ -122,6 +123,7 @@ struct CommandExecution {
     job: Option<crate::provisioning::command::Job>,
     reservation: usize,
     result: Option<Value>,
+    observes: Option<u64>,
 }
 enum Execution {
     Acs(Box<AcsExecution>),
@@ -177,6 +179,9 @@ impl Operation {
     fn command_running(&self) -> bool {
         self.command().is_some_and(|state| state.job.is_some())
     }
+    fn observes(&self) -> Option<u64> {
+        self.command().and_then(|state| state.observes)
+    }
     fn unstarted(&self) -> bool {
         !self.work_started
             && match &self.execution {
@@ -206,6 +211,7 @@ struct Controller {
     last_boot: BTreeMap<String, u64>,
     optical_epochs: BTreeMap<String, (u16, u64)>,
     recovered: BTreeMap<String, Value>,
+    observations: BTreeMap<String, Value>,
     retired: Vec<Value>,
     saved: String,
     owned: BTreeMap<String, BTreeMap<String, wan::Owned>>,
@@ -292,6 +298,10 @@ impl Controller {
             .retain(|id, op| Some(id) != device_id && op.device.optical_sn != serial);
         self.recovered
             .retain(|id, op| Some(id) != device_id && op["optical_sn"] != serial);
+        if let Some(id) = device_id {
+            self.observations.remove(id);
+            self.read_recovery.remove(id);
+        }
         self.owned.remove(cwmp_id);
         self.wifi_owned.remove(cwmp_id);
         self.dirty = true;
@@ -469,7 +479,10 @@ impl Controller {
 
     fn business_snapshot(&self) -> Value {
         let devices: Vec<_> = self.config.devices.iter().map(|d| {
-            let mut operation = self.operations.get(&d.id).map(Operation::view).or_else(|| self.recovered.get(&d.id).cloned()).unwrap_or_else(|| json!({"state":"not_started","items":d.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":"not_started"})).collect::<Vec<_>>() }));
+            let mut operation = self.business_operation(&d.id).map(Operation::view).or_else(|| self.recovered.get(&d.id).or_else(|| self.recovery_owner(d)).cloned()).unwrap_or_else(|| json!({"state":"not_started","items":d.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":"not_started"})).collect::<Vec<_>>() }));
+            if let Some(observation) = self.observation_view(d) {
+                operation["recovery_observation"] = observation;
+            }
             operation["backend"] = d.backend_view();
             if d.backend() == "disabled" {
                 operation = json!({"state":"disabled","items":[],"backend":d.backend_view(),"reason":"business provisioning is disabled for this device"});
@@ -640,6 +653,7 @@ impl Controller {
             .or_else(|| {
                 self.recovered
                     .values()
+                    .chain(self.observations.values())
                     .find(|op| op["operation_id"].as_u64() == Some(id))
                     .cloned()
             })
@@ -660,6 +674,7 @@ pub fn control(request: &str) -> String {
                     | "plan"
                     | "apply"
                     | "reconcile"
+                    | "observe"
                     | "retry"
             )
         );
@@ -721,6 +736,11 @@ pub fn control(request: &str) -> String {
                 let mut c = controller().lock().unwrap();
                 let ids = c.start_selected(target, false, false, None)?;
                 Ok(json!({"operation_ids":ids,"mode":"plan","reconcile":true}))
+            }
+            "observe" => {
+                let mut c = controller().lock().unwrap();
+                let id = c.observe_selected(v["target"].as_str().unwrap_or(""))?;
+                Ok(json!({"operation_ids":[id],"mode":"observe"}))
             }
             "retry" => {
                 let target = v["target"].as_str().unwrap_or("all");

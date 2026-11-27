@@ -505,8 +505,7 @@ impl Controller {
             );
         for id in ids {
             let identity = self
-                .operations
-                .get(id)
+                .business_operation(id)
                 .map(|op| (op.device.optical_sn.as_str(), op.device.cwmp_id.as_str()))
                 .or_else(|| {
                     self.recovered
@@ -523,7 +522,7 @@ impl Controller {
             let Some((serial, cwmp_id)) = identity else {
                 continue;
             };
-            let retain = self.operations.get(id).is_some_and(|op| {
+            let retain = self.business_operation(id).is_some_and(|op| {
                 op.facts().unresolved || (op.apply && op.stage != OperationPhase::Completed)
             }) || self
                 .recovered
@@ -533,7 +532,7 @@ impl Controller {
                 store.frames.remove(id);
                 continue;
             }
-            let active = self.operations.get(id).map(Operation::view);
+            let active = self.business_operation(id).map(Operation::view);
             let minimal = active
                 .as_ref()
                 .or_else(|| self.recovered.get(id))

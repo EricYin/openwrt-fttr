@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::io;
 use std::time::{Duration, Instant};
 pub fn run(command: &str, args: &[String]) -> io::Result<i32> {
-    let usage="fttrctl config check|reload\nfttrctl sync plan|apply|reconcile|retry [DEVICE|all] [--item SECTION] [--wait SECONDS] [--management]\nfttrctl sync reset_state DEVICE\nfttrctl sync management_plan|management_apply\nfttrctl sync status|operation ID";
+    let usage="fttrctl config check|reload\nfttrctl sync plan|apply|reconcile|retry [DEVICE|all] [--item SECTION] [--wait SECONDS] [--management]\nfttrctl sync observe DEVICE [--wait SECONDS]\nfttrctl sync reset_state DEVICE\nfttrctl sync management_plan|management_apply\nfttrctl sync status|operation ID";
     let mut values = Vec::new();
     let mut wait = 0u64;
     let mut management = false;
@@ -49,6 +49,9 @@ pub fn run(command: &str, args: &[String]) -> io::Result<i32> {
         ("sync", "plan" | "apply" | "reconcile" | "retry", 1..=2) => {
             json!({"op":op,"target":values.get(1).map(String::as_str).unwrap_or("all"),"management":management,"item":item})
         }
+        ("sync", "observe", 2) if !management && item.is_none() => {
+            json!({"op":op,"target":values[1]})
+        }
         ("sync", "reset_state", 2) if !management && item.is_none() && wait == 0 => {
             json!({"op":op,"target":values[1]})
         }
@@ -93,26 +96,31 @@ pub fn run(command: &str, args: &[String]) -> io::Result<i32> {
     let failed = reply.get("error").is_some_and(|v| !v.is_null())
         || reply["operations"].as_array().is_some_and(|a| {
             a.iter().any(|o| {
-                ["wan_lifecycle", "wifi_lifecycle"].iter().any(|key| {
-                    o[*key].as_object().is_some_and(|m| {
-                        m.values().any(|i| {
-                            matches!(i["state"].as_str(), Some("failed" | "blocked" | "unknown"))
+                o["observation_error"].is_string()
+                    || ["wan_lifecycle", "wifi_lifecycle"].iter().any(|key| {
+                        o[*key].as_object().is_some_and(|m| {
+                            m.values().any(|i| {
+                                matches!(
+                                    i["state"].as_str(),
+                                    Some("failed" | "blocked" | "unknown")
+                                )
+                            })
                         })
                     })
-                }) || o["items"].as_array().is_some_and(|items| {
-                    items.iter().any(|i| {
-                        matches!(
-                            i["state"].as_str(),
-                            Some(
-                                "failed"
-                                    | "blocked"
-                                    | "unknown"
-                                    | "accepted_pending_apply"
-                                    | "accepted_unverified"
+                    || o["items"].as_array().is_some_and(|items| {
+                        items.iter().any(|i| {
+                            matches!(
+                                i["state"].as_str(),
+                                Some(
+                                    "failed"
+                                        | "blocked"
+                                        | "unknown"
+                                        | "accepted_pending_apply"
+                                        | "accepted_unverified"
+                                )
                             )
-                        )
+                        })
                     })
-                })
             })
         });
     Ok(if failed {

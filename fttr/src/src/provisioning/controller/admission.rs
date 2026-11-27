@@ -64,11 +64,23 @@ fn reservation(device: &Device) -> usize {
 }
 
 impl Operation {
-    fn finish_command(
+    pub(super) fn finish_command(
         &mut self,
         outcome: Result<Value, crate::provisioning::command::Failure>,
         time: u64,
     ) {
+        if self.observes().is_some() {
+            let result = match outcome {
+                Ok(observation) => json!({"observation":observation}),
+                Err(failure) => json!({"observation_error":failure.reason}),
+            };
+            let state = self.command_mut().unwrap();
+            state.result = Some(result);
+            state.job = None;
+            state.reservation = 0;
+            self.complete(time);
+            return;
+        }
         let result = outcome.unwrap_or_else(|failure| json!({"items":self.device.items.iter().map(|i| json!({"id":i.id,"kind":i.kind,"service_type":i.service_type,"state":if failure.uncertain {ItemOutcome::Unknown} else {ItemOutcome::Blocked},"reason":failure.reason})).collect::<Vec<_>>(),"readback_verified":false,"effect_uncertain":failure.uncertain}));
         let state = self
             .command_mut()
@@ -173,7 +185,11 @@ impl Controller {
             .collect();
         for id in ids {
             let op = self.operations.remove(&id).unwrap();
-            self.recovered.insert(id, op.view());
+            if op.observes().is_some() {
+                self.observations.insert(id, op.view());
+            } else {
+                self.recovered.insert(id, op.view());
+            }
             self.dirty = true;
         }
     }
