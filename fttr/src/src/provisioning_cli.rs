@@ -49,7 +49,7 @@ pub fn run(command: &str, args: &[String]) -> io::Result<i32> {
         ("sync", "plan" | "apply" | "reconcile" | "retry", 1..=2) => {
             json!({"op":op,"target":values.get(1).map(String::as_str).unwrap_or("all"),"management":management,"item":item})
         }
-        ("sync", "observe", 2) if !management && item.is_none() => {
+        ("sync", "observe" | "recover_reboot", 2) if !management && item.is_none() => {
             json!({"op":op,"target":values[1]})
         }
         ("sync", "reset_state", 2) if !management && item.is_none() && wait == 0 => {

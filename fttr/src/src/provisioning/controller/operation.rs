@@ -166,7 +166,11 @@ impl Operation {
             if let Some(old_id) = state.observes {
                 let mut result = state.result.clone().unwrap_or_else(|| json!({}));
                 result["operation_id"] = json!(self.id);
-                result["mode"] = json!("observe");
+                result["mode"] = json!(if state.reboot_from.is_some() {
+                    "recover_reboot"
+                } else {
+                    "observe"
+                });
                 result["state"] = json!(self.stage);
                 result["revision"] = json!(self.revision);
                 result["completed_at"] = json!(self.completed_at);

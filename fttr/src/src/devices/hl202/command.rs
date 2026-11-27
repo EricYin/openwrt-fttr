@@ -297,11 +297,39 @@ impl Transaction {
         selection: &crate::mqtt_identity::Selection,
     ) -> io::Result<super::command_binding::SelectedResult> {
         let tx = Self::acquire_inner(target, false)?;
+        let script = format!(
+            "{}\n{}",
+            super::provisioning::BOOT_PROBE,
+            super::provisioning::INVENTORY
+        );
         super::command_binding::execute_transaction_async(
             &tx,
             selection,
-            super::provisioning::INVENTORY,
+            &script,
             Duration::from_secs(90),
+        )
+        .await
+    }
+
+    #[cfg(all(feature = "mqtt", feature = "diagnostics"))]
+    pub(super) async fn restart_for_recovery(
+        target: &str,
+        selection: &crate::mqtt_identity::Selection,
+        boot_id: &str,
+    ) -> io::Result<super::command_binding::SelectedResult> {
+        if !super::provisioning::valid_boot_id(boot_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid observed boot ID",
+            ));
+        }
+        let tx = Self::acquire_inner(target, false)?;
+        let script = format!("read -r boot </proc/sys/kernel/random/boot_id && [ \"$boot\" = '{boot_id}' ] && command -v reboot >/dev/null && reboot");
+        super::command_binding::execute_transaction_async(
+            &tx,
+            selection,
+            &script,
+            Duration::from_secs(12),
         )
         .await
     }

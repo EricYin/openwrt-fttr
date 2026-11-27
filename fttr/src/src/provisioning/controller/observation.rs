@@ -2,6 +2,56 @@
 use super::*;
 
 impl Controller {
+    pub(super) fn reboot_for_recovery(&mut self, target: &str) -> Result<u64, String> {
+        if !cfg!(all(
+            feature = "diagnostics",
+            feature = "device-hl202",
+            feature = "mqtt"
+        )) {
+            return Err("recovery restart requires the diagnostics build".into());
+        }
+        if !self.config.enabled {
+            return Err("provisioning disabled by UCI".into());
+        }
+        let d = self
+            .config
+            .devices
+            .iter()
+            .find(|d| d.id == target || d.optical_sn == target)
+            .ok_or("select one configured HL202 device")?;
+        let old_id = self
+            .recovery_owner(d)
+            .and_then(|op| op["operation_id"].as_u64())
+            .ok_or("no unambiguous unresolved operation")?;
+        let view = self
+            .observations
+            .get(&d.id)
+            .filter(|view| {
+                view["observes_operation_id"] == old_id
+                    && view["observation"]["inventory_complete"] == true
+                    && view["revision"] == self.config.device_revision(&d.id)
+                    && view["observation"]["native_pending_operation_id"].is_u64()
+                    && view["observation"]["restart_available"] == true
+                    && view["completed_at"]
+                        .as_u64()
+                        .is_some_and(|at| now().checked_sub(at).is_some_and(|age| age <= 180))
+            })
+            .ok_or("run a fresh complete recovery observation first")?;
+        let boot_id = view["observation"]["boot_id"]
+            .as_str()
+            .ok_or("missing ONU boot ID")?
+            .to_owned();
+        let id = self.observe_selected(target)?;
+        self.operations
+            .values_mut()
+            .find(|op| op.id == id)
+            .unwrap()
+            .command_mut()
+            .unwrap()
+            .reboot_from = Some(boot_id);
+        Ok(id)
+    }
+
     pub(super) fn business_operation(&self, id: &str) -> Option<&Operation> {
         self.operations.get(id).filter(|op| op.observes().is_none())
     }
@@ -175,6 +225,31 @@ mod tests {
         }
         c.schedule_observation(&d, true, 1000);
         assert!(c.operations.is_empty());
+        assert_eq!(c.operation_view(15), Some(old));
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostics")]
+    fn recovery_reboot_requires_recent_inventory_for_this_pending_operation() {
+        let (mut c, d, old) = fixture();
+        assert!(c.reboot_for_recovery(&d.id).is_err());
+        let boot = "73d5ff2a-4f34-409a-9577-166c32c0a83b";
+        let mut view = json!({"observes_operation_id":14,"completed_at":now(),
+            "revision":c.config.device_revision(&d.id),"observation":{"inventory_complete":true,
+            "native_pending_operation_id":9,"boot_id":boot,"restart_available":true}});
+        c.observations.insert(d.id.clone(), view.clone());
+        assert!(c.reboot_for_recovery(&d.id).is_err());
+        view["observes_operation_id"] = json!(15);
+        view["completed_at"] = json!(now().saturating_sub(181));
+        c.observations.insert(d.id.clone(), view.clone());
+        assert!(c.reboot_for_recovery(&d.id).is_err());
+        view["completed_at"] = json!(now());
+        c.observations.insert(d.id.clone(), view);
+        let id = c.reboot_for_recovery(&d.id).unwrap();
+        let op = c.operations.get(&d.id).unwrap();
+        assert_eq!(op.command().unwrap().reboot_from.as_deref(), Some(boot));
+        assert_eq!(c.operation_view(id).unwrap()["mode"], "recover_reboot");
+        assert!(c.reboot_for_recovery(&d.id).is_err());
         assert_eq!(c.operation_view(15), Some(old));
     }
 }

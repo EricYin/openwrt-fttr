@@ -124,6 +124,7 @@ struct CommandExecution {
     reservation: usize,
     result: Option<Value>,
     observes: Option<u64>,
+    reboot_from: Option<String>,
 }
 enum Execution {
     Acs(Box<AcsExecution>),
@@ -675,6 +676,7 @@ pub fn control(request: &str) -> String {
                     | "apply"
                     | "reconcile"
                     | "observe"
+                    | "recover_reboot"
                     | "retry"
             )
         );
@@ -741,6 +743,11 @@ pub fn control(request: &str) -> String {
                 let mut c = controller().lock().unwrap();
                 let id = c.observe_selected(v["target"].as_str().unwrap_or(""))?;
                 Ok(json!({"operation_ids":[id],"mode":"observe"}))
+            }
+            "recover_reboot" => {
+                let mut c = controller().lock().unwrap();
+                let id = c.reboot_for_recovery(v["target"].as_str().unwrap_or(""))?;
+                Ok(json!({"operation_ids":[id],"mode":"recover_reboot"}))
             }
             "retry" => {
                 let target = v["target"].as_str().unwrap_or("all");

@@ -135,6 +135,22 @@ where
     }
 }
 
+pub(super) const BOOT_PROBE: &str = r#"boot=; read -r boot </proc/sys/kernel/random/boot_id 2>/dev/null || boot=
+restart=0; command -v reboot >/dev/null 2>&1 && restart=1
+printf 'BOOT|%s|%s\n' "$boot" "$restart""#;
+
+pub(super) fn valid_boot_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+        && id.bytes().any(|b| !matches!(b, b'0' | b'-'))
+}
+
 pub(super) const INVENTORY: &str = r#"read_fields() {
  n=$1; shift
  for k in "$@"; do
@@ -679,12 +695,45 @@ pub async fn observe(
         .await
         .map_err(|e| format!("inventory command failed: {e}"))?;
     let text = inventory_reply(reply).map_err(|(reason, _)| reason)?;
-    let inventory = parse(&text)?;
+    let (boot, text) = text.split_once('\n').ok_or("missing boot probe frame")?;
+    let (boot_id, restart) = boot
+        .strip_prefix("BOOT|")
+        .and_then(|v| v.split_once('|'))
+        .ok_or("invalid boot probe frame")?;
+    let inventory = parse(text)?;
     if crate::omci_auth::serial_epoch(&device.optical_sn) != Some(auth_epoch) {
         return Err("OMCI authentication generation changed".into());
     }
     let owned = load_ownership(&device.optical_sn)?;
-    Ok(observation(device, &inventory, owned))
+    let mut result = observation(device, &inventory, owned);
+    if valid_boot_id(boot_id) {
+        result["boot_id"] = json!(boot_id.to_ascii_lowercase());
+        result["restart_available"] = json!(restart == "1");
+    }
+    Ok(result)
+}
+
+#[cfg(feature = "diagnostics")]
+pub async fn restart_for_recovery(
+    device: &Device,
+    boot_id: &str,
+) -> Result<Value, crate::provisioning::command::Failure> {
+    if !load_ownership(&device.optical_sn)?.pending {
+        return Err("native pending record no longer exists".into());
+    }
+    let (selection, mac) = selection(&device.optical_sn)?;
+    let reply = super::command::Transaction::restart_for_recovery(&mac, &selection, boot_id)
+        .await
+        .map_err(|e| {
+            crate::provisioning::command::Failure::uncertain(format!("restart dispatch: {e}"))
+        })?;
+    if reply.result.exit_code.is_some_and(|code| code != 0) {
+        return Err("restart command was rejected by the device".into());
+    }
+    Ok(
+        json!({"restart_reply": if reply.binding_current && reply.result.exit_code == Some(0) { "acknowledged" } else { "unconfirmed" },
+        "previous_boot_id":boot_id, "requires_fresh_observation":true}),
+    )
 }
 
 fn observation(device: &Device, inventory: &Inventory, owned: Ownership) -> Value {

@@ -70,8 +70,13 @@ impl Operation {
         time: u64,
     ) {
         if self.observes().is_some() {
+            let key = if self.command().unwrap().reboot_from.is_some() {
+                "restart"
+            } else {
+                "observation"
+            };
             let result = match outcome {
-                Ok(observation) => json!({"observation":observation}),
+                Ok(observation) => json!({(key):observation}),
                 Err(failure) => json!({"observation_error":failure.reason}),
             };
             let state = self.command_mut().unwrap();
@@ -137,6 +142,16 @@ impl Controller {
                 break;
             }
             let op = self.operations.get_mut(id).unwrap();
+            if op
+                .command()
+                .is_some_and(|state| state.reboot_from.is_some() && state.result.is_none())
+                && !op.command_running()
+                && time.checked_sub(op.started).is_none_or(|age| age > 30)
+            {
+                op.finish_command(Err("recovery restart expired before dispatch".into()), time);
+                self.dirty = true;
+                continue;
+            }
             if op.device.backend_kind() != Backend::Command
                 || op.command_running()
                 || matches!(
