@@ -8,6 +8,8 @@ mod queries;
 pub use queries::*;
 mod fpga;
 pub use fpga::*;
+mod pon_stats;
+pub use pon_stats::*;
 mod hl202;
 mod provisioning;
 mod results;

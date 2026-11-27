@@ -13,6 +13,8 @@ mod hl202;
 #[cfg(feature = "device-hl202")]
 #[path = "fttrctl/mqtt_command.rs"]
 mod mqtt_command;
+#[path = "fttrctl/pon_stats.rs"]
+mod pon_stats_command;
 #[cfg(feature = "device-hl202")]
 use mqtt_command::handle as handle_mqtt_command;
 
@@ -33,6 +35,7 @@ Commands:\n  \
   fec ONU_ID [--json] [--create-pm]  Read downstream FEC PM; optionally create missing PM instance\n  \
   us-fec ONU_ID [on|off|status] [--json]  Read or toggle per-ONU upstream FEC (AN4475-G2)\n  \
   hardware DEVICE COMMAND  Exclusive offline register/memory diagnostics (JSON; hardware help)\n  \
+  pon-stats ONU_ID [--samples N] [--interval-ms N] [--json]  Read-only AN4475-G2 PON counters / PHY\n  \
   fpga-read <addr>     Directly read 32-bit FPGA hardware register\n  \
   fpga-diag [ONU_ID|all] [--samples N] [--interval-ms N] [--json] [--offline]\n  \
   fpga-write <a> <v>   Directly write 32-bit FPGA hardware register\n  \
@@ -60,6 +63,9 @@ Commands:\n  \
                     | "bosa-write"
             )
         {
+            continue;
+        }
+        if !cfg!(feature = "platform-fiberhome-an4475-g2") && command == "pon-stats" {
             continue;
         }
         if !cfg!(feature = "device-hl202")
@@ -747,6 +753,16 @@ fn main() {
         "hardware" => {
             if let Err(error) = hardware_command::handle(&args[2..]) {
                 eprintln!("[-] Hardware diagnostic: {error}");
+                exit(1);
+            }
+        }
+        "pon-stats" => {
+            if let Err(error) = pon_stats_command::run(&args[2..]) {
+                if error.kind() == std::io::ErrorKind::InvalidInput {
+                    eprintln!("{error}");
+                } else {
+                    eprintln!("[-] PON stats diagnostic: {error}");
+                }
                 exit(1);
             }
         }

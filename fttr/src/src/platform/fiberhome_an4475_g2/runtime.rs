@@ -727,6 +727,39 @@ fn datapath_stage(
     })
 }
 
+/// Read-only PON counter/PHY snapshot, bound to ONU identity and generation.
+/// Served from the daemon's live FSL session so traffic-time sampling works;
+/// it performs no write, reset or clear-on-read operation.
+fn pon_stats(
+    cmd: fttr_api::PonStatsRequest,
+    states: &service::States,
+) -> io::Result<serde_json::Value> {
+    if !crate::controller::attribute_probe::identity_current(
+        states,
+        cmd.onu_id,
+        &cmd.serial,
+        cmd.generation,
+    ) {
+        return Err(io::Error::other(
+            "ONU identity/registration generation mismatch",
+        ));
+    }
+    with_session(|session| {
+        let onu = session
+            .onu(cmd.onu_id)
+            .copied()
+            .filter(|onu| onu.state == FslOnuState::Active)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ONU not active in FSL"))?;
+        let snapshot = super::diagnostics::read_pon_stats(session.fsl_mut(), onu.onu_index)?;
+        Ok(serde_json::json!({
+            "status": "success",
+            "stage": "pon_stats",
+            "onu_id": cmd.onu_id,
+            "snapshot": snapshot,
+        }))
+    })
+}
+
 /// Revokes only the ONU's business data GEM port and data T-CONT without
 /// deactivating the ONU's O5 registration or OMCC management channel.
 pub(crate) fn revoke_business(id: u8) -> io::Result<()> {
@@ -1573,6 +1606,14 @@ fn ipc_handler(
                 result.unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
             let _ = serde_json::to_writer(&mut stream, &response);
             let _ = stream.write_all(b"\n");
+        } else if let Some(request) = line.strip_prefix("PON_STATS ") {
+            let result = serde_json::from_str::<fttr_api::PonStatsRequest>(request)
+                .map_err(std::io::Error::other)
+                .and_then(|command| pon_stats(command, &services));
+            let response =
+                result.unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+            let _ = serde_json::to_writer(&mut stream, &response);
+            let _ = stream.write_all(b"\n");
         } else if let Some(request) = line.strip_prefix("DATAPATH_STAGE ") {
             let result = serde_json::from_str::<DatapathStageCommand>(request)
                 .map_err(std::io::Error::other)
@@ -1727,6 +1768,7 @@ mod ipc_tests {
             "OMCI_SNAPSHOT invalid",
             "OMCI_SET_ONCE invalid",
             "OMCI_EVTO_RULE invalid",
+            "PON_STATS invalid",
             "DATAPATH_STAGE invalid",
             "OMCI_ATTRIBUTE invalid",
             "MIB invalid",
