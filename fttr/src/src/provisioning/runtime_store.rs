@@ -81,58 +81,91 @@ pub(crate) fn approve(serial: &str) -> io::Result<()> {
     )
 }
 pub(crate) fn secret_mac(node: &str, value: &str) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    let path = Record::SecretKey.path("");
-    let key = match storage::read(&path) {
-        Ok(bytes) => {
-            let v: Value =
-                serde_json::from_slice(&bytes).map_err(|_| "invalid runtime secret key")?;
-            let hex = v["key"].as_str().ok_or("missing runtime secret key")?;
-            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err("corrupt runtime secret key".into());
-            }
-            (0..32)
-                .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
-                .collect::<Result<Vec<u8>, _>>()
-                .map_err(|_| "corrupt runtime secret key".to_string())?
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let mut key = [0u8; 32];
-            std::fs::File::open("/dev/urandom")
-                .and_then(|mut f| f.read_exact(&mut key))
-                .map_err(|err| format!("generate runtime secret key: {err}"))?;
-            let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-            storage::write_atomic(
-                &path,
-                &serde_json::to_vec(&serde_json::json!({"schema":1,"key":hex}))
-                    .map_err(|err| format!("serialize runtime secret key: {err}"))?,
-                true,
-            )
-            .map_err(|err| format!("persist runtime secret key: {err}"))?;
-            key.to_vec()
-        }
-        Err(e) => return Err(format!("read runtime secret key: {e}")),
-    };
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for (i, b) in key.iter().copied().enumerate() {
-        ipad[i] ^= b;
-        opad[i] ^= b;
+    Ok(SecretMacKey::load_or_create()?.sign(node, value))
+}
+
+/// Reuse one key snapshot for all MACs in a batch; do not cache it across RPCs.
+pub(crate) struct SecretMacKey([u8; 32]);
+
+impl SecretMacKey {
+    pub(crate) fn load_or_create() -> Result<Self, String> {
+        Self::read_at(&Record::SecretKey.path(""), true)
     }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(node.as_bytes());
-    inner.update([0]);
-    inner.update(value.as_bytes());
-    let inner_hash = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner_hash);
-    Ok(outer
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+
+    #[cfg(all(test, feature = "acs"))]
+    pub(crate) fn load() -> Result<Self, String> {
+        Self::read_at(&Record::SecretKey.path(""), false)
+    }
+
+    fn read_at(path: &str, create: bool) -> Result<Self, String> {
+        // Serialize first use so two device workers cannot record MACs under
+        // different keys. MAC computation itself runs outside this lock.
+        static KEY_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = KEY_LOCK
+            .lock()
+            .map_err(|_| "runtime secret key lock poisoned")?;
+        let mut key = [0; 32];
+        match storage::read(path) {
+            Ok(bytes) => {
+                let v: Value =
+                    serde_json::from_slice(&bytes).map_err(|_| "invalid runtime secret key")?;
+                let hex = v["key"].as_str().ok_or("missing runtime secret key")?;
+                if v["schema"] != 1
+                    || hex.len() != 64
+                    || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return Err("corrupt runtime secret key".into());
+                }
+                for (i, byte) in key.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
+                        .map_err(|_| "corrupt runtime secret key")?;
+                }
+            }
+            Err(e) if create && e.kind() == io::ErrorKind::NotFound => {
+                std::fs::File::open("/dev/urandom")
+                    .and_then(|mut f| f.read_exact(&mut key))
+                    .map_err(|err| format!("generate runtime secret key: {err}"))?;
+                storage::write_atomic(
+                    path,
+                    &serde_json::to_vec(&serde_json::json!({"schema":1,"key":hex_encode(&key)}))
+                        .map_err(|err| format!("serialize runtime secret key: {err}"))?,
+                    true,
+                )
+                .map_err(|err| format!("persist runtime secret key: {err}"))?;
+            }
+            Err(e) => return Err(format!("read runtime secret key: {e}")),
+        }
+        Ok(Self(key))
+    }
+
+    pub(crate) fn sign(&self, node: &str, value: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        for (i, b) in self.0.iter().copied().enumerate() {
+            ipad[i] ^= b;
+            opad[i] ^= b;
+        }
+        let mut inner = Sha256::new();
+        inner.update(ipad);
+        inner.update(node.as_bytes());
+        inner.update([0]);
+        inner.update(value.as_bytes());
+        let mut outer = Sha256::new();
+        outer.update(opad);
+        outer.update(inner.finalize());
+        hex_encode(&outer.finalize())
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        hex.push(DIGITS[usize::from(b >> 4)] as char);
+        hex.push(DIGITS[usize::from(b & 0xf)] as char);
+    }
+    hex
 }
 const LIMIT: usize = 8 * 1024 * 1024;
 const RECORDS: usize = 2048;
@@ -327,6 +360,29 @@ pub(crate) fn remove(key: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn concurrent_first_secret_use_shares_one_key() {
+        let root = storage::test_io::registry_directory("/tmp/fttr/concurrent-secret-test");
+        let path = format!("{root}/secret.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
+        let workers: Vec<_> = (0..12)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    SecretMacKey::read_at(&path, true)
+                        .unwrap()
+                        .sign("TEST-PARAMETER", "fixture-secret")
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert!(results.iter().all(|digest| *digest == results[0]));
+        let key = SecretMacKey::read_at(&path, false).unwrap();
+        assert_eq!(key.sign("TEST-PARAMETER", "fixture-secret"), results[0]);
+        assert_ne!(key.sign("TEST-PARAMETER", "different-fixture"), results[0]);
+    }
     #[test]
     fn missing_tmp_record_requires_new_explicit_write_admission() {
         let serial = "TEST00000083";

@@ -239,6 +239,7 @@ fn dispatch_sends_no_soap_when_sent_save_fails_and_can_retry_after_repair() {
     let state = fixture.0.state.lock().unwrap();
     assert_eq!(state.tasks[&1].state, TaskState::Queued);
     assert_eq!(state.tasks[&1].sent, None);
+    assert!(state.intents.is_empty());
     drop(state);
     assert_eq!(
         State::load(&fixture.0.state_file).unwrap().tasks[&1].state,
@@ -248,6 +249,21 @@ fn dispatch_sends_no_soap_when_sent_save_fails_and_can_retry_after_repair() {
     let (headers, body) = fixture.exchange("");
     assert!(headers.starts_with("HTTP/1.1 200"));
     assert_eq!(soap::parse(&body).unwrap().id, "fttr-1");
+    let state = fixture.0.state.lock().unwrap();
+    let intent = state
+        .intents
+        .get(&1)
+        .expect("sent write has original intent");
+    assert!(intent.matches_method("SetParameterValues"));
+    assert!(body.contains(&format!(
+        "<ParameterKey>{}</ParameterKey>",
+        intent.parameter_key
+    )));
+    let checkpoint = super::persistence::restart_state(&state);
+    assert_eq!(checkpoint.intents.get(&1), Some(intent));
+    assert!(!serde_json::to_string(&checkpoint)
+        .unwrap()
+        .contains("\"value\""));
 }
 
 #[test]
@@ -274,6 +290,7 @@ fn response_plus_next_save_failure_never_requeues_the_already_emitted_write() {
         serde_json::to_value(state.tasks[&1].result.as_ref().unwrap().get()).unwrap();
     assert_eq!(result["status"], "0");
     assert_eq!(state.tasks[&2].state, TaskState::Queued);
+    assert!(state.intents.is_empty());
     drop(state);
     let mut restarted = State::load(&fixture.0.state_file).unwrap();
     assert_eq!(restarted.tasks[&1].state, TaskState::Unknown);

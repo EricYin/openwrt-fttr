@@ -19,6 +19,48 @@ fn task(id: u64) -> Task {
 }
 
 #[test]
+fn lost_write_response_remains_unresolved_when_result_budget_is_exhausted() {
+    for method in [
+        "SetParameterValues",
+        "AddObject",
+        "DeleteObject",
+        "GetParameterValues",
+    ] {
+        let mut state = State::default();
+        let held = state
+            .budget
+            .reserve(resources::RESULT_BYTES, resources::RESULT_BYTES)
+            .unwrap();
+        let mut pending = task(1);
+        pending.method = method.into();
+        state.tasks.insert(1, pending);
+        let body = format!("<cwmp:{method}Response/>");
+        let mut response = soap::parse(&soap::envelope(
+            "urn:dslforum-org:cwmp-1-0",
+            "fttr-1",
+            &body,
+        ))
+        .unwrap();
+        response.data =
+            serde_json::from_value(json!({"status":"0", "instance_number":"1"})).unwrap();
+        state.response("compact-test", response).unwrap();
+        let is_write = method != "GetParameterValues";
+        assert_eq!(
+            state.tasks[&1].state,
+            if is_write {
+                TaskState::Unknown
+            } else {
+                TaskState::Fault
+            }
+        );
+        assert_eq!(state.tasks[&1].unresolved_write(), is_write);
+        state.prune();
+        assert!(state.tasks.contains_key(&1));
+        drop(held);
+    }
+}
+
+#[test]
 fn protected_slow_large_responses_survive_newer_small_results_and_ack() {
     let server = server();
     let mut state = State::default();

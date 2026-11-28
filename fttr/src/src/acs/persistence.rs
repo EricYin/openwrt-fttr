@@ -1,4 +1,3 @@
-use super::task::is_write;
 use super::{error_result, Server, State, TaskState};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -35,26 +34,7 @@ impl State {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
                 Err(e) => return Err(e),
             };
-            let mut state: Self = serde_json::from_slice(&bytes)?;
-            for task in state.tasks.values_mut() {
-                if !is_write(&task.method)
-                    || !matches!(
-                        task.state,
-                        TaskState::Sent | TaskState::Unknown | TaskState::AcceptedPendingApply
-                    )
-                {
-                    return Err(io::Error::other("invalid unresolved RPC checkpoint"));
-                }
-                task.state = TaskState::Unknown;
-                task.release_request();
-                task.result = Some(error_result(
-                    "unresolved write before process restart; fresh observation does not settle it",
-                ));
-                state
-                    .results
-                    .insert(task.id, super::retention::ResultInfo::protected());
-            }
-            return Ok(state);
+            return Self::restore_checkpoint(&bytes);
         }
         let file = match File::open(path) {
             Ok(file) => file,
@@ -112,6 +92,33 @@ impl State {
                     })?;
                 task.result = Some(response.with_charge(permit));
             }
+        }
+        Ok(state)
+    }
+
+    fn restore_checkpoint(bytes: &[u8]) -> io::Result<Self> {
+        let mut state: Self = serde_json::from_slice(bytes)?;
+        for (&id, task) in &mut state.tasks {
+            if task.id != id || !task.checkpoint_write() {
+                return Err(io::Error::other("invalid unresolved RPC checkpoint"));
+            }
+            state.next_id = state.next_id.max(id);
+            task.state = TaskState::Unknown;
+            task.release_request();
+            task.result = Some(error_result(
+                "unresolved write before process restart; fresh observation does not settle it",
+            ));
+            state
+                .results
+                .insert(id, super::retention::ResultInfo::protected());
+        }
+        if state.intents.iter().any(|(id, intent)| {
+            state
+                .tasks
+                .get(id)
+                .is_none_or(|task| !intent.matches_method(&task.method))
+        }) {
+            return Err(io::Error::other("invalid CWMP intent checkpoint"));
         }
         Ok(state)
     }
@@ -174,13 +181,9 @@ impl Server {
     }
 }
 
-fn restart_state(state: &State) -> State {
+pub(super) fn restart_state(state: &State) -> State {
     let mut restart = State::default();
-    for task in state
-        .tasks
-        .values()
-        .filter(|t| t.unresolved_write() || (t.state == TaskState::Sent && is_write(&t.method)))
-    {
+    for task in state.tasks.values().filter(|t| t.checkpoint_write()) {
         restart.next_id = restart.next_id.max(task.id);
         restart.tasks.insert(
             task.id,
@@ -195,6 +198,9 @@ fn restart_state(state: &State) -> State {
                 result: None,
             },
         );
+        if let Some(intent) = state.intents.get(&task.id) {
+            restart.intents.insert(task.id, intent.clone());
+        }
     }
     restart
 }
@@ -202,6 +208,46 @@ fn restart_state(state: &State) -> State {
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
+    #[test]
+    fn original_write_intent_survives_restart_without_plaintext_values() {
+        let args = serde_json::json!({"parameters":[{"name":"Device.WiFi.SSID.1.SSID","value":"fixture-value"},{"name":"Device.WiFi.AccessPoint.1.KeyPassphrase","value":"fixture-secret"}]});
+        let write = super::super::soap::WriteArgs::parse("SetParameterValues", &args)
+            .unwrap()
+            .unwrap();
+        let intent = super::super::intent::Intent::capture(&write).unwrap();
+        let mut state = State::default();
+        state.tasks.insert(
+            7,
+            super::super::Task {
+                id: 7,
+                device: "TEST00000084".into(),
+                method: "SetParameterValues".into(),
+                args,
+                state: TaskState::Sent,
+                created: 1,
+                sent: Some(2),
+                result: None,
+            },
+        );
+        state.intents.insert(7, intent.clone());
+        let encoded = serde_json::to_vec(&restart_state(&state)).unwrap();
+        let json = std::str::from_utf8(&encoded).unwrap();
+        assert!(!json.contains("fixture-secret"));
+        assert!(!json.contains("fixture-value"));
+        let restored = State::restore_checkpoint(&encoded).unwrap();
+        assert_eq!(restored.intents[&7], intent);
+        assert_eq!(restored.tasks[&7].args, serde_json::Value::Null);
+        assert_eq!(restored.tasks[&7].state, TaskState::Unknown);
+        assert!(restored.results[&7].protected);
+        assert!(super::super::policy::protect_unresolved(
+            &restored,
+            &restored.tasks[&7].device,
+            "DeleteObject"
+        )
+        .is_err());
+        state.tasks.get_mut(&7).unwrap().state = TaskState::Completed;
+        assert!(restart_state(&state).intents.is_empty());
+    }
     #[test]
     fn restart_records_exclude_readbacks_credentials_queued_work_and_completed_history() {
         let mut state = State::default();
@@ -231,5 +277,13 @@ mod checkpoint_tests {
         assert!(!String::from_utf8(serde_json::to_vec(&saved).unwrap())
             .unwrap()
             .contains("do-not-checkpoint"));
+        let mut old_checkpoint = saved;
+        old_checkpoint.next_id = 0;
+        let restored = State::restore_checkpoint(&serde_json::to_vec(&old_checkpoint).unwrap())
+            .expect("pre-intent checkpoints remain usable");
+        assert_eq!(restored.next_id, 1);
+        assert!(restored.tasks[&1].unresolved_write());
+        old_checkpoint.tasks.get_mut(&1).unwrap().id = 2;
+        assert!(State::restore_checkpoint(&serde_json::to_vec(&old_checkpoint).unwrap()).is_err());
     }
 }

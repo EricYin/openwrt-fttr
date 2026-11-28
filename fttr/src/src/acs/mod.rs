@@ -3,6 +3,7 @@ mod actor;
 mod dispatch;
 mod endpoint;
 mod http;
+mod intent;
 mod listener;
 mod policy;
 mod resources;
@@ -83,6 +84,8 @@ struct State {
     dispatch: dispatch::Dispatcher,
     devices: BTreeMap<String, Device>,
     tasks: BTreeMap<u64, Task>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    intents: BTreeMap<u64, intent::Intent>,
     #[serde(default)]
     results: BTreeMap<u64, retention::ResultInfo>,
     next_id: u64,

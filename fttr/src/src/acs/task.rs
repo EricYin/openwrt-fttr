@@ -58,6 +58,10 @@ impl Task {
             )
     }
 
+    pub(super) fn checkpoint_write(&self) -> bool {
+        self.unresolved_write() || (self.state == TaskState::Sent && is_write(&self.method))
+    }
+
     pub(super) fn release_request(&mut self) {
         if !self.state.is_active() {
             // Raw requests may carry credentials. The result and its lease are

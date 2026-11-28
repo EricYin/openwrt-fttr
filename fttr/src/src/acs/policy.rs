@@ -92,10 +92,7 @@ pub(super) fn protect_management(
 }
 
 pub(super) fn validate(method: &str, args: &Value) -> Result<(), String> {
-    let path = |v: &Value| {
-        v.as_str()
-            .is_some_and(|s| s.len() <= 1024 && !s.chars().any(char::is_control))
-    };
+    let path = |v: &Value| v.as_str().is_some_and(soap::valid_path);
     match method {
         "GetRPCMethods" => (),
         "AddObject" | "DeleteObject"
@@ -114,23 +111,10 @@ pub(super) fn validate(method: &str, args: &Value) -> Result<(), String> {
                         path(v) && v != "" && !v.as_str().is_some_and(|s| s.ends_with('.'))
                     })
             }) => {}
-        "SetParameterValues"
-            if args["parameters"].as_array().is_some_and(|a| {
-                !a.is_empty()
-                    && a.len() <= 32
-                    && a.iter().all(|v| {
-                        path(&v["name"])
-                            && v["name"] != ""
-                            && v["value"].as_str().is_some_and(|s| {
-                                s.len() <= 4096
-                                    && !s
-                                        .chars()
-                                        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
-                            })
-                    })
-            }) => {}
+        "SetParameterValues" => {
+            soap::set_parameters(args).map_err(|e| e.to_string())?;
+        }
         _ => return Err("invalid method or parameter arguments".into()),
     }
-    soap::request("urn:dslforum-org:cwmp-1-0", 1, method, args).map_err(|e| e.to_string())?;
     Ok(())
 }

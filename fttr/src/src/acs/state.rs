@@ -22,6 +22,8 @@ impl State {
                 ) < 180
         });
         self.results.retain(|id, _| self.tasks.contains_key(id));
+        self.intents
+            .retain(|id, _| self.tasks.get(id).is_some_and(|t| t.checkpoint_write()));
         for task in self.tasks.values_mut() {
             let mut legacy = super::retention::ResultInfo::default();
             let info = self.results.get_mut(&task.id).unwrap_or(&mut legacy);
@@ -134,73 +136,82 @@ impl State {
         if !self.schedule_device(device) {
             return Ok(None);
         }
-        if let Some(task) = self
+        let Some(task) = self
             .tasks
             .values()
             .find(|t| t.device == device && t.state == TaskState::Queued)
-        {
-            let internal_interval = self
-                .interval_authorizations
-                .get(&task.id)
-                .is_some_and(|grant| grant.permits(task, self));
-            let auth_valid = !matches!(
-                task.method.as_str(),
-                "SetParameterValues" | "AddObject" | "DeleteObject"
-            ) || crate::omci_auth::cwmp_epoch(device).is_some_and(|epoch| {
-                epoch == 0 || task.args["_omci_auth_epoch"].as_u64() == Some(epoch)
-            });
-            if let Err(reason) = if !auth_valid {
-                Err("OMCI authentication generation changed; queued write cancelled".into())
-            } else if internal_interval {
-                super::policy::protect_unresolved(self, device, &task.method)
-            } else {
-                protect_management(self, device, &task.method, &task.args)
-            } {
-                let id = task.id;
-                let task = self.tasks.get_mut(&id).unwrap();
-                task.state = TaskState::Fault;
-                task.result = Some(error_result(&reason));
-                self.mark_completed(id);
-                self.release_dispatch(id);
-                return Ok(None);
-            }
+        else {
+            return Ok(None);
+        };
+        let id = task.id;
+        let write = super::task::is_write(&task.method);
+        let epoch = task.args["_omci_auth_epoch"].as_u64();
+        let internal_interval = self
+            .interval_authorizations
+            .get(&id)
+            .is_some_and(|grant| grant.permits(task, self));
+        let auth_valid = !write
+            || crate::omci_auth::cwmp_epoch(device)
+                .is_some_and(|current| current == 0 || epoch == Some(current));
+        if let Err(reason) = if !auth_valid {
+            Err("OMCI authentication generation changed; queued write cancelled".into())
+        } else if internal_interval {
+            super::policy::protect_unresolved(self, device, &task.method)
+        } else {
+            protect_management(self, device, &task.method, &task.args)
+        } {
+            self.fail_dispatch(id, &reason);
+            return Ok(None);
         }
-        if let Some(task) = self
-            .tasks
-            .values_mut()
-            .find(|t| t.device == device && t.state == TaskState::Queued)
-        {
-            let xml = soap::request(namespace, task.id, &task.method, &task.args)?;
-            let undo = transaction::DispatchUndo {
-                id: task.id,
-                sent: task.sent,
-            };
-            let write = matches!(
-                task.method.as_str(),
-                "SetParameterValues" | "AddObject" | "DeleteObject"
-            );
-            let epoch = task.args["_omci_auth_epoch"].as_u64();
-            let mut admit = || {
-                task.state = TaskState::Sent;
-                task.sent = Some(now());
-                Ok(())
-            };
-            let admitted = if write {
-                crate::omci_auth::enqueue_cwmp(device, epoch, admit)
+
+        let prepared = (|| {
+            if let Some(args) = soap::WriteArgs::parse(&task.method, &task.args)? {
+                let intent = super::intent::Intent::capture(&args)?;
+                let xml = args.request(namespace, id, &intent.parameter_key);
+                Ok((Some(intent), xml))
             } else {
-                admit()
-            };
-            if let Err(error) = admitted {
-                let id = task.id;
-                task.state = TaskState::Fault;
-                task.result = Some(error_result(&error.to_string()));
-                self.mark_completed(id);
-                self.release_dispatch(id);
-                return Ok(None);
+                let xml = soap::request(namespace, id, &task.method, &task.args)?;
+                Ok((None, xml))
             }
-            return Ok(Some(transaction::PreparedRpc { xml, undo }));
+        })();
+        let (intent, xml) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.release_dispatch(id);
+                return Err(error);
+            }
+        };
+        let task = self.tasks.get_mut(&id).unwrap();
+        let undo = transaction::DispatchUndo {
+            id,
+            sent: task.sent,
+        };
+        let mut admit = || {
+            task.state = TaskState::Sent;
+            task.sent = Some(now());
+            Ok(())
+        };
+        let admitted = if write {
+            crate::omci_auth::enqueue_cwmp(device, epoch, admit)
+        } else {
+            admit()
+        };
+        if let Err(error) = admitted {
+            self.fail_dispatch(id, &error.to_string());
+            return Ok(None);
         }
-        Ok(None)
+        if let Some(intent) = intent {
+            self.intents.insert(id, intent);
+        }
+        Ok(Some(transaction::PreparedRpc { xml, undo }))
+    }
+
+    fn fail_dispatch(&mut self, id: u64, reason: &str) {
+        let task = self.tasks.get_mut(&id).unwrap();
+        task.state = TaskState::Fault;
+        task.result = Some(error_result(reason));
+        self.mark_completed(id);
+        self.release_dispatch(id);
     }
 
     pub(super) fn response(&mut self, device: &str, message: soap::Message) -> io::Result<()> {
@@ -259,6 +270,11 @@ impl State {
         }
         let method = task.method.clone();
         let completed = task.state == TaskState::Completed;
+        // If a successful write response cannot be retained, the consumer cannot
+        // recover its status or AddObject instance. Do not turn that loss into
+        // a definitive failure that could authorize a duplicate write.
+        let lost_write_response_is_unknown =
+            super::task::is_write(&method) && message.method != "Fault";
         if method == "GetParameterValues" && completed {
             let evidence = super::readback::service_evidence(&message.data);
             self.results.entry(id).or_default().management_services = evidence;
@@ -277,8 +293,16 @@ impl State {
         task.result = Some(match result {
             Some(result) => result,
             None => {
-                task.state = TaskState::Fault;
-                error_result("response_too_large: result exceeds its dispatch contract")
+                task.state = if lost_write_response_is_unknown {
+                    TaskState::Unknown
+                } else {
+                    TaskState::Fault
+                };
+                error_result(if lost_write_response_is_unknown {
+                    "write response could not be retained; execution outcome requires recovery"
+                } else {
+                    "response_too_large: result exceeds its dispatch contract"
+                })
             }
         });
         self.mark_completed(id);

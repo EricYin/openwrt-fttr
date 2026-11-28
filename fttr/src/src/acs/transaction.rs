@@ -22,6 +22,7 @@ impl DispatchUndo {
             .expect("prepared task remains locked");
         task.state = TaskState::Queued;
         task.sent = self.sent;
+        state.intents.remove(&self.id);
         state.release_dispatch(self.id);
     }
 }
@@ -101,6 +102,10 @@ impl Server {
             .results
             .extract_if(.., |id, _| tasks.iter().any(|(task_id, _)| id == task_id))
             .collect();
+        let intents: Vec<_> = state
+            .intents
+            .extract_if(.., |id, _| tasks.iter().any(|(task_id, _)| id == task_id))
+            .collect();
         let sessions: Vec<_> = state
             .sessions
             .extract_if(.., |_, (id, _, _)| id == device)
@@ -115,6 +120,7 @@ impl Server {
             Err(err) => {
                 state.tasks.extend(tasks);
                 state.results.extend(results);
+                state.intents.extend(intents);
                 state.sessions.extend(sessions);
                 Err(err)
             }

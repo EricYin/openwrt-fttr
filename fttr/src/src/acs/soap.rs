@@ -1,16 +1,116 @@
-use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::fmt::Write as _;
 use std::io;
 
 pub const SOAP: &str = "http://schemas.xmlsoap.org/soap/envelope/";
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Parameter {
-    pub name: String,
-    pub value: String,
-    #[serde(default = "string_type")]
-    pub kind: String,
+pub(super) const MAX_SET_PARAMETERS: usize = 32;
+pub(super) struct Parameter<'a> {
+    pub(super) name: &'a str,
+    pub(super) value: &'a str,
+    pub(super) kind: &'a str,
 }
-fn string_type() -> String {
-    "string".into()
+
+pub(super) enum WriteArgs<'a> {
+    Set(Vec<Parameter<'a>>),
+    Add(&'a str),
+    Delete(&'a str),
+}
+
+impl<'a> WriteArgs<'a> {
+    pub(super) fn parse(method: &str, args: &'a Value) -> io::Result<Option<Self>> {
+        let write = match method {
+            "SetParameterValues" => Self::Set(set_parameters(args)?),
+            "AddObject" | "DeleteObject" => {
+                let object = args["object"]
+                    .as_str()
+                    .filter(|s| !s.is_empty() && valid_path(s))
+                    .ok_or_else(|| bad("invalid CWMP object name"))?;
+                if method == "AddObject" {
+                    Self::Add(object)
+                } else {
+                    Self::Delete(object)
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(write))
+    }
+
+    pub(super) fn request(&self, namespace: &str, id: u64, parameter_key: &str) -> String {
+        let parameter_key = escape(parameter_key);
+        let body = match self {
+            Self::Set(values) => {
+                let mut list = String::new();
+                for p in values {
+                    let _ = write!(list, "<ParameterValueStruct><Name>{}</Name><Value xsi:type=\"xsd:{}\">{}</Value></ParameterValueStruct>", escape(p.name), p.kind, escape(p.value));
+                }
+                format!("<cwmp:SetParameterValues><ParameterList soap-enc:arrayType=\"cwmp:ParameterValueStruct[{}]\">{list}</ParameterList><ParameterKey>{parameter_key}</ParameterKey></cwmp:SetParameterValues>", values.len())
+            }
+            Self::Add(object) | Self::Delete(object) => {
+                let method = if matches!(self, Self::Add(_)) {
+                    "AddObject"
+                } else {
+                    "DeleteObject"
+                };
+                format!("<cwmp:{method}><ObjectName>{}</ObjectName><ParameterKey>{parameter_key}</ParameterKey></cwmp:{method}>", escape(object))
+            }
+        };
+        envelope(namespace, &format!("fttr-{id}"), &body)
+    }
+}
+
+pub(super) fn valid_path(path: &str) -> bool {
+    path.len() <= 1024 && !path.chars().any(char::is_control)
+}
+
+pub(super) fn valid_value_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string"
+            | "boolean"
+            | "int"
+            | "unsignedInt"
+            | "dateTime"
+            | "base64"
+            | "hexBinary"
+            | "long"
+            | "unsignedLong"
+    )
+}
+
+pub(super) fn set_parameters(args: &Value) -> io::Result<Vec<Parameter<'_>>> {
+    let values = args["parameters"]
+        .as_array()
+        .filter(|a| !a.is_empty() && a.len() <= MAX_SET_PARAMETERS)
+        .ok_or_else(|| bad("invalid SetParameterValues parameter list"))?;
+    let mut parameters = Vec::with_capacity(values.len());
+    for item in values {
+        let name = item["name"]
+            .as_str()
+            .filter(|s| !s.is_empty() && valid_path(s))
+            .ok_or_else(|| bad("invalid SetParameterValues parameter name"))?;
+        if parameters.iter().any(|p: &Parameter<'_>| p.name == name) {
+            return Err(bad("duplicate SetParameterValues parameter name"));
+        }
+        let value = item["value"]
+            .as_str()
+            .filter(|s| {
+                s.len() <= 4096
+                    && !s
+                        .chars()
+                        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+            })
+            .ok_or_else(|| bad("invalid SetParameterValues parameter value"))?;
+        let kind = match item.get("kind") {
+            None => "string",
+            Some(kind) => kind
+                .as_str()
+                .filter(|kind| valid_value_type(kind))
+                .ok_or_else(|| bad("unsupported XSD type"))?,
+        };
+        parameters.push(Parameter { name, value, kind });
+    }
+    Ok(parameters)
 }
 #[derive(Debug)]
 pub struct Message {
@@ -344,12 +444,7 @@ pub fn escape(value: &str) -> String {
 pub fn envelope(namespace: &str, id: &str, body: &str) -> String {
     format!("<?xml version=\"1.0\"?><soap:Envelope xmlns:soap=\"{SOAP}\" xmlns:cwmp=\"{}\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" xmlns:soap-enc=\"http://schemas.xmlsoap.org/soap/encoding/\"><soap:Header><cwmp:ID soap:mustUnderstand=\"1\">{}</cwmp:ID></soap:Header><soap:Body>{body}</soap:Body></soap:Envelope>", escape(namespace), escape(id))
 }
-pub fn request(
-    namespace: &str,
-    id: u64,
-    method: &str,
-    args: &serde_json::Value,
-) -> io::Result<String> {
+pub(super) fn request(namespace: &str, id: u64, method: &str, args: &Value) -> io::Result<String> {
     let body = match method {
         "GetRPCMethods" => "<cwmp:GetRPCMethods/>".into(),
         "GetParameterNames" => format!("<cwmp:GetParameterNames><ParameterPath>{}</ParameterPath><NextLevel>{}</NextLevel></cwmp:GetParameterNames>", escape(args["path"].as_str().unwrap_or("")), args["next_level"].as_bool().unwrap_or(false)),
@@ -357,16 +452,6 @@ pub fn request(
             let names = args["names"].as_array().ok_or_else(|| bad("names array required"))?;
             format!("<cwmp:GetParameterValues><ParameterNames soap-enc:arrayType=\"xsd:string[{}]\">{}</ParameterNames></cwmp:GetParameterValues>", names.len(), names.iter().map(|n| format!("<string>{}</string>", escape(n.as_str().unwrap_or("")))).collect::<String>())
         }
-        "SetParameterValues" => {
-            let values: Vec<Parameter> = serde_json::from_value(args["parameters"].clone()).map_err(|_| bad("parameters array required"))?;
-            let mut list = String::new();
-            for p in &values {
-                if !matches!(p.kind.as_str(), "string" | "boolean" | "int" | "unsignedInt" | "dateTime" | "base64" | "hexBinary" | "long" | "unsignedLong") { return Err(bad("unsupported XSD type")); }
-                list.push_str(&format!("<ParameterValueStruct><Name>{}</Name><Value xsi:type=\"xsd:{}\">{}</Value></ParameterValueStruct>", escape(&p.name), p.kind, escape(&p.value)));
-            }
-            format!("<cwmp:SetParameterValues><ParameterList soap-enc:arrayType=\"cwmp:ParameterValueStruct[{}]\">{list}</ParameterList><ParameterKey>fttr-{id}</ParameterKey></cwmp:SetParameterValues>", values.len())
-        }
-        "AddObject" | "DeleteObject" => format!("<cwmp:{method}><ObjectName>{}</ObjectName><ParameterKey>fttr-{id}</ParameterKey></cwmp:{method}>",escape(args["object"].as_str().unwrap_or(""))),
         _ => return Err(bad("unsupported ACS RPC")),
     };
     Ok(envelope(namespace, &format!("fttr-{id}"), &body))
@@ -409,7 +494,10 @@ mod tests {
             fault.data.rows().unwrap()[0]["name"],
             "InternetGatewayDevice.x"
         );
-        let xml=request("urn:dslforum-org:cwmp-1-0",2,"DeleteObject",&serde_json::json!({"object":"InternetGatewayDevice.WANDevice.1.WANConnectionDevice.4."})).unwrap();
+        let xml = WriteArgs::parse(
+            "DeleteObject",
+            &serde_json::json!({"object":"InternetGatewayDevice.WANDevice.1.WANConnectionDevice.4."}),
+        ).unwrap().unwrap().request("urn:dslforum-org:cwmp-1-0", 2, "fixture-key");
         assert_eq!(parse(&xml).unwrap().method, "DeleteObject");
     }
     #[test]
@@ -425,20 +513,18 @@ mod tests {
     }
     #[test]
     fn typed_write_is_escaped() {
-        let xml = request(
-            "urn:dslforum-org:cwmp-1-0",
-            1,
+        let xml = WriteArgs::parse(
             "SetParameterValues",
             &serde_json::json!({"parameters":[{"name":"x", "value":"<ssid>&", "kind":"string"}]}),
         )
-        .unwrap();
+        .unwrap()
+        .unwrap()
+        .request("urn:dslforum-org:cwmp-1-0", 1, "fixture-key");
         assert!(xml.contains("&lt;ssid&gt;&amp;"));
         assert!(parse(&xml).is_ok());
-        assert!(request(
-            "urn:dslforum-org:cwmp-1-0",
-            1,
+        assert!(WriteArgs::parse(
             "SetParameterValues",
-            &serde_json::json!({"parameters":[{"name":"x", "value":"a", "kind":"evil"}]})
+            &serde_json::json!({"parameters":[{"name":"x", "value":"a", "kind":"evil"}]}),
         )
         .is_err());
     }
